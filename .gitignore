@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.amp/
+
+# Packaging artefacts (see pyproject.toml). Editable installs write these;
+# they are derived from the source and must never be committed.
+build/
+dist/
+*.egg-info/
+
+# Agent-runtime local state. Ignored BY LOCATION, not by vetting what it holds
+# today: the property that makes it dangerous is where it sits, and the
+# property that made it safe was its contents. It is recreated by the runtime
+# after deletion, so ignoring is the only thing that stops a `git add -A`.
+.claude/
+.sandy/

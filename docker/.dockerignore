@@ -1,0 +1,11 @@
+# Keep the build context to what the image actually needs. `COPY router/`
+# takes the package as a directory (see Dockerfile for why file-by-file
+# manifests are banned here), so these exclusions are what stop tests and
+# build litter riding along with it.
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+router/tests/
+.git/
+.gitignore
+*.md

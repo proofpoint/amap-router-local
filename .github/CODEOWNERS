@@ -1,0 +1,20 @@
+# GitHub SILENTLY IGNORES an owner it cannot resolve -- an unknown handle, or
+# one without access to this repo. A wrong entry here does not error; it
+# produces a CODEOWNERS that reviews nothing, which is this repo's own "a check
+# that CANNOT PASS" failure mode wearing a config file. Confirm on the repo's
+# Settings -> Code review page that this rule shows as ACTIVE.
+#
+# This named an EMU-suffixed account for one day and that was wrong twice: it
+# disclosed an internal identity, AND an EMU account cannot access a regular
+# github.com org at all, so the rule would have been inert. A leak that also
+# does not work -- each failure hiding the other.
+#
+# (The offending handle is deliberately NOT quoted here. A comment explaining a
+# leak, which contains the leak, is the guard carrying the literal it guards
+# against. This file did exactly that for about a minute.)
+#
+# `@rappdw` is the account `gh auth status` reports as active for github.com and
+# whose token pushes to this remote, so it demonstrably has access. That is
+# evidence rather than a second guess, and still worth confirming.
+
+* @rappdw

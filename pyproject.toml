@@ -1,0 +1,58 @@
+# amap-router-local is packaged so that OTHER runtimes can import its policy
+# core -- `binding`, `config`, `peers`, `validate`, `attachments`, `deliver`,
+# `outbound`, `exposure`, `lock` --
+# instead of reimplementing it. `binding.py` calls itself "the security core:
+# recipient resolution"; two copies of a mutual-allowlist check drift, and they
+# drift silently, with both test suites staying green while the semantics
+# diverge. Packaging exists to make that duplication unnecessary.
+#
+# INSTALL EDITABLE, ALWAYS:  pip install -e .
+#
+# A copy install puts a second router under site-packages, and "which copy is
+# actually running" is exactly the ambiguity the fleet bring-up's 6.1b step
+# exists to rule out -- it hashes the baked code against the checkout to prove
+# an image matches its source. One source of truth on disk.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amap-router-local"
+version = "0.1.0"
+description = "Transport-free reference runtime for the Agent Mailbox Access Protocol, and the policy core other AMAP runtimes import"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Communications :: Email",
+  "Typing :: Typed",
+]
+
+# NOT a formality, and not an oversight. This runtime is standard-library
+# only, on purpose: it is meant to be auditable and to run with nothing but a
+# base image. An empty list makes that constraint machine-readable instead of
+# a promise in prose, so adding a dependency becomes a visible diff here
+# rather than a quiet import.
+dependencies = []
+
+[project.urls]
+"Protocol" = "https://github.com/proofpoint/amap-spec"
+
+[tool.setuptools]
+# `router.tests` ships deliberately: a consumer importing this as a library can
+# run the suite against the copy it actually imported, rather than against a
+# checkout it hopes is the same.
+#
+#     pytest --pyargs router.tests      # the whole suite, from anywhere, when editable
+#
+# Under a COPY install it fails at collection instead: test_docker.py resolves
+# `Path(__file__).parents[2]` to reach docker/derive-mounts.py at the repo
+# root, which does not exist under site-packages. That is the editable-only
+# rule enforcing itself, and it fails loudly at collection rather than quietly
+# at runtime -- which is the failure mode to want.
+packages = ["router", "router.tests"]
+
+[tool.setuptools.package-data]
+router = ["py.typed"]
