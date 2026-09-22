@@ -18,3 +18,5 @@ dist/
 
 CI-PHASE-1.md
 amap-router-local.md
+apply-ci-phase-1.sh
+*.bak
