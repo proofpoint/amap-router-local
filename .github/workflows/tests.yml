@@ -65,9 +65,11 @@ jobs:
             echo "spec present -- running the FULL suite including conformance"
             python -m unittest discover -s router/tests -t .
           else
-            echo "::warning title=Conformance tests NOT RUN::amap-spec is private and this job's GITHUB_TOKEN cannot read it. 70 of 645 tests, in 6 modules, are not running. Unblock by making proofpoint/amap-spec public, or by supplying a read-only token; then this step runs the full suite with no change to this file."
-            echo "PHASE 1: spec unavailable -- 6 conformance modules held back."
             skip="test_attachments_outbound test_happy_path test_outcomes test_peer_fixtures test_peer_routing test_validate_fixtures"
+            n=$(printf '%s\n' $skip | wc -l | tr -d ' ')
+            list=$(printf '%s, ' $skip | sed 's/, $//')
+            echo "PHASE 1: spec unavailable -- $n conformance modules held back."
+            echo "::warning title=Conformance tests NOT RUN::amap-spec is private and this job's GITHUB_TOKEN cannot read it, so $n modules are held back: $list. These are excluded whole, so more tests are skipped than actually need the spec. Unblock by making proofpoint/amap-spec public, or by supplying a read-only token; then this step runs the full suite with no change to this file."
             run=""
             for f in router/tests/test_*.py; do
               base=$(basename "$f" .py)
