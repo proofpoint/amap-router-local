@@ -82,20 +82,35 @@ behaviour.
 python3 -m pytest router/tests -q
 ```
 
-**636 tests, ~1.8 s.** No docker and no network: `router/tests/test_docker.py`
-pins properties of `docker/` by *reading* it — it never builds an image.
+**637 tests, ~1.9 s** (measured 2026-09-22). No docker and no network:
+`router/tests/test_docker.py` pins properties of `docker/` by *reading* it —
+it never builds an image.
+
+**Counts in this file go stale; measure before quoting one.** The previous
+pair here — "636 tests", "32 of the 636", "1 failure + 31 errors" — were all
+three wrong by the time anyone read them, and nothing fails when they are.
 
 But **not** "no fixtures outside the repo" — that claim was here and was
-wrong. **32 of the 636 need a sibling spec checkout** (`amap-spec`, formerly
-`agent-mailbox-protocol`) and on a bare clone they report `1 failure + 31
-errors`. That is correct behaviour, not breakage: `helpers._spec_root()`
-returns a path that does not exist rather than `None` precisely so the
-conformance tests fail loudly instead of skipping. The rule comes from a probe
-found guarded by a `skipTest`: it **did not fail, it stopped running**, and the
-suite went on reporting green without it. Resolving the checkout is the fix;
-tolerating the skip is not. Point
-`$AMAP_SPEC_REPO` at a checkout, or put one beside this repo, and the 32 run.
-`.github/workflows/tests.yml` does the former on 3.9 and 3.13.
+wrong. Some tests need a sibling spec checkout (`amap-spec`, formerly
+`agent-mailbox-protocol`), and on a bare clone they report **1 failure + 32
+errors**, spread over **6 modules**: `test_attachments_outbound`,
+`test_happy_path`, `test_outcomes`, `test_peer_fixtures`, `test_peer_routing`,
+`test_validate_fixtures`. That is correct behaviour, not breakage:
+`helpers._spec_root()` returns a path that does not exist rather than `None`
+precisely so the conformance tests fail loudly instead of skipping. The rule
+comes from a probe found guarded by a `skipTest`: it **did not fail, it
+stopped running**, and the suite went on reporting green without it. Resolving
+the checkout is the fix; tolerating the skip is not. Point `$AMAP_SPEC_REPO`
+at a checkout, or put one beside this repo, and they run.
+
+**CI is in PHASE 1 and a green run is NOT the full suite.**
+`proofpoint/amap-spec` is private and a workflow's default `GITHUB_TOKEN` is
+scoped to the repo it runs in — same org is not same repo — so the checkout
+fails and `.github/workflows/tests.yml` branches on whether the fixtures are
+there, holding back those 6 modules and emitting a `::warning` naming them.
+Note the granularity: it excludes whole MODULES, so **70 tests are held back
+to avoid 33 failures** — the other 37 would pass and do not run. amap-spec
+going public fixes all of it with no edit to the workflow.
 
 **Install editable, always: `pip install -e .`** A copy install puts a second
 router under `site-packages` and makes "which copy is running" ambiguous.
