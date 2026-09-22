@@ -15,3 +15,6 @@ dist/
 # after deletion, so ignoring is the only thing that stops a `git add -A`.
 .claude/
 .sandy/
+
+CI-PHASE-1.md
+amap-router-local.md
