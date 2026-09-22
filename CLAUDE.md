@@ -207,6 +207,45 @@ in front of you.
 third; the "when it fires" half is theirs too, from the exchange that found
 the fourth. The evidence is this repo's.)
 
+### The companion: every after-check needs one that fails when NOTHING HAPPENED
+
+The four above are all "the assertion was satisfied by a second producer".
+There is a degenerate case of that worth its own name, because the second
+producer is invisible: **the operation did not run at all.**
+
+When the passing state and the no-op state are indistinguishable, an
+after-check certifies a change that was never made. Three instances in one
+afternoon, 2026-09-22, all of them in throwaway tooling rather than in the
+suite — which is the point, since that is where nobody thinks to apply the
+rule:
+
+  * A test asserting an outcome beside the pinned `ext/` directory is NOT
+    consumed. It placed a hand-made file there, which the FILENAME pattern
+    refuses long before the directory is ever chosen, so it stayed green
+    under the mutation that adds a second scanned path. It was pinning the
+    regex. Fixed by MOVING a file `write_outcome` produced, leaving the
+    directory as the only reason it is not read.
+  * A host-side script that said **"Idempotent" in its own header** while
+    stacking duplicate lines on a second run. Found by running it twice.
+  * The identity rewrite. `git rebase --exec` with the exec written across
+    two lines is a HARD ERROR (`exec commands cannot contain newlines`); the
+    rebase then fast-forwarded and did nothing, and the after-checks reported
+    "tree identical" and "messages identical". Both true. Both meaningless.
+
+The third is the sharpest: the check that was fooled had been written
+specifically to catch a bad rewrite. "Tree identical" needed a companion
+asserting **the shas CHANGED**, and did not have one until the third attempt.
+
+So: pair every "X is unchanged" with an "and Y did change", and pair every
+"zero bad ones" with an "and N good ones" — a count that must be nonzero is
+what separates *checked* from *the grep did not run*. Ask of each check what
+it reports when the operation is a no-op. If the answer is "pass", it is not
+a check.
+
+(The positive-control half is the connector's, found on a grep. That it is
+not a grep habit is this repo's, found by three different no-ops in one
+afternoon.)
+
 ### The inverse: a check that CANNOT PASS
 
 The symmetric failure is a guard that is always closed — fail-closed, silent,
