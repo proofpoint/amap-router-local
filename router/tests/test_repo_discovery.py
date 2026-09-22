@@ -1,10 +1,13 @@
 """The two by-name sibling-checkout probes, pinned.
 
 `helpers._spec_root()` locates the spec checkout and
-`test_provision._connector_bin()` locates the connector's `bin/`. Both accept
-two spellings, because the family renames `agent-mailbox-protocol` ->
-`amap-spec` and `amp-connector-claude-code` -> `amap-connector-claude` in one
-flag day and the repos must be able to rename independently.
+`test_provision._connector_bin()` locates the connector's `bin/`. Each tries a
+TUPLE of names rather than one literal, because the family renames its repos
+(`agent-mailbox-protocol` -> `amap-spec`, `amp-connector-claude-code` ->
+`amap-connector-claude`) and the repos must be able to rename independently
+instead of landing together. A tuple at length one is still the right shape:
+the connector's old spelling was dropped on 2026-09-22 and re-adding a name
+is a one-line change.
 
 WHY THIS FILE EXISTS. The comment in `test_provision.py` records what happened
 the last time one of these probes carried a single hardcoded name: the name
@@ -157,14 +160,27 @@ class ConnectorBinTests(_DiscoveryTestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def test_new_name_wins_when_both_are_present(self):
-        self.checkout("amp-connector-claude-code", "bin")
+    def test_the_checkout_is_found_by_its_current_name(self):
         expected = self.checkout("amap-connector-claude", "bin")
         self.assertEqual(test_provision._connector_bin(), expected)
 
-    def test_old_name_is_found_when_only_it_is_present(self):
-        expected = self.checkout("amp-connector-claude-code", "bin")
-        self.assertEqual(test_provision._connector_bin(), expected)
+    def test_a_checkout_under_the_dropped_name_is_not_found(self):
+        """The cost of dropping `amp-connector-claude-code`, stated where it
+        can be read: such a checkout is no longer resolved, so the probe that
+        compares against the real connector SKIPS rather than fails — the
+        silent-skip failure this file exists to guard against.
+
+        Asserted against the FALLBACK path, not merely `!= that checkout`:
+        the fallback is what a caller actually receives, and a resolver that
+        returned some third wrong path would satisfy the weaker form. The
+        directory is created, so a resolver still carrying the old name finds
+        a real `is_dir()` hit and this goes red."""
+        stale = self.checkout("amp-connector-claude-code", "bin")
+        self.assertTrue(stale.is_dir())
+
+        self.assertEqual(
+            test_provision._connector_bin(),
+            self.siblings / "amap-connector-claude" / "bin")
 
     def test_neither_present_falls_back_to_the_post_rename_repo(self):
         self.assertEqual(

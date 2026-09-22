@@ -22,20 +22,25 @@ from router.util import NamespaceEscapeError
 # isn't there, so this suite stands alone.
 #
 # Resolved by trying each known name in turn rather than hardcoding one, NEWEST
-# FIRST: the family renames `amp-connector-claude-code` -> `amap-connector-claude`
-# in one flag day, and accepting both means this repo and the connector repo can
-# rename independently instead of having to land together. Drop the old name
-# once no checkout carries it. `$AMAP_CONNECTOR_REPO`, else `$AMP_CONNECTOR_REPO`,
+# FIRST, so this repo and the connector repo can rename independently instead of
+# having to land together. `$AMAP_CONNECTOR_REPO`, else `$AMP_CONNECTOR_REPO`,
 # overrides for a checkout that lives somewhere else.
 #
 # Hardcoding one name alone is what made this probe skip silently after the last
 # split — the suite stayed green while the one check that compares against the
 # real connector stopped running (see `amap-conformance-harness/tests/harness.py`,
-# same pattern). So the tuple is EXTENDED for a rename, never swapped.
+# same pattern). So the tuple is EXTENDED for a rename, NEVER SWAPPED, and it
+# stays a tuple at length one for exactly that reason.
 #
-# `amp-connectors` and `connector-reference` were the two pre-split spellings and
-# are gone: no checkout has carried either for two splits, so trying them bought
-# nothing but the impression of coverage.
+# Three pre-rename spellings have been dropped under the rule "drop the old name
+# once no checkout carries it": `amp-connectors` and `connector-reference` after
+# two splits, and `amp-connector-claude-code` on 2026-09-22 with the flag day to
+# `amap-connector-claude` long past. Each was trying a name that bought nothing
+# but the impression of coverage. Note what that rule cannot check: whether a
+# checkout still carries the name is not observable from here, and the cost of
+# being wrong is this probe skipping rather than failing. That is why the
+# resolver itself is pinned in `test_repo_discovery.py` — testing the RESOLVER,
+# not the thing it resolves, is what survives being wrong about this.
 def _connector_bin() -> Path:
     for var in ("AMAP_CONNECTOR_REPO", "AMP_CONNECTOR_REPO"):
         env = os.environ.get(var)
@@ -45,8 +50,7 @@ def _connector_bin() -> Path:
                 if root.joinpath(*tail).is_dir():
                     return root.joinpath(*tail)
             return root / "bin"
-    for name, tail in (("amap-connector-claude", ("bin",)),
-                       ("amp-connector-claude-code", ("bin",))):
+    for name, tail in (("amap-connector-claude", ("bin",)),):
         cand = AMP_ROOT.parent.joinpath(name, *tail)
         if cand.is_dir():
             return cand
