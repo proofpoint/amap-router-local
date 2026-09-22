@@ -559,13 +559,13 @@ signal ("this is a reply") is being read from a second place; the
 Work delegation between agents in different sandboxes, same principal:
 a second inbound tree, `<handoff_dir>/peer/{notices,messages}`, a sibling of
 `inbox/`, holding `kind: "peer"` notices that only this router writes and
-that the in-sandbox delivery daemon (amp-connector-claude-code) injects into
+that the in-sandbox delivery daemon (the AMAP connector) injects into
 the agent's session as a teammate's request. The tree IS the origin
 assertion — "authenticated same-principal origin, unscreened content" — so
 what goes into it is decided by write authority and declared edges, never by
 a field in the message. Design record: `delivery_design.md` and `RULINGS.md`
-in the connector's repo (amp-connector-claude-code); the wire is
-`agent-mailbox-protocol/spec/peer-origin.md`; this section is the operator's
+in the connector's repo; the wire is the spec repo's
+`spec/peer-origin.md`; this section is the operator's
 view.
 
 **Config.** Five optional top-level keys and one per-instance key:
@@ -651,16 +651,16 @@ it back. See `router/exposure.py`.
 into `outbox/ext/claude-code/outcomes/peer-<id>.json`
 (`delivered | held | denied | refused | ambiguous_target | inject_failed`).
 `claude-code` is the connector id the spec pins: it does not change when the
-connector's repository is renamed, and this router treats it as opaque. For
-one release the old repo-tracking spelling
-`outbox/ext/amp-connector-claude-code/outcomes/` is read too, for a daemon
-that has not been re-provisioned; both are scanned every poll, the pinned id
-first, and an outcome present under both is acted on once. Retiring the
-compatibility path is a deliberate edit — `router/tests/
-test_outcomes_ext_path.py` fails when it goes, because nothing else would:
-an outcome nobody reads is silence, and this router never infers anything
-from silence.
-Every poll reads those directories with the outbox discipline, records each
+connector's repository is renamed, and this router treats it as opaque. It is
+the ONLY directory scanned. A compatibility path under the old repo-tracking
+spelling was read alongside it for one release and was retired on 2026-09-22;
+`ext/` is agent-writable, so an outcome written under any other id sits there
+unread. That retirement was a deliberate edit rather than a cleanup, and the
+reason generalises to any future change here: an outcome nobody reads is
+silence, this router never infers anything from silence, and so nothing it
+observes would report the mistake. `router/tests/test_outcomes_ext_path.py`
+is what says which directory is scanned, in place of that missing signal.
+Every poll reads that directory with the outbox discipline, records each
 outcome once per `(tree, notice_id, outcome)` under
 `state_dir/<recipient>/outcomes/`, unlinks the file, and acts: `denied` and
 `refused` send the SENDER a DSN — a `deliver` notice in its `inbox/` from

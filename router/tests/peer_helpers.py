@@ -10,9 +10,7 @@ between sandy launch and enrolment for exactly that reason.
 
 The daemon's side of the seam is stood in for by `write_outcome`, which
 writes one outcome file in the agreed shape (`.tmp` + rename, like the real
-daemon) into an instance's `outbox/ext/claude-code/outcomes/` — or, with
-`legacy=True`, into the old connector id the router still reads for one
-release.
+daemon) into an instance's `outbox/ext/claude-code/outcomes/`.
 """
 
 from __future__ import annotations
@@ -101,27 +99,23 @@ def notice_id_of(filename: str) -> str:
     return filename[len("notice-"):-len(".json")]
 
 
-def outcomes_dir(cfg: RouterConfig, name: str, *, legacy: bool = False) -> Path:
-    """The outcomes directory under the spec-pinned connector id, or under
-    the old repo-tracking id with `legacy=True` (the compatibility path the
-    router scans for one release — `outcomes.LEGACY_CONNECTOR_ID`)."""
-    rel = outcomes_mod.LEGACY_OUTCOMES_REL if legacy else outcomes_mod.OUTCOMES_REL
-    return cfg.instances[name].outbox_root / rel
+def outcomes_dir(cfg: RouterConfig, name: str) -> Path:
+    """The outcomes directory under the spec-pinned connector id."""
+    return cfg.instances[name].outbox_root / outcomes_mod.OUTCOMES_REL
 
 
 def write_outcome(
     cfg: RouterConfig, name: str, notice_id: str, outcome: str, *,
     ts: str = "2026-09-03T12:00:00Z", detail: Optional[str] = None,
     doc_override: Optional[Dict[str, Any]] = None, filename: Optional[str] = None,
-    raw_override: Optional[bytes] = None, legacy: bool = False,
+    raw_override: Optional[bytes] = None,
 ) -> Path:
     """The daemon's write, as agreed: `.peer-<id>.json.tmp` + rename into
     `outbox/ext/<connector-id>/outcomes/peer-<id>.json`. Returns the final
-    path. `legacy=True` writes under the old connector id instead, standing
-    in for a daemon that has not been re-provisioned. `doc_override`
+    path. `doc_override`
     replaces the document wholesale (for shape tests); `raw_override` writes
     arbitrary bytes."""
-    d = outcomes_dir(cfg, name, legacy=legacy)
+    d = outcomes_dir(cfg, name)
     d.mkdir(parents=True, exist_ok=True)
     final = d / (filename or f"peer-{notice_id}.json")
     tmp = d / f".{final.name}.tmp"

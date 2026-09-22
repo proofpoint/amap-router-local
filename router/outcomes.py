@@ -13,11 +13,10 @@ one file per outcome, named `peer-<notice_id>.json`:
 
 `<name>` is `claude-code` — the id the spec pins, which does not change when
 the connector's repository is renamed and is opaque to this router
-(`CONNECTOR_ID`). For one release the old repo-tracking spelling
-`amp-connector-claude-code` is scanned too, preferred second, for a daemon
-that has not been re-provisioned yet (`LEGACY_CONNECTOR_ID`). Both are always
-scanned: a daemon writing the old id does not stop because the new directory
-exists, and an outcome nobody reads is indistinguishable from no outcome.
+(`CONNECTOR_ID`). A compatibility path under the old repo-tracking spelling
+was scanned alongside it for one release and was RETIRED on 2026-09-22; see
+that commit for the decision and for what was not established when it was
+made.
 
 Outcomes are INFORMATIONAL, NOT PROOF. They are written by the workspace
 uid — the agent's uid — so the receiving agent can forge `delivered` or
@@ -180,20 +179,6 @@ logger = logging.getLogger("amap_router_local.outcomes")
 #: nothing here may parse it.
 CONNECTOR_ID = "claude-code"
 
-#: The pre-ruling spelling, which did track the repo name and so would have
-#: had to move with it. COMPATIBILITY PATH, for one release: a daemon that
-#: has not yet been re-provisioned still writes here.
-#:
-#: REMOVING THIS IS A DELIBERATE EDIT, not a tidy-up. Drop it once every
-#: daemon in the fleet writes the pinned id, and expect
-#: `test_outcomes_ext_path.py::LegacyPathRetirementTests::
-#: test_removing_the_legacy_path_is_a_deliberate_edit` to go red — that test
-#: exists to make the removal a decision someone takes, rather than a line
-#: that quietly disappears while outcomes pile up unread in a directory
-#: nothing scans any more. Nothing would otherwise fail: unread outcomes are
-#: silence, and this router never infers anything from silence.
-LEGACY_CONNECTOR_ID = "amp-connector-claude-code"
-
 
 def outcomes_rel(connector_id: str) -> Path:
     """`ext/<connector_id>/outcomes`, relative to `outbox_root`."""
@@ -202,17 +187,12 @@ def outcomes_rel(connector_id: str) -> Path:
 
 #: Where the daemon writes, relative to `outbox_root` (spec `outbound/ext/<name>/`).
 OUTCOMES_REL = outcomes_rel(CONNECTOR_ID)
-#: The compatibility path, same layout under the old id.
-LEGACY_OUTCOMES_REL = outcomes_rel(LEGACY_CONNECTOR_ID)
-
-#: Scanned in this order, PREFERRED FIRST. Preference needs no special case:
-#: `_consume_one` records each transition once per `(tree, notice_id,
-#: outcome)` and discards a repeat as `duplicate`, so when the same outcome
-#: sits under both ids the one scanned first is the one acted on, and the
-#: other is consumed without being acted on twice. Two files that disagree
-#: are two different transitions and both are recorded, which is what a
-#: `held` followed by a `delivered` is anyway.
-OUTCOMES_RELS = (OUTCOMES_REL, LEGACY_OUTCOMES_REL)
+#: The directories scanned each poll. A TUPLE with one member, not a bare
+#: path: `_consume_dir` iterates it and shares one file budget across
+#: whatever it holds, and a second entry has been in here before. Keeping the
+#: shape means re-adding one is a one-line change rather than a reshaping of
+#: the consumption loop.
+OUTCOMES_RELS = (OUTCOMES_REL,)
 
 OUTCOME_NAME_RE = re.compile(r"^peer-([a-f0-9]{32})\.json$")
 

@@ -1,19 +1,22 @@
-"""The `outbound/ext/<name>/` connector id, and the one-release compat window.
+"""The `outbound/ext/<name>/` connector id: one pinned path, and nothing else.
 
 The spec pins `<name>` (AMAP core §2, `outbound/ext/<name>` as a stable
 connector id, v3.1.0 DRAFT): it MUST NOT change
 when the connector's repository is renamed, and MUST be treated as opaque.
-So the router reads `ext/claude-code/`, and — for one release — also the old
-repo-tracking spelling `ext/amp-connector-claude-code/`, for a daemon that
-has not been re-provisioned yet.
+So the router reads `ext/claude-code/` and nothing else. A compatibility path
+under the old repo-tracking spelling was scanned alongside it for one release
+and was retired on 2026-09-22.
 
 WHY THIS FILE EXISTS. Nothing fails when this goes wrong. An outcome the
 router never reads is silence, and silence is exactly what a peer message
 with no outcome yet looks like: the sender is simply never told, the operator
 never sees the `held` banner, and `peer_placed_denied` never lists the notice.
 The module docstring's own rule — this router never infers anything from
-silence — is what makes the failure invisible. So the compat path gets a test
-that fails loudly when it is removed, rather than a comment asking nicely.
+silence — is what makes the failure invisible. So the path the router scans
+gets a test that fails loudly when it changes, rather than a comment asking
+nicely. That argument is why the retirement above is a RULING and not a
+cleanup: dropping a scanned directory cannot be verified after the fact from
+anything this router observes.
 
 Driven through `outcomes.consume_instance`, the unit whose directory scan
 these tests are about; `test_outcomes.py` drives the same behaviour through
@@ -32,24 +35,21 @@ class ConnectorIdTests(unittest.TestCase):
     """The ids themselves, before any filesystem is involved."""
 
     def test_pinned_id_is_not_a_repo_name(self):
-        """The whole point of the spec ruling: the id outlives the rename of
-        `amp-connector-claude-code` -> `amap-connector-claude`, so it must not
-        carry a repo name at all."""
+        """The whole point of the spec ruling: the id outlives a rename of the
+        connector's REPOSITORY, so it must not carry a repo name at all. It
+        did not change when that repository was renamed, and this test is what
+        says so."""
         self.assertEqual(outcomes.CONNECTOR_ID, "claude-code")
         self.assertNotIn("amp", outcomes.CONNECTOR_ID)
         self.assertNotIn("amap", outcomes.CONNECTOR_ID)
 
-    def test_preferred_path_comes_first(self):
-        """Preference is scan order plus the existing `(tree, notice_id,
-        outcome)` dedup — there is no tie-break anywhere else, so the order
-        of this tuple IS the preference."""
-        self.assertEqual(
-            outcomes.OUTCOMES_RELS,
-            (outcomes.OUTCOMES_REL, outcomes.LEGACY_OUTCOMES_REL))
+    def test_the_scanned_tuple_is_the_pinned_path_alone(self):
+        """One member, and it is the one the spec pins. The tuple used to
+        carry a second, and this assertion is what says it no longer does —
+        a re-added path that nothing declares here is a directory the fleet
+        was never told about."""
+        self.assertEqual(outcomes.OUTCOMES_RELS, (outcomes.OUTCOMES_REL,))
         self.assertEqual(outcomes.OUTCOMES_REL, outcomes.outcomes_rel("claude-code"))
-
-    def test_the_two_paths_are_distinct(self):
-        self.assertNotEqual(outcomes.OUTCOMES_REL, outcomes.LEGACY_OUTCOMES_REL)
 
 
 class _ExtPathTestCase(RouterTestCase):
@@ -75,9 +75,8 @@ class _ExtPathTestCase(RouterTestCase):
         return outcomes.consume_instance(self.cfg, "b")
 
 
-class EitherPathIsConsumedTests(_ExtPathTestCase):
-    """An outcome is found under either id — the property the compat window
-    exists to provide."""
+class TheExtPathIsConsumedTests(_ExtPathTestCase):
+    """An outcome under the pinned id is found — the whole of the scan."""
 
     def test_outcome_under_the_pinned_id_is_consumed(self):
         write_outcome(self.cfg, "b", self.task(), "delivered")
@@ -87,151 +86,53 @@ class EitherPathIsConsumedTests(_ExtPathTestCase):
         self.assertEqual(summary["peer_delivered"], 1)
         self.assertEqual(summary["peer_outcome_discarded"], 0)
 
-    def test_outcome_under_the_legacy_id_is_consumed(self):
-        """A daemon that has not been re-provisioned. If this stops passing,
-        every such daemon's outcomes have become silence."""
-        write_outcome(self.cfg, "b", self.task(), "delivered", legacy=True)
+    def test_an_outcome_beside_the_pinned_dir_is_not_found(self):
+        """The inverse of the test above, and the one the retirement needs.
+        `ext/` is agent-writable, so a daemon writing any other id under it
+        produces a file the router must leave alone — the cost of the pinned
+        id is exactly that, and this is where it is stated.
+
+        THE FILE IS A REAL ONE, moved. A hand-made file in the stray
+        directory is refused by the FILENAME pattern long before the
+        directory is ever chosen, so it stays unread under a scan that was
+        broadened to reach it — the first version of this test did that and
+        survived the mutation that adds a second scanned path. Moving a file
+        `write_outcome` produced leaves the directory as the only reason it
+        is not consumed.
+
+        Asserted on `outcomes_seen`, not on `delivered`: an unread file and a
+        read-then-discarded one both leave `delivered` at zero, so that
+        surface cannot tell them apart."""
+        real = write_outcome(self.cfg, "b", self.task(), "delivered")
+        stray = outcomes_dir(self.cfg, "b").parent.parent / "some-other-id" / "outcomes"
+        stray.mkdir(parents=True)
+        real.rename(stray / real.name)
 
         summary = self.consume()
 
-        self.assertEqual(summary["peer_delivered"], 1)
-        self.assertEqual(summary["peer_outcome_discarded"], 0)
-
-    def test_the_legacy_path_is_scanned_even_when_the_pinned_one_exists(self):
-        """The failure mode worth naming: scanning only the preferred
-        directory when it exists would strand exactly the outcomes the window
-        is for, because a daemon writing the old id does not stop when the
-        new directory appears."""
-        outcomes_dir(self.cfg, "b").mkdir(parents=True, exist_ok=True)
-        write_outcome(self.cfg, "b", self.task(), "delivered", legacy=True)
-
-        summary = self.consume()
-
-        self.assertEqual(summary["peer_delivered"], 1)
-
-    def test_both_paths_are_consumed_in_one_poll(self):
-        write_outcome(self.cfg, "b", self.task(), "delivered")
-        write_outcome(self.cfg, "b", self.task(), "delivered", legacy=True)
-
-        summary = self.consume()
-
-        self.assertEqual(summary["peer_delivered"], 2)
-        self.assertEqual(summary["peer_outcomes_seen"], 2)
-
-    def test_a_consumed_file_is_unlinked_under_either_id(self):
-        pinned = write_outcome(self.cfg, "b", self.task(), "delivered")
-        legacy = write_outcome(self.cfg, "b", self.task(), "held", legacy=True)
-
-        self.consume()
-
-        self.assertFalse(pinned.exists())
-        self.assertFalse(legacy.exists())
-
-
-class PreferenceTests(_ExtPathTestCase):
-    """The same notice reported under both ids at once."""
-
-    def test_pinned_path_wins_when_both_carry_the_same_transition(self):
-        """Recorded once, not twice: the second copy is the existing
-        `duplicate` discard, and because the pinned path is scanned first it
-        is the one that was acted on.
-
-        The two files are made to DIFFER in content, so this test can tell
-        which one won. Counting records cannot: both copies say `delivered`,
-        so one record and one discard is the outcome whichever order they are
-        scanned in, and an assertion on the counts alone would survive the
-        order being reversed — a check that cannot fail."""
-        notice_id = self.task()
-        write_outcome(self.cfg, "b", notice_id, "delivered",
-                      ts="2026-09-03T12:00:00Z", detail="from the pinned id")
-        write_outcome(self.cfg, "b", notice_id, "delivered", legacy=True,
-                      ts="2026-09-04T09:00:00Z", detail="from the legacy id")
-
-        summary = self.consume()
-
-        self.assertEqual(summary["peer_delivered"], 1)
-        self.assertEqual(summary["peer_outcome_discarded"], 1)
-        self.assertEqual(summary["peer_outcomes_seen"], 2)
-        record = read_json(
-            outcomes.record_path(self.cfg.state_dir, "b", "peer", notice_id, "delivered"))
-        self.assertEqual(record["detail"], "from the pinned id")
-        self.assertEqual(record["outcome_ts"], "2026-09-03T12:00:00Z")
-
-    def test_both_copies_are_unlinked_so_neither_lingers(self):
-        """The duplicate is consumed as well as discarded — a copy left
-        behind would be re-read every poll for as long as it sat there."""
-        notice_id = self.task()
-        pinned = write_outcome(self.cfg, "b", notice_id, "delivered")
-        legacy = write_outcome(self.cfg, "b", notice_id, "delivered", legacy=True)
-
-        self.consume()
-
-        self.assertFalse(pinned.exists())
-        self.assertFalse(legacy.exists())
-
-    def test_two_different_transitions_are_both_recorded(self):
-        """Not a conflict to resolve: `held` under one id and `delivered`
-        under the other is the same pair of transitions a single directory
-        would carry over two polls, and the dedup key is per outcome."""
-        notice_id = self.task()
-        write_outcome(self.cfg, "b", notice_id, "delivered")
-        write_outcome(self.cfg, "b", notice_id, "held", legacy=True)
-
-        summary = self.consume()
-
-        self.assertEqual(summary["peer_delivered"], 1)
-        self.assertEqual(summary["peer_held"], 1)
-        self.assertEqual(summary["peer_outcome_discarded"], 0)
+        self.assertEqual(summary["peer_outcomes_seen"], 0)
+        self.assertTrue((stray / real.name).exists())
 
 
 class BudgetTests(_ExtPathTestCase):
     """`MAX_FILES_PER_POLL` bounds work per instance per poll."""
 
-    def test_the_budget_is_shared_across_both_directories(self):
-        """Two agent-writable directories must not buy twice the budget.
+    def test_the_budget_caps_one_poll_and_leaves_the_rest(self):
+        """Agent-writable input: the directory holds whatever the daemon put
+        there, so the scan is bounded rather than trusting the count.
 
-        THE NUMBERS ARE THE TEST. With a budget of 4 and three outcomes under
-        each id, a shared budget takes three from the pinned directory and one
-        from the legacy one: four. A per-directory budget takes all six, and
-        the cap means twice what it says. A budget of 3 cannot tell those
-        apart — the first directory exhausts it either way, both readings
-        stop at three, and the assertion passes whichever is implemented.
-        That version of this test was written first and survived its own
-        mutation; these numbers are what killed it."""
+        BOTH HALVES ARE THE TEST. That four were taken says the cap binds;
+        that the other two are STILL ON DISK says they were deferred and not
+        dropped, which is the difference between a bounded poll and silent
+        loss. A count alone cannot tell those apart — six written, four seen
+        reads the same either way."""
         patch = mock.patch.object(outcomes, "MAX_FILES_PER_POLL", 4)
         patch.start()
         self.addCleanup(patch.stop)
-        for _ in range(3):
-            write_outcome(self.cfg, "b", self.task(), "delivered")
-        for _ in range(3):
-            write_outcome(self.cfg, "b", self.task(), "delivered", legacy=True)
+        written = [write_outcome(self.cfg, "b", self.task(), "delivered")
+                   for _ in range(6)]
 
         summary = self.consume()
 
         self.assertEqual(summary["peer_outcomes_seen"], 4)
-
-
-class LegacyPathRetirementTests(unittest.TestCase):
-    """The tripwire. See this module's docstring for why a comment would not
-    have been enough."""
-
-    def test_removing_the_legacy_path_is_a_deliberate_edit(self):
-        """WHEN YOU ARE HERE TO RETIRE THE COMPAT PATH: that is this test
-        doing its job, not an obstacle. Confirm every daemon in the fleet
-        writes `ext/claude-code/` — one still writing the old id goes silent
-        the moment the path is dropped, and nothing else in this suite or in
-        production will say so — then delete this class along with
-        `LEGACY_CONNECTOR_ID`, `LEGACY_OUTCOMES_REL`, the `legacy=` argument
-        in `peer_helpers`, and the tests above that use it."""
-        self.assertEqual(
-            outcomes.LEGACY_CONNECTOR_ID, "amp-connector-claude-code",
-            "the compatibility id changed; a daemon writing the old one is "
-            "now unread, and unread outcomes are silence")
-        self.assertIn(
-            outcomes.LEGACY_OUTCOMES_REL, outcomes.OUTCOMES_RELS,
-            "the compatibility path is no longer scanned — retiring it is a "
-            "decision, so make it one: see this test's docstring")
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(sum(1 for f in written if f.exists()), 2)
