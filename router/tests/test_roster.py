@@ -91,17 +91,18 @@ class ContentTests(_RosterTree):
 
         roster.publish(cfg, 5.0)
 
-        self.assertEqual([m["slug"] for m in self.written()["members"]],
+        self.assertEqual([m["address"].split("@")[0] for m in self.written()["members"]],
                          ["alice-deadbeef"])
 
-    def test_a_member_carries_slug_address_and_state_and_nothing_else(self):
-        """No edges, no evidence, no basename split from the slug. Pinned as
-        the EXACT key set, so anything added — `may_task`, a delivery
-        timestamp, a `name` — goes red here rather than shipping fleet-wide."""
+    def test_a_member_carries_address_and_state_and_nothing_else(self):
+        """No edges, no evidence, no slug, no basename split from it. Pinned
+        as the EXACT key set: the schema's envelope is OPEN, so it would
+        accept a `may_task` or a delivery timestamp without complaint, and
+        emitting a member the spec does not define is still producer
+        non-conformance. This test is the gate the schema cannot be."""
         roster.publish(self.fleet(selected=("alice-deadbeef",)), 5.0)
 
         self.assertEqual(self.written()["members"], [{
-            "slug": "alice-deadbeef",
             "address": "alice-deadbeef@agents.internal",
             "state": "admitted",
         }])
@@ -110,17 +111,30 @@ class ContentTests(_RosterTree):
         roster.publish(self.fleet(), 5.0)
 
         doc = self.written()
-        self.assertEqual(set(doc), {"schema", "generated_ts", "interval_s",
-                                    "fleet_domain", "router", "members"})
-        self.assertEqual(doc["schema"], 1)
-        self.assertEqual(doc["fleet_domain"], DOMAIN)
+        self.assertEqual(set(doc), {"contract_version", "router", "written_at",
+                                    "interval_s", "members"})
+        self.assertEqual(doc["contract_version"], "2")
         self.assertEqual(doc["router"], "amap.router@agents.internal")
         self.assertEqual(doc["interval_s"], 5.0)
 
-    def test_members_are_sorted_by_slug(self):
-        roster.publish(self.fleet(selected=("carol-c0ffee01", "alice-deadbeef")), 5.0)
-        self.assertEqual([m["slug"] for m in self.written()["members"]],
-                         ["alice-deadbeef", "carol-c0ffee01"])
+    def test_members_are_sorted_by_ADDRESS_not_by_slug(self):
+        """The schema says "sorted by address", and for most fleets that is
+        the same order as sorting by instance name — which is exactly why a
+        test built on ordinary names cannot tell them apart. This pair is
+        chosen so the two orders DISAGREE: `-` (0x2d) sorts before `@` (0x40),
+        so `alice-deadbeef@…` precedes `alice@…` by address, while `alice`
+        precedes `alice-deadbeef` by name. The control asserts the
+        disagreement itself, so this cannot pass on a pair that no longer
+        distinguishes the two."""
+        names = ("alice", "alice-deadbeef")
+        self.assertEqual(sorted(names), ["alice", "alice-deadbeef"])
+        self.assertEqual(sorted(f"{n}@{DOMAIN}" for n in names),
+                         ["alice-deadbeef@agents.internal", "alice@agents.internal"])
+
+        roster.publish(self.fleet(selected=names), 5.0)
+
+        self.assertEqual([m["address"] for m in self.written()["members"]],
+                         ["alice-deadbeef@agents.internal", "alice@agents.internal"])
 
     def test_an_unknown_interval_is_OMITTED_not_defaulted(self):
         """A reader computes a freshness bound from it, so an invented value
@@ -264,13 +278,12 @@ class NeverReadBackTests(_RosterTree):
         output must be exactly what `build` makes from the admitted set."""
         cfg = self.fleet(selected=("alice-deadbeef",))
         self.roster_file.write_text(json.dumps({
-            "schema": 1, "members": [{"slug": "ghost-deadbeef",
-                                      "address": "ghost-deadbeef@agents.internal",
-                                      "state": "admitted"}]}))
+            "contract_version": "2", "members": [
+                {"address": "ghost-deadbeef@agents.internal", "state": "admitted"}]}))
 
         roster.publish(cfg, 5.0)
 
-        self.assertEqual([m["slug"] for m in self.written()["members"]],
+        self.assertEqual([m["address"].split("@")[0] for m in self.written()["members"]],
                          ["alice-deadbeef"])
 
 

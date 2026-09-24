@@ -65,30 +65,31 @@ Mode `0644`, applied before the rename. `mkstemp` creates `0600`, which for
 this file is the failure spec §10 names: the write succeeds, the content is
 correct, and no agent can read it.
 
-Schema (schema=1)::
+Shape — `schemas/roster.schema.json`, the draft's "The Fleet Roster"::
 
     {
-      "schema": 1,
-      "generated_ts": "2026-09-24T12:00:00Z",
-      "interval_s": 5.0,                  # OMITTED when unknown, never
-                                          #   defaulted — readers compute a
-                                          #   freshness bound from it
-      "fleet_domain": "agents.internal",
+      "contract_version": "2",
       "router": "amap.router@agents.internal",
+      "written_at": "2026-09-24T12:00:00Z",
+      "interval_s": 5.0,                  # OMITTED when unknown, never
+                                          #   defaulted — readers judge
+                                          #   written_at against it
       "members": [
-        {"slug": "alice-deadbeef",
-         "address": "alice-deadbeef@agents.internal",
-         "state": "admitted"}
+        {"address": "alice-deadbeef@agents.internal", "state": "admitted"}
       ]
     }
 
-`members` is sorted by slug and is exactly the admitted set of this poll.
-There is no basename or human name: splitting a slug at its last hyphen is
-how two nonexistent directories once got into a sibling's docs. A reader
-matches a slug by prefix.
+`members` is exactly the admitted set of this poll, SORTED BY ADDRESS as the
+schema requires — which is not the same as sorted by slug: `-` sorts before
+`@`, so `alice-deadbeef@…` precedes `alice@…`. Nothing else is emitted. The
+envelope is open so CONSUMERS tolerate members they do not know; EMITTING an
+undefined one is still producer non-conformance, which is why the slug and
+the fleet domain that v1 of this writer carried are gone: the slug is the
+address's local part, and the domain is `router`'s.
 
-This schema is v1 and is NOT a spec artifact yet: whether it belongs beside
-§10 in amap-spec is that repo's ruling, and has been asked for.
+Specified in amap-spec PR #5 (draft section "The Fleet Roster", a separate
+artifact from §10's peer directory). Validated against that schema, and its
+invalid fixtures proved rejected, by `test_roster_conformance.py`.
 """
 
 from __future__ import annotations
@@ -100,7 +101,8 @@ from typing import Any, Dict, Optional
 from .config import RouterConfig, address_for, router_address
 from .util import atomic_write, utc_ts
 
-SCHEMA = 1
+#: Every AMAP artifact carries it; a consumer refuses an unknown major.
+CONTRACT_VERSION = "2"
 ROSTER_DIRNAME = "roster"
 ROSTER_FILENAME = "roster.json"
 STATE_ADMITTED = "admitted"
@@ -125,22 +127,20 @@ def roster_dir(cfg: RouterConfig) -> Optional[Path]:
 
 
 def build(cfg: RouterConfig, interval_s: Optional[float],
-          generated_ts: str) -> Dict[str, Any]:
+          written_at: str) -> Dict[str, Any]:
     """The roster document. Pure: no filesystem, no clock."""
     doc: Dict[str, Any] = {
-        "schema": SCHEMA,
-        "generated_ts": generated_ts,
+        "contract_version": CONTRACT_VERSION,
+        "router": router_address(cfg.fleet_domain),
+        "written_at": written_at,
     }
     if interval_s is not None:
         doc["interval_s"] = interval_s
-    doc["fleet_domain"] = cfg.fleet_domain
-    doc["router"] = router_address(cfg.fleet_domain)
-    doc["members"] = [
-        {"slug": name,
-         "address": address_for(name, cfg.fleet_domain),
-         "state": STATE_ADMITTED}
-        for name in sorted(cfg.instances)
-    ]
+    doc["members"] = sorted(
+        ({"address": address_for(name, cfg.fleet_domain), "state": STATE_ADMITTED}
+         for name in cfg.instances),
+        key=lambda m: m["address"],
+    )
     return doc
 
 

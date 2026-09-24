@@ -444,9 +444,11 @@ nothing else does. The convention is pinned from both ends — the adapter's
 test and `test_roster.py::LocationConventionTests` — because a key would force
 a rollout order this loader's unknown-key refusal turns into an outage.
 
-**It grants nothing.** No edges, no `may_task`, no delivery evidence: members
-are the admitted set, each `{slug, address, state: "admitted"}`. Authorisation
-is still decided at submit time, and the result is still the only report.
+**It grants nothing.** No edges, no `may_task`, no delivery evidence. The file
+is `{contract_version: "2", router, written_at, interval_s?, members}`, and
+members are the admitted set, each exactly `{address, state: "admitted"}`,
+sorted by ADDRESS (not by name: `-` sorts before `@`). Authorisation is still
+decided at submit time, and the result is still the only report.
 
 **It is never read back** — not as a cache, for recovery, or as a
 cross-check. `NeverReadBackTests` watches every read path while publishing.
@@ -464,11 +466,16 @@ Written at the END of the poll, after the drain, so a newcomer's first-sight
 snapshot precedes its announcement; mode `0644`, because `mkstemp`'s `0600` is
 a correct file no agent can read.
 
-**Spec status: NONE YET.** v1 is this router's and the adapter's. Spec §10
-defines `directory.json`, a different artifact (a per-instance projection of
-the graph), and two of its lines collide with a shared roster by letter —
-"never a shared file", and "MUST NOT carry the agent's own address". Whether
-the roster sits outside §10 is amap-spec's ruling, and has been asked for.
+**Spec: its own section of the draft, "The Fleet Roster"** (amap-spec PR #5,
+unmerged at the time of writing), with `schemas/roster.schema.json` and
+`roster-*` fixtures. It is a separate artifact from §10's `directory.json`,
+which answers who an agent may ADDRESS; the roster answers only who EXISTS.
+`test_roster_conformance.py` validates the writer's real output against that
+schema — passed explicitly, never selected by filename — after proving the
+validator rejects every invalid roster fixture. The draft splits readability
+between the parties that can observe it: this router publishes only where the
+deployment designates and never creates it; the deployment exposes it. A
+roster written where nothing is exposed is inert, not a violation.
 
 ## Wiring to a real agent sandbox
 
