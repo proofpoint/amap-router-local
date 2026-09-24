@@ -116,18 +116,32 @@ than an oversight: a new conformance module is not in `skip`, so under the
 fallback it runs and goes red, because the alternative is silently widening
 the gap.
 
-**The full suite in CI exposed a flaky test that phase 1 had been hiding.**
-`test_attachments_outbound.py::TestOutboundSidecarTOCTOU` — the live-race
-harness — fails intermittently: 6–8 runs in 30 on one host, on two failure
-sites (the control probe's assertion, and `_reset_side_dir`'s "could not
-stabilize ... against the racing attacker", which also takes
-`test_live_race_separate_process_secret_never_leaks` with it). Pre-existing:
-the same rate was measured on the commit before the most recent feature. It
-is **OWED**, and the framing of the fix is "what is the control actually
-proving", not "make it flake less" — a probe that needs more attempts may be
-reporting that the window it guards has narrowed. Until it is fixed, a red CI
-run needs its failing test NAMED before anyone concludes a change broke
-something.
+**The full suite in CI exposed a race test that phase 1 had been hiding —
+and it was not flaky so much as VACUOUS.** Fixed 2026-09-24. Recorded
+because the diagnosis is the reusable part:
+
+  * `test_live_race_separate_process_secret_never_leaks` stayed GREEN with
+    BOTH `O_NOFOLLOW` guards removed from the production reader. Its
+    descriptor declared the agent's own bytes, so the size+sha256 check
+    rejected the secret whatever the pinning did; "never leaks" could not
+    fail. The attack now declares the SECRET's hash — an agent that knows a
+    file's hash (hashes travel in descriptors; bytes need not) can only get
+    the bytes delivered by making the router READ that file.
+  * Its control, the one that flaked 6–8 runs in 30, proved only that an
+    attacker beats a test-local reader with a deliberate `sleep` in it —
+    never that the REAL reader's gaps were hit. Replaced by
+    `TestOutboundSidecarEveryInterleaving`: each attack (dir -> symlink,
+    ordinal -> symlink, ordinal -> hardlink) performed deterministically
+    before EVERY `os` call the reader makes, with a control per guard that
+    disables that guard in the real reader and must find a leak.
+  * "Could not stabilize ... against the racing attacker" was the victim
+    racing the attacker for its own SETUP: the attacker `rmtree`d the real
+    sidecar dir every cycle. It now parks and restores it.
+
+The live test is kept as STRESS, not proof — now red 10/10 with the pin
+guard removed, where it was green before. 0 failures in 60 runs after the
+fix. A red CI run still needs its failing test NAMED before anyone concludes
+a change broke something.
 
 **Install editable, always: `pip install -e .`** A copy install puts a second
 router under `site-packages` and makes "which copy is running" ambiguous.

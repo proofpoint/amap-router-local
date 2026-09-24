@@ -15,7 +15,6 @@ import multiprocessing
 import os
 import shutil
 import signal
-import time
 import unittest
 from unittest import mock
 
@@ -557,155 +556,286 @@ class TestOutboundSidecarTOCTOU(RouterTestCase):
         for path in (self.cfg.instances["bob"].inbox_root).rglob("*"):
             if path.is_file():
                 self.assertNotIn(secret_bytes, path.read_bytes())
-        # The swap target itself is untouched.
+        # The swap target itself is untouched. EXISTENCE FIRST, as its own
+        # assertion: with the pin's O_NOFOLLOW removed, cleanup follows the
+        # planted symlink and DELETES this file, and reading it back then
+        # raised FileNotFoundError — red, but as an incidental ERROR rather
+        # than this test failing for the reason it states.
+        self.assertTrue((secret_dir / "0").exists(),
+                        "the swap target was DELETED through the planted symlink")
         self.assertEqual((secret_dir / "0").read_bytes(), secret_bytes)
 
     def test_live_race_separate_process_secret_never_leaks(self):
-        """A SEPARATE process races renaming the sidecar dir <-> a symlink
-        to a secret-bearing dir, as fast as it can, while the parent
-        drains the SAME request repeatedly. Across every attempt, the
-        secret bytes must never appear in bob's namespace."""
+        """STRESS, NOT PROOF. A separate process swaps the sidecar dir for a
+        symlink to a secret-bearing dir and back, as fast as it can, while
+        this process ingests the same request repeatedly. The secret must
+        never come back from an ingest.
+
+        The proof that no interleaving leaks is
+        `TestOutboundSidecarEveryInterleaving`, which places each attack
+        deterministically before every filesystem call the reader makes.
+        What this adds is real parallelism — a second process the scheduler
+        interleaves however it likes — and it claims nothing about WHICH
+        interleavings it hit.
+
+        THE DESCRIPTOR DECLARES THE SECRET'S size and sha256. This is what
+        makes "never leaks" able to fail: an agent that knows a file's hash
+        (hashes travel in descriptors; bytes need not) but not its bytes can
+        only get them delivered by making the router READ that file. With the
+        descriptor declaring the real attachment's hash — as this test once
+        did — the hash check rejects the secret whatever the pinning does,
+        and this test stayed green with BOTH `O_NOFOLLOW` guards removed.
+
+        Companions: the attacker completed swaps while ingests ran, and it
+        exited cleanly. A stress test whose attacker never ran is the no-op
+        form of this test."""
         secret_dir = self.tmp / "victim-live-race"
         secret_dir.mkdir()
         secret_bytes = b"live-race secret bytes"
         (secret_dir / "0").write_bytes(secret_bytes)
 
-        data = b"the real attachment for the live race"
-        desc = attachment_descriptor(data)
+        data = b"the agent's own attachment bytes"
+        desc = attachment_descriptor(secret_bytes)   # the attacker knows the hash
         req_id = "00000002"
         write_request(self.cfg, "alice", req_id, to=["agent.bob@local"], attachments=[desc])
         side = stage_outbound_sidecars(self.cfg, "alice", req_id, [data])
 
         stop = multiprocessing.Event()
+        swaps = multiprocessing.Value("i", 0)
         proc = multiprocessing.Process(
-            target=_attacker_swap_loop, args=(str(side), str(secret_dir), stop),
+            target=_attacker_swap_loop, args=(str(side), str(secret_dir), stop, swaps),
         )
         proc.start()
+        leaked = False
         try:
-            leaked = False
             for _ in range(150):
                 try:
-                    ingest_or_none = _try_ingest(self.cfg, "alice", req_id, [desc])
-                except Exception:
-                    ingest_or_none = None
-                if ingest_or_none is not None:
-                    for att in ingest_or_none:
-                        if att.data == secret_bytes:
-                            leaked = True
-                # restore a clean sidecar for the next iteration (best
-                # effort — the attacker process may also be mid-swap).
-                _reset_side_dir(side, data)
-            self.assertFalse(leaked, "TOCTOU: secret bytes were read from the swap target")
-        finally:
-            stop.set()
-            proc.join(timeout=5)
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=2)
-
-    def test_path_based_control_can_detect_the_bug_class(self):
-        """A test-local NAIVE reader (path-join, verify-then-reread — the
-        exact defect class `_open_child`-pinning fixes) run under a widened
-        version of the same race MUST lose at least once. This proves the
-        race harness itself is capable of exercising the window — i.e.
-        that the defense tests above are not vacuously passing because the
-        race never fires."""
-        secret_dir = self.tmp / "victim-control"
-        secret_dir.mkdir()
-        secret_bytes = b"control-probe secret bytes"
-        (secret_dir / "0").write_bytes(secret_bytes)
-
-        data = b"the real attachment for the control"
-        req_id = "00000003"
-        side = self.cfg.instances["alice"].outbox_root / f"req-{req_id}.attachments"
-
-        def naive_read_ordinal_0() -> bytes:
-            """Vulnerable-by-construction: checks the path exists, THEN
-            reopens it by path a moment later — a real check-then-act gap,
-            unlike the production code under test."""
-            path = side / "0"
-            if not path.is_file():
-                raise FileNotFoundError(path)
-            time.sleep(0.001)  # widen the window deliberately
-            return path.read_bytes()
-
-        stop = multiprocessing.Event()
-        proc = multiprocessing.Process(
-            target=_attacker_swap_loop, args=(str(side), str(secret_dir), stop),
-        )
-        proc.start()
-        try:
-            leaked = False
-            for _ in range(300):
-                _reset_side_dir(side, data)
-                try:
-                    got = naive_read_ordinal_0()
-                except OSError:
+                    got = _try_ingest(self.cfg, "alice", req_id, [desc])
+                except attachments_mod.AttachmentIngestError:
                     continue
-                if got == secret_bytes:
+                if any(att.data == secret_bytes for att in got):
                     leaked = True
-                    break
-            self.assertTrue(
-                leaked,
-                "control probe never observed the secret via the naive path-based "
-                "reader — the race harness may not actually be exercising the "
-                "window; strengthen it before trusting the defense tests above",
-            )
         finally:
             stop.set()
             proc.join(timeout=5)
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=2)
+        self.assertFalse(leaked, "TOCTOU: the secret was read through the swapped path")
+        self.assertEqual(proc.exitcode, 0, "the attacker process did not exit cleanly")
+        self.assertGreater(swaps.value, 0, "the attacker never completed a swap — no race ran")
 
 
-def _reset_side_dir(side, data: bytes) -> None:
-    """Best-effort recreate a clean, real sidecar dir at `side` containing
-    ordinal "0" == `data` — tolerant of a CONCURRENT attacker process
-    racing the exact same path (retries past the transient `FileExistsError`/
-    `NotADirectoryError`/`FileNotFoundError` that racing produces, a
-    bounded number of times, rather than treating any single one as a test
-    failure)."""
-    for _ in range(200):
+class TestOutboundSidecarEveryInterleaving(RouterTestCase):
+    """THE PROOF that no interleaving of an agent's swap with the reader
+    redirects a read — by construction, not by sampling.
+
+    The reader's safety argument is about the gaps BETWEEN filesystem calls:
+    the sidecar dir is pinned by one `O_NOFOLLOW` open, and everything after
+    goes through that fd; each ordinal is opened `O_NOFOLLOW` relative to it
+    and its fstat must show a regular file with `st_nlink == 1`. So this
+    intercepts every `os` call the reader makes and, for each k, performs the
+    attack immediately before the k-th one — every gap, once, for each of the
+    three attacks an agent owning the sidecar can mount.
+
+    The descriptor declares the SECRET's size and sha256 (see the live-race
+    test for why): a leak is then exactly "ingest returned the secret", and
+    the hash check cannot mask a pinning failure.
+
+    Each attack has a CONTROL that disables the one guard it targets, in the
+    real reader, and requires a leak at some k. That replaces a test-local
+    naive reader, which could only show that an attacker beats a reader with
+    a deliberate sleep in it — never that these gaps are the ones that
+    matter, and never deterministically."""
+
+    _INTERCEPTED = ("open", "scandir", "fstat", "read", "close", "dup")
+    REQ = "00000004"
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.make_config({"alice": ["bob"], "bob": ["alice"]}, mode="handoff")
+        self.secret_dir = self.tmp / "victim-every-interleaving"
+        self.secret_dir.mkdir()
+        self.secret = b"bytes the agent can hash but must never get delivered"
+        (self.secret_dir / "0").write_bytes(self.secret)
+        self.data = b"the agent's own, different attachment"
+        self.desc = attachment_descriptor(self.secret)
+        write_request(self.cfg, "alice", self.REQ, to=["agent.bob@local"],
+                      attachments=[self.desc])
+        self.side = stage_outbound_sidecars(self.cfg, "alice", self.REQ, [self.data])
+        self.parked = self.side.with_name(self.side.name + ".parked")
+
+    # -- the three attacks, each performed with the REAL os functions --------
+    #
+    # Each RETURNS what it observes afterwards, via lstat/stat (neither is
+    # intercepted), and that observation — not the fact that the attack was
+    # called — is what counts as "fired". The first version set `fired`
+    # unconditionally after calling the attack, and a mutation that made the
+    # attack do nothing left every proof test green: the companion was
+    # checking a flag the harness set, not the thing it stood for.
+
+    def _swap_dir_for_symlink(self):
+        os.rename(self.side, self.parked)
+        os.symlink(self.secret_dir, self.side)
+        return os.path.islink(self.side)
+
+    def _swap_ordinal_for_symlink(self):
+        os.unlink(self.side / "0")
+        os.symlink(self.secret_dir / "0", self.side / "0")
+        return os.path.islink(self.side / "0")
+
+    def _swap_ordinal_for_hardlink(self):
+        os.unlink(self.side / "0")
+        os.link(self.secret_dir / "0", self.side / "0")
+        return os.stat(self.side / "0").st_nlink == 2
+
+    def _restage(self):
+        """Put the agent's own sidecar back, whatever the last attack did."""
+        if os.path.islink(self.side):
+            os.unlink(self.side)
+        if self.parked.exists():
+            if self.side.exists():
+                shutil.rmtree(self.side)
+            os.rename(self.parked, self.side)
+        target = self.side / "0"
+        if os.path.lexists(target):
+            os.unlink(target)
+        target.write_bytes(self.data)
+
+    def _ingest(self, attack, k, *, disable=None):
+        """Ingest once, performing `attack` immediately before the k-th
+        intercepted `os` call (k=0: never). Returns (result or None, fired,
+        calls). `disable` names one guard to switch off, for the controls."""
+        real = {n: getattr(os, n) for n in self._INTERCEPTED}
+        state = {"n": 0, "fired": False}
+
+        def wrap(name):
+            def intercepted(*a, **kw):
+                state["n"] += 1
+                if state["n"] == k:
+                    state["fired"] = attack()
+                if name == "open" and disable == "ordinal-nofollow" and "dir_fd" in kw \
+                        and a and a[0] == "0":
+                    a = (a[0], a[1] & ~os.O_NOFOLLOW) + a[2:]
+                result = real[name](*a, **kw)
+                if name == "fstat" and disable == "nlink":
+                    return _NlinkOne(result)
+                return result
+            return intercepted
+
+        patches = [mock.patch.object(os, n, wrap(n)) for n in self._INTERCEPTED]
+        if disable == "dir-nofollow":
+            patches.append(mock.patch.object(
+                attachments_mod, "open_child_pinned", _open_child_FOLLOWING))
+        for p in patches:
+            p.start()
         try:
-            if os.path.islink(side) or os.path.exists(side):
-                shutil.rmtree(side, ignore_errors=True)
-                try:
-                    os.unlink(side)
-                except OSError:
-                    pass
-        except OSError:
-            pass
-        try:
-            os.makedirs(side, exist_ok=False)
-            with open(os.path.join(side, "0"), "wb") as f:
-                f.write(data)
-            return
-        except OSError:
-            continue
-    raise RuntimeError(f"could not stabilize {side} against the racing attacker")
+            try:
+                result = attachments_mod.ingest_attachments(
+                    self.cfg, "alice", self.REQ, [self.desc])
+            except attachments_mod.AttachmentIngestError:
+                result = None
+        finally:
+            for p in patches:
+                p.stop()
+            self._restage()
+        return result, state["fired"], state["n"]
+
+    def _every_gap(self, attack, *, disable=None):
+        """Run the attack before each call of a clean ingest. Returns the ks
+        at which the secret came back. Asserts the attack fired at EVERY k —
+        a k it did not fire at is a gap this proved nothing about."""
+        _, fired, calls = self._ingest(attack, 0, disable=disable)
+        self.assertFalse(fired)
+        self.assertGreater(calls, 5, "the reader made almost no calls — interception is not attached")
+        leaks = []
+        for k in range(1, calls + 1):
+            result, fired, _ = self._ingest(attack, k, disable=disable)
+            self.assertTrue(fired, f"the attack never fired before call {k}")
+            if result is not None and any(a.data == self.secret for a in result):
+                leaks.append(k)
+        return leaks
+
+    # -- the positive control every "rejected" below depends on ---------------
+
+    def test_a_sidecar_that_really_holds_the_bytes_is_accepted(self):
+        """With the descriptor declaring the secret's hash, every guarded
+        run below is REJECTED — which would also be true if ingest rejected
+        this descriptor for some unrelated reason. It does not: a sidecar
+        that genuinely contains those bytes is accepted."""
+        (self.side / "0").write_bytes(self.secret)
+        result = attachments_mod.ingest_attachments(self.cfg, "alice", self.REQ, [self.desc])
+        self.assertEqual([a.data for a in result], [self.secret])
+
+    # -- the proof: no gap leaks, for each attack -----------------------------
+
+    def test_no_gap_leaks_when_the_sidecar_dir_is_swapped_for_a_symlink(self):
+        self.assertEqual(self._every_gap(self._swap_dir_for_symlink), [])
+
+    def test_no_gap_leaks_when_the_ordinal_is_swapped_for_a_symlink(self):
+        self.assertEqual(self._every_gap(self._swap_ordinal_for_symlink), [])
+
+    def test_no_gap_leaks_when_the_ordinal_is_swapped_for_a_hardlink(self):
+        self.assertEqual(self._every_gap(self._swap_ordinal_for_hardlink), [])
+
+    # -- the controls: each guard, removed from the REAL reader, is caught ----
+
+    def test_control_without_the_dir_pin_a_gap_leaks(self):
+        self.assertTrue(self._every_gap(self._swap_dir_for_symlink, disable="dir-nofollow"),
+                        "the dir attack found no gap even with the pin's O_NOFOLLOW removed "
+                        "— this harness cannot detect the defect it exists for")
+
+    def test_control_without_the_ordinal_nofollow_a_gap_leaks(self):
+        self.assertTrue(self._every_gap(self._swap_ordinal_for_symlink,
+                                        disable="ordinal-nofollow"),
+                        "the ordinal-symlink attack found no gap with O_NOFOLLOW removed")
+
+    def test_control_without_the_nlink_check_a_gap_leaks(self):
+        self.assertTrue(self._every_gap(self._swap_ordinal_for_hardlink, disable="nlink"),
+                        "the hardlink attack found no gap with the nlink check blinded")
 
 
-def _attacker_swap_loop(side_dir: str, secret_dir: str, stop) -> None:
-    """Runs in a SEPARATE process: as fast as possible, replace `side_dir`
-    with a symlink to `secret_dir`, then remove the symlink, repeating
-    until `stop` is set. Never recreates the real directory — the victim
-    loop (in the parent process) is responsible for that between attempts,
-    so this process's only job is winning (or not) the swap race."""
+class _NlinkOne:
+    """An fstat result reporting `st_nlink == 1` whatever the file has — the
+    nlink guard, blinded, for its control."""
+
+    def __init__(self, st):
+        self._st = st
+
+    def __getattr__(self, name):
+        return 1 if name == "st_nlink" else getattr(self._st, name)
+
+
+def _open_child_FOLLOWING(parent_fd, name):
+    """`util.open_child_pinned` WITHOUT `O_NOFOLLOW` — the pin, broken, for
+    its control. Deliberately the one-flag difference and nothing else."""
+    try:
+        return "dir", os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "other", None
+
+
+def _attacker_swap_loop(side_dir: str, secret_dir: str, stop, swaps) -> None:
+    """Runs in a SEPARATE process: as fast as possible, park the real sidecar
+    dir, put a symlink to `secret_dir` in its place, remove the symlink, and
+    put the real dir back — counting completed swaps — until `stop` is set.
+
+    The real dir is MOVED, never destroyed. The loop this replaces
+    `rmtree`d it every cycle, so the victim had to rebuild it between
+    attempts while the attacker kept deleting it — racing the attacker for
+    its own setup, which is the race this test was not about and the source
+    of "could not stabilize". `stop` is checked only between whole cycles,
+    so the real dir is always back in place when this returns."""
+    parked = side_dir + ".parked"
     while not stop.is_set():
-        try:
-            shutil.rmtree(side_dir, ignore_errors=True)
-        except OSError:
-            pass
-        try:
-            os.symlink(secret_dir, side_dir)
-        except OSError:
-            pass
-        try:
-            if os.path.islink(side_dir):
-                os.unlink(side_dir)
-        except OSError:
-            pass
+        os.rename(side_dir, parked)
+        os.symlink(secret_dir, side_dir)
+        os.unlink(side_dir)
+        os.rename(parked, side_dir)
+        with swaps.get_lock():
+            swaps.value += 1
 
 
 def _try_ingest(cfg, name, req_id, descriptors):
