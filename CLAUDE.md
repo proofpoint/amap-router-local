@@ -82,35 +82,52 @@ behaviour.
 python3 -m pytest router/tests -q
 ```
 
-**637 tests, ~1.9 s** (measured 2026-09-22). No docker and no network:
+**667 tests, ~3 s** (measured 2026-09-24). No docker and no network:
 `router/tests/test_docker.py` pins properties of `docker/` by *reading* it —
 it never builds an image.
 
-**Counts in this file go stale; measure before quoting one.** The previous
-pair here — "636 tests", "32 of the 636", "1 failure + 31 errors" — were all
-three wrong by the time anyone read them, and nothing fails when they are.
+**Counts in this file go stale; measure before quoting one.** Every count this
+section has carried was wrong by the time anyone read it, and nothing fails
+when they are — "636 tests", then "637", and "6 modules" for the
+spec-dependent set, each true for about a day.
 
 But **not** "no fixtures outside the repo" — that claim was here and was
 wrong. Some tests need a sibling spec checkout (`amap-spec`, formerly
-`agent-mailbox-protocol`), and on a bare clone they report **1 failure + 32
-errors**, spread over **6 modules**: `test_attachments_outbound`,
+`agent-mailbox-protocol`), and on a bare clone they report **1 failure + 34
+errors**, spread over **7 modules**: `test_attachments_outbound`,
 `test_happy_path`, `test_outcomes`, `test_peer_fixtures`, `test_peer_routing`,
-`test_validate_fixtures`. That is correct behaviour, not breakage:
-`helpers._spec_root()` returns a path that does not exist rather than `None`
-precisely so the conformance tests fail loudly instead of skipping. The rule
-comes from a probe found guarded by a `skipTest`: it **did not fail, it
-stopped running**, and the suite went on reporting green without it. Resolving
-the checkout is the fix; tolerating the skip is not. Point `$AMAP_SPEC_REPO`
-at a checkout, or put one beside this repo, and they run.
+`test_roster_conformance`, `test_validate_fixtures` (the failure is
+`test_all_request_fixtures`, deterministically). That is correct behaviour,
+not breakage: `helpers._spec_root()` returns a path that does not exist rather
+than `None` precisely so the conformance tests fail loudly instead of
+skipping. The rule comes from a probe found guarded by a `skipTest`: it **did
+not fail, it stopped running**, and the suite went on reporting green without
+it. Resolving the checkout is the fix; tolerating the skip is not. Point
+`$AMAP_SPEC_REPO` at a checkout, or put one beside this repo, and they run.
 
-**CI is in PHASE 1 and a green run is NOT the full suite.**
-`proofpoint/amap-spec` is private and a workflow's default `GITHUB_TOKEN` is
-scoped to the repo it runs in — same org is not same repo — so the checkout
-fails and `.github/workflows/tests.yml` branches on whether the fixtures are
-there, holding back those 6 modules and emitting a `::warning` naming them.
-Note the granularity: it excludes whole MODULES, so **70 tests are held back
-to avoid 33 failures** — the other 37 would pass and do not run. amap-spec
-going public fixes all of it with no edit to the workflow.
+**CI runs the FULL suite, since 2026-09-24**, because `proofpoint/amap-spec`
+went public and the workflow's spec checkout stopped failing. Nobody edited
+the workflow for that: it branches on whether the fixtures are present, and
+the phase-1 branch — hold back the spec-dependent modules, emit a `::warning`
+naming them — is still there as the fallback if the checkout ever fails
+again. Its `skip` list still names the ORIGINAL six modules, not
+`test_roster_conformance`, and that is the workflow's stated design rather
+than an oversight: a new conformance module is not in `skip`, so under the
+fallback it runs and goes red, because the alternative is silently widening
+the gap.
+
+**The full suite in CI exposed a flaky test that phase 1 had been hiding.**
+`test_attachments_outbound.py::TestOutboundSidecarTOCTOU` — the live-race
+harness — fails intermittently: 6–8 runs in 30 on one host, on two failure
+sites (the control probe's assertion, and `_reset_side_dir`'s "could not
+stabilize ... against the racing attacker", which also takes
+`test_live_race_separate_process_secret_never_leaks` with it). Pre-existing:
+the same rate was measured on the commit before the most recent feature. It
+is **OWED**, and the framing of the fix is "what is the control actually
+proving", not "make it flake less" — a probe that needs more attempts may be
+reporting that the window it guards has narrowed. Until it is fixed, a red CI
+run needs its failing test NAMED before anyone concludes a change broke
+something.
 
 **Install editable, always: `pip install -e .`** A copy install puts a second
 router under `site-packages` and makes "which copy is running" ambiguous.
