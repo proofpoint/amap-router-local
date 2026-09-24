@@ -170,6 +170,12 @@ class StatusTracker:
         #: now" gets a stale answer with nothing in the document admitting
         #: it. The peer that asked for this was about to do exactly that.
         self.admitted: Optional[List[str]] = None
+        #: The last `roster.publish` outcome, so `service.poll_once` logs a
+        #: skip once when it starts rather than every poll. Held here because
+        #: this is the one object every caller of the loop body passes in.
+        #: NOT serialised into status.json: the roster file's own
+        #: `generated_ts` is the evidence that it is being published.
+        self.roster_outcome: Optional[str] = None
 
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that

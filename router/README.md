@@ -430,6 +430,46 @@ stored** (`config.derive_matrix`, recomputed fresh on every call) and
 binding for a reply always comes from the private ledger (see "Reply vs.
 cold send" below).
 
+## The fleet roster (`roster.json`)
+
+Who EXISTS in the fleet, written every poll so an agent can find a peer's
+address — a sandy slug carries a suffix nothing can derive, so without a list
+an agent can task only someone who has already written to it. Full contract:
+`router/roster.py`'s docstring.
+
+**Where.** `dirname(selected_json)/roster/roster.json`, with no config key. The
+host adapter creates `roster/` at install and mounts it READ-ONLY into every
+selected sandbox as `$AMAP_ROSTER_DIR`; this router writes inside it and
+nothing else does. The convention is pinned from both ends — the adapter's
+test and `test_roster.py::LocationConventionTests` — because a key would force
+a rollout order this loader's unknown-key refusal turns into an outage.
+
+**It grants nothing.** No edges, no `may_task`, no delivery evidence: members
+are the admitted set, each `{slug, address, state: "admitted"}`. Authorisation
+is still decided at submit time, and the result is still the only report.
+
+**It is never read back** — not as a cache, for recovery, or as a
+cross-check. `NeverReadBackTests` watches every read path while publishing.
+
+**Not written**, each logged once when it starts rather than every poll:
+
+| condition | why it is a skip |
+|---|---|
+| authored `instances` config | no `selected_json`, so no location to derive |
+| no `fleet_domain` | members would have no fleet address |
+| host verdict unavailable | the set is UNKNOWN, not empty; the old roster ages past its freshness bound instead of announcing an empty fleet |
+| `roster/` absent | the adapter's directory; creating it would hide their install failure |
+
+Written at the END of the poll, after the drain, so a newcomer's first-sight
+snapshot precedes its announcement; mode `0644`, because `mkstemp`'s `0600` is
+a correct file no agent can read.
+
+**Spec status: NONE YET.** v1 is this router's and the adapter's. Spec §10
+defines `directory.json`, a different artifact (a per-instance projection of
+the graph), and two of its lines collide with a shared roster by letter —
+"never a shared file", and "MUST NOT carry the agent's own address". Whether
+the roster sits outside §10 is amap-spec's ruling, and has been asked for.
+
 ## Wiring to a real agent sandbox
 
 1. Add the instance to the router config's `instances` map (see "Config"

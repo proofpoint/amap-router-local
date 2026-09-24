@@ -32,7 +32,7 @@ import logging
 import time
 from typing import Dict
 
-from . import outbound, outcomes
+from . import outbound, outcomes, roster
 from .config import RouterConfig
 from .config import ConfigError, load
 from .status import StatusTracker, render_discovery
@@ -154,6 +154,25 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker) -> Dict[str, Dict[str, 
         tracker.write(cfg.state_dir)
     except Exception:
         logger.exception("error writing status.json — isolated, continuing the loop")
+    # The roster, AFTER the drain: a newcomer's first-sight snapshot has been
+    # taken by now, so nothing is announced before the router has adopted it
+    # (`roster` module docstring). HERE rather than in `run_forever`, so every
+    # caller of the loop body publishes — the loop's own docstring records
+    # what happened the last time a step lived only in the one caller nothing
+    # exercised. Its own belt: a roster failure must not take down the poll,
+    # and must not be confused with a status.json failure in the log.
+    try:
+        outcome = roster.publish(cfg, tracker.interval_s)
+    except Exception:
+        logger.exception("error writing roster.json — isolated, continuing the loop")
+        outcome = "errored"
+    # Logged when the outcome CHANGES, not every poll — a standing skip
+    # repeated every five seconds is how an operator learns to stop reading
+    # the log. `errored` is logged above with its traceback each time.
+    if outcome != tracker.roster_outcome and outcome != "errored":
+        (logger.info if outcome == roster.WRITTEN else logger.warning)(
+            "roster: %s", outcome)
+    tracker.roster_outcome = outcome
     return summary
 
 

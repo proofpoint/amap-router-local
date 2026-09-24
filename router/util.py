@@ -77,7 +77,8 @@ def verify_namespace_containment(namespace: Union[str, Path], target: Union[str,
         )
 
 
-def atomic_write(path: Union[str, Path], data: bytes) -> None:
+def atomic_write(path: Union[str, Path], data: bytes, *,
+                 make_parents: bool = True, mode: Optional[int] = None) -> None:
     """Write `data` to `path` atomically: `tempfile.mkstemp` in the
     destination directory, then `os.replace`. Creates parent directories
     as needed. A reader can never observe a partial file at `path`.
@@ -85,13 +86,32 @@ def atomic_write(path: Union[str, Path], data: bytes) -> None:
     Does NOT itself check namespace containment — callers writing into an
     instance namespace must call `verify_namespace_containment` first (see
     that function's docstring); this primitive is also used for
-    `state_dir` writes, which have no namespace to check against."""
+    `state_dir` writes, which have no namespace to check against.
+
+    Two keyword-only options, both defaulting to the behaviour every caller
+    before them relied on — this module has an out-of-package dependent, so
+    the positional signature does not move:
+
+    `make_parents=False` refuses to create the destination directory: a
+    missing one raises `FileNotFoundError` from `mkstemp` itself, with no
+    check-then-create window. For a directory that belongs to someone else,
+    whose absence is THEIR failure to report — creating it here would hide
+    that, and would put the file somewhere nothing reads.
+
+    `mode` is applied to the temp file BEFORE the rename, so the file never
+    exists at `path` with any other mode. It matters because `mkstemp`
+    creates `0600`: right for router-private `state_dir` files, and exactly
+    wrong for a file another uid must read — the write succeeds, the content
+    is correct, and the reader gets EACCES."""
     dest = Path(path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    if make_parents:
+        dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=dest.name + ".")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
         os.replace(tmp_name, dest)
     except BaseException:
         try:

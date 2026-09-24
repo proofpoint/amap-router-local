@@ -424,6 +424,11 @@ class RouterConfig:
     #: Present only under discovery. An authored `instances` object cannot
     #: produce one: everything it could report is an error there.
     discovery: Optional[DiscoveryReport] = None
+    #: The host's admission verdict, kept because `roster.roster_dir` derives
+    #: the roster's location from it. Present only under discovery, like
+    #: `discovery` above — an authored config has no verdict file, and
+    #: therefore no roster.
+    selected_json: Optional[Path] = None
 
 
 def address_for(name: str, fleet_domain: Optional[str] = None) -> str:
@@ -814,6 +819,7 @@ def load_obj(
             "config: `instances` and `instances_dir` are two sources for one "
             "instance set — one or the other, never both"
         )
+    selected_json: Optional[Path] = None
     if "instances_dir" in top:
         instances_dir = _require_absolute(top["instances_dir"], "config.instances_dir")
         if "selected_json" not in top:
@@ -1214,6 +1220,7 @@ def load_obj(
         peer_reply_window_seconds=peer_reply_window_seconds,
         discovery=(replace(discovery, inert_edges=inert)
                    if discovery is not None else None),
+        selected_json=selected_json,
     )
 
     # The two lanes are DISJOINT per ordered pair. A pair that is both a
