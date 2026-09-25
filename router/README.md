@@ -461,6 +461,7 @@ cross-check. `NeverReadBackTests` watches every read path while publishing.
 | no `fleet_domain` | members would have no fleet address |
 | host verdict unavailable | the set is UNKNOWN, not empty; the old roster ages past its freshness bound instead of announcing an empty fleet |
 | `roster/` absent | the adapter's directory; creating it would hide their install failure |
+| `roster/` not writable (EROFS, EACCES, EPERM) | designated but not bound read-write for the router; `docker/derive-mounts.py` binds it `rw` over its `ro` parent when it exists. Any other write error is a fault and propagates |
 
 Written at the END of the poll, after the drain, so a newcomer's first-sight
 snapshot precedes its announcement; mode `0644`, because `mkstemp`'s `0600` is

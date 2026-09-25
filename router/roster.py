@@ -54,6 +54,11 @@ WHEN IT IS NOT WRITTEN, and why each is a skip rather than an error:
   * the roster directory is ABSENT. It is the adapter's directory, created
     at its install. This module never creates it: doing so would hide the
     adapter's failure, and put the file somewhere no manifest mounts.
+  * the roster directory is NOT WRITABLE by this process (EROFS, EACCES,
+    EPERM). The location is designated but was not bound read-write for the
+    router — found on the first real deploy, where the directory sat inside
+    the read-only mount of its parent. Any OTHER write error is a fault and
+    propagates.
 
 WRITTEN AT THE END OF THE POLL, after the drain, never before. A newly
 admitted instance's first-sight snapshot is taken during the drain, so by
@@ -94,6 +99,7 @@ invalid fixtures proved rejected, by `test_roster_conformance.py`.
 
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -163,4 +169,17 @@ def publish(cfg: RouterConfig, interval_s: Optional[float]) -> str:
                      make_parents=False, mode=FILE_MODE)
     except FileNotFoundError:
         return f"skipped: roster directory absent ({target_dir}) — the host adapter creates it"
+    except OSError as e:
+        # PRESENT BUT NOT WRITABLE is a deployment state, like absent: the
+        # location is designated, and this process was not given write access
+        # to it. Found on the first real deploy — the directory sat inside a
+        # read-only bind — where it logged a full traceback every poll. A
+        # standing state is logged once, when it starts, like every other
+        # skip here. ONLY these errnos: anything else (a full disk, an I/O
+        # error) is a fault, and still propagates to `poll_once`'s belt.
+        if e.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+            return (f"skipped: roster directory not writable ({target_dir}: "
+                    f"{e.strerror}) — the deployment must bind it read-write "
+                    f"for the router")
+        raise
     return WRITTEN

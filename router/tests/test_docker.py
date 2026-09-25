@@ -410,15 +410,27 @@ class DeriveMountsUnderDiscoveryTests(unittest.TestCase):
     the entire point of discovery.
     """
 
-    def _derive(self, doc):
+    def _derive(self, doc, roster=None):
+        """`roster`: None (no roster dir on the host), "dir", or "symlink"."""
         import json as _json
         import subprocess
         import tempfile
+        from router.roster import ROSTER_DIRNAME
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             for rel in ("state", "features/amap/instances", "intake"):
                 (tmp / rel).mkdir(parents=True, exist_ok=True)
             (tmp / "features/amap/selected.json").write_text("{}")
+            # Built from the WRITER's constant, never a literal: if the
+            # emitter's own "roster" drifts from it, the rw mount stops
+            # appearing and the rw test below goes red — the name is pinned
+            # by behaviour, not by matching text in the script.
+            roster_path = tmp / "features/amap" / ROSTER_DIRNAME
+            if roster == "dir":
+                roster_path.mkdir()
+            elif roster == "symlink":
+                (tmp / "elsewhere").mkdir()
+                roster_path.symlink_to(tmp / "elsewhere")
             rendered = _json.dumps({k: (str(tmp / v) if k.endswith(("_dir", "_json"))
                                         else v)
                                     for k, v in doc.items()})
@@ -483,6 +495,44 @@ class DeriveMountsUnderDiscoveryTests(unittest.TestCase):
                         self.assertLess(j, i,
                                         f"{parent} is mounted after its child {child} "
                                         f"and would shadow it")
+
+    _DISCOVERY = {"state_dir": "state", "instances_dir": "features/amap/instances",
+                  "selected_json": "features/amap/selected.json"}
+
+    def test_an_existing_roster_dir_is_mounted_READ_WRITE_after_its_ro_parent(self):
+        """The first real deploy: `roster.py` resolved the right path inside
+        the `:ro` mount of `dirname(selected_json)` and got EROFS every poll.
+        The roster dir needs its own `rw` bind, AFTER its parent — a parent
+        applied later would shadow it back to read-only."""
+        rc, mounts, err = self._derive(dict(self._DISCOVERY), roster="dir")
+        self.assertEqual(rc, 0, err)
+        paths = [p for p, _m in mounts]
+        modes = dict((p, m) for p, m in mounts)
+        roster = [p for p in paths if p.endswith("/features/amap/roster")]
+        parent = [p for p in paths if p.endswith("/features/amap")]
+        self.assertEqual(len(roster), 1, paths)
+        self.assertEqual(modes[roster[0]], "rw")
+        self.assertEqual(modes[parent[0]], "ro")
+        self.assertLess(paths.index(parent[0]), paths.index(roster[0]))
+
+    def test_an_absent_roster_dir_is_NOT_mounted(self):
+        """Docker creates a missing bind source — as root — rather than
+        refusing, which would make the runtime the creator of a location the
+        spec says it MUST NOT create. Absent means no mount, and the writer
+        skips. The companion: the rest of the discovery branch still ran, so
+        "no roster mount" is not "the branch exited early"."""
+        rc, mounts, err = self._derive(dict(self._DISCOVERY), roster=None)
+        self.assertEqual(rc, 0, err)
+        paths = [p for p, _m in mounts]
+        self.assertFalse([p for p in paths if p.endswith("/roster")], paths)
+        self.assertTrue([p for p in paths if p.endswith("/features/amap")], paths)
+        self.assertTrue([p for p in paths if p.endswith("/instances")], paths)
+
+    def test_a_symlinked_roster_dir_is_NOT_mounted(self):
+        """It would bind wherever it points."""
+        rc, mounts, err = self._derive(dict(self._DISCOVERY), roster="symlink")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse([p for p, _m in mounts if p.endswith("/roster")], mounts)
 
     def test_instances_dir_without_a_verdict_is_refused(self):
         rc, mounts, err = self._derive({

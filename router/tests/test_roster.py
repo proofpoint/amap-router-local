@@ -12,6 +12,7 @@ mounts.
 """
 
 import builtins
+import errno
 import json
 import logging
 import os
@@ -187,6 +188,26 @@ class SkipTests(_RosterTree):
         self.assertTrue(outcome.startswith("skipped: roster directory absent"), outcome)
         self.assertFalse(self.roster_dir.exists())
 
+    def test_a_READ_ONLY_roster_dir_is_a_skip_not_an_error(self):
+        """What the first real deploy hit: the directory sat inside a
+        read-only bind. It is a deployment state — designated, not bound
+        writable — so it is a named skip, like absent."""
+        cfg = self.fleet()
+        with mock.patch.object(roster, "atomic_write",
+                               side_effect=OSError(errno.EROFS, "Read-only file system")):
+            outcome = roster.publish(cfg, 5.0)
+        self.assertTrue(outcome.startswith("skipped: roster directory not writable"), outcome)
+
+    def test_any_OTHER_write_error_still_propagates(self):
+        """The skip is for errnos that mean "not bound writable". A full disk
+        is a fault, and must reach `poll_once`'s belt as one — pinned so the
+        handler cannot quietly widen to every `OSError`."""
+        cfg = self.fleet()
+        with mock.patch.object(roster, "atomic_write",
+                               side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            with self.assertRaises(OSError):
+                roster.publish(cfg, 5.0)
+
     def test_no_fleet_domain_is_skipped(self):
         for slug in ("alice-deadbeef",):
             self.dir_for(slug)
@@ -342,6 +363,23 @@ class PollIntegrationTests(_RosterTree):
         roster_lines = [r for r in logs.output if "roster:" in r]
         self.assertEqual(len(roster_lines), 1, logs.output)
         self.assertIn("roster directory absent", roster_lines[0])
+
+    def test_a_read_only_roster_dir_is_logged_ONCE_and_never_as_an_ERROR(self):
+        """The deploy logged a full ERROR with traceback every five seconds.
+        Three polls now: exactly one WARNING, and no ERROR at all. The one
+        warning is the companion — zero warnings would also mean "no ERROR"."""
+        cfg = self.fleet()
+        tracker = StatusTracker(interval_s=5.0)
+        with mock.patch.object(roster, "atomic_write",
+                               side_effect=OSError(errno.EROFS, "Read-only file system")), \
+             self.assertLogs("amap_router_local", level="WARNING") as logs:
+            for _ in range(3):
+                service.poll_once(cfg, tracker)
+        roster_lines = [r for r in logs.output if "roster" in r]
+        self.assertEqual(len(roster_lines), 1, logs.output)
+        self.assertTrue(roster_lines[0].startswith("WARNING"), roster_lines[0])
+        self.assertIn("not writable", roster_lines[0])
+        self.assertFalse([r for r in logs.output if r.startswith("ERROR")], logs.output)
 
     def test_a_roster_failure_does_not_take_down_the_poll(self):
         """status.json still written, the summary still returned. The

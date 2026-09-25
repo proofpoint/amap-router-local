@@ -78,6 +78,32 @@ if instances_dir:
     verdict_dir = os.path.dirname(os.path.abspath(os.path.expanduser(selected_json)))
     want(verdict_dir, "ro", "selected_json's directory")
 
+    # THE ROSTER DIRECTORY, READ-WRITE, over its read-only parent — the same
+    # shape as `instances_dir`, and for the same reason. `router/roster.py`
+    # writes `dirname(selected_json)/roster/roster.json`, which sits INSIDE the
+    # `:ro` mount just above. Without its own `rw` bind the writer resolves the
+    # right path and gets EROFS on every poll. It shipped that way: the design
+    # checked that the router could SEE this directory and never that it
+    # could WRITE it, and the first real deploy found it.
+    #
+    # EMITTED ONLY IF IT EXISTS ON THE HOST. Docker creates a missing bind
+    # source rather than refusing, as root — which would make the runtime the
+    # creator of the deployment's location, and the spec's roster section says
+    # a runtime MUST NOT create it. So absent means no mount, and the writer
+    # falls through to its logged "roster directory absent" skip. Not a
+    # refusal either: a fleet whose adapter predates the roster is correct,
+    # just rosterless — unlike `missing` above, which is silent non-delivery.
+    #
+    # A SYMLINK IS NOT A DIRECTORY here. A symlinked source would bind wherever
+    # it points; the same pinned-directory discipline the router applies to
+    # every agent-adjacent path. The literal "roster" is pinned against
+    # `roster.ROSTER_DIRNAME` by `test_docker.py`: this script imports nothing
+    # from the router, and a rename on one side only would bind a directory
+    # the writer never uses.
+    roster_dir = os.path.join(verdict_dir, "roster")
+    if os.path.isdir(roster_dir) and not os.path.islink(roster_dir):
+        roots.append((roster_dir, "rw"))
+
 for name, spec in sorted(instances.items()):
     if not isinstance(spec, dict):
         sys.exit(f"instance {name!r} is not an object")
