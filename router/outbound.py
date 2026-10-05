@@ -563,14 +563,41 @@ def _drain_reply(
         result = _result_doc(req_id, "rejected", reason_code=REASON_UNRESOLVED_REPLY)
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
 
+    # draft.to/cc on a reply are ALWAYS discarded: the recipient is the bound
+    # sender from the private ledger, never what the agent wrote. What varies
+    # is only whether that is worth an operator's attention.
+    #
+    # It used to WARN whenever to/cc was non-empty — which is every reply,
+    # because the spec requires `draft.to` (minItems 1) and the connector
+    # tells agents to address a reply to its sender. A correct reply and a
+    # misaddressed one logged the same line, so the warning carried no
+    # signal. Found in a live run by amap-deploy-openshell.
+    #
+    # Now: naming ONLY the bound sender is the normal case (DEBUG); naming
+    # anyone else WARNS. The comparison is casefolded — instance names are
+    # casefold-unique (`config._check_casefold`), so this cannot conflate two
+    # instances. The discarded addresses are still never echoed into the log
+    # (`test_logging.py`): the warning carries a count, not the values.
     draft = doc.get("draft") or {}
-    if draft.get("to") or draft.get("cc"):
-        logger.warning(
-            "reply from instance %r (req_id=%r, in_reply_to=%r) supplied "
-            "draft.to/cc — discarded outright, bound to %r instead per the "
-            "private ledger",
-            name, req_id, in_reply_to, bound_instance,
-        )
+    supplied = list(draft.get("to") or []) + list(draft.get("cc") or [])
+    if supplied:
+        bound_address = address_for(bound_instance, cfg.fleet_domain)
+        others = [a for a in supplied
+                  if not (isinstance(a, str) and a.casefold() == bound_address.casefold())]
+        if others:
+            logger.warning(
+                "reply from instance %r (req_id=%r, in_reply_to=%r) addressed "
+                "%d recipient(s) other than its bound sender — draft.to/cc "
+                "discarded outright, bound to %r instead per the private ledger",
+                name, req_id, in_reply_to, len(others), bound_instance,
+            )
+        else:
+            logger.debug(
+                "reply from instance %r (req_id=%r, in_reply_to=%r) addressed "
+                "its bound sender %r — draft.to/cc discarded as always, bound "
+                "per the private ledger",
+                name, req_id, in_reply_to, bound_instance,
+            )
 
     if record.get("tree") == deliver_mod.TREE_PEER:
         return _drain_peer_reply(
