@@ -128,13 +128,3 @@ is matters too** — a question filed in the implementation that raised it is
 visible to everyone except the party who can answer it.
 
 [amp]: https://github.com/proofpoint/amap-spec
-
-### Additional connector outcomes
-
-`connector_outcome_ids` is an optional top-level router setting. Its default
-`["claude-code"]` preserves existing deployments. A mixed pilot sets
-`["claude-code", "codex"]`; only those explicit extension directories are read.
-IDs are distinct opaque path segments matching `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`.
-The poll-wide scan budget and recipient/tree/notice/outcome dedup key are shared
-across directories. Delivery acceptance remains informational and does not prove
-that a task or an outbound submission completed. Retain state_dir on upgrade.

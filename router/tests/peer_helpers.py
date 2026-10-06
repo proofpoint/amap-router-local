@@ -99,9 +99,10 @@ def notice_id_of(filename: str) -> str:
     return filename[len("notice-"):-len(".json")]
 
 
-def outcomes_dir(cfg: RouterConfig, name: str) -> Path:
-    """The outcomes directory under the spec-pinned connector id."""
-    return cfg.instances[name].outbox_root / outcomes_mod.OUTCOMES_REL
+def outcomes_dir(cfg: RouterConfig, name: str, connector_id: Optional[str] = None) -> Path:
+    """The outcomes directory for `connector_id`, default the first configured id."""
+    cid = connector_id if connector_id is not None else cfg.connector_outcome_ids[0]
+    return cfg.instances[name].outbox_root / outcomes_mod.outcomes_rel(cid)
 
 
 def write_outcome(

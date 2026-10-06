@@ -128,6 +128,14 @@ independent.)
   `attachment_max_total_bytes` (default 32 MiB, combined). Each must be a
   positive integer if given; `attachment_max_total_bytes` must be >=
   `attachment_max_bytes`. Router-wide, not per-instance.
+- `connector_outcome_ids` (OPTIONAL, default `["claude-code"]`): the connector
+  ids whose `outbox/ext/<id>/outcomes/` directories are scanned for delivery
+  outcomes, in order — `["claude-code", "codex"]` for a fleet mixing Claude
+  and Codex connectors. Each id matches `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`
+  (it is a path segment under an agent-writable tree), and ids equal ignoring
+  case are refused. Router-wide: every id is scanned in every instance. **Roll
+  out the router first:** this loader refuses unknown keys, so a deployment
+  that renders this key for an older router has its whole config refused.
 - `state_dir`, and every instance's declared root (`handoff_dir` or
   `namespace` — exactly one of the two, per instance), MUST be absolute
   paths, and MUST NOT be nested inside one another (in either direction)
@@ -698,17 +706,20 @@ it back. See `router/exposure.py`.
 **Delivery outcomes and DSNs.** The daemon reports each notice's last hop
 into `outbox/ext/claude-code/outcomes/peer-<id>.json`
 (`delivered | held | denied | refused | ambiguous_target | inject_failed`).
-`claude-code` is the connector id the spec pins: it does not change when the
-connector's repository is renamed, and this router treats it as opaque. It is
-the ONLY directory scanned. A compatibility path under the old repo-tracking
-spelling was read alongside it for one release and was retired on 2026-09-22;
-`ext/` is agent-writable, so an outcome written under any other id sits there
-unread. That retirement was a deliberate edit rather than a cleanup, and the
-reason generalises to any future change here: an outcome nobody reads is
-silence, this router never infers anything from silence, and so nothing it
-observes would report the mistake. `router/tests/test_outcomes_ext_path.py`
-is what says which directory is scanned, in place of that missing signal.
-Every poll reads that directory with the outbox discipline, records each
+`claude-code` is the default connector id, and the first the spec names; a
+mixed fleet lists more in `connector_outcome_ids` (see "Config"). An id does
+not change when a connector's repository is renamed, and this router treats
+it as opaque. ONLY the configured directories are scanned: `ext/` is
+agent-writable, so an outcome written under any other id sits there unread.
+One per-poll budget and one dedup key span all of them, so a second directory
+buys no extra work and one transition reported under two ids is acted on —
+and DSN'd — once. A compatibility path under an old repo-tracking spelling was
+read for one release and retired on 2026-09-22. Changing the scanned set is a
+deliberate edit rather than a cleanup: an outcome nobody reads is silence,
+this router never infers anything from silence, and so nothing it observes
+would report the mistake. `router/tests/test_outcomes_ext_path.py` is what
+says which directories are scanned, in place of that missing signal.
+Every poll reads those directories with the outbox discipline, records each
 outcome once per `(tree, notice_id, outcome)` under
 `state_dir/<recipient>/outcomes/`, unlinks the file, and acts: `denied` and
 `refused` send the SENDER a DSN — a `deliver` notice in its `inbox/` from
