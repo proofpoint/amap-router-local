@@ -11,12 +11,9 @@ one file per outcome, named `peer-<notice_id>.json`:
      "notice_id": "<32 hex, = the filename's>",
      "detail": "<optional free text>"}                      # no other keys
 
-`<name>` is `claude-code` — the id the spec pins, which does not change when
-the connector's repository is renamed and is opaque to this router
-(`CONNECTOR_ID`). A compatibility path under the old repo-tracking spelling
-was scanned alongside it for one release and was RETIRED on 2026-09-22; see
-that commit for the decision and for what was not established when it was
-made.
+`<name>` is an explicitly configured opaque connector ID. The default is
+`claude-code`; deployments opt into additional IDs with connector_outcome_ids.
+The poll-wide budget and semantic dedup key apply across all configured IDs.
 
 Outcomes are INFORMATIONAL, NOT PROOF. They are written by the workspace
 uid — the agent's uid — so the receiving agent can forge `delivered` or
@@ -574,7 +571,8 @@ def _consume_dir(cfg: RouterConfig, name: str, inst: Any, summary: Dict[str, Any
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
         examined = 0
-        for rel_base in OUTCOMES_RELS:
+        for connector_id in cfg.connector_outcome_ids:
+            rel_base = outcomes_rel(connector_id)
             if examined >= MAX_FILES_PER_POLL:
                 break
             rel = (inst.outbox_root / rel_base).relative_to(root)

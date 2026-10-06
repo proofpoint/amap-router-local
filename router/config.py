@@ -147,7 +147,7 @@ ALLOW_ANY = "ALLOW_ANY"
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 _TOP_KEYS = {
-    "state_dir", "instances",
+    "state_dir", "instances", "connector_outcome_ids",
     "attachment_max_bytes", "attachment_max_count", "attachment_max_total_bytes",
     "fleet_domain", "intake_dir",
     "sender_exposure_window_seconds", "peer_reply_window_seconds",
@@ -429,6 +429,7 @@ class RouterConfig:
     #: `discovery` above — an authored config has no verdict file, and
     #: therefore no roster.
     selected_json: Optional[Path] = None
+    connector_outcome_ids: Tuple[str, ...] = ("claude-code",)
 
 
 def address_for(name: str, fleet_domain: Optional[str] = None) -> str:
@@ -1210,8 +1211,14 @@ def load_obj(
                     f"{root_key} ({root}) must not be nested inside one another"
                 )
 
+    outcome_ids = top.get("connector_outcome_ids", ["claude-code"])
+    if (not isinstance(outcome_ids, list) or not outcome_ids
+        or any(not isinstance(x, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", x) for x in outcome_ids)
+        or len(set(outcome_ids)) != len(outcome_ids)):
+        raise ConfigError("config.connector_outcome_ids must be distinct safe path segments")
+
     cfg = RouterConfig(
-        state_dir=state_dir, instances=instances,
+        state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
         attachment_max_bytes=attachment_max_bytes,
         attachment_max_count=attachment_max_count,
         attachment_max_total_bytes=attachment_max_total_bytes,
