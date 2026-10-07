@@ -641,6 +641,77 @@ class TestResetIdempotence(RouterTestCase):
         self.assertFalse(summary2["was_seen"])
 
 
+class TestResetConnectorExtension(RouterTestCase):
+    """`outbound/ext/` is the spec's Connector-owned side channel, and the
+    deletion-rights table gives the runtime no right over it. Reset clears
+    only what the router consumes by agreement — the outcome files under
+    `ext/<id>/outcomes/` for each configured id — and leaves everything
+    else under `ext/` alone. Until 2026-10-07 it removed `ext/` whole."""
+
+    def _populate(self, ids=("claude-code", "codex")):
+        cfg = self.make_config({"alice": ["bob"], "bob": ["alice"]}, mode="handoff")
+        from dataclasses import replace
+        cfg = replace(cfg, connector_outcome_ids=ids)
+        provision(cfg, "alice", create=True)
+        ext = cfg.instances["alice"].outbox_root / "ext"
+        files = {}
+        for cid in ("claude-code", "codex", "unconfigured-id"):
+            d = ext / cid / "outcomes"
+            d.mkdir(parents=True)
+            files[cid] = d / f"peer-{'a' * 32}.json"
+            files[cid].write_text("{}")
+        files["connector-private"] = ext / "claude-code" / "state.json"
+        files["connector-private"].write_text("{}")
+        return cfg, ext, files
+
+    def test_configured_outcomes_are_emptied_and_everything_else_survives(self):
+        """The companion that gives "survives" its meaning: the configured
+        outcome files DID go, so reset ran and reached into ext/."""
+        cfg, ext, files = self._populate()
+        self.assertTrue(all(f.exists() for f in files.values()))
+
+        reset.reset_instance(cfg, "alice")
+
+        self.assertFalse(files["claude-code"].exists())
+        self.assertFalse(files["codex"].exists())
+        self.assertTrue((ext / "claude-code" / "outcomes").is_dir(), "outcomes/ itself is kept")
+        self.assertTrue(files["unconfigured-id"].exists(), "an unconfigured id is not ours")
+        self.assertTrue(files["connector-private"].exists(), "connector state is not ours")
+
+    def test_only_the_CONFIGURED_ids_are_emptied(self):
+        """With the default ids, codex's outcomes are not the router's."""
+        cfg, _ext, files = self._populate(ids=("claude-code",))
+
+        reset.reset_instance(cfg, "alice")
+
+        self.assertFalse(files["claude-code"].exists())
+        self.assertTrue(files["codex"].exists())
+
+    def test_the_dry_run_plan_lists_exactly_what_reset_removes_under_ext(self):
+        cfg, ext, files = self._populate()
+
+        plan = reset.plan_reset(cfg, "alice")
+        under_ext = sorted(p for p in plan.mailbox_paths if ext in p.parents or p == ext)
+
+        self.assertEqual(under_ext, sorted([files["claude-code"], files["codex"]]))
+
+    def test_a_symlinked_outcomes_dir_escaping_the_root_aborts_and_touches_nothing(self):
+        """The same abort every skeleton leaf gets: a symlink resolving
+        OUTSIDE the instance root is never followed, and the reset stops."""
+        cfg, ext, files = self._populate(ids=("claude-code",))
+        outside = self.tmp / "victim-outside"
+        outside.mkdir()
+        victim = outside / "keep.json"
+        victim.write_text("precious")
+        shutil.rmtree(ext / "claude-code" / "outcomes")
+        os.symlink(outside, ext / "claude-code" / "outcomes")
+
+        with self.assertRaises(NamespaceEscapeError):
+            reset.reset_instance(cfg, "alice")
+
+        self.assertEqual(victim.read_text(), "precious")
+
+
 class TestResetCLI(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp_ctx = tempfile.TemporaryDirectory()

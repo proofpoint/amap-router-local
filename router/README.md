@@ -271,7 +271,12 @@ refusal protects (see `router/provision.py`'s `ProvisionRefusesToCreateHostOwned
 Removed: every direct entry of each root other than its two skeleton
 leaves (stray `req-*.json`, `.attachments/` sidecar dirs, and anything else
 an agent — or a router version that predates this one — left at the top of a
-root), plus the CONTENTS of all four skeleton leaves.
+root), plus the CONTENTS of all four skeleton leaves. **Except the outbox's
+`ext/`**, the spec's Connector-owned side channel, over which the spec's
+deletion-rights table gives the runtime no right: reset empties only
+`ext/<id>/outcomes/` for each configured `connector_outcome_ids` id (the files
+this router already consumes) and leaves everything else under `ext/` in
+place. Before 2026-10-07 it removed `ext/` whole, as a stray.
 
 **Mailbox and router-private state are wiped in the SAME operation —
 never one without the other.** A mailbox-only wipe produces a poisoned

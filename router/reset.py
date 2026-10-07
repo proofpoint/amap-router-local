@@ -86,6 +86,10 @@ WHAT GETS TOUCHED, PER INSTANCE:
       also independently swept by `attachments.
       remove_outbound_sidecar_dir` once a request is consumed), strays
     - the CONTENTS of `outbox_root/results/` and `outbox_root/processed/`
+    - the CONTENTS of `outbox_root/ext/<id>/outcomes/` for each configured
+      `connector_outcome_ids` id — and NOTHING ELSE under `ext/`, which is
+      connector-owned and is never removed (`_OUTBOX_PRESERVE`). Until
+      2026-10-07 `ext/` was swept whole as an unnamed stray.
     - `peer_root` (`InstanceConfig.peer_root`, handoff mode in a fleet with
       a `fleet_domain`): its direct entries other than `notices/`,
       `messages/`, and the CONTENTS of those two — the peer tree is emptied
@@ -253,6 +257,19 @@ _INBOX_KEEP = ("notices", "messages")
 _OUTBOX_KEEP = ("results", "processed")
 _PEER_KEEP = ("notices", "messages")
 
+# Top-level outbox names reset NEVER removes, because they are not the
+# router's. `ext/` is the spec's "Connector-owned side channel"
+# (`outbound/ext/<name>/`), and the spec's deletion-rights table gives the
+# runtime no right over it. What reset DOES clear inside it is exactly what
+# the router already consumes by agreement: the outcome files under
+# `ext/<id>/outcomes/` for each configured `connector_outcome_ids` id
+# (`_empty_outcomes`). Anything else a connector keeps under `ext/` — today
+# or later — survives a reset. Until 2026-10-07 reset removed `ext/` whole,
+# as an unnamed stray.
+_OUTBOX_PRESERVE = ("ext",)
+_EXT = "ext"
+_OUTCOMES = "outcomes"
+
 # The one `state_dir/<name>` entry a reset preserves (module docstring).
 _STATE_KEEP = (audit_mod.AUDIT_DIR,)
 
@@ -344,6 +361,7 @@ def _verify_containment(cfg: RouterConfig, name: str) -> None:
 def _enumerate_mailbox_removals(
     inbox_root: Optional[Path], outbox_root: Optional[Path],
     peer_root: Optional[Path] = None,
+    outcome_ids: Tuple[str, ...] = (),
 ) -> List[Path]:
     """Every mailbox path a reset would remove for one instance, for
     PREVIEW purposes: direct entries of each given root other than its
@@ -356,10 +374,16 @@ def _enumerate_mailbox_removals(
     (replaced by a file, a symlink, or simply absent) is treated as a
     stray top-level entry instead — removed outright rather than
     descended into, since there is nothing safe to "empty contents of."
+
+    The outbox's `_OUTBOX_PRESERVE` names are never listed; instead the
+    CONTENTS of `ext/<id>/outcomes/` for each of `outcome_ids` are, when
+    every component is a real, non-symlink directory — the same rule
+    `_empty_outcomes` applies, so the preview matches what happens.
     """
     paths: List[Path] = []
-    for root, keep in (
-        (inbox_root, _INBOX_KEEP), (outbox_root, _OUTBOX_KEEP), (peer_root, _PEER_KEEP),
+    for root, keep, preserve in (
+        (inbox_root, _INBOX_KEEP, ()), (outbox_root, _OUTBOX_KEEP, _OUTBOX_PRESERVE),
+        (peer_root, _PEER_KEEP, ()),
     ):
         if root is None:
             continue
@@ -368,6 +392,8 @@ def _enumerate_mailbox_removals(
         except OSError:
             entries = []
         for p in entries:
+            if p.name in preserve:
+                continue  # not the router's to remove; see _OUTBOX_PRESERVE
             if p.name in keep and p.is_dir() and not p.is_symlink():
                 continue  # a real skeleton leaf — kept; its contents are below
             paths.append(p)
@@ -376,6 +402,15 @@ def _enumerate_mailbox_removals(
             if leaf.is_dir() and not leaf.is_symlink():
                 try:
                     paths.extend(sorted(leaf.iterdir(), key=lambda p: p.name))
+                except OSError:
+                    pass
+    if outbox_root is not None:
+        for cid in outcome_ids:
+            chain = [outbox_root / _EXT, outbox_root / _EXT / cid,
+                     outbox_root / _EXT / cid / _OUTCOMES]
+            if all(c.is_dir() and not c.is_symlink() for c in chain):
+                try:
+                    paths.extend(sorted(chain[-1].iterdir(), key=lambda p: p.name))
                 except OSError:
                     pass
     return paths
@@ -434,6 +469,7 @@ def plan_reset(cfg: RouterConfig, name: str) -> ResetPlan:
         inbox_root if inbox_available else None,
         outbox_root if outbox_available else None,
         peer_root if peer_available else None,
+        cfg.connector_outcome_ids,
     )
 
     return ResetPlan(
@@ -553,7 +589,8 @@ def _remove_one(dir_fd: int, name: str) -> None:
 
 
 def _empty_root(
-    root: Path, root_fd: int, base_dir: Path, keep: Tuple[str, ...]
+    root: Path, root_fd: int, base_dir: Path, keep: Tuple[str, ...],
+    preserve: Tuple[str, ...] = (),
 ) -> Tuple[bool, int]:
     """Empty the CONTENTS of one mailbox root (`inbox_root` or
     `outbox_root`, `base_dir`), in place: every direct entry other than
@@ -580,7 +617,7 @@ def _empty_root(
             names = []
         removed = 0
         for entry_name in names:
-            if entry_name in keep:
+            if entry_name in keep or entry_name in preserve:
                 continue
             _remove_one(base_fd, entry_name)
             removed += 1
@@ -601,6 +638,47 @@ def _empty_root(
         return True, removed
     finally:
         os.close(base_fd)
+
+
+def _empty_outcomes(
+    root: Path, root_fd: int, outbox_root: Path, outcome_ids: Tuple[str, ...],
+) -> int:
+    """Empty `outbox_root/ext/<id>/outcomes/` for each configured id — the
+    one part of the connector-owned `ext/` tree reset clears, because it is
+    the part this router consumes (`_OUTBOX_PRESERVE`). Returns the count
+    removed.
+
+    Each component — the outbox root, `ext`, `<id>`, `outcomes` — is pinned
+    with `_pin_or_abort`, exactly like a skeleton leaf: a symlink resolving
+    OUTSIDE `root` aborts the reset (`NamespaceEscapeError`); anything else
+    that is not a real directory ends the descent for that id WITHOUT being
+    removed, because nothing under `ext/` other than outcome files is the
+    router's to delete."""
+    removed = 0
+    kind, base_fd = _pin_or_abort(
+        root_fd, outbox_root.name, root=root, current_path=outbox_root)
+    if kind != "dir":
+        return 0
+    try:
+        for cid in outcome_ids:
+            fds: List[int] = []
+            parent_fd, path = base_fd, outbox_root
+            try:
+                for part in (_EXT, cid, _OUTCOMES):
+                    path = path / part
+                    kind, fd = _pin_or_abort(parent_fd, part, root=root, current_path=path)
+                    if kind != "dir":
+                        break
+                    fds.append(fd)
+                    parent_fd = fd
+                else:
+                    removed += _remove_all_in(parent_fd)
+            finally:
+                for fd in fds:
+                    os.close(fd)
+    finally:
+        os.close(base_fd)
+    return removed
 
 
 def _empty_mailboxes(cfg: RouterConfig, name: str) -> Dict[str, Any]:
@@ -627,7 +705,11 @@ def _empty_mailboxes(cfg: RouterConfig, name: str) -> Dict[str, Any]:
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
         inbox_available, inbox_removed = _empty_root(root, root_fd, inst.inbox_root, _INBOX_KEEP)
-        outbox_available, outbox_removed = _empty_root(root, root_fd, inst.outbox_root, _OUTBOX_KEEP)
+        outbox_available, outbox_removed = _empty_root(
+            root, root_fd, inst.outbox_root, _OUTBOX_KEEP, _OUTBOX_PRESERVE)
+        if outbox_available:
+            outbox_removed += _empty_outcomes(
+                root, root_fd, inst.outbox_root, cfg.connector_outcome_ids)
         if inst.peer_root is not None:
             peer_available, peer_removed = _empty_root(root, root_fd, inst.peer_root, _PEER_KEEP)
     finally:
