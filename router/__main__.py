@@ -10,7 +10,8 @@
                                  and (with a fleet_domain) the directed peer task graph; --json prints ONLY
                                  the graph as {recipient-address: [sender-address, ...]} for the adapter's
                                  --verify to diff against each agent's peers.json
-  status [--json]               print (or dump) the last-written state_dir/status.json
+  status [--json|--check]       print (or dump) the last-written state_dir/status.json;
+                                --check exits 1 unless the last poll is within 3x interval_s
   provision NAME [--format env|json] [--no-create]
                                  print the four connector env vars for NAME; creates its skeleton dirs (and, on
                                  the peer lane, <handoff_dir>/peer/{notices,messages} and <intake_dir>/NAME/)
@@ -44,7 +45,7 @@ from .peers import render_peers, render_peers_json
 from .provision import ProvisionError, format_env, format_report, provision, report
 from .reset import ResetError, plan_resets, reset_instances
 from .service import run_forever, run_once
-from .status import render_discovery as status_render_discovery, NOT_WRITTEN_MSG, read as status_read, render as status_render
+from .status import render_discovery as status_render_discovery, NOT_WRITTEN_MSG, health as status_health, read as status_read, render as status_render
 from .util import NamespaceEscapeError
 
 
@@ -89,6 +90,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="print (or dump) the router's last-written status")
     p_status.add_argument("--json", action="store_true", help="dump the raw status.json document")
+    p_status.add_argument(
+        "--check", action="store_true",
+        help="exit 0 if the last poll is within 3x interval_s, else 1 (one line on stdout "
+             "or stderr); what the image's HEALTHCHECK runs")
 
     p_provision = sub.add_parser("provision", help="print connector env vars for one instance")
     p_provision.add_argument("name", help="instance name, as it appears in config.instances")
@@ -356,6 +361,12 @@ def main(argv=None) -> int:
 
     if args.command == "status":
         doc = status_read(cfg.state_dir)
+        if args.check:
+            # Before the `doc is None` branch below, so a missing document
+            # gets the same one-line verdict shape as every other failure.
+            healthy, reason = status_health(doc)
+            print(reason, file=sys.stdout if healthy else sys.stderr)
+            return 0 if healthy else 1
         if doc is None:
             print(f"router: {NOT_WRITTEN_MSG}", file=sys.stderr)
             return 1

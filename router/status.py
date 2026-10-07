@@ -83,7 +83,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from .util import atomic_write, utc_ts
 
@@ -262,6 +262,43 @@ def read(state_dir: Union[str, Path]) -> Optional[Dict[str, Any]]:
     if not isinstance(doc, dict):
         return None
     return doc
+
+
+#: A status document older than this many poll intervals means the loop has
+#: stopped writing — hung, crashed, or never started. The same factor the host
+#: adapter's `router_health` applies to `interval_s`, so the two judges agree.
+STALE_FACTOR = 3
+
+
+def health(doc: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    """`(healthy, one-line reason)` for a status document, or for `None`
+    (no readable `status.json`). The ONE definition of "healthy" in this
+    package: `status --check` exits on it, and the image's `HEALTHCHECK`
+    calls that.
+
+    Healthy means a poll was recorded within `STALE_FACTOR` x `interval_s`.
+    Everything this cannot establish is UNHEALTHY, never assumed fine:
+      - no readable document;
+      - no `interval_s` — omitted when unknown, and then no bound can be
+        computed. `once` never writes one, so a `once`-only deployment has
+        no health to report, which is the truth;
+      - no `last_poll_ts`, or one that does not parse.
+    A poll timestamp in the FUTURE is treated as fresh: it can only come
+    from clock skew between writer and reader, and calling that unhealthy
+    would fail a working router."""
+    if doc is None:
+        return False, "unhealthy: no readable status.json (the run loop has not written one)"
+    interval = doc.get("interval_s")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0:
+        return False, "unhealthy: status.json has no interval_s, so freshness cannot be judged"
+    age = _age_seconds(doc.get("last_poll_ts"))
+    if age is None:
+        return False, "unhealthy: status.json has no parseable last_poll_ts"
+    bound = STALE_FACTOR * float(interval)
+    if age > bound:
+        return False, (f"unhealthy: last poll {age:.0f}s ago, over the {bound:.0f}s bound "
+                       f"({STALE_FACTOR} x interval {interval}s)")
+    return True, f"healthy: last poll {max(age, 0):.0f}s ago (bound {bound:.0f}s)"
 
 
 def _age_seconds(ts: Optional[str]) -> Optional[float]:

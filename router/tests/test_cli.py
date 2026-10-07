@@ -13,7 +13,9 @@ from pathlib import Path
 from router.__main__ import main
 
 
-class TestCLI(unittest.TestCase):
+class _CLITestCase(unittest.TestCase):
+    """A real config on disk and an in-process `main` runner."""
+
     def setUp(self) -> None:
         self._tmp_ctx = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp_ctx.name)
@@ -40,6 +42,8 @@ class TestCLI(unittest.TestCase):
             code = main(["--config", str(self.config_path), *args])
         return code, out.getvalue(), err.getvalue()
 
+
+class TestCLI(_CLITestCase):
     def test_peers_and_matrix_alias(self):
         code, out, _ = self._run("peers")
         self.assertEqual(code, 0)
@@ -162,6 +166,71 @@ class TestCLI(unittest.TestCase):
             code = main(["--config", str(bad_config), "peers"])
         self.assertEqual(code, 2)
 
+
+class StatusCheckTests(_CLITestCase):
+    """`status --check`: the one definition of healthy (`status.health`),
+    which the image's HEALTHCHECK runs. Each test writes a real status.json
+    and asserts BOTH the exit code and the stream: a verdict printed to the
+    wrong stream, or the right exit with no verdict, are each a defect."""
+
+    def _write(self, *, age_s, interval_s=5.0, drop=()):
+        from datetime import datetime, timedelta, timezone
+        from router.status import StatusTracker
+        tracker = StatusTracker(interval_s=interval_s)
+        tracker.record_poll({})
+        doc = tracker.to_doc()
+        doc["last_poll_ts"] = (datetime.now(timezone.utc) - timedelta(seconds=age_s)
+                               ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for k in drop:
+            doc.pop(k, None)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "status.json").write_text(json.dumps(doc))
+
+    def test_a_fresh_poll_is_healthy(self):
+        self._write(age_s=2)
+        code, out, err = self._run("status", "--check")
+        self.assertEqual(code, 0)
+        self.assertIn("healthy:", out)
+        self.assertEqual(err, "")
+
+    def test_a_poll_older_than_three_intervals_is_unhealthy(self):
+        """THE BOUNDARY IS THE TEST. 16s against interval 5 (bound 15) is
+        unhealthy; the fresh test above and the one below show a poll within
+        the bound is not. A factor of 4 or of 2 would move one of them."""
+        self._write(age_s=16)
+        code, out, err = self._run("status", "--check")
+        self.assertEqual(code, 1)
+        self.assertIn("unhealthy: last poll", err)
+        self.assertEqual(out, "")
+
+    def test_a_poll_just_inside_three_intervals_is_healthy(self):
+        self._write(age_s=13)
+        code, _out, _err = self._run("status", "--check")
+        self.assertEqual(code, 0)
+
+    def test_no_status_file_is_unhealthy_with_a_verdict(self):
+        """Not the plain `status` "has not written status yet" path: the
+        check's own one-line verdict, so a HEALTHCHECK log says why."""
+        code, out, err = self._run("status", "--check")
+        self.assertEqual(code, 1)
+        self.assertIn("unhealthy: no readable status.json", err)
+
+    def test_no_interval_is_unhealthy_never_assumed(self):
+        """`interval_s` is omitted when unknown. Without it there is no
+        bound, and an unknown is reported as unhealthy, not as fine."""
+        self._write(age_s=1, drop=("interval_s",))
+        code, _out, err = self._run("status", "--check")
+        self.assertEqual(code, 1)
+        self.assertIn("no interval_s", err)
+
+    def test_unparseable_last_poll_is_unhealthy(self):
+        self._write(age_s=1)
+        doc = json.loads((self.state_dir / "status.json").read_text())
+        doc["last_poll_ts"] = "yesterday-ish"
+        (self.state_dir / "status.json").write_text(json.dumps(doc))
+        code, _out, err = self._run("status", "--check")
+        self.assertEqual(code, 1)
+        self.assertIn("no parseable last_poll_ts", err)
 
 if __name__ == "__main__":
     unittest.main()

@@ -96,6 +96,25 @@ class DockerfileManifestTests(unittest.TestCase):
         self.assertNotRegex(text, r"(?m)^USER\s+\S")
 
 
+class HealthcheckTests(unittest.TestCase):
+    """The image's HEALTHCHECK must call the PACKAGE's check, never carry its
+    own staleness logic, so there is one tested definition of healthy."""
+
+    def test_the_healthcheck_runs_status_check_through_the_entrypoint(self):
+        dockerfile = (_REPO / "docker" / "Dockerfile").read_text()
+        lines = [l for l in dockerfile.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        hc = [i for i, l in enumerate(lines) if l.startswith("HEALTHCHECK")]
+        self.assertEqual(len(hc), 1, "exactly one HEALTHCHECK instruction")
+        cmd = lines[hc[0] + 1] if lines[hc[0]].rstrip().endswith("\\") else lines[hc[0]]
+        self.assertIn('CMD ["/app/docker/entrypoint.sh", "status", "--check"]', cmd)
+
+    def test_the_entrypoint_forwards_extra_args_to_status(self):
+        """Without "$@" on the status line, --check never reaches the CLI and
+        plain `status` exits 0 whenever any status.json exists."""
+        entry = (_REPO / "docker" / "entrypoint.sh").read_text()
+        self.assertIn('status) exec python3 -m router --config "$ROUTER_CONFIG" status "$@"', entry)
+
+
 class NoCredentialsNoNetworkTests(unittest.TestCase):
     """The two properties that distinguish this runtime from a mail-carrying
     one. Both are claims the README makes; these keep the container honest

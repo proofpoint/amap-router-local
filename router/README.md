@@ -381,13 +381,22 @@ bob    drained=1 accepted=0 rejected=1 for_human=0 quarantined=1 errors=0  ** FI
 carol  drained=0 accepted=0 rejected=0 for_human=0 quarantined=0 errors=0  (first sight — outbox was empty, nothing quarantined)
 ```
 
+**`status --check`** is the one definition of healthy: exit 0 while the last
+poll is within 3x `interval_s` (the same factor the host adapter's
+`router_health` uses), else exit 1, with one line saying why — on stdout when
+healthy, stderr when not. Anything it cannot establish is unhealthy, never
+assumed fine: no readable `status.json`, no `interval_s` (omitted when unknown;
+`once` never writes one), or an unparseable `last_poll_ts`. The image's Docker
+`HEALTHCHECK` runs it, so `docker ps` shows `healthy`/`unhealthy`. Plain Docker
+reports that but does not restart on it — `--restart` acts on exit.
+
 Field glossary:
 
 | Field | Meaning |
 |---|---|
 | `pid` | the router process that wrote this file |
 | `started_ts` | when THIS process started — the counter window's start |
-| `last_poll_ts` | timestamp of the most recent poll (age is what `status` prints; there's no baked-in staleness heuristic — the operator judges) |
+| `last_poll_ts` | timestamp of the most recent poll (age is what `status` prints; `status --check` judges it — see below) |
 | `polls` | number of polls this process has run |
 | `instances.<name>.last_summary` | the most recent poll's `drain_instance` summary, verbatim — carries `first_sight: 1` on the poll that snapshotted this instance |
 | `instances.<name>.totals` | cumulative per-outcome + per-refusal-path counts, this process lifetime, including `first_sight` and `quarantined`, and on the peer lane the `peer_*` outcome counters (see "Peer lane") |

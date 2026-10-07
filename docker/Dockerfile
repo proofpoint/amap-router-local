@@ -63,5 +63,14 @@ ENV HOME=/tmp \
 # into an instance's inbox are owned exactly like the ones sandy made. Pinning
 # a uid here would produce root-owned notices in the operator's home directory.
 
+# HEALTH is the run loop's own status.json, judged by `status --check`: healthy
+# while the last poll is within 3x the interval. The definition lives in the
+# package (`router.status.health`), where the suite runs it, not here. Plain
+# Docker reports this but does not restart on it — `--restart` acts on exit —
+# so it is visibility in `docker ps`, not recovery. The start period covers
+# the first poll; the interval need not match the router's.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD ["/app/docker/entrypoint.sh", "status", "--check"]
+
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
 CMD ["run"]
