@@ -966,6 +966,27 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `accepted` | `peer_routed` | Peer lane: placed in the recipient's `peer/` tree along a declared edge (or, for a reply, the reverse edge). `message_id` is the peer message id. Fresh task and reply alike — the code names the TREE |
 | `rejected` | `peer_single_recipient` | Peer lane: a submit touching a declared edge named more than one recipient or carried `cc`. Refused whole; a mixed-lane submit is never half-sent |
 | `rejected` | `peer_reply_window_expired` | Peer lane: the reply key resolves to a peer notice, no edge exists in the reply's direction, and the notice is older than `peer_reply_window_seconds` |
+| `queued_for_human` | `transport_anomaly` | External leg (not yet reachable from any built-in policy; see "In-flight requests"): the transport request was archived without a result, its result failed validation, no transport is configured, or the request carried attachments (staging to the transport is not built yet). Never resubmitted |
+
+## In-flight requests (external leg, partly built)
+
+`router/inflight.py` holds a request that stays unanswered across polls: one
+handed to a second runtime and settled from that runtime's result. Nothing
+reaches it yet. No built-in policy returns `outbound.ExternalRoute`, and
+`drain_instance`'s `transport` port is omitted by every caller; the rest of
+the external leg (classification, the transport itself, re-placement) is
+designed but not built. The transport is an optional plugin.
+
+* A record per request at `state_dir/<name>/inflight/<req_id>.json`, holding
+  the staged copy; the agent's file stays in its outbox, skipped, until settled.
+* Transport req_ids come from `state_dir/<name>/transport/next_req_id`,
+  persisted before use and never reused. `reset` preserves it.
+* No timeout settles a request. The drain summary (and so `status.json`)
+  carries `inflight`, `inflight_oldest_age_s` and `inflight_stale` (past one
+  hour), with one WARNING per stale request per process. These keys appear
+  only for an instance with a transport or with records.
+* The downstream verdict passes through verbatim, `detail` prefixed
+  `transport:`.
 
 ## Retention / deletion rights (v2.2.0)
 

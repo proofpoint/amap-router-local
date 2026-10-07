@@ -179,8 +179,8 @@ PUBLIC_MODULES = ("attachments", "binding", "config", "deliver", "exposure",
                   "lock", "outbound", "peers", "validate")
 
 #: Implementation. May change shape without notice.
-INTERNAL_MODULES = ("__main__", "audit", "console", "outcomes", "provision", "reset",
-                    "roster", "service", "status")
+INTERNAL_MODULES = ("__main__", "audit", "console", "inflight", "outcomes", "provision",
+                    "reset", "roster", "service", "status")
 
 #: Named by no ruling yet. Absent from the plan's table, not assigned by it.
 UNCLASSIFIED_MODULES = ("firstsight", "util")
