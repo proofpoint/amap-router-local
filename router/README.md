@@ -133,7 +133,11 @@ independent.)
   outcomes, in order — `["claude-code", "codex"]` for a fleet mixing Claude
   and Codex connectors. Each id matches `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`
   (it is a path segment under an agent-writable tree), and ids equal ignoring
-  case are refused. Router-wide: every id is scanned in every instance. **Roll
+  case are refused. Router-wide: every id is scanned in every instance. The
+  ORDER is the scan order against one shared per-poll budget: the first id is
+  scanned first, and a later id gets only what the earlier ones leave, so a
+  flooded first directory DEFERS the next one's outcomes to later polls (none
+  is dropped; each waits its turn). **Roll
   out the router first:** this loader refuses unknown keys, so a deployment
   that renders this key for an older router has its whole config refused.
 - `state_dir`, and every instance's declared root (`handoff_dir` or
@@ -713,7 +717,9 @@ it as opaque. ONLY the configured directories are scanned: `ext/` is
 agent-writable, so an outcome written under any other id sits there unread.
 One per-poll budget and one dedup key span all of them, so a second directory
 buys no extra work and one transition reported under two ids is acted on —
-and DSN'd — once. A compatibility path under an old repo-tracking spelling was
+and DSN'd — once. Directories are scanned in the configured order, so under
+budget pressure the first id's outcomes are read first and a later id's wait
+for a later poll. A compatibility path under an old repo-tracking spelling was
 read for one release and retired on 2026-09-22. Changing the scanned set is a
 deliberate edit rather than a cleanup: an outcome nobody reads is silence,
 this router never infers anything from silence, and so nothing it observes
