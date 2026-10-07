@@ -21,3 +21,6 @@ amap-router-local.md
 apply-ci-phase-1.sh
 *.bak
 fix-ci-warning.sh
+
+# Operator decision records: a working record, kept untracked by request.
+decisions/
