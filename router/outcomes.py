@@ -11,12 +11,13 @@ one file per outcome, named `peer-<notice_id>.json`:
      "notice_id": "<32 hex, = the filename's>",
      "detail": "<optional free text>"}                      # no other keys
 
-`<name>` is `claude-code` — the id the spec pins, which does not change when
-the connector's repository is renamed and is opaque to this router
-(`CONNECTOR_ID`). A compatibility path under the old repo-tracking spelling
-was scanned alongside it for one release and was RETIRED on 2026-09-22; see
-that commit for the decision and for what was not established when it was
-made.
+`<name>` is a connector id from `config.connector_outcome_ids` — default
+`("claude-code",)`, the first id the spec names. Each id is stable and opaque:
+it does not change when a connector's repository is renamed, and nothing here
+parses it. A mixed fleet lists one id per connector (`["claude-code",
+"codex"]`), and every listed directory is scanned in every instance, under one
+per-poll budget and one dedup key. A compatibility path under a repo-tracking
+spelling was scanned for one release and RETIRED on 2026-09-22.
 
 Outcomes are INFORMATIONAL, NOT PROOF. They are written by the workspace
 uid — the agent's uid — so the receiving agent can forge `delivered` or
@@ -170,29 +171,14 @@ from .util import atomic_write, utc_ts
 
 logger = logging.getLogger("amap_router_local.outcomes")
 
-#: The connector id in `outbound/ext/<name>/`. The spec pins it
-#: (AMAP core §2, the commit pinning `outbound/ext/<name>` as a stable
-#: connector id — v3.1.0 DRAFT): `<name>` MUST NOT change when the
-#: connector's repository is renamed, and MUST be treated as opaque. So this
-#: is a CONSTANT, not a repo name that happens to be current — it survives
-#: `amp-connector-claude-code` -> `amap-connector-claude` untouched, and
-#: nothing here may parse it.
-CONNECTOR_ID = "claude-code"
-
-
 def outcomes_rel(connector_id: str) -> Path:
-    """`ext/<connector_id>/outcomes`, relative to `outbox_root`."""
+    """`ext/<connector_id>/outcomes`, relative to `outbox_root`. The only
+    place the path is spelled; the ids come from `cfg.connector_outcome_ids`
+    and are validated at load (`config._connector_outcome_ids`). There is
+    deliberately no module-level constant for "the" directory any more: one
+    survived the change to configurable ids, read by nothing but a test that
+    went on pinning it."""
     return Path("ext") / connector_id / "outcomes"
-
-
-#: Where the daemon writes, relative to `outbox_root` (spec `outbound/ext/<name>/`).
-OUTCOMES_REL = outcomes_rel(CONNECTOR_ID)
-#: The directories scanned each poll. A TUPLE with one member, not a bare
-#: path: `_consume_dir` iterates it and shares one file budget across
-#: whatever it holds, and a second entry has been in here before. Keeping the
-#: shape means re-adding one is a one-line change rather than a reshaping of
-#: the consumption loop.
-OUTCOMES_RELS = (OUTCOMES_REL,)
 
 OUTCOME_NAME_RE = re.compile(r"^peer-([a-f0-9]{32})\.json$")
 
@@ -558,23 +544,26 @@ def consume_instance(cfg: RouterConfig, name: str) -> Dict[str, Any]:
 
 def _consume_dir(cfg: RouterConfig, name: str, inst: Any, summary: Dict[str, Any]) -> None:
     """The consumption half of `consume_instance`: the pinned descent into
-    each of the agent's outcomes directories (`OUTCOMES_RELS`, preferred
-    first) and one `_consume_one` per file.
+    each configured outcomes directory (`cfg.connector_outcome_ids`, in
+    order) and one `_consume_one` per file.
 
-    BOTH ids are scanned, not whichever exists: the compatibility window is
-    for a daemon that has not been re-provisioned yet, and that daemon keeps
-    writing under the old id whether or not the new directory has appeared.
-    Scanning only the preferred one when it exists would strand exactly the
-    outcomes the window is for — silently, since unread outcomes are silence.
+    EVERY configured id is scanned in EVERY instance, not only the one that
+    instance's connector uses — nothing here knows which connector a sandbox
+    runs, and a directory that does not exist costs one failed open. It adds
+    no trust: these are agent-writable, so an agent writing under another
+    connector's id can do nothing it could not already do under its own.
 
     `MAX_FILES_PER_POLL` is a bound on work per instance per poll, so it is
-    shared ACROSS the directories rather than applied to each: these are
-    agent-writable, and two directories must not buy twice the budget."""
+    shared ACROSS the directories rather than applied to each: two
+    directories must not buy twice the budget. And the dedup key is
+    `(tree, notice_id, outcome)`, with no directory in it, so one transition
+    reported under two ids is recorded — and DSN'd — once."""
     root = inst.root
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
         examined = 0
-        for rel_base in OUTCOMES_RELS:
+        for connector_id in cfg.connector_outcome_ids:
+            rel_base = outcomes_rel(connector_id)
             if examined >= MAX_FILES_PER_POLL:
                 break
             rel = (inst.outbox_root / rel_base).relative_to(root)

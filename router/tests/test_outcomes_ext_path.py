@@ -1,11 +1,12 @@
-"""The `outbound/ext/<name>/` connector id: one pinned path, and nothing else.
+"""The `outbound/ext/<name>/` connector ids: exactly the configured ones.
 
-The spec pins `<name>` (AMAP core §2, `outbound/ext/<name>` as a stable
-connector id, v3.1.0 DRAFT): it MUST NOT change
-when the connector's repository is renamed, and MUST be treated as opaque.
-So the router reads `ext/claude-code/` and nothing else. A compatibility path
-under the old repo-tracking spelling was scanned alongside it for one release
-and was retired on 2026-09-22.
+The spec makes `<name>` a stable connector id ("The Volume Layout",
+`outbound/ext/<name>/`): it MUST NOT change when the connector's repository is
+renamed, and MUST be treated as opaque. The router scans
+`ext/<id>/outcomes/` for each id in `config.connector_outcome_ids` — default
+`("claude-code",)` — and nothing else. A compatibility path under an old
+repo-tracking spelling was scanned for one release and retired on 2026-09-22;
+configurable ids followed, for mixed Claude/Codex fleets.
 
 WHY THIS FILE EXISTS. Nothing fails when this goes wrong. An outcome the
 router never reads is silence, and silence is exactly what a peer message
@@ -14,9 +15,11 @@ never sees the `held` banner, and `peer_placed_denied` never lists the notice.
 The module docstring's own rule — this router never infers anything from
 silence — is what makes the failure invisible. So the path the router scans
 gets a test that fails loudly when it changes, rather than a comment asking
-nicely. That argument is why the retirement above is a RULING and not a
-cleanup: dropping a scanned directory cannot be verified after the fact from
-anything this router observes.
+nicely. That argument is why any change to the scanned set is a RULING and
+not a cleanup: dropping a scanned directory cannot be verified after the fact
+from anything this router observes. Asserted on BEHAVIOUR — a file that is or
+is not consumed — never on a constant: the change to configurable ids left a
+constant behind that nothing read, and a test that went on pinning it.
 
 Driven through `outcomes.consume_instance`, the unit whose directory scan
 these tests are about; `test_outcomes.py` drives the same behaviour through
@@ -24,9 +27,10 @@ these tests are about; `test_outcomes.py` drives the same behaviour through
 """
 
 import unittest
+from dataclasses import replace
 from unittest import mock
 
-from router import outbound, outcomes
+from router import config, outbound, outcomes
 from router.tests.helpers import RouterTestCase, read_json, result_path, write_request
 from router.tests.peer_helpers import addr, make_peer_config, outcomes_dir, write_outcome
 
@@ -34,22 +38,18 @@ from router.tests.peer_helpers import addr, make_peer_config, outcomes_dir, writ
 class ConnectorIdTests(unittest.TestCase):
     """The ids themselves, before any filesystem is involved."""
 
-    def test_pinned_id_is_not_a_repo_name(self):
-        """The whole point of the spec ruling: the id outlives a rename of the
-        connector's REPOSITORY, so it must not carry a repo name at all. It
-        did not change when that repository was renamed, and this test is what
-        says so."""
-        self.assertEqual(outcomes.CONNECTOR_ID, "claude-code")
-        self.assertNotIn("amp", outcomes.CONNECTOR_ID)
-        self.assertNotIn("amap", outcomes.CONNECTOR_ID)
+    def test_the_default_id_is_not_a_repo_name(self):
+        """The whole point of the spec ruling: an id outlives a rename of the
+        connector's REPOSITORY, so it must not carry a repo name at all. The
+        default did not change when that repository was renamed, and this test
+        is what says so."""
+        self.assertEqual(config.DEFAULT_CONNECTOR_OUTCOME_IDS, ("claude-code",))
+        for cid in config.DEFAULT_CONNECTOR_OUTCOME_IDS:
+            self.assertNotIn("amp", cid)
+            self.assertNotIn("amap", cid)
 
-    def test_the_scanned_tuple_is_the_pinned_path_alone(self):
-        """One member, and it is the one the spec pins. The tuple used to
-        carry a second, and this assertion is what says it no longer does —
-        a re-added path that nothing declares here is a directory the fleet
-        was never told about."""
-        self.assertEqual(outcomes.OUTCOMES_RELS, (outcomes.OUTCOMES_REL,))
-        self.assertEqual(outcomes.OUTCOMES_REL, outcomes.outcomes_rel("claude-code"))
+    def test_the_path_is_ext_id_outcomes(self):
+        self.assertEqual(str(outcomes.outcomes_rel("codex")), "ext/codex/outcomes")
 
 
 class _ExtPathTestCase(RouterTestCase):
@@ -112,6 +112,26 @@ class TheExtPathIsConsumedTests(_ExtPathTestCase):
 
         self.assertEqual(summary["peer_outcomes_seen"], 0)
         self.assertTrue((stray / real.name).exists())
+
+
+class TheConfiguredIdsAreScannedTests(_ExtPathTestCase):
+    """What replaced the assertion on a constant: the scanned set, observed."""
+
+    def test_an_outcome_under_a_second_CONFIGURED_id_is_consumed(self):
+        """The inverse of `test_an_outcome_beside_the_pinned_dir_is_not_found`:
+        the same move, into a directory the config DOES list, is consumed.
+        Together they pin that the config — not a constant — decides."""
+        self.cfg = replace(self.cfg, connector_outcome_ids=("claude-code", "codex"))
+        real = write_outcome(self.cfg, "b", self.task(), "delivered")
+        target = outcomes_dir(self.cfg, "b", "codex")
+        target.mkdir(parents=True)
+        real.rename(target / real.name)
+
+        summary = self.consume()
+
+        self.assertEqual(summary["peer_outcomes_seen"], 1)
+        self.assertEqual(summary["peer_delivered"], 1)
+        self.assertFalse((target / real.name).exists())
 
 
 class BudgetTests(_ExtPathTestCase):

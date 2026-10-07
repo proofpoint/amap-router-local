@@ -146,8 +146,21 @@ ALLOW_ANY = "ALLOW_ANY"
 # tool that ever touches it.
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+#: Connector ids for `outbound/ext/<id>/outcomes/` — the directories
+#: `outcomes._consume_dir` scans, in this order. The spec ("The Volume
+#: Layout", `outbound/ext/<name>/`) makes `<name>` a stable connector id,
+#: chosen once and opaque to the runtime: it must not change when a
+#: connector's repository is renamed, and nothing here parses it. Each id
+#: becomes a PATH SEGMENT under an agent-writable tree, so the alphabet is
+#: narrow and has no dot (no `.`, `..` or hidden names). `\Z`, not `$`, which
+#: in Python also matches before a trailing newline.
+_CONNECTOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+#: The default keeps every deployment that predates the key exactly as it
+#: was. `claude-code` is the first id the spec names.
+DEFAULT_CONNECTOR_OUTCOME_IDS: Tuple[str, ...] = ("claude-code",)
+
 _TOP_KEYS = {
-    "state_dir", "instances",
+    "state_dir", "instances", "connector_outcome_ids",
     "attachment_max_bytes", "attachment_max_count", "attachment_max_total_bytes",
     "fleet_domain", "intake_dir",
     "sender_exposure_window_seconds", "peer_reply_window_seconds",
@@ -429,6 +442,9 @@ class RouterConfig:
     #: `discovery` above — an authored config has no verdict file, and
     #: therefore no roster.
     selected_json: Optional[Path] = None
+    #: Which `outbound/ext/<id>/outcomes/` directories are scanned, in order.
+    #: One budget and one dedup key span all of them (`outcomes._consume_dir`).
+    connector_outcome_ids: Tuple[str, ...] = DEFAULT_CONNECTOR_OUTCOME_IDS
 
 
 def address_for(name: str, fleet_domain: Optional[str] = None) -> str:
@@ -1210,8 +1226,10 @@ def load_obj(
                     f"{root_key} ({root}) must not be nested inside one another"
                 )
 
+    outcome_ids = _connector_outcome_ids(top)
+
     cfg = RouterConfig(
-        state_dir=state_dir, instances=instances,
+        state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
         attachment_max_bytes=attachment_max_bytes,
         attachment_max_count=attachment_max_count,
         attachment_max_total_bytes=attachment_max_total_bytes,
@@ -1240,6 +1258,41 @@ def load_obj(
                     f"per ordered pair, or the sender could choose its lane"
                 )
     return cfg
+
+
+def _connector_outcome_ids(top: Dict[str, Any]) -> Tuple[str, ...]:
+    """`config.connector_outcome_ids`, validated: a non-empty list of distinct
+    connector ids, each matching `_CONNECTOR_ID_RE`. Absent means
+    `DEFAULT_CONNECTOR_OUTCOME_IDS`.
+
+    THIS LOADER REFUSES UNKNOWN KEYS, so this key forces a rollout order: a
+    router that understands it must be running before any deployment renders
+    it, or that deployment's whole config is refused and nothing drains.
+
+    DISTINCT BY CASEFOLD, not by equality, for the reason `_check_casefold`
+    gives for instance names: on a case-insensitive filesystem `Codex` and
+    `codex` are one directory. Scanned twice it would cost nothing but budget
+    (the dedup key holds) — but a config that names one directory twice is a
+    mistake worth refusing, and naming both spellings says which."""
+    raw = top.get("connector_outcome_ids", list(DEFAULT_CONNECTOR_OUTCOME_IDS))
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(
+            f"config.connector_outcome_ids: expected a non-empty list of connector "
+            f"ids, got {raw!r}")
+    seen: Dict[str, str] = {}
+    for cid in raw:
+        if not isinstance(cid, str) or not _CONNECTOR_ID_RE.match(cid):
+            raise ConfigError(
+                f"config.connector_outcome_ids: {cid!r} is not a connector id — "
+                f"it becomes a path segment under outbound/ext/, so it must match "
+                f"{_CONNECTOR_ID_RE.pattern}")
+        folded = cid.casefold()
+        if folded in seen:
+            raise ConfigError(
+                f"config.connector_outcome_ids: {seen[folded]!r} and {cid!r} name "
+                f"the same directory (equal, or equal ignoring case)")
+        seen[folded] = cid
+    return tuple(raw)
 
 
 def _check_casefold(names: List[str]) -> None:
