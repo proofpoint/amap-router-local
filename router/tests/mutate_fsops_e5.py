@@ -128,6 +128,26 @@ M = [
   '            if _inside_stage(d):\n'
   '                raise BindingError(f"dependency {i} ({dep_name!r}) is inside a stage directory")\n', '',
   [E + 'DependencyTests.test_dependency_scope_is_the_destinations_tree']),
+ ('D3b the exists_same post-compare check is past the different-bytes return', F,
+  '                same = self._read_all(fd, len(data)) == data\n'
+  '                self._check_deps(deps)     # after the compare, before the barrier\n'
+  '                if not same:\n                    return self._different(dfd, name, "different bytes", fd)\n',
+  '                same = self._read_all(fd, len(data)) == data\n'
+  '                if not same:\n                    return self._different(dfd, name, "different bytes", fd)\n'
+  '                self._check_deps(deps)     # after the compare, before the barrier\n',
+  [E + 'DependencyTests.test_the_post_compare_check_precedes_exists_different']),
+ ('D4e the recovery post-compare check is past the different-bytes return', F,
+  '                self._check_deps(deps)     # after the compare, before the barrier\n'
+  '                if not same:\n                    return self._different(dfd, name, "interrupted commit with different bytes",\n'
+  '                                           fd)\n',
+  '                if not same:\n                    return self._different(dfd, name, "interrupted commit with different bytes",\n'
+  '                                           fd)\n'
+  '                self._check_deps(deps)     # after the compare, before the barrier\n',
+  [E + 'DependencyTests.test_the_post_compare_check_precedes_exists_different_in_recovery']),
+ ('D12 any cause string is accepted', F,
+  '        if cause not in DEPENDENCY_CAUSES:\n'
+  '            raise ValueError(f"unknown dependency anomaly cause {cause!r}")\n', '',
+  [E + 'DependencyTests.test_an_unknown_cause_cannot_be_constructed']),
  ('D5 the binding guard trusts the pinned descriptor', F,
   '        here = self._canonical_dir(b)\n', '        here = self._live_fd(b)\n',
   [E + 'DependencyTests.test_the_dir_swapped_before_the_sentinel_is_refused_before_the_link',

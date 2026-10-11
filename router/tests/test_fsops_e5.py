@@ -441,7 +441,21 @@ class DependencyTests(_Strict, _HopCase):
         self.assert_second_check_fires()
         self.assertTrue(self.stage_path().exists(), "the stage is kept")
 
-    def assert_second_check_fires(self):
+    def test_the_post_compare_check_precedes_exists_different(self):
+        """Different bytes at a committed final: the dependency, intact at
+        entry and gone by the post-compare check, is the anomaly, never
+        `exists_different`."""
+        self.assertEqual(self.sentinel(), "created")
+        self.assert_second_check_fires(data=b"other bytes")
+
+    def test_the_post_compare_check_precedes_exists_different_in_recovery(self):
+        """The same on the F1 path: an interrupted commit whose bytes differ."""
+        with self.crash_at("linked"), self.assertRaises(_Crash):
+            self.sentinel()
+        self.assert_second_check_fires(data=b"other bytes")
+        self.assertTrue(self.stage_path().exists(), "the stage is kept")
+
+    def assert_second_check_fires(self, data=DATA):
         """The entry check passes; the dep is broken before the second."""
         real = fsops.FsOps._check_deps
         calls = []
@@ -452,8 +466,8 @@ class DependencyTests(_Strict, _HopCase):
                 (self.att_path / "0").unlink()
             return real(ops, deps)
         with mock.patch.object(fsops.FsOps, "_check_deps", check):
-            self.anomaly("missing")
-        self.assertEqual(len(calls), 2)
+            self.anomaly("missing", data=data)
+        self.assertGreaterEqual(len(calls), 2)
 
     def test_the_post_check_on_an_exists_different_fast_path(self):
         """A symlink final is `exists_different` without any compare; the
@@ -558,6 +572,9 @@ class DependencyTests(_Strict, _HopCase):
         self.assertEqual(ops.commit_durable(stage, att, "0", ATT, 0o640), "created")
         self.assertEqual(self.sentinel(ops=ops, stage=stage, dest=out,
                                        deps=[_dep(att, "0", ATT)]), "exists_same")
+
+    def test_an_unknown_cause_cannot_be_constructed(self):
+        self.expect(ValueError, fsops.DependencyAnomaly, "hardlink", 0, "x", "d")
 
     def test_malformed_deps_are_refused_before_anything(self):
         for bad in ([(self.att, "0", len(ATT))], [(self.att, "0", -1, "0" * 64)],

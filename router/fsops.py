@@ -150,7 +150,8 @@ class DependencyAnomaly(FsOpsError):
     any result; the stage is kept."""
 
     def __init__(self, cause: str, index: int, name: str, detail: str):
-        assert cause in DEPENDENCY_CAUSES, cause
+        if cause not in DEPENDENCY_CAUSES:
+            raise ValueError(f"unknown dependency anomaly cause {cause!r}")
         super().__init__(f"dependency {index} ({name!r}): {cause}: {detail}")
         self.cause = cause
         self.index = index
