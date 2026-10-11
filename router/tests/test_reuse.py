@@ -48,7 +48,18 @@ def _connector_reset(cfg, name):
 
 
 def _anchor(cfg, name, req_id="00000001"):
-    return read_json(outbound._private_result_path(cfg, name, req_id))
+    path = outbound._private_result_path(cfg, name, req_id)
+    if not path.is_file():
+        raise AssertionError(f"no private anchor for {req_id}")
+    return read_json(path)
+
+
+def _published(test, cfg, name, req_id="00000001"):
+    """The published result, asserted to exist first: a missing result is
+    a FAILURE of the claim under test, not an error in reading it."""
+    path = result_path(cfg, name, req_id)
+    test.assertTrue(path.is_file(), f"no result published for {req_id}")
+    return read_json(path)
 
 
 class InflightReuseTests(_InflightCase):
@@ -80,7 +91,7 @@ class InflightReuseTests(_InflightCase):
         self.port.send_all()
         s = self.drain()
 
-        r = self.result()
+        r = _published(self, self.cfg, "alice")
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
         self.assertEqual(s["outbound_req_id_reused"], 1)
         # The old work settled PRIVATELY: its own verdict, under its own digest.
@@ -100,7 +111,7 @@ class InflightReuseTests(_InflightCase):
         live.write_bytes(b"{" + b" " * (DEFAULT_READ_CAP + 1) + b"}")
         self.port.send_all()
         self.drain()
-        r = self.result()
+        r = _published(self, self.cfg, "alice")
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
         self.assertEqual(_anchor(self.cfg, "alice")["result"]["outcome"], "accepted")
 
@@ -117,7 +128,7 @@ class InflightReuseTests(_InflightCase):
         os.link(other, live)
         self.port.send_all()
         s = self.drain()
-        r = self.result()
+        r = _published(self, self.cfg, "alice")
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
         self.assertEqual(s["outbound_errored"], 0)
         self.assertEqual(_anchor(self.cfg, "alice")["result"]["outcome"], "accepted")
@@ -150,7 +161,7 @@ class InflightReuseTests(_InflightCase):
             raise OSError(errno.ELOOP, "a symlink at the name")
         with mock.patch.object(outbound, "_read_request_pinned", eloop):
             s = self.drain()
-        r = self.result()
+        r = _published(self, self.cfg, "alice")
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
         self.assertEqual(s["inflight_errored"], 0)
         self.assertEqual(_anchor(self.cfg, "alice")["result"]["outcome"], "accepted")
@@ -162,14 +173,14 @@ class InflightReuseTests(_InflightCase):
         (self.cfg.instances["alice"].outbox_root / "req-00000001.json").unlink()
         self.port.send_all()
         self.drain()
-        r = self.result()
+        r = _published(self, self.cfg, "alice")
         self.assertEqual((r["outcome"], r["reason_code"]), ("accepted", "allowlisted"))
 
     def test_the_unchanged_live_entry_settles_as_before(self):
         self._in_flight()
         self.port.send_all()
         s = self.drain()
-        self.assertEqual(self.result()["outcome"], "accepted")
+        self.assertEqual(_published(self, self.cfg, "alice")["outcome"], "accepted")
         self.assertEqual(s["outbound_req_id_reused"], 0)
 
     def test_a_transient_read_fault_at_settle_decides_nothing(self):
@@ -187,7 +198,7 @@ class InflightReuseTests(_InflightCase):
         self.assertEqual(s["inflight_errored"], 1)
         self.assertIs(outbound._read_request_pinned, real)
         self.drain()
-        self.assertEqual(self.result()["outcome"], "accepted")
+        self.assertEqual(_published(self, self.cfg, "alice")["outcome"], "accepted")
 
 
 class DigestlessAnchorReuseTests(RouterTestCase):
@@ -213,7 +224,7 @@ class DigestlessAnchorReuseTests(RouterTestCase):
         self._settle_oversized()
         write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], body_text="new")
         s = outbound.drain_instance(self.cfg, "alice")
-        r = read_json(result_path(self.cfg, "alice", "00000001"))
+        r = _published(self, self.cfg, "alice")
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
         self.assertEqual((s["outbound_req_id_reused"], s["outbound_resumed"]), (1, 0))
         self.assertEqual(list_notices(self.cfg, "bob"), [])
@@ -223,7 +234,7 @@ class DigestlessAnchorReuseTests(RouterTestCase):
         self._settle_oversized()
         self._oversized(fill=b"\t")
         s = outbound.drain_instance(self.cfg, "alice")
-        r = read_json(result_path(self.cfg, "alice", "00000001"))
+        r = _published(self, self.cfg, "alice")
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "malformed_request"))
         self.assertEqual((s["outbound_req_id_reused"], s["outbound_resumed"]), (0, 1))
 
@@ -254,5 +265,5 @@ class DigestlessAnchorReuseTests(RouterTestCase):
         s = outbound.drain_instance(self.cfg, "alice")
         self.assertEqual((s["outbound_resumed"], s["outbound_req_id_reused"],
                           s["outbound_errored"]), (1, 0, 0))
-        r = read_json(result_path(self.cfg, "alice", "00000001"))
+        r = _published(self, self.cfg, "alice")
         self.assertEqual(r["reason_code"], "malformed_request")

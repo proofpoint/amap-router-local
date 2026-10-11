@@ -67,19 +67,15 @@ M = [
   [R + 'InflightReuseTests.test_a_hard_linked_reuse_is_refused']),
 ]
 
-#: A run is RED only when unittest itself reports the named test FAILED or
-#: in ERROR. A non-zero exit for any other reason (the mutant broke the
-#: import, the test id is wrong) proves nothing about the rule.
-_RED_MARKERS = ("FAILED (",)
-_NOT_A_VERDICT = ("SyntaxError", "IndentationError", "ModuleNotFoundError",
-                  "ImportError: Failed to import", "has no attribute '")
-
-
+#: A run is RED only when unittest reports the named test as a FAILURE: an
+#: assertion in the test itself did not hold. An ERROR (the code under the
+#: mutant crashed, the import broke, the test id is wrong) is reported but
+#: is not RED: it proves the mutant broke something, not that the test
+#: pins the rule.
 def _red(r) -> bool:
     out = r.stdout + r.stderr
-    if any(m in out for m in _NOT_A_VERDICT):
-        return False
-    return r.returncode != 0 and any(m in out for m in _RED_MARKERS)
+    return (r.returncode != 0 and "\nFAIL: " in "\n" + out
+            and "FAILED (failures=" in out)
 
 
 def main() -> int:
@@ -109,7 +105,8 @@ def main() -> int:
                                    capture_output=True, text=True)
                 red = _red(r)
                 ok &= red
-                print(f"{label:52s} {t.split('.')[-1][:58]}: {'RED' if red else 'GREEN (survived)'}")
+                verdict = "RED" if red else ("ERROR only (not RED)" if r.returncode else "GREEN (survived)")
+                print(f"{label:52s} {t.split('.')[-1][:58]}: {verdict}")
         finally:
             path.write_text(orig)
     print(f"{len(M)} mutants: " + ("ALL RED" if ok else "SOME SURVIVED OR MISSING"))
