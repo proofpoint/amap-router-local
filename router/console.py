@@ -407,11 +407,16 @@ def gather(
 ) -> Dict[str, Any]:
     """Everything the page shows, read fresh. Stores nothing."""
     # Under a registry, private state is keyed by logical_id: read the keys
-    # the way a poll would, without persisting the seq floor. A held
-    # instance keeps its name, which shows what is (or is not) there.
+    # the way a poll would, without persisting the seq floor. A HELD instance
+    # has no key (`config.state_key` raises), so NO private state is read for
+    # it: it is shown as held, with the registry's reason, and its ledger is
+    # not listed. That is the situation the page most needs to show.
+    held: Dict[str, str] = {}
     if cfg.registry_dir is not None:
-        cfg = registry_mod.keyed_config(cfg, registry_mod.report_for(
-            cfg.registry_dir, cfg.state_dir, cfg.instances, persist=False))
+        report = registry_mod.report_for(
+            cfg.registry_dir, cfg.state_dir, cfg.instances, persist=False)
+        cfg = registry_mod.keyed_config(cfg, report)
+        held = dict(report.held or {})
     names = sorted(cfg.instances)
     status_doc = status_mod.read(cfg.state_dir) or {}
     host = load_host_facts(host_facts_path)
@@ -419,7 +424,19 @@ def gather(
     per_instance: Dict[str, Dict[str, Any]] = {}
     for name in names:
         inst = cfg.instances[name]
+        if name in held:
+            per_instance[name] = {
+                "seen": None,             # unknown: its private state is not read
+                "held": held[name],
+                "mode": inst.mode,
+                "peer_lane": inst.peer_root is not None,
+                "address": address_for(name, cfg.fleet_domain),
+                "status": (status_doc.get("instances") or {}).get(name) or {},
+                "events": [],
+            }
+            continue
         per_instance[name] = {
+            "held": None,
             "seen": firstsight_mod.read_marker(cfg.state_dir, name,
                                                state_key=state_key(cfg, name)) is not None,
             "mode": inst.mode,
@@ -436,6 +453,8 @@ def gather(
     messages: List[Dict[str, Any]] = []
     pairs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for recipient in names:
+        if recipient in held:
+            continue                      # no key: its ledger is not read
         for rec in _ledger_records(cfg, recipient):
             notice_id = str(rec.get("notice_id") or "")
             if not notice_id:
@@ -565,7 +584,7 @@ def _excluded(
         "not_enrolled": not_enrolled if isinstance(not_enrolled, list) else None,
         "not_enrolled_known": host.get("available") and isinstance(not_enrolled, list),
         "no_edge": no_edge,
-        "never_polled": [n for n in names if not per_instance[n]["seen"]],
+        "never_polled": [n for n in names if per_instance[n]["seen"] is False],
     }
 
 
@@ -736,7 +755,9 @@ def _health_section(data: Dict[str, Any]) -> str:
         # report, which is not the same as counters that are zero.
         observed = bool(totals)
         flags = []
-        if not inst["seen"]:
+        if inst.get("held"):
+            flags.append(_pill("warn", f"HELD: {inst['held']}"))
+        elif not inst["seen"]:
             flags.append(_pill("warn", "NEVER POLLED"))
         if inst["mode"] == MODE_NAMESPACE:
             flags.append(_pill("unk", "namespace mode"))

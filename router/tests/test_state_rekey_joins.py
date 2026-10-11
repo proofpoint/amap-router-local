@@ -134,6 +134,30 @@ class OutcomeJoinTests(_Migrated):
         self.assertEqual(task[0]["outcome"], "denied")
 
 
+class ConsoleWithAHeldInstanceTests(_Migrated):
+    """The page renders while an instance is held, shows it as held with the
+    registry's reason, and reads none of its private state."""
+
+    def page(self):
+        return console.render_html(self.cfg)
+
+    def test_state_not_migrated(self):
+        self.lid_dir("a").rename(self.state_dir / "a")          # a is back under its name
+        data = console.gather(self.cfg)
+        self.assertEqual(data["instances"]["a"]["held"], registry.HELD_NOT_MIGRATED)
+        self.assertIsNone(data["instances"]["a"]["seen"])
+        self.assertIn("HELD: state_not_migrated", self.page())
+        # b is resolved and its ledger (the pre-registry task) is still listed.
+        self.assertIn(self.task_id, [m["notice_id"] for m in data["messages"]])
+
+    def test_not_registered(self):
+        self.put(["a"])
+        data = console.gather(self.cfg)
+        self.assertEqual(data["instances"]["b"]["held"], registry.HELD_NOT_REGISTERED)
+        self.assertEqual(data["messages"], [], "b's ledger was read although b is held")
+        self.assertIn("HELD: not_registered", self.page())
+
+
 class ExposureJoinTests(_Migrated):
     """exposure.assess reads the sender's ledger under its logical_id."""
 
