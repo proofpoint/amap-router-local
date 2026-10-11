@@ -38,6 +38,12 @@ M = [
   '            if st.st_uid != os.geteuid():\n'
   '                raise BindingError(\n                    f"private stage',
   [E + 'PrivateRefusalTests.test_a_wrong_mode_stage_is_refused_never_repaired']),
+ ('P3b the private stage owner is not checked', F,
+  '            if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:\n'
+  '                raise BindingError(\n                    f"private stage',
+  '            if stat.S_IMODE(st.st_mode) != 0o700:\n'
+  '                raise BindingError(\n                    f"private stage',
+  [E + 'PrivateRefusalTests.test_a_stage_of_another_owner_is_refused']),
  ('P4 the private root is fsynced only on creation', F,
   '            os.fsync(root_fd)\n            self._register(fd, PRIVATE, root.tree, (".stage",))\n',
   '            if created:\n                os.fsync(root_fd)\n'
@@ -110,10 +116,39 @@ M = [
   '                same = self._read_all(fd, len(data)) == data\n'
   '                if not same:\n                    return self._different(dfd, name, "interrupted',
   [E + 'DependencyTests.test_the_post_compare_check_on_f1_recovery']),
+ ('D4b exists_different does not observe the deps again', F,
+  '        evidence."""\n        self._check_deps(deps)\n        if fd is not None:\n',
+  '        evidence."""\n        if fd is not None:\n',
+  [E + 'DependencyTests.test_the_post_check_on_an_exists_different_fast_path']),
+ ('D4c a dependency in another tree is accepted', F,
+  '            if d.kind != dest.kind or d.tree != dest.tree:\n'
+  '                raise BindingError(f"dependency {i} ({dep_name!r}) is in another tree")\n', '',
+  [E + 'DependencyTests.test_dependency_scope_is_the_destinations_tree']),
+ ('D4d a dependency inside a stage is accepted', F,
+  '            if _inside_stage(d):\n'
+  '                raise BindingError(f"dependency {i} ({dep_name!r}) is inside a stage directory")\n', '',
+  [E + 'DependencyTests.test_dependency_scope_is_the_destinations_tree']),
  ('D5 the binding guard trusts the pinned descriptor', F,
   '        here = self._canonical_dir(b)\n', '        here = self._live_fd(b)\n',
   [E + 'DependencyTests.test_the_dir_swapped_before_the_sentinel_is_refused_before_the_link',
    E + 'DependencyTests.test_a_dep_in_another_directory_whose_directory_moved']),
+ ('D5b the walk up does not check the tree root', F,
+  '                    if (st.st_dev, st.st_ino) != b.tree:\n',
+  '                    if False:\n',
+  [E + 'DependencyTests.test_a_dep_directory_moved_into_another_tree_at_the_same_path']),
+ ('D5c every walk error is a move', F,
+  '                    if e.errno in _WALK_MOVED:\n', '                    if True:\n',
+  [E + 'DependencyTests.test_walk_errors_that_say_moved_and_those_that_say_nothing']),
+ ('D5d a move on the walk propagates as a fault', F,
+  '                    if e.errno in _WALK_MOVED:\n', '                    if False:\n',
+  [E + 'DependencyTests.test_walk_errors_that_say_moved_and_those_that_say_nothing']),
+ ('D1b no entry check when the final exists', F,
+  '        self._check_deps(deps)\n        if self._exists(dfd, name):\n'
+  '            return self._on_exists(sfd, dfd, name, sname, data, mode, deps)\n',
+  '        if self._exists(dfd, name):\n'
+  '            return self._on_exists(sfd, dfd, name, sname, data, mode, deps)\n'
+  '        self._check_deps(deps)\n',
+  [E + 'DependencyTests.test_the_entry_check_comes_before_any_recovery_compare']),
  ('D6 a dependency link count is not checked', F,
   '                if st.st_nlink != 1:\n'
   '                    raise DependencyAnomaly("link_count", i, name, f"link count {st.st_nlink}")\n', '',
@@ -157,6 +192,17 @@ M = [
  ('K6 a requested setgid bit is honoured', F,
   '        want = mode & 0o777\n', '        want = mode & 0o7777\n',
   [E + 'MkdirPredicateTests.test_a_requested_setgid_bit_means_nothing']),
+ ('K8 the owner is not compared', F,
+  '    elif final.st_uid != os.geteuid():\n        why = f"owned by uid {final.st_uid}"\n', '',
+  [E + 'MkdirPredicateTests.test_a_directory_of_another_owner_is_refused']),
+ ('K9 the predicate only on pre-existing directories', F,
+  '            _mkdir_predicate(os.fstat(fd), want, os.fstat(parent_fd), name)\n',
+  '            if not created:\n'
+  '                _mkdir_predicate(os.fstat(fd), want, os.fstat(parent_fd), name)\n',
+  [E + 'MkdirPredicateTests.test_a_new_directory_is_checked_too']),
+ ('K10 a new directory is always fchmodded', F,
+  '                if stat.S_IMODE(st.st_mode) & 0o777 != want:\n', '                if True:\n',
+  [E + 'MkdirPredicateTests.test_no_fchmod_when_the_umask_removed_nothing']),
  ('K7 the permission bits are not compared', F,
   '    elif stat.S_IMODE(final.st_mode) & 0o777 != want:\n', '    elif False:\n',
   [E + 'MkdirPredicateTests.test_a_pre_existing_mismatch_is_refused_never_repaired']),

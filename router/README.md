@@ -1231,12 +1231,22 @@ amendment E5: a `(1, x)` plugin is refused here, and a `(2, x)` plugin by a
   pairwise disjoint.
 - `commit_durable(..., deps=...)` checks each earlier member of a
   publication (its directory still at its path in its tree, then size and
-  sha256 by a bounded read) before and after the link, raising on a
-  mismatch. Those are point-in-time observations: a publication is
-  complete only once its READER has verified what it consumes.
+  sha256 by a bounded read) before and after the link or compare, on every
+  result path, raising on a mismatch. A dependency must be in the
+  destination's own tree and outside any stage directory, or it is refused
+  before anything is staged. Those are point-in-time observations: a
+  publication is complete only once its READER has verified what it
+  consumes. A caller treats any exception from `commit_durable` or
+  `mkdir_and_pin` as "not committed"; the implementation's anomaly classes
+  are not part of the Protocol.
 - `mkdir_and_pin` checks the final `fstat` of the descriptor it returns
   (owner, permission bits, no setuid or sticky bit, the parent's setgid
   bit), and never repairs an existing directory.
+
+`router/transport.py` names these at `(2, 0)`, beside the Protocols:
+`HOPFSOPS_METHODS` (methods only), `HOPFSOPS_ATTRIBUTES` (`NOT_YET`,
+`UnsafeRead`), `Dependency` (a `deps` element's type) and
+`UNSAFE_READ_REASONS`.
 
 **This router's implementation of `HopFsOps`** is `router/fsops.py`
 (internal). It is built and tested but NOT activated: nothing hands it to a

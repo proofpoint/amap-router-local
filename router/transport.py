@@ -269,7 +269,9 @@ class HopFsOps(Protocol):
     DEPENDENCIES (`deps`, on a publication's sentinel only). Each
     `(dir_fd, name, size, sha256)` is an earlier commit of the same
     publication, in commit order; its directory may differ from the
-    sentinel's. For each one the implementation checks:
+    sentinel's but is in the SAME TREE as the destination and never inside
+    a stage directory. A dependency outside that scope raises before
+    anything is staged. For each one the implementation checks:
 
       * the binding guard: `dir_fd`'s directory is still at its recorded
         path in its tree, by a fresh `O_NOFOLLOW` walk from the tree root,
@@ -282,7 +284,7 @@ class HopFsOps(Protocol):
 
     They are checked BEFORE any stage, compare, recovery or `exists_*`
     answer, and AGAIN after the link or the compare, before the barrier or
-    the result, on every path. A failure RAISES the implementation's
+    the result, on every path, `exists_different` included. A failure RAISES the implementation's
     dependency anomaly, naming its cause (binding moved, missing, not
     regular, link count, size, digest); it is never `created` or
     `exists_same`, and the stage is kept. These are point-in-time

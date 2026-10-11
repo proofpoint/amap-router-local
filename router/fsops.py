@@ -134,6 +134,11 @@ class UnsafeRead(FsOpsError):
 _KIND_ERRNOS = frozenset({errno.ELOOP, errno.ENXIO})
 
 
+#: Errnos on the canonical walk that mean the binding is no longer at its
+#: path (gone, a symlink, not a directory). Anything else propagates.
+_WALK_MOVED = frozenset({errno.ENOENT, errno.ELOOP, errno.ENOTDIR})
+
+
 #: `DependencyAnomaly.cause` values (`transport.HopFsOps`, DEPENDENCIES).
 DEPENDENCY_CAUSES = ("binding_moved", "missing", "not_regular", "link_count",
                      "size", "digest")
@@ -675,6 +680,15 @@ class FsOps:
         if not isinstance(data, bytes):
             raise FsOpsError("data must be the frozen bytes")
         deps = _check_deps_shape(deps)
+        for i, (dep_fd, dep_name, _size, _digest) in enumerate(deps):
+            d = self.binding(dep_fd)
+            # The same publication: a dependency lives in the destination's
+            # own tree, never in a stage directory. Refused before anything
+            # is staged.
+            if d.kind != dest.kind or d.tree != dest.tree:
+                raise BindingError(f"dependency {i} ({dep_name!r}) is in another tree")
+            if _inside_stage(d):
+                raise BindingError(f"dependency {i} ({dep_name!r}) is inside a stage directory")
         if not stage.is_stage or (stage.dev, stage.ino) not in self._validated_stages:
             raise BindingError("stage_dirfd is not a stage directory opened by open_stage_dir")
         if _inside_stage(dest):
@@ -796,22 +810,25 @@ class FsOps:
             return None
         fd = live
         try:
-            for _ in b.rel:
-                up = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-                os.close(fd)
-                fd = up
-            st = os.fstat(fd)
-            if (st.st_dev, st.st_ino) != b.tree:
-                os.close(fd)
-                return None
-            for part in b.rel:
+            for part in [".."] * len(b.rel) + [None] + list(b.rel):
+                if part is None:     # at the top: it must be b's own tree root
+                    st = os.fstat(fd)
+                    if (st.st_dev, st.st_ino) != b.tree:
+                        os.close(fd)
+                        return None
+                    continue
                 try:
-                    down = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-                except OSError:
-                    os.close(fd)
-                    return None
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError as e:
+                    # What is (or is not) at a path says the binding moved;
+                    # any other fault (EIO, EACCES, ...) says nothing and
+                    # propagates. The same on the way up and the way down.
+                    if e.errno in _WALK_MOVED:
+                        os.close(fd)
+                        return None
+                    raise
                 os.close(fd)
-                fd = down
+                fd = nxt
             st = os.fstat(fd)
             if (st.st_dev, st.st_ino) != (b.dev, b.ino):
                 os.close(fd)
@@ -845,10 +862,16 @@ class FsOps:
         except FileNotFoundError:
             return False
 
-    def _different(self, dfd: int, name: str, why: str, fd: Optional[int] = None) -> str:
-        """The anomaly. Before it is returned, the existing file (when it is
-        a regular file we opened) and the destination are fsynced, as for
-        every exists_* result; any own stage is KEPT as evidence."""
+    def _different(self, dfd: int, name: str, why: str, fd: Optional[int] = None,
+                   deps=()) -> str:
+        """The anomaly. The dependencies are observed again first (E5: on
+        EVERY result path, so a broken publication is reported as such, not
+        as `exists_different`); a caller that has just checked them after
+        its own compare passes none. Before it is returned, the existing
+        file (when it is a regular file we opened) and the destination are
+        fsynced, as for every exists_* result; any own stage is KEPT as
+        evidence."""
+        self._check_deps(deps)
         if fd is not None:
             os.fsync(fd)
         os.fsync(dfd)
@@ -867,14 +890,14 @@ class FsOps:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
         except OSError as e:
             if e.errno == errno.ELOOP:
-                return self._different(dfd, name, "a symlink")
+                return self._different(dfd, name, "a symlink", deps=deps)
             raise
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
-                return self._different(dfd, name, "not a regular file")
+                return self._different(dfd, name, "not a regular file", deps=deps)
             if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != mode:
-                return self._different(dfd, name, "owner or mode", fd)
+                return self._different(dfd, name, "owner or mode", fd, deps=deps)
             if st.st_nlink == 1:
                 same = self._read_all(fd, len(data)) == data
                 self._check_deps(deps)     # after the compare, before the barrier
@@ -894,9 +917,11 @@ class FsOps:
                 try:
                     sst = os.stat(sname, dir_fd=sfd, follow_symlinks=False)
                 except FileNotFoundError:
-                    return self._different(dfd, name, "a second link that is not our stage", fd)
+                    return self._different(dfd, name, "a second link that is not our stage", fd,
+                                           deps=deps)
                 if (sst.st_dev, sst.st_ino) != (st.st_dev, st.st_ino):
-                    return self._different(dfd, name, "our stage is a different inode", fd)
+                    return self._different(dfd, name, "our stage is a different inode", fd,
+                                           deps=deps)
                 # Our interrupted commit (F1). Everything is established with
                 # the stage still present, so readers keep seeing NOT_YET (H1).
                 self._step("recover_before_compare")
@@ -914,7 +939,7 @@ class FsOps:
                 if os.fstat(fd).st_nlink != 1:
                     raise FsOpsError(f"{name!r} is not at link count 1 after recovery")
                 return "exists_same"
-            return self._different(dfd, name, f"link count {st.st_nlink}", fd)
+            return self._different(dfd, name, f"link count {st.st_nlink}", fd, deps=deps)
         finally:
             os.close(fd)
 

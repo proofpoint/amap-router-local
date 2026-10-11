@@ -147,6 +147,15 @@ class PrivateRefusalTests(_PrivateCase):
         self.refused(fsops.BindingError, ops.open_private_stage_dir, root)
         self.assertEqual(stat.S_IMODE(os.stat(self.priv / ".stage").st_mode), 0o750)
 
+    def test_a_stage_of_another_owner_is_refused(self):
+        """The owner half of the check: the same 0700 directory, seen by a
+        writer of another uid, is refused."""
+        ops = self.new_ops()
+        root = ops.open_root_nofollow(str(self.priv))
+        other = os.geteuid() + 1
+        with mock.patch.object(fsops.os, "geteuid", lambda: other):
+            self.refused(fsops.BindingError, ops.open_private_stage_dir, root)
+
     def test_a_stage_reached_by_descend_is_refused_at_commit(self):
         ops = self.new_ops()
         root = ops.open_root_nofollow(str(self.priv))
@@ -446,6 +455,66 @@ class DependencyTests(_Strict, _HopCase):
             self.anomaly("missing")
         self.assertEqual(len(calls), 2)
 
+    def test_the_post_check_on_an_exists_different_fast_path(self):
+        """A symlink final is `exists_different` without any compare; the
+        dependency, intact at entry and removed before the second check, is
+        still reported as the anomaly, never as `exists_different`."""
+        os.symlink("/etc/hostname", self.final())
+        self.assert_second_check_fires()
+
+    def test_dependency_scope_is_the_destinations_tree(self):
+        """The same publication: a dependency in another tree, or inside a
+        stage directory, is refused before anything is staged."""
+        intake = self.ops.open_root_nofollow(str(self.hop / ".control"))
+        istage = self.ops.open_stage_dir(intake, "intake")
+        self.assertEqual(self.ops.commit_durable(istage, intake, "x", ATT, 0o640), "created")
+        (self.hop / LID / GEN / "up" / "stage" / "planted").write_bytes(ATT)
+        for label, deps in (("another tree", [_dep(intake, "x", ATT)]),
+                            ("a stage directory", [_dep(self.up_stage, "planted", ATT)])):
+            with self.subTest(label):
+                e = self.expect(fsops.BindingError, self.sentinel, deps=deps)
+                self.assertNotIsInstance(e, fsops.DependencyAnomaly)
+                self.assertFalse(self.final().exists())
+                self.assertFalse(self.stage_path().exists())
+
+    def walk_fault(self, part, code):
+        """Make the canonical walk's open of `part` fail with `code`."""
+        real = os.open
+
+        def fail(path, flags, *a, **kw):
+            if path == part and flags & os.O_DIRECTORY:
+                raise OSError(code, os.strerror(code))
+            return real(path, flags, *a, **kw)
+        return mock.patch.object(fsops.os, "open", fail)
+
+    def test_walk_errors_that_say_moved_and_those_that_say_nothing(self):
+        """Gone, a symlink or not a directory, on the way up ('..') or down
+        (a recorded name), is `binding_moved`; any other fault propagates
+        as itself and is never read as a move."""
+        for part in ("..", "req-00000001.attachments"):
+            for code in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR):
+                with self.subTest(part=part, errno=errno.errorcode[code]):
+                    with self.walk_fault(part, code):
+                        self.anomaly("binding_moved")
+            for code in (errno.EIO, errno.EACCES):
+                with self.subTest(part=part, errno=errno.errorcode[code]):
+                    with self.walk_fault(part, code):
+                        e = self.expect(OSError, self.sentinel)
+                    self.assertNotIsInstance(e, fsops.DependencyAnomaly)
+                    self.assertEqual(e.errno, code)
+        self.assertFalse(self.final().exists())
+
+    def test_the_entry_check_comes_before_any_recovery_compare(self):
+        """F1: an interrupted sentinel whose dependency broke meanwhile is
+        refused at ENTRY, before recovery starts comparing anything."""
+        with self.crash_at("linked"), self.assertRaises(_Crash):
+            self.sentinel()
+        (self.att_path / "0").unlink()
+        steps = []
+        with mock.patch.object(self.ops, "_step", lambda label, **kw: steps.append(label)):
+            self.anomaly("missing")
+        self.assertNotIn("recover_before_compare", steps)
+
     def test_a_broken_dep_is_reported_before_exists_different(self):
         self.assertEqual(self.sentinel(), "created")
         (self.att_path / "0").unlink()
@@ -455,6 +524,29 @@ class DependencyTests(_Strict, _HopCase):
         """The sentinel is in outbound/; its dep's directory is swapped."""
         self.swap_dir()
         self.anomaly("binding_moved")
+
+    def test_a_dep_directory_moved_into_another_tree_at_the_same_path(self):
+        """The walk back up must reach the dependency's OWN tree root: a
+        directory moved into another tree at the same relative path is
+        found again by name from that other root, so only the tree check
+        refuses it."""
+        other = self.priv.parent / "state2"
+        other.mkdir()
+        ops = fsops.FsOps(hop_root=self.hop, private_roots=[self.priv, other])
+        roots = {}
+        for p in (self.priv, other):
+            root = ops.open_root_nofollow(str(p))
+            out = ops.mkdir_and_pin(root, "outbound", 0o750)
+            roots[p] = (root, ops.open_private_stage_dir(root), out)
+        root_a, stage_a, out_a = roots[self.priv]
+        item = ops.mkdir_and_pin(out_a, "req-1.attachments", 0o750)
+        self.assertEqual(ops.commit_durable(stage_a, item, "0", ATT, 0o640), "created")
+        os.rename(self.priv / "outbound" / "req-1.attachments",
+                  other / "outbound" / "req-1.attachments")
+        e = self.expect(fsops.DependencyAnomaly, ops.commit_durable, stage_a, out_a,
+                        "req-1.json", DATA, 0o640, deps=[_dep(item, "0", ATT)])
+        self.assertEqual(e.cause, "binding_moved")
+        self.assertFalse((self.priv / "outbound" / "req-1.json").exists())
 
     def test_a_restart_over_a_swapped_directory_is_caught_by_content(self):
         with self.crash_at("linked"), self.assertRaises(_Crash):
@@ -521,6 +613,25 @@ class MkdirPredicateTests(_Strict, unittest.TestCase):
         self.succeeds(self.ops.mkdir_and_pin, self.outbound, "a", 0o2750)
         self.assertEqual(stat.S_IMODE(self.mode("a")), 0o750)
 
+    def test_a_new_directory_is_checked_too(self):
+        """The predicate applies to a directory this call created: with the
+        repairing fchmod made a no-op, the umask-narrowed one is refused."""
+        os.chmod(self.base, 0o770)
+        self.umask(0o077)
+        with mock.patch.object(fsops.os, "fchmod", lambda fd, mode: None):
+            self.expect(fsops.MkdirRefused, self.ops.mkdir_and_pin, self.outbound, "n", 0o750)
+
+    def test_no_fchmod_when_the_umask_removed_nothing(self):
+        os.chmod(self.base, 0o2770)
+        self.umask(0o022)
+        calls = []
+        real = os.fchmod
+        with mock.patch.object(fsops.os, "fchmod",
+                               lambda fd, mode: (calls.append(mode), real(fd, mode))):
+            self.succeeds(self.ops.mkdir_and_pin, self.outbound, "q", 0o750)
+        self.assertEqual(calls, [])
+        self.assertEqual(stat.S_IMODE(self.mode("q")), 0o2750)
+
     def test_a_pre_existing_mismatch_is_refused_never_repaired(self):
         os.chmod(self.base, 0o770)
         for name, mode in (("m", 0o700), ("s", 0o1750), ("g", 0o2750)):
@@ -530,6 +641,16 @@ class MkdirPredicateTests(_Strict, unittest.TestCase):
                 with self.assertRaises(fsops.MkdirRefused):
                     self.ops.mkdir_and_pin(self.outbound, name, 0o750)
                 self.assertEqual(stat.S_IMODE(self.mode(name)), mode)
+
+    def test_a_directory_of_another_owner_is_refused(self):
+        """The owner clause: a compliant directory, seen by a writer of
+        another uid, is refused."""
+        os.chmod(self.base, 0o770)
+        os.mkdir(self.base / "o")
+        os.chmod(self.base / "o", 0o750)
+        other = os.geteuid() + 1
+        with mock.patch.object(fsops.os, "geteuid", lambda: other):
+            self.expect(fsops.MkdirRefused, self.ops.mkdir_and_pin, self.outbound, "o", 0o750)
 
     def test_the_check_is_on_the_pinned_descriptor(self):
         """A compliant directory put at the name after the open does not
