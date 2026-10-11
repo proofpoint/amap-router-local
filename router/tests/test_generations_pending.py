@@ -9,15 +9,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from unittest import mock
 
-from router import generations, outbound, registry
+from router import generations, outbound, registry, service
+from router.status import StatusTracker
 from router.tests.helpers import (
     attachment_descriptor, stage_outbound_sidecars, gen_state, keyed_for_poll, list_notices, read_json, result_path, write_request,
 )
 from router.tests.peer_helpers import addr
 from router.tests.test_generations import LIDS, _Gens, snapshot
 from router.tests.test_inflight import EXT, FakeTransport, _external
+from router.util import DEFAULT_READ_CAP
 
 
 class _Pending(_Gens):
@@ -355,6 +358,27 @@ class ReviewRoundTests(_Pending):
         self.assertNotEqual(gen_state(self.state_dir, LIDS["alpha"]), old)
         return old
 
+    def test_an_unreadable_generations_file_on_the_second_read_holds_the_drain(self):
+        """The root pin reads the generations file; the fenced enumeration
+        reads it again and fails. That must hold the drain, never read as
+        "no fenced generations": the current generation would deliver the
+        fenced-owned file, and the fenced replay deliver it again."""
+        self.fence_with_pending()
+        self.release_bravo(alpha={"binding_seq": 9})
+        real = generations.read_doc
+
+        def second_read_fails(*a, **kw):
+            if sys._getframe(1).f_code.co_name == "_fenced_views":
+                raise generations.GenerationHeld(generations.HELD_LAYOUT_CONFLICT, "injected")
+            return real(*a, **kw)
+
+        with mock.patch.object(generations, "read_doc", second_read_fails):
+            self.poll()
+        self.assertEqual(self.bodies(), [], "drained past an unreadable enumeration")
+        for _ in range(2):
+            self.poll()
+        self.assertEqual(self.bodies(), ["handed over"], "delivered twice, or not at all")
+
     def test_a_damaged_fenced_record_keeps_its_file(self):
         old = self.fence_with_pending()
         (old / outbound.PENDING_DIR / "00000001.json").write_text("{damaged")
@@ -495,3 +519,87 @@ class ReviewRoundTests(_Pending):
                     self.assert_nothing_decided(gdir)
                     self.poll()
                     self.assertEqual(self.bodies(), ["handed over" if fenced else "original"])
+
+
+class DigestlessAnchorTests(_Pending):
+    """A fenced anchor with no digest (its original was too large to read)
+    owns the live file only while that file still cannot be read."""
+
+    def settle_oversized(self, publish=True):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        live = self.cfg.instances["alpha"].outbox_root / "req-00000001.json"
+        live.write_bytes(b"{" + b" " * (DEFAULT_READ_CAP + 1) + b"}")
+        if publish:
+            self.poll()
+        else:
+            with mock.patch.object(outbound, "_publish_result_and_archive",
+                                   side_effect=OSError(5, "injected")):
+                self.poll()
+        old = gen_state(self.state_dir, LIDS["alpha"])
+        anchor = old / "results" / "00000001.json"
+        self.assertTrue(anchor.is_file(), "precondition: no anchor")
+        self.assertIsNone(json.loads(anchor.read_text()).get("digest", "missing"),
+                          "precondition: an anchor with no digest")
+        generations.operator_new(self.cfg, "alpha", "connector reset")
+        self.assertNotEqual(gen_state(self.state_dir, LIDS["alpha"]), old)
+        return old, live
+
+    def test_a_readable_reuse_under_a_fenced_digestless_anchor_is_answered(self):
+        """The id is reused after a connector reset: the readable file is a
+        new request, the current generation's to answer."""
+        self.settle_oversized()
+        self.poll()
+        for sub in ("results", "processed"):
+            shutil.rmtree(self.cfg.instances["alpha"].outbox_root / sub, ignore_errors=True)
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="new")
+        for _ in range(3):
+            self.poll()
+        self.assertEqual(self.bodies(), ["new"], "the reused id was never delivered")
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(), "never answered")
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
+                         "accepted")
+
+    def test_a_still_oversized_file_is_completed_by_the_fenced_verdict(self):
+        old, live = self.settle_oversized(publish=False)
+        for _ in range(2):
+            self.poll()
+        new = gen_state(self.state_dir, LIDS["alpha"])
+        self.assertFalse((new / "results" / "00000001.json").exists(),
+                         "the current generation answered it")
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(),
+                        "the fenced verdict was never completed")
+        r = read_json(result_path(self.cfg, "alpha", "00000001"))
+        self.assertEqual(r.get("reason_code"), "malformed_request")
+        self.assertFalse(live.exists(), "never archived")
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+
+    def test_a_damaged_fenced_anchor_keeps_its_file(self):
+        old, live = self.settle_oversized(publish=False)
+        (old / "results" / "00000001.json").write_text("{damaged")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="new")
+        for _ in range(2):
+            self.poll()
+        new = gen_state(self.state_dir, LIDS["alpha"])
+        self.assertEqual(list_notices(self.cfg, "bravo"), [], "the current generation took it")
+        self.assertFalse((new / "results" / "00000001.json").exists())
+        self.assertTrue(live.exists())
+
+    def test_a_damaged_fenced_anchor_is_shown_in_status_with_its_age(self):
+        old, live = self.settle_oversized(publish=False)
+        (old / "results" / "00000001.json").write_text("{damaged")
+        tracker = StatusTracker(interval_s=5.0)
+        service.poll_once(self.cfg, tracker, None)
+        doc = (tracker.to_doc().get("generations") or {}).get("alpha") or {}
+        shown = doc.get("fenced_damaged_anchors")
+        self.assertIsNotNone(shown, "a damaged anchor holds its file silently")
+        gen = old.name[len(generations.GEN_PREFIX):]
+        self.assertEqual([e.get("req_id") for e in shown.get(gen, [])], ["00000001"])
+        self.assertGreaterEqual(shown[gen][0].get("age_s"), 0)
+
+    def test_a_readable_fenced_anchor_is_not_shown_as_damaged(self):
+        self.settle_oversized(publish=False)
+        tracker = StatusTracker(interval_s=5.0)
+        service.poll_once(self.cfg, tracker, None)
+        doc = (tracker.to_doc().get("generations") or {}).get("alpha") or {}
+        self.assertIn("generation", doc, "precondition: no generations section")
+        self.assertNotIn("fenced_damaged_anchors", doc)

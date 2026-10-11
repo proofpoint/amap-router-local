@@ -1274,7 +1274,19 @@ before any of that work runs and is fail-closed: a record that cannot be read,
 or whose replay fails, keeps its file owned, and a file is released only once
 its work is demonstrably settled or its record is gone. A fenced replay never
 delivers from the live entry, but it still READS it, to decide whether the
-Result may be published.
+Result may be published. An anchor whose original could not be read (it has
+no digest) owns the live file only while that file still cannot be read for
+what it is: the stored verdict then completes it, and a readable file under
+the id is a new request, the current generation's. An anchor that cannot
+itself be read keeps its file, and is shown with its age under
+`generations.<name>.fenced_damaged_anchors`.
+
+**A recipient held mid-pass.** If a recipient's root is replaced between the
+poll's check and its write, the request goes pending with what that pass
+already did recorded as done. In the rare case that the snapshot cannot then
+be taken and some recipients already have the message, it cannot wait: it is
+answered once, in a single Result, with the held recipient counted as
+failed.
 
 **Pending requests carry a private snapshot.** Before a pending record is
 written, the raw request and every verified attachment are written, durably,

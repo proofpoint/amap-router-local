@@ -22,6 +22,7 @@ import sys
 P = "router.tests.test_generations_pending."
 H = "router.tests.test_held_local."
 OB = "router/outbound.py"
+GN = "router/generations.py"
 
 M = [
  # -- the snapshot -----------------------------------------------------------
@@ -110,6 +111,31 @@ M = [
   '    except OSError:\n        return HELD                        # a transient fault decides nothing\n',
   '    except OSError:\n        live = True\n',
   [P + 'ReviewRoundTests.test_a_transient_fault_on_the_live_read_decides_nothing']),
+ ('W6 a well-formed digest-less anchor always claims', OB,
+  '        if digest is _DAMAGED_ANCHOR:\n            out.add(live.name)\n',
+  '        if digest is _DAMAGED_ANCHOR or digest is None:\n            out.add(live.name)\n',
+  [P + 'DigestlessAnchorTests.test_a_readable_reuse_under_a_fenced_digestless_anchor_is_answered']),
+ ('W7 a damaged anchor releases its file', OB,
+  '        if digest is _DAMAGED_ANCHOR:\n            out.add(live.name)\n            continue\n',
+  '        if digest is _DAMAGED_ANCHOR:\n            continue\n',
+  [P + 'DigestlessAnchorTests.test_a_damaged_fenced_anchor_keeps_its_file']),
+ ('W8 a digest-less fenced verdict is never completed', OB,
+  '        if digest is _DAMAGED_ANCHOR or inflight_mod.record_path(view, name, req_id).exists() \\\n',
+  '        if digest is _DAMAGED_ANCHOR or digest is None or inflight_mod.record_path(view, name, req_id).exists() \\\n',
+  [P + 'DigestlessAnchorTests.test_a_still_oversized_file_is_completed_by_the_fenced_verdict']),
+ ('W9 a damaged fenced anchor is not shown', GN,
+  '            if anchor_digest(d / fn) is not DAMAGED_ANCHOR:\n                continue\n',
+  '            continue\n',
+  [P + 'DigestlessAnchorTests.test_a_damaged_fenced_anchor_is_shown_in_status_with_its_age']),
+ ('W10 every fenced anchor is shown as damaged', GN,
+  '            if anchor_digest(d / fn) is not DAMAGED_ANCHOR:\n                continue\n',
+  '            if False:\n                continue\n',
+  [P + 'DigestlessAnchorTests.test_a_readable_fenced_anchor_is_not_shown_as_damaged']),
+ ('W11 an unreadable fenced enumeration reads as none', OB,
+  '    doc = generations_mod.read_doc(cfg.state_dir, lid)\n    if doc is None:\n',
+  '    try:\n        doc = generations_mod.read_doc(cfg.state_dir, lid)\n'
+  '    except generations_mod.GenerationHeld:\n        return []\n    if doc is None:\n',
+  [P + 'ReviewRoundTests.test_an_unreadable_generations_file_on_the_second_read_holds_the_drain']),
  # -- the recipient ------------------------------------------------------------------
  ('R1 delivering records no recipient generation', OB,
   '        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts(),\n                 recipient_gen=_recipient_gen(cfg, t["recipient"]))\n',

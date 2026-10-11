@@ -2414,15 +2414,23 @@ def _fenced_views(cfg: RouterConfig, name: str) -> List[RouterConfig]:
     """For each FENCED generation of `name` (work and anchors both matter:
     `_drain_fenced`), a view of `cfg` whose generation key for `name` is that
     generation's, so every generation-scoped path resolves into it. The
-    other instances keep their current generations."""
+    other instances keep their current generations.
+
+    The enumeration fails CLOSED: a generations file that cannot be read
+    here (though it read for the root pin a moment earlier) raises
+    `GenerationHeld`, and the drain stops before first sight or any current
+    work. Read as "no fenced generations", it would release every file they
+    own to the current generation, and a fenced replay later would deliver
+    it again."""
     if cfg.registry_dir is None or name not in cfg.gen_keys:
         return []
     lid = cfg.gen_keys[name].partition("/")[0]
-    try:
-        doc = generations_mod.read_doc(cfg.state_dir, lid)
-    except generations_mod.GenerationHeld:
-        doc = None
-    fenced = [g["gen"] for g in (doc or {}).get("gens", []) if g["gen"] != doc["current"]]
+    doc = generations_mod.read_doc(cfg.state_dir, lid)
+    if doc is None:
+        raise generations_mod.GenerationHeld(
+            generations_mod.HELD_LAYOUT_CONFLICT,
+            f"{generations_mod.GEN_FILE} vanished during the drain")
+    fenced = [g["gen"] for g in doc.get("gens", []) if g["gen"] != doc["current"]]
     out = []
     for gen in fenced:
         keys = dict(cfg.gen_keys)
@@ -2493,13 +2501,14 @@ def _drain_fenced(
 def _fenced_claims(cfg: RouterConfig, view: RouterConfig, name: str) -> Set[str]:
     """Live outbox files a fenced generation (`view`) may own: those of its
     in-flight and pending records and of its anchors, unless the live bytes
-    are demonstrably a DIFFERENT request. A record that cannot be read, or a
-    live file that cannot be, stays claimed."""
+    are demonstrably a DIFFERENT request. A record or anchor that cannot be
+    read, or a live file that cannot be, stays claimed. A well-formed anchor
+    with no digest (its original could not be read) claims the file only
+    while the live entry still cannot be read for what it is: a readable file
+    under that id is another request, the current generation's to answer."""
     out: Set[str] = set()
     outbox = cfg.instances[name].outbox_root
-    pairs = list(_owned_digests(view, name))
-    pairs += [(rid, d) for rid, d in _anchor_digests(view, name)]
-    for req_id, digest in pairs:
+    for req_id, digest in _owned_digests(view, name):
         live = outbox / f"req-{req_id}.json"
         if not os.path.lexists(live):
             continue
@@ -2511,23 +2520,54 @@ def _fenced_claims(cfg: RouterConfig, view: RouterConfig, name: str) -> Set[str]
                 out.add(live.name)
         except OSError:
             out.add(live.name)
+    for req_id, digest in _anchor_digests(view, name):
+        live = outbox / f"req-{req_id}.json"
+        if not os.path.lexists(live):
+            continue
+        if digest is _DAMAGED_ANCHOR:
+            out.add(live.name)
+            continue
+        try:
+            if _live_is_original(cfg, name, req_id, digest):
+                out.add(live.name)
+        except (OSError, ReadTooLargeError):
+            out.add(live.name)
     return out
 
 
-def _anchor_digests(cfg: RouterConfig, name: str) -> List[Tuple[str, Optional[str]]]:
+_DAMAGED_ANCHOR = generations_mod.DAMAGED_ANCHOR
+
+
+def _anchor_digests(cfg: RouterConfig, name: str) -> List[Tuple[str, Any]]:
+    """(req_id, digest) of every anchor in `cfg`'s generation for `name`;
+    an unreadable anchor's digest is `_DAMAGED_ANCHOR` (shown in status as
+    `fenced_damaged_anchors`)."""
     d = gen_state_dir(cfg, name) / "results"
     try:
         names = [p.name for p in d.iterdir() if p.name.endswith(".json")]
     except (FileNotFoundError, NotADirectoryError):
         return []
-    out: List[Tuple[str, Optional[str]]] = []
-    for fn in names:
-        try:
-            env = json.loads((d / fn).read_text(encoding="utf-8"))
-            out.append((fn[:-len(".json")], env.get("digest") if isinstance(env, dict) else None))
-        except (OSError, ValueError):
-            out.append((fn[:-len(".json")], None))
-    return out
+    return [(fn[:-len(".json")], generations_mod.anchor_digest(d / fn)) for fn in names]
+
+
+def _live_is_original(cfg: RouterConfig, name: str, req_id: str,
+                      digest: Optional[str]) -> bool:
+    """Is the live entry under `req_id` still the request an anchor with
+    `digest` answered? With no digest the original could not be read, so the
+    live entry is it only while it still cannot be read for what it is (the
+    resume rule for a digest-less anchor). Absent is False; a transient fault
+    RAISES."""
+    if digest is not None:
+        return not _live_differs(cfg, name, req_id, digest)
+    try:
+        _read_request_pinned(cfg, name, f"req-{req_id}.json")
+    except FileNotFoundError:
+        return False              # nothing there for the anchor to own
+    except (ReadTooLargeError, OSError) as e:
+        if _unreadable_now(e):
+            return True
+        raise
+    return False
 
 
 def _anchor_result(cfg: RouterConfig, name: str, req_id: str) -> Dict[str, Any]:
@@ -2538,14 +2578,14 @@ def _settled_unarchived(cfg: RouterConfig, view: RouterConfig, name: str) -> Lis
     """Fenced anchors whose request is still in the outbox, the same bytes."""
     out = []
     for req_id, digest in _anchor_digests(view, name):
-        if digest is None or inflight_mod.record_path(view, name, req_id).exists() \
+        if digest is _DAMAGED_ANCHOR or inflight_mod.record_path(view, name, req_id).exists() \
                 or _pending_path(view, name, req_id).exists():
             continue
         try:
-            if not _live_differs(cfg, name, req_id, digest) and \
-                    os.path.lexists(cfg.instances[name].outbox_root / f"req-{req_id}.json"):
+            if os.path.lexists(cfg.instances[name].outbox_root / f"req-{req_id}.json") \
+                    and _live_is_original(cfg, name, req_id, digest):
                 out.append(req_id)
-        except OSError:
+        except (OSError, ReadTooLargeError):
             continue
     return out
 

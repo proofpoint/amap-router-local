@@ -66,6 +66,7 @@ import logging
 import os
 import re
 import secrets
+import time
 import dataclasses
 import types
 from dataclasses import dataclass
@@ -627,6 +628,59 @@ def fenced_work(state_dir: Path, logical_id: str) -> Dict[str, Dict[str, int]]:
     return out
 
 
+#: `anchor_digest`'s answer for an anchor that cannot be read or is not an
+#: anchor: distinct from `None`, which a well-formed anchor carries when its
+#: original request could not be read.
+DAMAGED_ANCHOR: Any = object()
+
+
+def anchor_digest(path: Path) -> Any:
+    """The digest a private anchor (`results/<req_id>.json`) records: a
+    string, `None` (its original could not be read), or `DAMAGED_ANCHOR`."""
+    try:
+        env = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return DAMAGED_ANCHOR
+    if not isinstance(env, dict) or not isinstance(env.get("result"), dict):
+        return DAMAGED_ANCHOR
+    digest = env.get("digest")
+    return digest if digest is None or isinstance(digest, str) else DAMAGED_ANCHOR
+
+
+def damaged_anchors(state_dir: Path, logical_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """For each FENCED generation, its anchors that cannot be read, with
+    their age: such an anchor keeps any live file under its id claimed
+    (fail-closed), so it must not do so silently."""
+    try:
+        doc = read_doc(state_dir, logical_id)
+    except GenerationHeld:
+        return {}
+    if doc is None:
+        return {}
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    now = time.time()
+    for g in doc["gens"]:
+        if g["gen"] == doc["current"]:
+            continue
+        d = gen_dir(state_dir, logical_id, g["gen"]) / "results"
+        try:
+            names = sorted(e.name for e in os.scandir(d) if e.name.endswith(".json"))
+        except OSError:
+            continue
+        found = []
+        for fn in names:
+            if anchor_digest(d / fn) is not DAMAGED_ANCHOR:
+                continue
+            try:
+                age = max(0, int(now - os.lstat(d / fn).st_mtime))
+            except OSError:
+                age = None
+            found.append({"req_id": fn[:-len(".json")], "age_s": age})
+        if found:
+            out[g["gen"]] = found
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The operator verb: `router generation new`
 # ---------------------------------------------------------------------------
@@ -840,6 +894,9 @@ def status_doc(cfg: Any, report: Any) -> Optional[Dict[str, Any]]:
         fenced = fenced_work(cfg.state_dir, logical_id)
         if fenced:
             entry["fenced_work"] = fenced
+        damaged = damaged_anchors(cfg.state_dir, logical_id)
+        if damaged:
+            entry["fenced_damaged_anchors"] = damaged
         counts = reuse_counts(cfg.state_dir, logical_id)
         if counts:
             entry["req_id_reused"] = counts
