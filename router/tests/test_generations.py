@@ -402,6 +402,52 @@ class RecipientRootTests(_Gens):
         self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["reason_code"],
                          outbound.REASON_QUARANTINED)
 
+    def test_a_root_replaced_inside_the_drain_is_never_read(self):
+        """The read window: the root is replaced AFTER the drain pinned and
+        checked it, before any request is read. The drain acts only through
+        the pinned descriptor: the replacement's request is never read,
+        delivered or anchored; the original is processed in the directory it
+        was verified as, under its own generation."""
+        from router import firstsight
+        root = self.cfg.instances["alpha"].root
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="original")
+        k = keyed_for_poll(self.cfg)
+        real = firstsight.record_first_sight
+
+        def swap_then_first_sight(cfg, name, **kw):
+            if name == "alpha":
+                self.replace_root("alpha")
+                write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")],
+                              body_text="REPLACEMENT")
+            return real(cfg, name, **kw)
+        with mock.patch.object(firstsight, "record_first_sight", swap_then_first_sight):
+            outbound.drain_instance(k, "alpha")
+        inbox = self.cfg.instances["bravo"].inbox_root / "messages"
+        bodies = [json.loads((inbox / n).read_text())["body_text"]
+                  for n in list_notices(self.cfg, "bravo")]
+        self.assertNotIn("REPLACEMENT", bodies, "read through the replaced root")
+        self.assertEqual(bodies, ["original"])
+        anchor = read_json(gen_state(self.state_dir, LIDS["alpha"]) / "results" / "00000001.json")
+        live = (self.cfg.instances["alpha"].outbox_root / "req-00000001.json").read_bytes()
+        import hashlib
+        self.assertNotEqual(anchor["digest"], hashlib.sha256(live).hexdigest(),
+                            "the old generation anchored the replacement")
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists(),
+                         "a result was published into the replacement root")
+        old = Path(str(root) + ".old")
+        self.assertTrue((old / "outbox" / "results" / "00000001.json").is_file()
+                        or (old / "outbound" / "results" / "00000001.json").is_file())
+
+    def test_the_publish_itself_verifies_its_root(self):
+        """Defence in depth behind the pinned view: a publish handed a root
+        path that now names another directory refuses before writing."""
+        from router import attachments as attachments_mod
+        k = keyed_for_poll(self.cfg)
+        self.replace_root("alpha")
+        with self.assertRaises(attachments_mod.RootChanged):
+            outbound._publish_result_and_archive(k, "alpha", "00000001", b"{}")
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists())
+
     def test_a_result_is_never_published_into_a_replaced_root(self):
         """Past the drain's own check (a root replaced mid-request), the
         publish's root descriptor must be the recorded root."""

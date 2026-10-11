@@ -56,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -232,7 +233,11 @@ def record_first_sight(cfg: RouterConfig, name: str) -> Tuple[Dict[str, Any], bo
             "instance": name,
             "first_seen_ts": utc_ts(),
             "mode": inst.mode,
-            "declared_root": str(inst.root),
+            # Under a drain's pinned view the root is a descriptor path; the
+            # marker records where that directory actually is.
+            "declared_root": (os.path.realpath(inst.root)
+                              if str(inst.root).startswith("/proc/self/fd/")
+                              else str(inst.root)),
             "outbox_snapshot": snapshot,
         }
         # Loud on purpose. On a router meeting an existing fleet for the

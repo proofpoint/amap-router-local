@@ -1247,8 +1247,11 @@ a crash between first sight's sentinel and its marker; the way out, once the
 operator has looked, is `router generation new <name> --reason ...`, whose
 fresh generation takes its own first sight. A generations file that is lost
 while generation directories remain holds too (`state_layout_conflict`): a
-fresh start would reuse their transport ids. Under a registry, a drain also
-verifies that its own root is still the one its generation recorded. A delivery to
+fresh start would reuse their transport ids. Under a registry, a drain opens
+its instance's root once, checks that descriptor is the directory its
+generation recorded, and does everything else (first sight, the listing,
+every read, the publish and the archive) through that descriptor: a root
+replaced after the check is never read or written by that drain. A delivery to
 a held instance holds (below), and so does one whose root was replaced after
 the poll's check: every placement writes through a root descriptor that must
 be the directory the recipient's current generation recorded.

@@ -121,6 +121,7 @@ other instance's.
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import hashlib
 import inspect
@@ -2063,18 +2064,65 @@ def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
     return out
 
 
-def _verify_own_root(cfg: RouterConfig, name: str) -> None:
+def _pin_own_root(cfg: RouterConfig, name: str) -> Tuple[RouterConfig, Optional[int]]:
+    """Under a registry: open `name`'s root ONCE (`O_NOFOLLOW`), check that
+    descriptor is the directory its current generation recorded, and return
+    a view of `cfg` in which every path of that instance (root, outbox,
+    inbox, peer tree) goes THROUGH that descriptor (`/proc/self/fd/<fd>/…`,
+    which resolves to the opened directory wherever it has been moved). So
+    first sight, the listing, every read, the publish and the archive all
+    act on the verified directory: a root replaced after this check is never
+    read or written by this drain. The caller closes the descriptor.
+    Without a registry: `(cfg, None)`, unchanged."""
     expected = generations_mod.expected_root(cfg, name)
     if expected is None:
-        return
-    seen = generations_mod.root_identity(cfg.instances[name].root)
-    if (seen["st_dev"], seen["st_ino"]) != expected:
+        return cfg, None
+    inst = cfg.instances[name]
+    try:
+        fd = os.open(str(inst.root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
         raise generations_mod.GenerationHeld(
             generations_mod.HELD_CONNECTOR_UNVERIFIED,
-            f"{name!r}: the root was replaced since this poll's generation check")
+            f"{name!r}: the root cannot be opened: {type(e).__name__}") from None
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != expected:
+            raise generations_mod.GenerationHeld(
+                generations_mod.HELD_CONNECTOR_UNVERIFIED,
+                f"{name!r}: the root was replaced since this poll's generation check")
+        pinned = Path(f"{generations_mod.PINNED_PREFIX}{fd}")
+    except BaseException:
+        os.close(fd)
+        raise
+
+    def through(p: Optional[Path]) -> Optional[Path]:
+        return None if p is None else pinned / p.relative_to(inst.root)
+    view_inst = dataclasses.replace(
+        inst, root=pinned, inbox_root=through(inst.inbox_root),
+        outbox_root=through(inst.outbox_root), peer_root=through(inst.peer_root))
+    instances = dict(cfg.instances)
+    instances[name] = view_inst
+    return dataclasses.replace(cfg, instances=instances), fd
 
 
 def drain_instance(
+    cfg: RouterConfig, name: str,
+    *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
+    cold_policy: Optional[ColdPolicy] = None,
+    transport: Optional[inflight_mod.TransportPort] = None,
+) -> Dict[str, int]:
+    """See `_drain_instance`. Under a registry the drain runs on the view
+    `_pin_own_root` returns, so it can only act on the verified root."""
+    view, fd = _pin_own_root(cfg, name)
+    try:
+        return _drain_instance(view, name, deliver_backend=deliver_backend,
+                               cold_policy=cold_policy, transport=transport)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _drain_instance(
     cfg: RouterConfig, name: str,
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
     cold_policy: Optional[ColdPolicy] = None,
@@ -2128,12 +2176,9 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # open for exactly one poll. `record_first_sight` is idempotent after the
     # first call — it never re-snapshots, because that would move the
     # quarantine line forward over whatever appeared since.
-    # Under a registry, the root this drain is about to read and write must
-    # still be the one the instance's current generation recorded: a root
-    # replaced since the poll's pre-pass is not drained under the old
-    # generation (no anchor there, no result into the new root). The next
-    # pre-pass begins the new root's generation.
-    _verify_own_root(cfg, name)
+    # Under a registry `drain_instance` has already pinned this instance's
+    # root and checked it against the current generation's (`_pin_own_root`):
+    # every path below goes through that descriptor.
     marker_doc, first_sight = firstsight.record_first_sight(cfg, name)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)
 

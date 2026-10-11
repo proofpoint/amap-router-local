@@ -254,13 +254,22 @@ def binding_of(entry: Any) -> Dict[str, Any]:
             "binding_seq": entry.binding_seq}
 
 
+#: The path prefix of a root pinned by an open descriptor (`outbound._pin_own_root`).
+PINNED_PREFIX = "/proc/self/fd/"
+
+
 def root_identity(root: Path) -> Dict[str, Any]:
     """`{path, st_dev, st_ino}` of the instance root, from the descriptor
     an `O_NOFOLLOW | O_DIRECTORY` open returns: the identity of what is at
     the path NOW, never a separate stat of the path. Raises
     `GenerationHeld(connector_state_unverified)` when it cannot be opened."""
+    # A root already pinned by a descriptor (a drain's view) is the opened
+    # directory itself; the magic link is followed by design.
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if not str(root).startswith(PINNED_PREFIX):
+        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(str(root), flags)
     except OSError as e:
         raise GenerationHeld(HELD_CONNECTOR_UNVERIFIED,
                              f"instance root {str(root)!r} cannot be opened: "
