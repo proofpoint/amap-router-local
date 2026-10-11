@@ -91,13 +91,13 @@ def _validate_attachment(item: Any, idx: int) -> Result:
             return _fail(
                 REASON_MALFORMED, f"draft.attachments[{idx}]: missing required '{req}'"
             )
-    if not _is_nonempty_str(item["filename"]) or not _NO_CTL_RE.match(item["filename"]):
+    if not _is_nonempty_str(item["filename"]) or not _NO_CTL_RE.fullmatch(item["filename"]):
         return _fail(
             REASON_MALFORMED,
             f"draft.attachments[{idx}].filename: expected a non-empty string "
             "with no control characters",
         )
-    if not _is_nonempty_str(item["media_type"]) or not _NO_CTL_RE.match(item["media_type"]):
+    if not _is_nonempty_str(item["media_type"]) or not _NO_CTL_RE.fullmatch(item["media_type"]):
         return _fail(
             REASON_MALFORMED,
             f"draft.attachments[{idx}].media_type: expected a non-empty string "
@@ -107,7 +107,7 @@ def _validate_attachment(item: Any, idx: int) -> Result:
         return _fail(
             REASON_MALFORMED, f"draft.attachments[{idx}].size_bytes: expected an integer >= 0"
         )
-    if not _is_str(item["sha256"]) or not _SHA256_RE.match(item["sha256"]):
+    if not _is_str(item["sha256"]) or not _SHA256_RE.fullmatch(item["sha256"]):
         return _fail(
             REASON_MALFORMED,
             f"draft.attachments[{idx}].sha256: expected 64 lowercase hex chars",
@@ -131,7 +131,7 @@ def _validate_draft(draft: Any) -> Result:
     if not all(_is_str(t) for t in to):
         return _fail(REASON_MALFORMED, "draft.to: every entry must be a string")
     for i, t in enumerate(to):
-        if not _ADDR_RE.match(t):
+        if not _ADDR_RE.fullmatch(t):
             return _fail(
                 REASON_MALFORMED,
                 f"draft.to[{i}]: expected one bare addr-spec, got {t!r}",
@@ -142,13 +142,13 @@ def _validate_draft(draft: Any) -> Result:
         if not isinstance(cc, list) or not all(_is_str(c) for c in cc):
             return _fail(REASON_MALFORMED, "draft.cc: expected an array of strings")
         for i, c in enumerate(cc):
-            if not _ADDR_RE.match(c):
+            if not _ADDR_RE.fullmatch(c):
                 return _fail(
                     REASON_MALFORMED,
                     f"draft.cc[{i}]: expected one bare addr-spec, got {c!r}",
                 )
 
-    if not _is_str(draft["subject"]) or not _NO_CTL_RE.match(draft["subject"]):
+    if not _is_str(draft["subject"]) or not _NO_CTL_RE.fullmatch(draft["subject"]):
         return _fail(
             REASON_MALFORMED, "draft.subject: expected a string with no control characters"
         )
@@ -157,7 +157,7 @@ def _validate_draft(draft: Any) -> Result:
 
     if "reply_to_message_id" in draft:
         rtmi = draft["reply_to_message_id"]
-        if rtmi is not None and (not _is_str(rtmi) or not _NO_CTL_RE.match(rtmi)):
+        if rtmi is not None and (not _is_str(rtmi) or not _NO_CTL_RE.fullmatch(rtmi)):
             return _fail(
                 REASON_MALFORMED,
                 "draft.reply_to_message_id: expected a string with no control "
@@ -203,26 +203,26 @@ def validate_request(doc: Any) -> Result:
     if "req_id" not in doc:
         return _fail(REASON_MALFORMED, "request: missing required 'req_id'")
     req_id = doc["req_id"]
-    if not _is_nonempty_str(req_id) or not _REQ_ID_RE.match(req_id):
+    if not _is_nonempty_str(req_id) or not _REQ_ID_RE.fullmatch(req_id):
         return _fail(REASON_MALFORMED, f"req_id: invalid {req_id!r}")
 
     # No fixture pins these three, but the schema constrains them the same
     # way it constrains `subject`, and this module exists to mirror it.
     if "agent_id" in doc and (
-        not _is_nonempty_str(doc["agent_id"]) or not _NO_CTL_RE.match(doc["agent_id"])
+        not _is_nonempty_str(doc["agent_id"]) or not _NO_CTL_RE.fullmatch(doc["agent_id"])
     ):
         return _fail(
             REASON_MALFORMED,
             "agent_id: expected a non-empty string with no control characters",
         )
     if "ts" in doc and (
-        not _is_nonempty_str(doc["ts"]) or not _NO_CTL_RE.match(doc["ts"])
+        not _is_nonempty_str(doc["ts"]) or not _NO_CTL_RE.fullmatch(doc["ts"])
     ):
         return _fail(
             REASON_MALFORMED, "ts: expected a non-empty string with no control characters"
         )
     if "in_reply_to" in doc and (
-        not _is_str(doc["in_reply_to"]) or not _NO_CTL_RE.match(doc["in_reply_to"])
+        not _is_str(doc["in_reply_to"]) or not _NO_CTL_RE.fullmatch(doc["in_reply_to"])
     ):
         return _fail(
             REASON_MALFORMED, "in_reply_to: expected a string with no control characters"
