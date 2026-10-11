@@ -868,7 +868,8 @@ def reset_instance(cfg: RouterConfig, name: str) -> Dict[str, Any]:
         raise ResetError(
             f"reset: {name!r} names no configured instance (known: {sorted(cfg.instances)})"
         )
-    return _reset_one(_keyed(cfg, [name], persist=True), name)
+    keyed = _keyed(cfg, [name], persist=True)
+    return _reset_one(keyed, name, _generation_inputs(keyed, name))
 
 
 def _generation_inputs(cfg: RouterConfig, name: str) -> Optional[Dict[str, Any]]:
@@ -881,12 +882,16 @@ def _generation_inputs(cfg: RouterConfig, name: str) -> Optional[Dict[str, Any]]
         return None
     entry = cfg.registry_report.resolved[name]
     lid = entry.logical_id
+    if (cfg.state_dir / lid / generations_mod.MIGRATION_FILE).exists():
+        raise ResetError(f"reset: {name!r} has an unfinished migration; finish it first")
     try:
         doc = generations_mod.read_doc(cfg.state_dir, lid)
         if doc is None and generations_mod.legacy_entries(cfg.state_dir, lid):
             raise ResetError(
                 f"reset: {name!r} has state in the pre-generation layout; adopt it or "
                 "fence it first (`router generation adopt|fence-legacy`)")
+        if doc is None:
+            generations_mod.check_unlisted(cfg.state_dir, lid)
         root = generations_mod.root_identity(cfg.instances[name].root)
         if doc is not None:
             generations_mod.next_counter(
@@ -896,10 +901,22 @@ def _generation_inputs(cfg: RouterConfig, name: str) -> Optional[Dict[str, Any]]
     return {"entry": entry, "root": root}
 
 
-def _reset_one(cfg: RouterConfig, name: str) -> Dict[str, Any]:
-    """`reset_instance` on a view `_keyed` has already validated."""
+def _reset_one(cfg: RouterConfig, name: str,
+               gen_inputs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """`reset_instance` on a view `_keyed` has already validated, with the
+    generation inputs every selected instance passed before any acted."""
     plan = _plan_one(cfg, name)  # validates name; fast, early containment probe
-    gen_inputs = _generation_inputs(cfg, name)
+    generation = None
+    if gen_inputs is not None:
+        # Under a registry the new generation is begun, durably (the current
+        # one fenced, the successor's counter carried), BEFORE anything is
+        # wiped: a crash after this point leaves a fenced generation holding
+        # all its work and a fresh current one, never a wiped instance whose
+        # old generation is still current.
+        entry = gen_inputs["entry"]
+        generation = generations_mod.begin(
+            cfg.state_dir, name, entry.logical_id, generations_mod.binding_of(entry),
+            gen_inputs["root"], generations_mod.REASON_RESET)
     state_removed = _clear_state(cfg, name)
     mailbox = _empty_mailboxes(cfg, name)
     # Re-sweep, LIVE (not `plan.state_paths`, computed before any of this
@@ -917,14 +934,8 @@ def _reset_one(cfg: RouterConfig, name: str) -> Dict[str, Any]:
         "mailbox_removed": mailbox["removed"],
         "audit_preserved": False,
     }
-    if gen_inputs is not None:
-        # Fence the current generation and begin the next, after both sweeps:
-        # what the old generation holds is kept, and the new one starts
-        # fresh, with its own first sight and the carried transport counter.
-        entry = gen_inputs["entry"]
-        summary["generation"] = generations_mod.begin(
-            cfg.state_dir, name, entry.logical_id, generations_mod.binding_of(entry),
-            gen_inputs["root"], generations_mod.REASON_RESET)
+    if generation is not None:
+        summary["generation"] = generation
     # The evidence this command spares records the command itself. Written
     # LAST, after both sweeps, so the line describes what actually happened;
     # never fatal — a reset that succeeded is not undone by a log failure.
@@ -997,6 +1008,10 @@ def reset_instances(cfg: RouterConfig, names: Iterable[str]) -> List[Dict[str, A
         # Under the lock, before anything is removed: a name the registry
         # holds aborts the whole batch (`_keyed`).
         cfg = _keyed(cfg, names, persist=True)
-        return [_reset_one(cfg, name) for name in names]
+        # Every selected instance's generation inputs are established before
+        # ANY instance is acted on: one that cannot begin a generation
+        # refuses the whole batch with nothing changed anywhere.
+        inputs = {name: _generation_inputs(cfg, name) for name in names}
+        return [_reset_one(cfg, name, inputs[name]) for name in names]
     finally:
         lk.release()

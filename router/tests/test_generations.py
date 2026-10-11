@@ -192,6 +192,28 @@ class HoldTests(_Gens):
         shutil.rmtree(gen_state(self.state_dir, LIDS["alpha"]))
         self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)
 
+    def test_a_lost_generations_file_holds_rather_than_restart(self):
+        """Generation directories without the file that lists them: a fresh
+        start at counter 1 would reuse their transport ids and ignore their
+        anchors. Held; reset refuses too."""
+        d = gen_state(self.state_dir, LIDS["alpha"])
+        (d / "transport" / "next_req_id").write_text("42")
+        (self.state_dir / LIDS["alpha"] / generations.GEN_FILE).unlink()
+        self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)
+        self.assertFalse((self.state_dir / LIDS["alpha"] / generations.GEN_FILE).exists())
+        with self.assertRaises(reset.ResetError):
+            reset.reset_instances(self.cfg, ["alpha"])
+        self.assertEqual(generations.generation_dirs(self.state_dir / LIDS["alpha"]), [d])
+
+    def test_an_empty_leftover_of_an_interrupted_first_start_is_not_a_loss(self):
+        lid = self.state_dir / LIDS["alpha"]
+        shutil.rmtree(lid)
+        left = generations.gen_dir(self.state_dir, LIDS["alpha"], "f" * 32)
+        (left / "transport").mkdir(parents=True)
+        (left / "transport" / "next_req_id").write_text("1")
+        self.assertIsNone(self.held())
+        self.assertIsNotNone(self.doc())
+
     def test_an_unfinished_migration_holds(self):
         (self.state_dir / LIDS["alpha"] / generations.MIGRATION_FILE).write_text("{}")
         self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)
@@ -272,9 +294,26 @@ class CounterTests(_Gens):
                 else:
                     (p / "results").mkdir()
                     (p / "results" / "00000001.json").write_text(json.dumps(
-                        {"digest": "x", "result": {"detail": "transport: sent"}}))
+                        {"digest": "x", "result": {}, "transport_req_id": "00000001"}))
                 self.put(alpha={"binding_seq": 99})
                 self.assertEqual(self.held(), generations.HELD_COUNTER_UNVERIFIED)
+
+    def test_a_hand_off_settled_as_an_anomaly_still_counts(self):
+        """An id handed out and settled as an anomaly (archived with no
+        result) left no verdict text from the transport; its anchor records
+        the id it held, so a lost counter still holds."""
+        port = FakeTransport()
+        write_request(self.cfg, "alpha", "00000001", to=[EXT])
+        k = keyed_for_poll(self.cfg)
+        outbound.drain_instance(k, "alpha", transport=port, cold_policy=_external)
+        port.archived["00000001"] = port.pending.pop("00000001")    # archived, no result
+        outbound.drain_instance(k, "alpha", transport=port, cold_policy=_external)
+        anchor = read_json(self.pred() / "results" / "00000001.json")
+        self.assertEqual(anchor["result"]["reason_code"], "transport_anomaly")
+        self.assertEqual(anchor.get("transport_req_id"), "00000001")
+        (self.pred() / "transport" / "next_req_id").unlink()
+        self.put(alpha={"binding_seq": 99})
+        self.assertEqual(self.held(), generations.HELD_COUNTER_UNVERIFIED)
 
     def test_a_corrupt_counter_holds(self):
         (self.pred() / "transport" / "next_req_id").write_text("seven")
@@ -344,6 +383,40 @@ class RecipientRootTests(_Gens):
         self.assertEqual(config_mod.target_hold(k, "bravo"),
                          generations.HELD_RECIPIENT_UNRESOLVED)
 
+    def test_a_sender_root_replaced_after_the_pre_pass_is_not_drained(self):
+        """The drain verifies its OWN root against the generation's: a root
+        replaced since the pre-pass gets no anchor in the old generation, no
+        result, no delivery; the next poll begins its generation, whose first
+        sight quarantines what was staged."""
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        k = keyed_for_poll(self.cfg)
+        old = gen_state(self.state_dir, LIDS["alpha"])
+        self.replace_root("alpha")
+        with self.assertRaises(generations.GenerationHeld):
+            outbound.drain_instance(k, "alpha")
+        self.assertFalse((old / "results" / "00000001.json").exists())
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists())
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        self.poll()
+        self.poll()
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["reason_code"],
+                         outbound.REASON_QUARANTINED)
+
+    def test_a_result_is_never_published_into_a_replaced_root(self):
+        """Past the drain's own check (a root replaced mid-request), the
+        publish's root descriptor must be the recorded root."""
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        k = keyed_for_poll(self.cfg)
+        real = outbound._finish
+
+        def swap_then_finish(*a, **kw):
+            self.replace_root("alpha")
+            return real(*a, **kw)
+        with mock.patch.object(outbound, "_finish", swap_then_finish):
+            outbound.drain_instance(k, "alpha")
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists(),
+                         "published into a replaced root")
+
     def test_the_pre_pass_runs_before_any_instance_drains(self):
         order = []
         real = generations.resolve
@@ -407,6 +480,16 @@ class OperatorNewTests(_Gens):
         line = json.loads(log.strip().splitlines()[-1])
         self.assertEqual((line["event"], line["gen"], line["fenced"]),
                          (generations.EVENT_GENERATION_MINTED, plan["generation"], old))
+
+    def test_a_failed_audit_line_commits_nothing(self):
+        """The audit line is part of the verb's commit: if it cannot be
+        written, the verb refuses and the current generation is unchanged."""
+        from router import audit as audit_mod
+        before = self.doc()
+        with mock.patch.object(audit_mod, "append", side_effect=OSError(errno.EIO, "injected")):
+            e = self.expect(generations.OperatorRefused, self.new)
+        self.assertIn("audit", str(e))
+        self.assertEqual(self.doc(), before)
 
     def test_a_dry_run_writes_nothing(self):
         before = self.doc()
@@ -523,3 +606,99 @@ class ReusePendingExitTests(_Gens):
         self.assertEqual(tracker.to_doc()["generations"]["alpha"]["fenced_work"],
                          {old: {"inflight": 1, "pending": 0}})
         self.assertEqual(port.writes, ["00000001"], "the held request was handed over")
+
+
+class GenerationScopedAnchorsTests(_Gens):
+    """The promise a generation exists to keep: after `generation new`, an id
+    the connector reuses is a NEW request. Its old anchor answered it within
+    the old generation and stays there, untouched."""
+
+    def test_a_reused_id_is_refused_within_a_generation_and_accepted_after_new(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="first")
+        self.poll()
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
+                         "accepted")
+        old_anchor = gen_state(self.state_dir, LIDS["alpha"]) / "results" / "00000001.json"
+        before = old_anchor.read_bytes() if old_anchor.exists() else None
+        outbox = self.cfg.instances["alpha"].outbox_root
+        shutil.rmtree(outbox / "results")
+        shutil.rmtree(outbox / "processed")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="second")
+        self.poll()
+        r = read_json(result_path(self.cfg, "alpha", "00000001"))
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
+        generations.operator_new(self.cfg, "alpha", "connector counter reset")
+        self.poll()                      # the new generation's first sight: outbox empty
+        shutil.rmtree(outbox / "results")
+        shutil.rmtree(outbox / "processed")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="third")
+        self.poll()
+        r = read_json(result_path(self.cfg, "alpha", "00000001"))
+        self.assertEqual(r["outcome"], "accepted", "a reused id was refused in a new generation")
+        self.assertEqual(len(list_notices(self.cfg, "bravo")), 2)
+        self.assertIsNotNone(before, "no anchor in the generation it settled in")
+        self.assertEqual(old_anchor.read_bytes(), before, "the old generation's anchor changed")
+
+
+class ExposureClampTests(_Gens):
+
+    def test_the_window_is_clamped_to_first_sight_in_the_generation(self):
+        """Under a registry `exposure.assess` reads the first-sight marker
+        from the sender's generation, so a young first sight still clamps."""
+        from router import exposure
+        d = gen_state(self.state_dir, LIDS["alpha"])
+        marker = json.loads((d / "first-seen.json").read_text())
+        marker["first_seen_ts"] = "2026-09-03T11:00:00Z"
+        (d / "first-seen.json").write_text(json.dumps(marker))
+        stamp = exposure.assess(keyed_for_poll(self.cfg), "alpha", now="2026-09-03T12:00:00Z")
+        self.assertEqual(stamp["window_start"], "2026-09-03T11:00:00Z")
+
+
+class ResetGenerationTests(_Gens):
+    """`reset` under a registry: refused during a migration, all selected
+    instances checked before any acts, and the new generation begun before
+    anything is wiped."""
+
+    def test_an_unfinished_migration_refuses_reset(self):
+        (self.state_dir / LIDS["alpha"] / generations.MIGRATION_FILE).write_text("{}")
+        before = self.doc()
+        with self.assertRaises(reset.ResetError):
+            reset.reset_instances(self.cfg, ["alpha"])
+        self.assertEqual(self.doc(), before)
+
+    def test_one_instance_that_cannot_begin_refuses_the_whole_batch(self):
+        before = self.doc("alpha")
+        write_request(self.cfg, "alpha", "00000009", to=[addr("bravo")])
+        (gen_state(self.state_dir, LIDS["bravo"]) / "transport" / "next_req_id").write_text("x")
+        with self.assertRaises(reset.ResetError):
+            reset.reset_instances(self.cfg, ["alpha", "bravo"])
+        self.assertEqual(self.doc("alpha"), before, "alpha was acted on")
+        self.assertTrue((self.cfg.instances["alpha"].outbox_root / "req-00000009.json").exists())
+
+    def test_the_generation_is_begun_before_anything_is_wiped(self):
+        old = self.cur()
+        ledger = self.state_dir / LIDS["alpha"] / "delivered"
+        ledger.mkdir()
+        (ledger / "notice-x.json").write_text("{}")
+        with mock.patch.object(reset, "_clear_state", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                reset.reset_instances(self.cfg, ["alpha"])
+        self.assertNotEqual(self.cur(), old, "nothing was begun before the wipe")
+        self.assertTrue((ledger / "notice-x.json").exists())
+        fenced = next(g for g in self.raw_doc()["gens"] if g["gen"] == old)
+        self.assertIsNotNone(fenced.get("fenced_ts"))
+
+
+class ReuseCountTests(_Gens):
+
+    def test_status_counts_settled_reuse_per_generation(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="first")
+        self.poll()
+        outbox = self.cfg.instances["alpha"].outbox_root
+        shutil.rmtree(outbox / "results")
+        shutil.rmtree(outbox / "processed")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="second")
+        tracker = StatusTracker(interval_s=5.0)
+        service.poll_once(self.cfg, tracker, None)
+        doc = tracker.to_doc()["generations"]["alpha"]
+        self.assertEqual(doc.get("req_id_reused"), {self.cur(): 1})

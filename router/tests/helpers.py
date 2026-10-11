@@ -328,4 +328,3 @@ def adopt_test_markers(cfg: RouterConfig) -> None:
         gdir.mkdir(parents=True, exist_ok=True)
         (gdir / "first-sight.taken").write_text("adopted")
         os.rename(marker, gdir / "first-seen.json")
-

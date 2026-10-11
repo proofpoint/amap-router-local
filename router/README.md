@@ -1242,7 +1242,13 @@ layout (`legacy_state_unadopted`), when its generations file or current
 generation is unreadable or inconsistent or a migration is unfinished
 (`state_layout_conflict`), or when its current generation has taken first
 sight but its marker is gone (`first_sight_marker_lost`; it is never
-re-snapshotted, which would move the quarantine line forward). A delivery to
+re-snapshotted, which would move the quarantine line forward). That includes
+a crash between first sight's sentinel and its marker; the way out, once the
+operator has looked, is `router generation new <name> --reason ...`, whose
+fresh generation takes its own first sight. A generations file that is lost
+while generation directories remain holds too (`state_layout_conflict`): a
+fresh start would reuse their transport ids. Under a registry, a drain also
+verifies that its own root is still the one its generation recorded. A delivery to
 a held instance holds (below), and so does one whose root was replaced after
 the poll's check: every placement writes through a root descriptor that must
 be the directory the recipient's current generation recorded.

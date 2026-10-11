@@ -48,7 +48,9 @@ M = [
   [R + 'InflightReuseTests.test_an_oversized_reuse_is_refused_too',
    R + 'DigestlessAnchorReuseTests.test_a_still_oversized_request_resumes']),
  ('U7 private settle publishes anyway', 'router/outbound.py',
-  '            _write_anchor(cfg, name, req_id, result, req_digest=digest)\n            return result["outcome"]\n',
+  '            _write_anchor(cfg, name, req_id, result, req_digest=digest,\n'
+  '                          transport_req_id=record.get("transport_req_id"))\n'
+  '            return result["outcome"]\n',
   '            return _finish(cfg, name, req_id, result, req_digest=digest)\n',
   [R + 'InflightReuseTests.test_a_reused_id_never_settles_with_the_old_verdict']),
  ('U8 no errno kinds are verdicts', 'router/outbound.py',

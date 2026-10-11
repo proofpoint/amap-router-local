@@ -102,15 +102,19 @@ REASON_RESET = "reset"
 EVENT_GENERATION_MINTED = audit_mod.EVENT_GENERATION_MINTED
 
 _COUNTER_RE = re.compile(r"[1-9][0-9]{0,17}\Z")
-#: The prefix `inflight` puts on a transport verdict's detail.
-_TRANSPORT_DETAIL = "transport: "
+
+
+class AuditCommitFailed(Exception):
+    """An operator verb's audit line could not be appended; the generations
+    file was put back as it was (`begin`, `audit_required`)."""
 
 
 class GenerationHeld(Exception):
     """`reason` is one of `HOLD_REASONS`; `detail` says what was seen."""
 
     def __init__(self, reason: str, detail: str):
-        assert reason in HOLD_REASONS, reason
+        if reason not in HOLD_REASONS:
+            raise ValueError(f"unknown generation hold reason {reason!r}")
         super().__init__(f"{reason}: {detail}")
         self.reason = reason
         self.detail = detail
@@ -152,6 +156,32 @@ def legacy_entries(state_dir: Path, logical_id: str) -> List[str]:
     """The pre-generation entries directly under `state_dir/<logical_id>/`."""
     d = lid_dir(state_dir, logical_id)
     return [n for n in GEN_SCOPED if _present(d / n)]
+
+
+def _empty_leftover(d: Path) -> bool:
+    """A generation directory an interrupted FIRST start left behind: its
+    counter at 1 and nothing else (`begin` writes the counter before the
+    generations file names it)."""
+    if not _is_fresh(d):
+        return False
+    try:
+        return _counter_path(d).read_text(encoding="ascii").strip() == "1"
+    except OSError:
+        return False
+
+
+def check_unlisted(state_dir: Path, logical_id: str) -> None:
+    """Without a generations file, any generation directory but an empty
+    leftover of an interrupted first start means the file was LOST: what
+    those generations hold (anchors, an allocated transport counter) would
+    be ignored by a fresh start at counter 1, reusing ids. Raises
+    `GenerationHeld(state_layout_conflict)`."""
+    strays = [d.name for d in generation_dirs(lid_dir(state_dir, logical_id))
+              if not _empty_leftover(d)]
+    if strays:
+        raise GenerationHeld(HELD_LAYOUT_CONFLICT,
+                             f"generation directories {strays} exist but no {GEN_FILE}; "
+                             "a fresh start would reuse their transport ids")
 
 
 def read_doc(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
@@ -256,9 +286,11 @@ def _counter_path(d: Path) -> Path:
 
 
 def _handed_out(d: Path) -> bool:
-    """Whether generation directory `d` shows ANY transport id handed out:
-    an in-flight record or marker, or a settled anchor whose verdict came
-    from the transport."""
+    """Whether generation directory `d` shows ANY transport id allocated:
+    an in-flight record or marker, or a settled anchor that recorded the
+    transport id its record held (`outbound._write_anchor`), whatever its
+    verdict: an anomaly settles a handed-out id just as surely as a result
+    does. Read from that recorded field, never from the verdict's text."""
     try:
         if any(True for _ in os.scandir(d / "inflight")):
             return True
@@ -274,11 +306,10 @@ def _handed_out(d: Path) -> bool:
         return True
     for e in entries:
         try:
-            result = json.loads(Path(e.path).read_text(encoding="utf-8"))["result"]
-        except (OSError, ValueError, KeyError, TypeError):
-            return True          # cannot be shown not to be a transport verdict
-        detail = result.get("detail") if isinstance(result, dict) else None
-        if isinstance(detail, str) and detail.startswith(_TRANSPORT_DETAIL):
+            envelope = json.loads(Path(e.path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True          # cannot be shown not to record an allocation
+        if not isinstance(envelope, dict) or envelope.get("transport_req_id") is not None:
             return True
     return False
 
@@ -312,14 +343,23 @@ def next_counter(pred_dir: Optional[Path]) -> int:
 # ---------------------------------------------------------------------------
 
 def begin(state_dir: Path, name: str, logical_id: str, binding: Mapping[str, Any],
-          root: Mapping[str, Any], reason: str, *, note: Optional[str] = None) -> str:
+          root: Mapping[str, Any], reason: str, *, note: Optional[str] = None,
+          audit_required: bool = False) -> str:
     """Begin a new current generation for `logical_id`, fencing the current
     one if there is one. In this order, each step durable before the next:
     the new directory and its counter (carried from the predecessor), then
     the generations file naming it current. A crash before the file is
     written leaves an unlisted directory that nothing reads; one after it
-    leaves the new generation current. Returns the new id."""
+    leaves the new generation current. Returns the new id.
+
+    `audit_required` (an operator verb): the audit line is part of the
+    commit. If it cannot be appended, the generations file is put back as
+    it was and the failure raises; the new directory stays unlisted."""
     doc = read_doc(state_dir, logical_id)
+    try:
+        prior = gen_file(state_dir, logical_id).read_bytes()
+    except FileNotFoundError:
+        prior = None
     pred = current(doc) if doc is not None else None
     pred_dir = gen_dir(state_dir, logical_id, pred["gen"]) if pred is not None else None
     start = next_counter(pred_dir)
@@ -344,7 +384,19 @@ def begin(state_dir: Path, name: str, logical_id: str, binding: Mapping[str, Any
                          gen=gen, reason=reason, fenced=pred["gen"] if pred else None,
                          transport_counter=start, binding=dict(binding),
                          root=dict(root), **({"note": note} if note else {}))
-    except Exception:  # noqa: BLE001 -- the generation is durable; the line is best effort
+    except Exception as e:  # noqa: BLE001
+        if audit_required:
+            if prior is None:
+                gen_file(state_dir, logical_id).unlink()
+                fd = os.open(str(lid_dir(state_dir, logical_id)), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            else:
+                atomic_write(gen_file(state_dir, logical_id), prior, durable_root=state_dir)
+            raise AuditCommitFailed(f"{type(e).__name__}: {e}") from e
+        # Automatic: the generation is durable and in force; the line is best effort.
         logger.exception("instance %r: generation %s began but its audit line failed",
                          name, gen)
     logger.warning("instance %r (%s): generation %s began (%s)%s; transport ids from %d",
@@ -397,6 +449,7 @@ def resolve(state_dir: Path, name: str, entry: Any, root: Path) -> str:
         if legacy:
             raise GenerationHeld(HELD_LEGACY_UNADOPTED,
                                  f"pre-generation state {legacy}; adopt it or fence it")
+        check_unlisted(state_dir, lid)
         return begin(state_dir, name, lid, binding, observed, REASON_FIRST)
     cur = current(doc)
     d = gen_dir(state_dir, lid, cur["gen"])
@@ -634,8 +687,13 @@ def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> 
                 "transport_counter": start, "root": root, "reason": reason.strip()}
         if dry_run:
             return dict(plan, dry_run=True)
-        plan["generation"] = begin(cfg.state_dir, name, lid, binding_of(entry), root,
-                                   REASON_OPERATOR, note=reason.strip())
+        try:
+            plan["generation"] = begin(cfg.state_dir, name, lid, binding_of(entry), root,
+                                       REASON_OPERATOR, note=reason.strip(),
+                                       audit_required=True)
+        except AuditCommitFailed as e:
+            raise OperatorRefused(
+                f"the audit line could not be written, so nothing was changed: {e}") from None
         return plan
     finally:
         if lk is not None:
@@ -652,6 +710,41 @@ REUSE_HINT = ("a different request is held under an id still in flight. Same-roo
               "<instance> --reason ...`: the old work settles in the fenced generation, "
               "and the new generation's first sight quarantines the held request "
               "(rejected/quarantined_pre_approval) for the agent to resubmit.")
+
+
+#: In a generation: how many requests it has settled as `req_id_reused`.
+REUSE_COUNT_FILE = "req_id_reused"
+
+
+def record_reuse(cfg: Any, name: str) -> None:
+    """Count one `req_id_reused` refusal in `name`'s current generation (under
+    a registry; nothing without one). A statistic for status: a fault here is
+    logged and never fails the refusal it counts."""
+    if cfg.registry_dir is None:
+        return
+    try:
+        path = Path(cfg.state_dir) / cfg.gen_keys[name] / REUSE_COUNT_FILE
+        try:
+            n = int(path.read_text(encoding="ascii").strip())
+        except FileNotFoundError:
+            n = 0
+        atomic_write(path, str(n + 1).encode("ascii"), durable_root=cfg.state_dir)
+    except Exception:  # noqa: BLE001
+        logger.exception("instance %r: could not count a req_id_reused refusal", name)
+
+
+def reuse_counts(state_dir: Path, logical_id: str) -> Dict[str, int]:
+    """`{generation: req_id_reused refusals it settled}`, for every
+    generation with any."""
+    out: Dict[str, int] = {}
+    for d in generation_dirs(lid_dir(state_dir, logical_id)):
+        try:
+            n = int((d / REUSE_COUNT_FILE).read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            continue
+        if n > 0:
+            out[d.name[len(GEN_PREFIX):]] = n
+    return out
 
 
 def reuse_pending(cfg: Any, name: str) -> List[Dict[str, Any]]:
@@ -697,6 +790,9 @@ def status_doc(cfg: Any, report: Any) -> Optional[Dict[str, Any]]:
         fenced = fenced_work(cfg.state_dir, logical_id)
         if fenced:
             entry["fenced_work"] = fenced
+        counts = reuse_counts(cfg.state_dir, logical_id)
+        if counts:
+            entry["req_id_reused"] = counts
         held = reuse_pending(cfg, name)
         if held:
             entry["req_id_reused_pending"] = held
