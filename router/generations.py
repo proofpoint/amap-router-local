@@ -1588,7 +1588,10 @@ SKEW_S = 1
 def legacy_marker(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
     """What the legacy layout says about when and where it began:
     `{"first_seen_ts", "declared_root", "source"}`, or None when it has no
-    marker it can be read from. `first-seen.json` first; one a pre-generation
+    marker it can be read from. Either file must carry a list
+    `outbox_snapshot`, as first sight requires of a marker (a pre-generation
+    router adopted an `approval.json` only with one): otherwise the adopted
+    generation could never drain. `first-seen.json` first; one a pre-generation
     router adopted from `approval.json` is trusted only when its
     `first_seen_ts` IS that `approved_ts` (otherwise it may have been the
     clock at adoption). Then `approval.json`, only with a valid
@@ -1607,7 +1610,8 @@ def legacy_marker(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
         ts, root = doc.get("first_seen_ts"), doc.get("declared_root")
         if doc.get("adopted_from") == "approval.json" and doc.get("approved_ts") != ts:
             return None
-        if isinstance(ts, str) and parse_utc_ts(ts) and isinstance(root, str):
+        if (isinstance(ts, str) and parse_utc_ts(ts) and isinstance(root, str)
+                and isinstance(doc.get("outbox_snapshot"), list)):
             return {"first_seen_ts": ts, "declared_root": root, "source": "first-seen.json"}
         return None
     if _present(d / "first-seen.json"):
@@ -1615,7 +1619,8 @@ def legacy_marker(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
     doc = load("approval.json")
     if doc is not None:
         ts, root = doc.get("approved_ts"), doc.get("declared_root")
-        if isinstance(ts, str) and parse_utc_ts(ts) and isinstance(root, str):
+        if (isinstance(ts, str) and parse_utc_ts(ts) and isinstance(root, str)
+                and isinstance(doc.get("outbox_snapshot"), list)):
             return {"first_seen_ts": ts, "declared_root": root, "source": "approval.json"}
     return None
 
@@ -1935,6 +1940,10 @@ def _run_journal(cfg: Any, name: str, journal: Dict[str, Any], report: Any) -> D
     return _summary(name, journal)
 
 
+#: A conversion journaled as begun and not yet decided.
+CONVERTING = "converting"
+
+
 def _convert_pending(view: Any, name: str, journal: Dict[str, Any]) -> None:
     """adopt only: each version-1 pending record gains a snapshot, from the
     live request it names, when those bytes still match its digest
@@ -1951,10 +1960,17 @@ def _convert_pending(view: Any, name: str, journal: Dict[str, Any]) -> None:
         names = []
     for fn in names:
         req_id = fn[:-len(".json")]
-        if req_id in done:
+        if done.get(req_id, CONVERTING) != CONVERTING:
             continue
-        done[req_id] = outbound_mod.convert_v1_pending(view, name, req_id)
+        resumed = done.get(req_id) == CONVERTING
+        done[req_id] = CONVERTING          # journaled BEFORE the record can change
         _write_journal(view.state_dir, journal["logical_id"], journal)
+        outcome = outbound_mod.convert_v1_pending(view, name, req_id)
+        if resumed and outcome == outbound_mod.KEPT_V2:
+            outcome = outbound_mod.CONVERTED   # this verb converted it before a crash
+        # Persisted by the next record's intent, or by the phase that follows;
+        # a crash before either resumes through CONVERTING, above.
+        done[req_id] = outcome
 
 
 # ---------------------------------------------------------------------------

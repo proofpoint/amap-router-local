@@ -745,7 +745,59 @@ class ReviewWitnessTests(_Legacy):
             return real(view, name, req_id)
         with mock.patch.object(outbound, "convert_v1_pending", convert):
             self.expect(Crash, self.migrate)
-        self.assertEqual(self.journal().get("converted"), {REQ: outbound.CONVERTED})
+        self.assertEqual(self.journal().get("converted"),
+                         {REQ: outbound.CONVERTED, "00000003": generations.CONVERTING})
         self.migrate()
         self.assertEqual(self.journal()["converted"],
                          {REQ: outbound.CONVERTED, "00000003": outbound.CONVERTED})
+
+
+class MarkerSnapshotTests(_Legacy):
+    """A marker adopt can stand on carries a list `outbox_snapshot`, as
+    first sight requires; otherwise the adopted generation could never
+    drain, so adopt refuses and points to fence-legacy (review round 2)."""
+
+    def approval_only(self, **snapshot):
+        self.poll()
+        self.to_legacy()
+        m = json.loads((self.lid() / "first-seen.json").read_text())
+        (self.lid() / "first-seen.json").unlink()
+        (self.lid() / "approval.json").write_text(json.dumps(
+            {"approved_ts": "2026-01-01T00:00:00Z", "declared_root": m["declared_root"],
+             **snapshot}))
+
+    def test_an_approval_without_a_snapshot_refuses(self):
+        self.approval_only()
+        self.assertIn("fence-legacy", str(self.refuse()))
+        self.migrate("fence-legacy")
+
+    def test_an_approval_with_a_snapshot_that_is_not_a_list_refuses(self):
+        self.approval_only(outbox_snapshot="garbage")
+        self.assertIn("fence-legacy", str(self.refuse()))
+
+    def test_a_first_seen_marker_without_a_snapshot_refuses(self):
+        self.poll()
+        self.to_legacy()
+        f = self.lid() / "first-seen.json"
+        doc = json.loads(f.read_text())
+        doc.pop("outbox_snapshot")
+        f.write_text(json.dumps(doc))
+        self.assertIn("fence-legacy", str(self.refuse()))
+
+
+class ConversionIntentTests(_Legacy):
+
+    def test_a_crash_after_a_conversion_before_its_outcome_is_recorded(self):
+        self.make_pending(body="one")
+        self.to_legacy()
+        self.to_v1()
+        real = outbound.convert_v1_pending
+
+        def convert(view, name, req_id):
+            real(view, name, req_id)
+            raise Crash("after the record changed, before its outcome was journaled")
+        with mock.patch.object(outbound, "convert_v1_pending", convert):
+            self.expect(Crash, self.migrate)
+        self.assertEqual(self.journal().get("converted"), {REQ: generations.CONVERTING})
+        self.migrate()
+        self.assertEqual(self.journal()["converted"], {REQ: outbound.CONVERTED})
