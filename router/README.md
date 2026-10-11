@@ -1269,7 +1269,12 @@ generation recorded and the live outbox entry is still its request;
 otherwise the verdict stays in that generation (an anchor, nothing published,
 nothing archived). A file such work still owns is neither taken into the new
 generation's first sight nor drained by it. What fenced generations still
-hold is shown as `generations.<name>.fenced_work`.
+hold is shown as `generations.<name>.fenced_work`. Ownership is taken
+before any of that work runs and is fail-closed: a record that cannot be read,
+or whose replay fails, keeps its file owned, and a file is released only once
+its work is demonstrably settled or its record is gone. A fenced replay never
+delivers from the live entry, but it still READS it, to decide whether the
+Result may be published.
 
 **Pending requests carry a private snapshot.** Before a pending record is
 written, the raw request and every verified attachment are written, durably,

@@ -13,7 +13,7 @@ from unittest import mock
 
 from router import generations, outbound, registry
 from router.tests.helpers import (
-    gen_state, keyed_for_poll, list_notices, read_json, result_path, write_request,
+    attachment_descriptor, stage_outbound_sidecars, gen_state, keyed_for_poll, list_notices, read_json, result_path, write_request,
 )
 from router.tests.peer_helpers import addr
 from router.tests.test_generations import LIDS, _Gens, snapshot
@@ -302,3 +302,196 @@ class PinnedListingTests(_Pending):
                 outbound.drain_instance(k, "alpha")
         self.assertEqual(cm.exception.reason, generations.HELD_CONNECTOR_UNVERIFIED)
         self.assertIn("/proc", str(cm.exception))
+
+
+def _notice_froms(test, name="bravo"):
+    d = test.cfg.instances[name].inbox_root / "notices"
+    return [json.loads((d / n).read_text())["message"]["from"] for n in list_notices(test.cfg, name)]
+
+
+class ReviewRoundTests(_Pending):
+
+    # -- R1: the pinned sender address ------------------------------------------
+
+    def test_replay_sends_from_the_pinned_address_after_a_domain_flip(self):
+        """The fleet's domain flips between pin and replay: an address derived
+        now would carry the new domain. (Routing the old-domain recipient
+        addresses is the alias table's job, a later step; here only the
+        sender's derivation sees the flip.)"""
+        from router import deliver as deliver_mod
+        self.make_pending()
+        pinned = self.record()["from_address"]
+        real = deliver_mod.address_for
+        flipped = lambda n, d=None: real(n, "flipped.example")  # noqa: E731
+        self.release_bravo()
+        with mock.patch.object(deliver_mod, "address_for", flipped):
+            self.poll()
+        self.assertEqual(_notice_froms(self), [pinned])
+
+    def test_replay_sends_from_the_pinned_address_after_a_name_override(self):
+        """The registry renames the sender between pin and replay: the
+        address derived now is not the one the request was accepted under."""
+        from router import deliver as deliver_mod
+        self.make_pending()
+        pinned = self.record()["from_address"]
+        real = deliver_mod.address_for
+        renamed = lambda n, d=None: real("alpha-renamed" if n == "alpha" else n, d)  # noqa: E731
+        self.release_bravo()
+        with mock.patch.object(deliver_mod, "address_for", renamed), \
+                mock.patch.object(outbound, "address_for", renamed):
+            self.poll()
+        self.assertEqual(_notice_froms(self), [pinned])
+
+    # -- R2 / R5: fenced ownership is fail-closed ---------------------------------
+
+    def fence_with_pending(self):
+        self.make_pending(body="handed over")
+        old = gen_state(self.state_dir, LIDS["alpha"])
+        self.seq += 1
+        doc = snapshot(self.seq, alpha={"binding_seq": 9})
+        doc["entries"] = [e for e in doc["entries"] if e["name"] != "bravo"]
+        (self.reg / registry.SNAPSHOT).write_text(json.dumps(doc))   # rebind alpha; bravo held
+        self.poll()
+        self.assertNotEqual(gen_state(self.state_dir, LIDS["alpha"]), old)
+        return old
+
+    def test_a_damaged_fenced_record_keeps_its_file(self):
+        old = self.fence_with_pending()
+        (old / outbound.PENDING_DIR / "00000001.json").write_text("{damaged")
+        self.release_bravo(alpha={"binding_seq": 9})
+        self.poll()
+        self.assertEqual(list_notices(self.cfg, "bravo"), [], "the current generation took it")
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists())
+
+    def test_a_fenced_replay_error_never_releases_its_file(self):
+        """A fenced settlement that errors after placing (the anchor write
+        fails) keeps its claim: the current generation does not drain the
+        same file that poll, so the recipient gets it ONCE."""
+        self.fence_with_pending()
+        self.release_bravo(alpha={"binding_seq": 9})
+        real = outbound._write_anchor
+        calls = []
+
+        def fail_once(*a, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError(5, "injected")
+            return real(*a, **kw)
+        new = gen_state(self.state_dir, LIDS["alpha"])
+        with mock.patch.object(outbound, "_write_anchor", fail_once):
+            self.poll()
+        self.poll()
+        self.assertEqual(self.bodies(), ["handed over"], "delivered twice, or not at all")
+        self.assertFalse((new / "results" / "00000001.json").exists(),
+                         "the current generation answered the fenced generation's request")
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(), "never answered")
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
+                         "accepted")
+
+    def test_a_fenced_replay_error_keeps_the_file_out_of_first_sight(self):
+        old = self.fence_with_pending()
+        new = gen_state(self.state_dir, LIDS["alpha"])
+        (new / "first-seen.json").unlink()
+        (new / "first-sight.taken").unlink()
+        self.release_bravo(alpha={"binding_seq": 9})
+        with mock.patch.object(outbound, "_write_anchor", side_effect=OSError(5, "injected")):
+            self.poll()
+        path = new / "first-seen.json"
+        marker = json.loads(path.read_text()) if path.exists() else {"outbox_snapshot": []}
+        self.assertNotIn("req-00000001.json",
+                         [e.get("filename") for e in marker["outbox_snapshot"]])
+        self.assertFalse((new / "results" / "00000001.json").exists())
+        self.assertTrue((old / outbound.PENDING_DIR / "00000001.json").exists())
+
+    def test_a_fenced_in_flight_record_settled_but_not_archived_is_completed_once(self):
+        """The in-flight twin: the anchor is written, the publish fails, the
+        record is cleaned up next poll. The fenced verdict is still completed
+        (published, archived) and the current generation never drains it."""
+        port = FakeTransport()
+        write_request(self.cfg, "alpha", "00000001", to=[EXT])
+        outbound.drain_instance(keyed_for_poll(self.cfg), "alpha", transport=port,
+                                cold_policy=_external)
+        generations.operator_new(self.cfg, "alpha", "counter reset")
+        port.send_all()
+        with mock.patch.object(outbound, "_publish_result_and_archive",
+                               side_effect=OSError(5, "injected")):
+            outbound.drain_instance(keyed_for_poll(self.cfg), "alpha", transport=port,
+                                    cold_policy=_external)
+        for _ in range(2):
+            outbound.drain_instance(keyed_for_poll(self.cfg), "alpha", transport=port,
+                                    cold_policy=_external)
+        self.assertEqual(port.writes, ["00000001"], "handed over twice")
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(),
+                        "the fenced verdict was never completed")
+        r = read_json(result_path(self.cfg, "alpha", "00000001"))
+        self.assertEqual(r["outcome"], "accepted")
+
+    # -- R3: crash boundaries --------------------------------------------------------
+
+    def test_a_crash_part_way_through_the_snapshot(self):
+        self.hold_bravo()
+        data = b"attached bytes"
+        stage_outbound_sidecars(self.cfg, "alpha", "00000001", [data])
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")],
+                      attachments=[attachment_descriptor(data)])
+        real = outbound.atomic_write
+
+        def crash_on_attachment(path, *a, **kw):
+            if str(path).endswith("/a0"):
+                raise OSError(5, "crash")
+            return real(path, *a, **kw)
+        with mock.patch.object(outbound, "atomic_write", crash_on_attachment):
+            self.poll()
+        self.assertFalse((self.pending_dir() / "00000001.json").exists())
+        self.release_bravo()
+        self.poll()
+        self.poll()
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
+                         "accepted")
+        self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
+        self.assertEqual(self.listing(), [], "the partial snapshot survived")
+
+    def test_a_crash_after_the_anchor_before_the_record_is_removed(self):
+        self.make_pending()
+        self.release_bravo()
+        with mock.patch.object(outbound, "_remove_pending", side_effect=OSError(5, "crash")):
+            self.poll()
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
+        self.assertEqual(self.listing(), [])
+
+    # -- R4: a transient fault decides nothing --------------------------------------------
+
+    def transient(self, code):
+        import errno as errno_mod
+        real = outbound._read_request_pinned
+
+        def fault(cfg, name, filename, *a, **kw):
+            if name == "alpha" and filename == "req-00000001.json":
+                raise OSError(code, os.strerror(code))
+            return real(cfg, name, filename, *a, **kw)
+        return mock.patch.object(outbound, "_read_request_pinned", fault)
+
+    def assert_nothing_decided(self, gen_dir):
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        self.assertFalse((gen_dir / "results" / "00000001.json").exists())
+        self.assertFalse((gen_dir / "reuse-pending").exists(), "a reuse was recorded")
+
+    def test_a_transient_fault_on_the_live_read_decides_nothing(self):
+        import errno as errno_mod
+        for code in (errno_mod.EIO, errno_mod.EACCES, errno_mod.EMFILE):
+            for fenced in (False, True):
+                with self.subTest(errno=errno_mod.errorcode[code], fenced=fenced):
+                    self.setUp()
+                    if fenced:
+                        gdir = self.fence_with_pending()
+                        self.release_bravo(alpha={"binding_seq": 9})
+                    else:
+                        self.make_pending()
+                        gdir = gen_state(self.state_dir, LIDS["alpha"])
+                        self.release_bravo()
+                    with self.transient(code):
+                        self.poll()
+                    self.assert_nothing_decided(gdir)
+                    self.poll()
+                    self.assertEqual(self.bodies(), ["handed over" if fenced else "original"])

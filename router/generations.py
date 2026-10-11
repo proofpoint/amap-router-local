@@ -812,6 +812,8 @@ def reuse_pending(cfg: Any, name: str) -> List[Dict[str, Any]]:
         return out
     now = time.time()
     for req_id, digest in owned:
+        if digest is None:
+            continue    # a record that cannot be read cannot show a reuse
         try:
             if not outbound_mod._live_differs(cfg, name, req_id, digest):
                 continue

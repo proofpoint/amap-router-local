@@ -1679,6 +1679,9 @@ HOLD_RECIPIENT_GENERATION_CHANGED = "recipient_generation_changed"
 #: An injected delivery backend that cannot take the pre-minted identity:
 #: held, never placed with a fresh one.
 HOLD_BACKEND_NO_PRESET = "backend_no_preset"
+#: An injected backend that cannot take a pending record's pinned sender
+#: address: held, never sent from a re-derived one.
+HOLD_BACKEND_NO_FROM = "backend_no_from_address"
 
 
 class PendingDamaged(Exception):
@@ -1965,8 +1968,19 @@ def _begin_pending(
     try:
         raw = _read_request_pinned(cfg, name, f"req-{req_id}.json")
     except (ReadTooLargeError, OSError):
-        return HELD
-    if hashlib.sha256(raw).hexdigest() != req_digest:
+        raw = None
+    if raw is None or hashlib.sha256(raw).hexdigest() != req_digest:
+        if settled and any(settled.values()):
+            # Placements this pass already made must still get the request's
+            # one Result: without the evaluated bytes there is no snapshot to
+            # hold on, so it is answered now, the held recipients as failed.
+            for r in recipients:
+                settled.setdefault(r, None)
+            rec = {"kind": kind, "binding": pin, "targets": [
+                {"recipient": r, "state": "delivered" if settled[r] else "failed",
+                 "message_id": (settled[r] or {}).get("message_id")} for r in recipients]}
+            return _finish(cfg, name, req_id, _pending_result(cfg, req_id, rec, attachments),
+                           req_digest=req_digest)
         return HELD
     snapshot = _write_snapshot(cfg, name, req_id, raw, list(attachments or []))
     gen = cfg.gen_keys.get(name, "").partition("/")[2]
@@ -1991,20 +2005,35 @@ def _place_target(
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     reply_record: Optional[Dict[str, Any]],
     deliver_backend: Optional[deliver_mod.DeliveryBackend],
+    from_address: Optional[str] = None,
 ) -> Dict[str, str]:
     preset = (target["notice_id"], target["ts"])
+    pinned = {"from_address": from_address} if from_address is not None else {}
     if target["kind"] == "peer":
         return deliver_mod.deliver_peer(
             cfg, cfg.state_dir, name, target["recipient"], doc,
-            reply_to_record=reply_record, attachments=attachments, preset=preset)
+            reply_to_record=reply_record, attachments=attachments, preset=preset, **pinned)
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
     # Every backend path places with the PRE-MINTED identity; one that cannot
     # take it is refused BEFORE placement (a replay would otherwise mint a
     # second id and a second ledger record).
     if not _accepts_preset(backend):
         raise deliver_mod.RecipientHeld(target["recipient"], HOLD_BACKEND_NO_PRESET)
+    if pinned and not _accepts_kw(backend, "from_address"):
+        raise deliver_mod.RecipientHeld(target["recipient"], HOLD_BACKEND_NO_FROM)
     return backend(cfg, cfg.state_dir, name, target["recipient"], doc,
-                   reply_to_record=reply_record, attachments=attachments, preset=preset)
+                   reply_to_record=reply_record, attachments=attachments, preset=preset,
+                   **pinned)
+
+
+def _accepts_kw(backend: Callable[..., Any], kw: str) -> bool:
+    """True when `backend` takes keyword `kw` (named, or **kwargs)."""
+    try:
+        params = inspect.signature(backend).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == kw and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)
+               or p.kind is p.VAR_KEYWORD for p in params)
 
 
 def _accepts_preset(backend: Callable[..., Any]) -> bool:
@@ -2042,7 +2071,8 @@ def _place_one(
     _write_pending(cfg, path, rec)
     try:
         delivered = _place_target(cfg, name, t, doc, attachments,
-                                  pin["record"] if pin else None, deliver_backend)
+                                  pin["record"] if pin else None, deliver_backend,
+                                  from_address=rec.get("from_address"))
     except deliver_mod.RecipientHeld as e:
         t["reason"] = e.reason              # identity kept: a later poll replays it
         return True
@@ -2381,15 +2411,20 @@ def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
 
 
 def _fenced_views(cfg: RouterConfig, name: str) -> List[RouterConfig]:
-    """For each FENCED generation of `name` that still holds in-flight or
-    pending work, a view of `cfg` whose generation key for `name` is that
+    """For each FENCED generation of `name` (work and anchors both matter:
+    `_drain_fenced`), a view of `cfg` whose generation key for `name` is that
     generation's, so every generation-scoped path resolves into it. The
     other instances keep their current generations."""
     if cfg.registry_dir is None or name not in cfg.gen_keys:
         return []
     lid = cfg.gen_keys[name].partition("/")[0]
+    try:
+        doc = generations_mod.read_doc(cfg.state_dir, lid)
+    except generations_mod.GenerationHeld:
+        doc = None
+    fenced = [g["gen"] for g in (doc or {}).get("gens", []) if g["gen"] != doc["current"]]
     out = []
-    for gen in generations_mod.fenced_work(cfg.state_dir, lid):
+    for gen in fenced:
         keys = dict(cfg.gen_keys)
         keys[name] = generations_mod.gen_key(lid, gen)
         out.append(generations_mod.keyed(cfg, keys))
@@ -2412,24 +2447,107 @@ def _drain_fenced(
     with matching bytes: the current generation neither takes them into its
     first-sight snapshot nor drains them (they are already handed over)."""
     owned: Set[str] = set()
+    outbox = cfg.instances[name].outbox_root
     for view in _fenced_views(cfg, name):
         try:
-            if transport is not None and inflight_mod.list_records(view, name):
-                _advance_inflight(view, name, transport, {}, fenced=True)
-            for req_id in sorted(_pending_ids(view, name)):
+            same_root = _same_root(view, name)
+        except Exception:  # noqa: BLE001
+            same_root = True     # cannot be shown otherwise: keep every claim
+        # 1. Ownership FIRST, fail-closed: every live file a fenced record or
+        #    anchor may own is claimed before any work is attempted, and an
+        #    error below never shrinks the claim.
+        if same_root:
+            owned |= _fenced_claims(cfg, view, name)
+        # 2. The work, each record isolated: an error keeps its claim.
+        if transport is not None:
+            try:
+                if inflight_mod.list_records(view, name):
+                    _advance_inflight(view, name, transport, {}, fenced=True)
+            except Exception:
+                logger.exception("instance %r: error stepping fenced in-flight work — "
+                                 "isolated, its files stay claimed", name)
+        for req_id in sorted(_pending_ids(view, name)):
+            try:
                 _drain_pending(view, name, f"req-{req_id}.json", req_id, fenced=True,
                                deliver_backend=deliver_backend, cold_policy=cold_policy)
-            if _same_root(view, name):
-                for req_id, digest in _owned_digests(view, name):
-                    try:
-                        if not _live_differs(cfg, name, req_id, digest) and \
-                                (cfg.instances[name].outbox_root / f"req-{req_id}.json").exists():
-                            owned.add(f"req-{req_id}.json")
-                    except OSError:
-                        owned.add(f"req-{req_id}.json")    # cannot be shown not to be ours
-        except Exception:
-            logger.exception("instance %r: error stepping a fenced generation — isolated", name)
-    return owned
+            except Exception:
+                logger.exception("instance %r: error replaying fenced pending %r — "
+                                 "isolated, its file stays claimed", name, req_id)
+        # 3. A fenced verdict whose publish or archive did not complete (an
+        #    error after the anchor) is completed here, while the live file
+        #    is still its request: the same resume the current generation's
+        #    anchors get.
+        if same_root:
+            for req_id in sorted(_settled_unarchived(cfg, view, name)):
+                try:
+                    _publish_result_and_archive(
+                        view, name, req_id, json.dumps(
+                            _anchor_result(view, name, req_id), sort_keys=True).encode("utf-8"))
+                except Exception:
+                    logger.exception("instance %r: error completing fenced verdict %r — "
+                                     "isolated, its file stays claimed", name, req_id)
+    # 4. A claim is released only when its file has left the outbox.
+    return {f for f in owned if os.path.lexists(outbox / f)}
+
+
+def _fenced_claims(cfg: RouterConfig, view: RouterConfig, name: str) -> Set[str]:
+    """Live outbox files a fenced generation (`view`) may own: those of its
+    in-flight and pending records and of its anchors, unless the live bytes
+    are demonstrably a DIFFERENT request. A record that cannot be read, or a
+    live file that cannot be, stays claimed."""
+    out: Set[str] = set()
+    outbox = cfg.instances[name].outbox_root
+    pairs = list(_owned_digests(view, name))
+    pairs += [(rid, d) for rid, d in _anchor_digests(view, name)]
+    for req_id, digest in pairs:
+        live = outbox / f"req-{req_id}.json"
+        if not os.path.lexists(live):
+            continue
+        if digest is None:
+            out.add(live.name)
+            continue
+        try:
+            if not _live_differs(cfg, name, req_id, digest):
+                out.add(live.name)
+        except OSError:
+            out.add(live.name)
+    return out
+
+
+def _anchor_digests(cfg: RouterConfig, name: str) -> List[Tuple[str, Optional[str]]]:
+    d = gen_state_dir(cfg, name) / "results"
+    try:
+        names = [p.name for p in d.iterdir() if p.name.endswith(".json")]
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    out: List[Tuple[str, Optional[str]]] = []
+    for fn in names:
+        try:
+            env = json.loads((d / fn).read_text(encoding="utf-8"))
+            out.append((fn[:-len(".json")], env.get("digest") if isinstance(env, dict) else None))
+        except (OSError, ValueError):
+            out.append((fn[:-len(".json")], None))
+    return out
+
+
+def _anchor_result(cfg: RouterConfig, name: str, req_id: str) -> Dict[str, Any]:
+    return json.loads(_private_result_path(cfg, name, req_id).read_text(encoding="utf-8"))["result"]
+
+
+def _settled_unarchived(cfg: RouterConfig, view: RouterConfig, name: str) -> List[str]:
+    """Fenced anchors whose request is still in the outbox, the same bytes."""
+    out = []
+    for req_id, digest in _anchor_digests(view, name):
+        if digest is None or inflight_mod.record_path(view, name, req_id).exists() \
+                or _pending_path(view, name, req_id).exists():
+            continue
+        try:
+            if not _live_differs(cfg, name, req_id, digest) and \
+                    os.path.lexists(cfg.instances[name].outbox_root / f"req-{req_id}.json"):
+                out.append(req_id)
+        except OSError:
+            continue
+    return out
 
 
 def _pending_ids(cfg: RouterConfig, name: str) -> List[str]:
@@ -2445,9 +2563,11 @@ def _owned_digests(cfg: RouterConfig, name: str) -> List[Tuple[str, Optional[str
     `cfg`'s generation for `name`."""
     out: List[Tuple[str, Optional[str]]] = []
     for req_id in inflight_mod.list_records(cfg, name):
-        rec = inflight_mod.read_record(cfg, name, req_id)
-        if rec is not None:
-            out.append((req_id, rec.get("digest")))
+        try:
+            rec = inflight_mod.read_record(cfg, name, req_id)
+        except Exception:  # noqa: BLE001 -- a damaged record keeps its claim
+            rec = None
+        out.append((req_id, rec.get("digest") if isinstance(rec, dict) else None))
     for req_id in _pending_ids(cfg, name):
         try:
             out.append((req_id, _read_pending(_pending_path(cfg, name, req_id), req_id)

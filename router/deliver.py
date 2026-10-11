@@ -413,6 +413,7 @@ def deliver(
     reply_to_record: Optional[Dict[str, Any]] = None,
     attachments: Optional[List[attachments_mod.VerifiedAttachment]] = None,
     preset: Optional[Tuple[str, str]] = None,
+    from_address: Optional[str] = None,
 ) -> Dict[str, str]:
     """Deliver `request` (a validated submit-request document) from
     instance `sender` to instance `recipient` on the MAIL lane. `reply_to_
@@ -446,7 +447,11 @@ def deliver(
     message_id = notice_id  # PICKED: no external provider exists; coincide the two.
 
     draft = request.get("draft") or {}
-    from_address = address_for(sender, cfg.fleet_domain)
+    # A pending request's replay passes the address PINNED when it was
+    # accepted: a domain flip or a name override since then never changes
+    # whom the message is from.
+    if from_address is None:
+        from_address = address_for(sender, cfg.fleet_domain)
     to_address = address_for(recipient, cfg.fleet_domain)
     recipient_cfg = cfg.instances[recipient]
 
@@ -507,6 +512,7 @@ def deliver_peer(
     reply_to_record: Optional[Dict[str, Any]] = None,
     attachments: Optional[List[attachments_mod.VerifiedAttachment]] = None,
     preset: Optional[Tuple[str, str]] = None,
+    from_address: Optional[str] = None,
 ) -> Dict[str, str]:
     """`deliver`'s twin on the PEER lane: place `request` from `sender` into
     `recipient`'s `peer/` tree as a `kind: "peer"` notice (module
@@ -529,7 +535,11 @@ def deliver_peer(
     message_id = notice_id
 
     draft = request.get("draft") or {}
-    from_address = address_for(sender, cfg.fleet_domain)
+    # A pending request's replay passes the address PINNED when it was
+    # accepted: a domain flip or a name override since then never changes
+    # whom the message is from.
+    if from_address is None:
+        from_address = address_for(sender, cfg.fleet_domain)
     to_address = address_for(recipient, cfg.fleet_domain)
     in_reply_to = _in_reply_to_from(reply_to_record)
     stamp = exposure_mod.assess(cfg, sender, now=ts)
