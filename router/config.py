@@ -83,6 +83,12 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
     (`<intake_dir>/<instance>/`, created by `provision`). Same containment
     rules as `state_dir`. Nothing in this repo reads it yet: it exists so the
     adapter can express the mount before an email router is real.
+  - `registry_dir` — the host registry's directory (a read-only mount
+    holding `registry.json`; `router/registry.py`). Present, each poll reads
+    it and drains only instances whose name is an active, uncontested
+    registry entry; every other instance is HELD and reported. Absent,
+    nothing changes. It must not be inside `state_dir` or any instance
+    root: an agent-reachable registry would let an agent choose identities.
   - `transport_plugin` — `{"path": <absolute path>, "sha256": <64 hex>}`,
     the optional transport plugin, pinned by path and content hash, never
     by import name (`router/transport.py`). Both members or the key absent:
@@ -150,7 +156,10 @@ ALLOW_ANY = "ALLOW_ANY"
 # First character stays alphanumeric: a leading `.` would make the state
 # directory hidden, and a leading `-` reads as a flag to every command-line
 # tool that ever touches it.
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# `\Z`, not `$`, and applied with `fullmatch`: `$` also matches before a
+# final newline, so `match` accepted "name\n" and handed it on as a path
+# component.
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 #: Connector ids for `outbound/ext/<id>/outcomes/` — the directories
 #: `outcomes._consume_dir` scans, in this order. The spec ("The Volume
@@ -173,7 +182,7 @@ _TOP_KEYS = {
     "task_graph", "mail_graph",
     "instances_dir", "selected_json",
     "peer_senders", "peers",
-    "transport_plugin",
+    "transport_plugin", "registry_dir",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders"}
 
@@ -455,6 +464,9 @@ class RouterConfig:
     #: The pinned transport plugin, or None for none (`transport_plugin`
     #: in the module docstring).
     transport_plugin: Optional["TransportPluginPin"] = None
+    #: The host registry's directory, or None for none (`registry_dir` in
+    #: the module docstring).
+    registry_dir: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -718,7 +730,7 @@ def _discover_instances(
     contested = {f: names for f, names in contested.items() if len(names) > 1}
 
     for slug in found:
-        if not _NAME_RE.match(slug):
+        if not _NAME_RE.fullmatch(slug):
             skipped[slug] = "name is not a valid instance name"
             continue
         if slug.casefold() == ROUTER_LOCAL_PART.casefold():
@@ -968,7 +980,7 @@ def load_obj(
     peer_senders_raw: Dict[str, List[str]] = {}
     extras: Dict[str, Dict[str, Any]] = {}  # name -> caller-validated extra keys
     for name, spec in instances_raw.items():
-        if not _NAME_RE.match(name):
+        if not _NAME_RE.fullmatch(name):
             raise ConfigError(
                 f"config.instances: instance name {name!r} must match "
                 f"^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ — sandy's slug alphabet, "
@@ -1267,6 +1279,19 @@ def load_obj(
 
     outcome_ids = _connector_outcome_ids(top)
     transport_plugin = _transport_plugin(top)
+    registry_dir: Optional[Path] = None
+    if "registry_dir" in top:
+        registry_dir = _require_absolute(top["registry_dir"], "config.registry_dir")
+        if _is_within(registry_dir, state_dir) or _is_within(state_dir, registry_dir):
+            raise ConfigError(
+                f"config.registry_dir ({registry_dir}) and config.state_dir ({state_dir}) "
+                "must not be nested inside one another")
+        for name, (_mode, root_key, root) in roots.items():
+            if _is_within(registry_dir, root) or _is_within(root, registry_dir):
+                raise ConfigError(
+                    f"config.registry_dir ({registry_dir}) and config.instances.{name}."
+                    f"{root_key} ({root}) must not be nested inside one another: an "
+                    "agent-reachable registry would let an agent choose identities")
 
     cfg = RouterConfig(
         state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
@@ -1280,6 +1305,7 @@ def load_obj(
                    if discovery is not None else None),
         selected_json=selected_json,
         transport_plugin=transport_plugin,
+        registry_dir=registry_dir,
     )
 
     # The two lanes are DISJOINT per ordered pair. A pair that is both a

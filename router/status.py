@@ -177,6 +177,11 @@ class StatusTracker:
         #: `generated_ts` is the evidence that it is being published.
         self.roster_outcome: Optional[str] = None
 
+    def record_registry(self, doc: Optional[Dict[str, Any]]) -> None:
+        """This poll's registry reading (`registry.Report.to_doc`), or None
+        when no registry is configured. Replaced every poll: it is state."""
+        self.registry = doc
+
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that
         errored — the set the loader accepted is known even when draining it
@@ -223,6 +228,12 @@ class StatusTracker:
             "polls": self.polls,
             "instances": self.instances,
         }
+        # Present only under a registry: "state" (ok / unavailable /
+        # rolled_back), "seq", and every instance HELD with its reason. A
+        # rolled-back registry stays held until the operator removes
+        # state_dir/registry/seq (router/README.md).
+        if getattr(self, "registry", None) is not None:
+            doc["registry"] = self.registry
         # Omitted, never defaulted, when this tracker cannot answer. A
         # consumer distinguishes "a router older than this field" from a
         # wrong value only if the absence is real.

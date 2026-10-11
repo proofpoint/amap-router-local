@@ -186,6 +186,16 @@ class BarrierOrderTests(_HopCase):
         self.assertEqual(events, [("fsync", "file"), ("fsync", "stage_dir"), ("link",),
                                   ("fsync", "dest_dir"), ("unlink",), ("fsync", "stage_dir")])
 
+    def test_a_stale_stage_is_unlinked_durably_before_restaging(self):
+        """B §e.2 step 1: a stale own stage with no final is unlinked AND the
+        stage dir fsynced, before the new stage is written, so a crash can
+        never resurrect the stale stage beside the new final."""
+        self.stage_path().write_bytes(b"stale")
+        events, (a, b, c) = self.spy()
+        with a, b, c:
+            self.assertEqual(self.commit(), "created")
+        self.assertEqual(events[:3], [("unlink",), ("fsync", "stage_dir"), ("fsync", "file")])
+
     def test_stage_tree_is_durable_bottom_up_before_it_returns(self):
         lid = self.ops.descend_pinned(self.ops.open_root_nofollow(str(self.hop)), LID)
         lid_ino = os.fstat(lid).st_ino

@@ -1,0 +1,78 @@
+{
+  "entries": [
+    {
+      "adapter": "sandy",
+      "binding_seq": 1,
+      "bindings": [
+        {
+          "adapter": "sandy",
+          "seq": 1,
+          "stable_key": "/srv/work/alpha",
+          "ts": "2026-10-11T04:00:00Z"
+        }
+      ],
+      "enrollment_epoch": 1,
+      "enrollments": [
+        {
+          "epoch": 1,
+          "first_registered_ts": "2026-10-11T04:00:00Z",
+          "seq": 1
+        }
+      ],
+      "first_registered_ts": "2026-10-11T04:00:00Z",
+      "logical_id": "72a96bbced1aa04414517b96ebbb6179",
+      "name": "alpha",
+      "name_seq": 1,
+      "names": [
+        {
+          "name": "alpha",
+          "seq": 1,
+          "ts": "2026-10-11T04:00:00Z"
+        }
+      ],
+      "retired": null,
+      "stable_key": "/srv/work/alpha",
+      "state": "active"
+    },
+    {
+      "adapter": "sandy",
+      "binding_seq": 2,
+      "bindings": [
+        {
+          "adapter": "sandy",
+          "seq": 2,
+          "stable_key": "/srv/work/beta",
+          "ts": "2026-10-11T04:00:00Z"
+        }
+      ],
+      "enrollment_epoch": 1,
+      "enrollments": [
+        {
+          "epoch": 1,
+          "first_registered_ts": "2026-10-11T04:00:00Z",
+          "seq": 2
+        }
+      ],
+      "first_registered_ts": "2026-10-11T04:00:00Z",
+      "logical_id": "030d5b0fab378c317f723cc22ea0af15",
+      "name": "beta",
+      "name_seq": 2,
+      "names": [
+        {
+          "name": "beta",
+          "seq": 2,
+          "ts": "2026-10-11T04:00:00Z"
+        }
+      ],
+      "retired": {
+        "seq": 3,
+        "ts": "2026-10-11T04:00:00Z"
+      },
+      "stable_key": "/srv/work/beta",
+      "state": "retired"
+    }
+  ],
+  "schema": "amap-host.registry/1",
+  "seq": 3,
+  "written_at": "2026-10-11T04:00:00Z"
+}

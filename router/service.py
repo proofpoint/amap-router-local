@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import outbound, outcomes, roster, transport as transport_mod
+from . import outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
 from .config import RouterConfig
 from .config import ConfigError, load
 from .status import StatusTracker, render_discovery
@@ -83,7 +83,31 @@ def start_transport(cfg: RouterConfig) -> Optional[Any]:
         "yet; it cannot be activated")
 
 
-def run_once(cfg: RouterConfig, transport: Any = _LOAD) -> Dict[str, Dict[str, int]]:
+#: What this process last logged about the registry, so a standing hold is
+#: logged when it changes, not every poll.
+_REGISTRY_LOGGED: Dict[str, Any] = {}
+
+
+def registry_report(cfg: RouterConfig) -> "registry_mod.Report":
+    """This poll's reading of the registry (`registry.report_for`), logged
+    when its state or its held set changes."""
+    report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances)
+    if report.state != "off":
+        key = (report.state, report.code, tuple(sorted(report.held.items())))
+        if _REGISTRY_LOGGED.get(str(cfg.state_dir)) != key:
+            _REGISTRY_LOGGED[str(cfg.state_dir)] = key
+            if report.state == "ok":
+                (logger.warning if report.held else logger.info)(
+                    "registry: seq %s; drained %s; held %s", report.seq,
+                    sorted(report.resolved), dict(sorted(report.held.items())))
+            else:
+                logger.error("registry %s (%s): %s; HOLDING every instance %s",
+                             report.state, report.code, report.detail, sorted(report.held))
+    return report
+
+
+def run_once(cfg: RouterConfig, transport: Any = _LOAD,
+             report: Optional["registry_mod.Report"] = None) -> Dict[str, Dict[str, int]]:
     """Drain every configured instance's outbound/ once. Returns
     `{instance_name: drain_summary}` for logging/tests.
 
@@ -112,8 +136,12 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD) -> Dict[str, Dict[str, i
     """
     if transport is _LOAD:
         transport = start_transport(cfg)
+    if report is None:
+        report = registry_report(cfg)
     summary: Dict[str, Dict[str, int]] = {}
     for name in sorted(cfg.instances):
+        if report.state != "off" and name not in report.resolved:
+            continue  # held by the registry (`registry_report` says why)
         try:
             result = outbound.drain_instance(cfg, name, transport=transport)
         except Exception:
@@ -191,7 +219,12 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
     try:
         # The no-plugin call keeps its exact shape (`run_once(cfg)`), so a
         # router without a plugin runs precisely the code it ran before.
-        summary = run_once(cfg) if transport is _LOAD else run_once(cfg, transport)
+        report = registry_report(cfg)
+        tracker.record_registry(report.to_doc() if report.state != "off" else None)
+        if report.state == "off":
+            summary = run_once(cfg) if transport is _LOAD else run_once(cfg, transport)
+        else:
+            summary = run_once(cfg, transport, report)
     except Exception:
         logger.exception(
             "error running a full poll — isolated, continuing the loop"
