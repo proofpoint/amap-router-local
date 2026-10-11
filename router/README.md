@@ -1308,8 +1308,114 @@ notice was placed there, the operator decides whether that counts (the
 request can be answered by fencing the SENDER's generation, or left held);
 if it was not, the request stays held until the operator acts.
 
-**Not yet built** (later steps): the operator verbs that adopt or fence
-pre-generation state, so such an instance stays held; aliases.
+**Migrating pre-generation state.** An instance whose state predates
+generations (its entries directly under `state_dir/<logical_id>/`) holds as
+`legacy_state_unadopted` until the operator, with the router stopped, runs
+one of:
+
+```sh
+python3 -m router --config C generation adopt NAME --reason TEXT [--dry-run]
+python3 -m router --config C generation fence-legacy NAME --reason TEXT [--dry-run]
+```
+
+`adopt` attests that the root and binding are unchanged since that state was
+written: everything moves, exactly, into the first current generation (the
+transport counter included), and each version-1 pending record gains a
+snapshot taken from the live request it names, only when those bytes still
+match its digest (otherwise it stays version 1 and holds as before).
+An adopted generation always records that it took first sight (the
+`first-sight.taken` sentinel), and when the legacy layout has only an old
+`approval.json` its marker is written FROM that file, as a pre-generation
+router's upgrade did: `first_seen_ts` is the `approved_ts`, verbatim, and
+`adopted_from` says so. Both are planned in the journal and checked like
+every moved path. `fence-legacy` makes the old state a FENCED generation and
+begins a fresh current one: that legacy generation recorded only a path for
+its root, which vouches for nothing, so its work settles privately, and the
+fresh generation's own first sight quarantines whatever is in the outbox (the
+agent resubmits). Use it when the origin cannot be vouched for. A generation
+that records no root identity (this one, or one begun while its root could
+not be opened) claims no live file and publishes nothing; before migration
+existed, the root check failed on such a record with a `TypeError`, which the
+fenced drain treated as keep-every-claim.
+
+Both are journaled in `state_dir/<logical_id>/migration.json`: every fact the
+verb depends on is planned there, durably, before the first rename, and
+never recomputed. Each phase is durable before the next; a crash leaves the
+instance held (`state_layout_conflict`) and re-running the SAME verb resumes,
+deciding each path from what is at its source and destination (both present,
+or neither, is a conflict, never a tie-break), and only while the binding
+(for adopt, also the root) it recorded still verifies. The other verb is
+refused while a journal exists; the same verb once done changes nothing. The
+journal is kept when done, and "done" is believed only when the generations
+file lists what it made with the same legacy record and its blocker is in
+place. The attestation, with `--reason`, the binding and root observed and
+the journal's digest, is written durably to the audit log before `done`, once
+however many runs it takes.
+
+**The transport counter is preserved, or the verb refuses.** The plan
+classifies the legacy state once. A legacy counter moves exactly. Without
+one, the verb refuses whenever any transport id is proven allocated (an
+in-flight entry, or an anchor recording a transport id, passing a verdict
+through from the transport (`detail` beginning `transport: `), or recording
+a `transport_anomaly` other than the two refusals made before any id was
+allocated), and whenever an anchor is not exactly the shape a
+pre-generation router wrote: no flag overrides either. With no anchors at
+all it proceeds. With only local anchors it proceeds only on
+`--no-transport-history=N`, N being exactly the count it found, which
+attests that the instance never had a transport route. **A false
+attestation can silently reuse a transport id once the transport has pruned
+the old one**, which breaks the rule that an id is never handed out twice;
+an attested chain is shown as `generations.<name>.legacy_attested`, and every
+later `generation new` and `reset` logs a WARNING naming it. The migrated
+generation and the journal carry the same record of all this, and a
+successor's counter is taken from it: a migrated counter that is later lost,
+or found below the value migrated (a rollback), holds the instance
+(`transport_counter_unverified`), as does a migrated generation whose record
+is missing or disagrees with the journal, or a record no journal names.
+
+**adopt's evidence.** `adopt` also refuses, pointing to `fence-legacy`, when
+the legacy marker is missing (an old `approval.json` stands in only with a
+real `approved_ts`; a marker a pre-generation router adopted from one is
+trusted only if its `first_seen_ts` is that `approved_ts`), when the marker's
+root is not this instance's root (paths compared normalised, never
+resolved), when the registry's binding history is malformed or does not end
+in the current binding, or when it records a REBIND (any binding after the
+initial one) at or after the legacy state's first sight, with a 1 second
+margin for clock skew. The initial binding is not compared: a registry
+imported after the router first saw an instance records that binding later
+than first sight, and the root check and the attestation stand for it.
+
+**What "done" is checked against.** Every reader of the journal first checks
+that it is well-formed for its phase and for this identity, and, from
+`complete` on, that the digest its attestation commits to is the one
+recomputed from its body and that the planned line carries exactly the
+body's facts; anything else holds (`state_layout_conflict`). On every poll: the generation chain the
+verb made, with the binding and root it recorded; every moved path, with its
+type, and the digested files unchanged; the legacy record and every anchor
+its manifest lists, unchanged; the counter floor; the blocker. Not on every
+poll, but at the verb's own resume and before every `reset` and
+`generation new`: exactly one copy of the planned attestation line in the
+audit log. That line is planned into the journal (fixed bytes) before
+`complete` and written durably once; a torn copy left by a crash is ended
+with a newline and the line written whole after it; a malformed line that
+mentions this journal, a different line for it, or a second copy holds the
+instance; a malformed line about anything else is skipped with a WARNING.
+
+Each version-1 conversion's outcome is checked against the record it
+describes before `complete`, and again whenever a run resumes at
+`complete`. So an operator who repairs or replaces a pending record between
+a crash and the resume gets a refusal naming that record (the instance stays
+held) rather than a migration that attests something the record no longer
+shows.
+
+**Rolling back past this version is not supported.** The last step before a
+migration completes leaves a DIRECTORY named `first-seen.json` where the
+legacy marker was. An older router run against the migrated layout fails at
+its first statement, before listing or delivering anything, instead of
+taking a fresh first sight and restarting the transport counter. `reset`
+leaves it, and the journal, in place.
+
+**Not yet built** (later steps): aliases.
 
 ### Held local delivery
 

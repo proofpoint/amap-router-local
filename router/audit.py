@@ -88,6 +88,10 @@ EVENT_GENERATION_MINTED = "generation_minted"
 #: (`state: "held"`), and later was refused as `req_id_reused`
 #: (`state: "refused"`): one line per transition, never per poll.
 EVENT_REUSE_PENDING = "req_id_reused_pending"
+#: An operator migrated pre-generation state (`router generation adopt` or
+#: `fence-legacy`): the verb, its `--reason`, the binding and root observed,
+#: the generations it made, and the digest of the journal it completed.
+EVENT_MIGRATION = "generation_migrated"
 
 
 class AuditError(Exception):
@@ -122,15 +126,17 @@ def build_line(event: str, instance: str, fields: Dict[str, Any]) -> bytes:
 
 
 def append(state_dir: Path, instance: str, event: str, *,
-           state_key: Optional[str] = None, **fields: Any) -> None:
+           state_key: Optional[str] = None, durable: bool = False, **fields: Any) -> None:
     """Append one line for `event` to `instance`'s log. See the module
-    docstring for the write discipline and the symlink refusal."""
+    docstring for the write discipline and the symlink refusal. `durable`:
+    the line is fsynced (and the log's directory, when this created it)
+    before this returns, for a line a commit depends on."""
     append_bytes(state_dir, instance, build_line(event, instance, fields),
-                 state_key=state_key)
+                 state_key=state_key, durable=durable)
 
 
 def append_bytes(state_dir: Path, instance: str, line: bytes, *,
-                 state_key: Optional[str] = None) -> None:
+                 state_key: Optional[str] = None, durable: bool = False) -> None:
     """`append` for a line already built by `build_line` — the form
     `deliver.py` uses so the line is composed before the commit sequence
     and written at its place in it."""
@@ -140,6 +146,7 @@ def append_bytes(state_dir: Path, instance: str, line: bytes, *,
             f"refusing to append to the audit log: {inst_dir} is a symlink"
         )
     d = audit_dir(state_dir, instance, state_key=state_key)
+    created = durable and not (d / AUDIT_FILENAME).exists()
     d.mkdir(parents=True, exist_ok=True)
     fd = os.open(
         str(d / AUDIT_FILENAME),
@@ -147,7 +154,43 @@ def append_bytes(state_dir: Path, instance: str, line: bytes, *,
         0o600,
     )
     try:
-        os.write(fd, line)
+        view = memoryview(line)
+        while view:                      # a full write, never a short one
+            view = view[os.write(fd, view):]
+        if durable:
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+    if created:
+        for p in (d, d.parent):
+            dfd = os.open(str(p), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+
+
+def read_raw(state_dir: Path, state_key: str) -> Optional[bytes]:
+    """The log's bytes exactly, or None when there is no log. STRICT, unlike
+    `read_events`: any failure to read raises (`OSError`), and a symlinked
+    identity directory or log raises `AuditError`. For a check that must not
+    mistake "could not read" for "not there"."""
+    inst_dir = Path(state_dir) / state_key
+    if inst_dir.is_symlink():
+        raise AuditError(f"{inst_dir} is a symlink")
+    path = inst_dir / AUDIT_DIR / AUDIT_FILENAME
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks)
     finally:
         os.close(fd)
 

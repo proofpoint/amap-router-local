@@ -282,17 +282,27 @@ _OUTCOMES = "outcomes"
 _STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR)
 
 
-def _kept(cfg: RouterConfig, entry_name: str) -> bool:
+def _kept(cfg: RouterConfig, entry_name: str, *, blocker: bool = False) -> bool:
     """Whether a reset leaves `state_dir/<key>/<entry_name>` alone. Under a
     registry, also every generation (`gen-*`), the generations file and a
     migration journal: a reset FENCES the current generation and begins a
-    new one (`_reset_one`), it never deletes one."""
+    new one (`_reset_one`), it never deletes one. And the migration's
+    rollback blocker, when `blocker` says the journal records it."""
     if entry_name in _STATE_KEEP:
         return True
     if cfg.registry_dir is None:
         return False
     return (entry_name.startswith(generations_mod.GEN_PREFIX)
-            or entry_name in (generations_mod.GEN_FILE, generations_mod.MIGRATION_FILE))
+            or entry_name in (generations_mod.GEN_FILE, generations_mod.MIGRATION_FILE)
+            or (blocker and entry_name == generations_mod.BLOCKER))
+
+
+def _blocker(cfg: RouterConfig, name: str) -> bool:
+    """Under a registry: whether `state_dir/<logical_id>/first-seen.json` is
+    the migration's recorded rollback blocker, which a reset never removes
+    (removing it would let an older router take a fresh first sight)."""
+    return (cfg.registry_dir is not None
+            and generations_mod.is_recorded_blocker(cfg.state_dir, state_key(cfg, name)))
 
 
 class ResetError(Exception):
@@ -505,7 +515,8 @@ def _plan_one(cfg: RouterConfig, name: str) -> ResetPlan:
     # out of the "rest of state_dir" listing below (since the exclusion
     # used to be by path identity regardless of whether this branch had
     # actually included it) — surviving the reset entirely.
-    if first_seen_marker.is_symlink() or first_seen_marker.exists():
+    blocker = _blocker(cfg, name)
+    if (first_seen_marker.is_symlink() or first_seen_marker.exists()) and not blocker:
         state_paths.append(first_seen_marker)
     inst_state_dir = instance_state_dir(cfg, name)
     if inst_state_dir.is_dir() and not inst_state_dir.is_symlink():
@@ -518,7 +529,8 @@ def _plan_one(cfg: RouterConfig, name: str) -> ResetPlan:
         # when the marker was actually appended above. `audit/` is never
         # listed: a reset preserves it (module docstring).
         state_paths.extend(
-            p for p in rest if p not in state_paths and not _kept(cfg, p.name)
+            p for p in rest
+            if p not in state_paths and not _kept(cfg, p.name, blocker=blocker)
         )
 
     inbox_root, outbox_root = inst.inbox_root, inst.outbox_root
@@ -838,7 +850,8 @@ def _clear_state(cfg: RouterConfig, name: str) -> int:
     removed = 0
     first_seen_marker = firstsight.marker_path(cfg.state_dir, name,
                                                state_key=state_key(cfg, name))
-    if first_seen_marker.is_symlink() or first_seen_marker.exists():
+    blocker = _blocker(cfg, name)
+    if (first_seen_marker.is_symlink() or first_seen_marker.exists()) and not blocker:
         _remove_path(first_seen_marker)
         removed += 1
     try:
@@ -846,7 +859,7 @@ def _clear_state(cfg: RouterConfig, name: str) -> int:
     except OSError:
         rest = []
     for p in rest:
-        if _kept(cfg, p.name):
+        if _kept(cfg, p.name, blocker=blocker):
             continue
         _remove_path(p)
         removed += 1
@@ -882,9 +895,9 @@ def _generation_inputs(cfg: RouterConfig, name: str) -> Optional[Dict[str, Any]]
         return None
     entry = cfg.registry_report.resolved[name]
     lid = entry.logical_id
-    if (cfg.state_dir / lid / generations_mod.MIGRATION_FILE).exists():
-        raise ResetError(f"reset: {name!r} has an unfinished migration; finish it first")
     try:
+        generations_mod.migration_state(cfg.state_dir, lid, audit=True)
+        generations_mod.warn_attested(cfg.state_dir, name, lid, "reset")
         doc = generations_mod.read_doc(cfg.state_dir, lid)
         if doc is None and generations_mod.legacy_entries(cfg.state_dir, lid):
             raise ResetError(

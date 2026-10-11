@@ -2348,6 +2348,67 @@ def _drain_pending_v1(
     return _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend)
 
 
+#: `convert_v1_pending`'s outcomes.
+CONVERTED = "converted"
+KEPT_V2 = "already_v2"
+KEPT_DAMAGED = "kept_v1_damaged"
+KEPT_UNREAD = "kept_v1_request_unreadable"
+KEPT_CHANGED = "kept_v1_request_changed"
+KEPT_ATTACHMENTS = "kept_v1_attachments_changed"
+
+
+def pending_version(cfg: RouterConfig, name: str, req_id: str) -> Any:
+    """A pending record's version (1 or 2), "damaged" when it cannot be
+    trusted, or None when there is none."""
+    path = _pending_path(cfg, name, req_id)
+    if not os.path.lexists(path):
+        return None
+    try:
+        return _read_pending(path, req_id)["v"]
+    except PendingDamaged:
+        return "damaged"
+
+
+def convert_v1_pending(cfg: RouterConfig, name: str, req_id: str) -> str:
+    """`router generation adopt` only, under the drain lock, with `cfg`
+    keyed to the adopted generation: give a version-1 pending record its
+    snapshot. The source is the live request the record names, read
+    through the pinned path, and only when its bytes match the record's
+    digest and its attachments verify against the descriptors those bytes
+    declare. The snapshot is durable first; then the record is replaced
+    atomically by its version-2 form. Anything else keeps the record at
+    version 1, which holds as before; nothing is synthesised. Returns one
+    of the outcomes above."""
+    path = _pending_path(cfg, name, req_id)
+    try:
+        rec = _read_pending(path, req_id)
+    except PendingDamaged:
+        return KEPT_DAMAGED
+    if rec["v"] != 1:
+        return KEPT_V2
+    try:
+        raw = _read_request_pinned(cfg, name, f"req-{req_id}.json")
+    except (ReadTooLargeError, OSError):
+        return KEPT_UNREAD
+    if hashlib.sha256(raw).hexdigest() != rec["request_sha256"]:
+        return KEPT_CHANGED
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+        descriptors = doc["draft"].get("attachments") or []
+        attachments = attachments_mod.ingest_attachments(cfg, name, req_id, descriptors)
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError,
+            attachments_mod.AttachmentIngestError):
+        return KEPT_ATTACHMENTS
+    gen = cfg.gen_keys.get(name, "").partition("/")[2]
+    new = dict(rec, v=PENDING_VERSION,
+               snapshot=_write_snapshot(cfg, name, req_id, raw, attachments),
+               source_gen=gen[len(generations_mod.GEN_PREFIX):] if gen else None,
+               from_address=address_for(name, cfg.fleet_domain))
+    _check_pending(new, req_id)
+    _write_pending(cfg, path, new)
+    return CONVERTED
+
+
 def _sweep_answered_pending(cfg: RouterConfig, name: str) -> None:
     """A crash between a pending request's Result and the removal of its
     record leaves a record for a request already answered (and archived, so
