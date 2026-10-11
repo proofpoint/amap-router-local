@@ -69,8 +69,10 @@ class _Legacy(_Pending):
         path = d / f"{req_id}.json"
         rec = json.loads(path.read_text())
         shutil.rmtree(d / f"{req_id}.{rec['snapshot']['nonce']}.snap")
-        for k in ("snapshot", "source_gen", "from_address"):
-            rec.pop(k)
+        for k in ("snapshot", "source_gen", "from_address", "aliases"):
+            rec.pop(k, None)
+        for t in rec["targets"]:
+            t.pop("address", None)       # as held local delivery first wrote version 1
         rec["v"] = 1
         path.write_text(json.dumps(rec, sort_keys=True))
 

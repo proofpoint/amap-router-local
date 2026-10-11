@@ -441,10 +441,11 @@ class RequestIdentityTests(_Fleet):
         path = self.pending("alpha", "00000001")
         rec = json.loads(path.read_text())
         rec["v"] = 1
-        for k in ("snapshot", "source_gen", "from_address"):
+        for k in ("snapshot", "source_gen", "from_address", "aliases"):
             rec.pop(k, None)
         for t in rec["targets"]:
             t.pop("recipient_gen", None)
+            t.pop("address", None)
         path.write_text(json.dumps(rec))
         write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="CHANGED")
         self.recover("not_registered", "bravo")

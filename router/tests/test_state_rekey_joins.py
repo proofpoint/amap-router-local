@@ -320,10 +320,11 @@ class ReservedStateNameTests(RouterTestCase):
             self.assertIn("keeps in state_dir", cfg.discovery.skipped[slug])
 
     def test_the_set_is_the_entries_this_router_owns(self):
-        from router import lock, status
+        from router import aliases, lock, status
         self.assertEqual(config_mod.RESERVED_STATE_NAMES,
                          frozenset({registry.SEQ_DIR.casefold(),
-                                    status.STATUS_FILENAME.casefold()}))
+                                    status.STATUS_FILENAME.casefold(),
+                                    aliases.STORE_DIR.casefold()}))
         self.assertIsNone(config_mod._NAME_RE.fullmatch(lock.LOCK_NAME),
                           "the lock file's name must stay unrepresentable as an instance")
 

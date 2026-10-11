@@ -92,6 +92,11 @@ EVENT_REUSE_PENDING = "req_id_reused_pending"
 #: `fence-legacy`): the verb, its `--reason`, the binding and root observed,
 #: the generations it made, and the digest of the journal it completed.
 EVENT_MIGRATION = "generation_migrated"
+#: The alias store (`router/aliases.py`), in the router-level log
+#: `state_dir/registry/aliases.audit.jsonl`: its first initialisation (the
+#: creation witness's line) or a recovery of it, each tombstone written, each
+#: `router aliases reinit`, and each move into or out of unverified.
+EVENT_ALIAS_STORE = "alias_store"
 
 
 class AuditError(Exception):
@@ -163,6 +168,37 @@ def append_bytes(state_dir: Path, instance: str, line: bytes, *,
         os.close(fd)
     if created:
         for p in (d, d.parent):
+            dfd = os.open(str(p), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+
+
+def append_router_line(state_dir: Path, subdir: str, filename: str, line: bytes) -> None:
+    """Durably append `line` to a ROUTER-level log, `state_dir/<subdir>/<filename>`
+    (the alias store's audit log: `router/aliases.py`). The same discipline
+    as `append_bytes(durable=True)`: a symlinked `subdir` is refused,
+    `O_APPEND | O_CREAT | O_NOFOLLOW`, a full write, and fsync of the file
+    and, when this created them, of the log and its directory's parent.
+    Callers hold the drain lock."""
+    d = Path(state_dir) / subdir
+    if d.is_symlink():
+        raise AuditError(f"refusing to append: {d} is a symlink")
+    created_dir = not d.exists()
+    created = created_dir or not (d / filename).exists()
+    d.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(d / filename), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+                 0o600)
+    try:
+        view = memoryview(line)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if created:
+        for p in ((d, d.parent) if created_dir else (d,)):
             dfd = os.open(str(p), os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(dfd)

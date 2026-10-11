@@ -106,6 +106,9 @@ class Entry:
     #: parsed only by `router generation adopt` (`generations.parse_bindings`):
     #: an ordinary poll never depends on it.
     bindings_json: str = ""
+    #: The name history exactly as the registry gave it (canonical JSON),
+    #: parsed only for an identity the alias table names.
+    names_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -239,6 +242,7 @@ def parse(data: bytes) -> Registry:
             first_registered_ts=_field(e, "first_registered_ts", _str(_TS), what),
             state=_field(e, "state", lambda v: isinstance(v, str) and v in _STATES, what),
             bindings_json=json.dumps(e.get("bindings"), sort_keys=True),
+            names_json=json.dumps(e.get("names"), sort_keys=True),
         ))
     ids = [e.logical_id for e in entries]
     if len(set(ids)) != len(ids):
@@ -352,7 +356,7 @@ _REGISTRY_FILES = ("generations.json", "migration.json")
 #: `state_dir` entries that are this router's own, never an instance's: the
 #: seq floor's directory and the status file (compared casefolded, for a
 #: case-insensitive state_dir).
-_OWN_STATE_ENTRIES = frozenset({SEQ_DIR.casefold(), "status.json"})
+_OWN_STATE_ENTRIES = frozenset({SEQ_DIR.casefold(), "status.json", "aliases"})
 _ID_SHAPED = re.compile(r"[0-9a-fA-F]{32}\Z")
 
 
@@ -399,6 +403,12 @@ class Report:
     #: only for a name the registry does not know (`not_registered`).
     #: What a pending delivery pins, so a later rebind of the name is caught.
     known: Mapping[str, str] = None  # type: ignore[assignment]
+    #: The same names as `known`, each to its whole active registry entry
+    #: (the alias table reads a target's name history from it).
+    entries: Mapping[str, Entry] = None  # type: ignore[assignment]
+    #: EVERY entry the registry holds, any state, configured or not: the
+    #: alias table's collision and name-reuse checks look past this router.
+    all_entries: Tuple[Entry, ...] = ()
 
     def to_doc(self) -> Dict[str, Any]:
         doc: Dict[str, Any] = {"state": self.state}
@@ -446,8 +456,9 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
     held: Dict[str, str] = {}
     # Every configured name with an ACTIVE entry of exactly that name, held
     # or not: a skeleton collision holds the name but its identity is known.
-    known = {e.name: e.logical_id for e in reg.entries
-             if e.state == "active" and e.name in set(names)}
+    entries = {e.name: e for e in reg.entries
+               if e.state == "active" and e.name in set(names)}
+    known = {n: e.logical_id for n, e in entries.items()}
     for n in names:
         if n in colliding:
             held[n] = HELD_COLLISION
@@ -459,7 +470,8 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
                 held[n] = why
         else:
             held[n] = HELD_NOT_REGISTERED
-    return Report(state="ok", seq=reg.seq, resolved=resolved, held=held, known=known)
+    return Report(state="ok", seq=reg.seq, resolved=resolved, held=held, known=known,
+                  entries=entries, all_entries=tuple(reg.entries))
 
 
 def stranded_state(state_dir: Path) -> List[str]:

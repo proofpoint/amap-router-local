@@ -1141,8 +1141,10 @@ router has accepted is kept in `state_dir/registry/seq`. A snapshot with a
 lower `seq` means the registry was restored, and adopting it could re-bind
 names to older identities, so every instance stays held and `status.json`
 shows `registry.state: "rolled_back"`. To accept a deliberate restore, the
-operator removes `state_dir/registry/seq`; the next poll accepts the
-snapshot's `seq` as the new floor.
+operator removes the seq FILE, `state_dir/registry/seq`, and nothing else
+under `state_dir/registry/` (which also holds the alias store's floor,
+witness and audit log, below); the next poll accepts the snapshot's `seq` as
+the new floor.
 
 **Losing `state_dir` loses the floor.** With `state_dir/registry/seq` gone,
 the next snapshot is accepted whatever its `seq`, a rolled-back one
@@ -1415,7 +1417,95 @@ its first statement, before listing or delivering anything, instead of
 taking a fresh first sight and restarting the transport counter. `reset`
 leaves it, and the journal, in place.
 
-**Not yet built** (later steps): aliases.
+### Aliases
+
+Under a registry, the router config may carry an alias table (contract
+§2.3): `"aliases": [{"old": ..., "new": ..., "expires": ...}]`. `old` is an
+exact address (an ASCII name as its local part, a lowercase domain); `new`
+is an identity's canonical `<name>@<fleet_domain>`; `expires` a UTC
+timestamp. The loader refuses a table without a registry, a `new` outside
+the fleet's domain, a duplicate `old`, a chain (a `new` that is some `old`),
+a reserved local part, and a same-domain `old` that is a case or confusable
+variant of its own target. An instance named `aliases` is now a load error:
+`state_dir/aliases/` is the store. `old`'s domain is not restricted: an entry
+the operator writes can make an address that looks external deliver locally.
+The table is operator-owned configuration, so that is the operator's choice,
+stated here rather than prevented.
+
+**Every poll decides each entry, before anything drains.** ACTIVE: not
+expired, not tombstoned, its target a known identity (resolved, or held by
+the registry, in which case the delivery holds exactly as a direct address
+would), `old`'s local part in that identity's registry name history (whose
+last element must be its current name), and `old` no other identity's
+current name by skeleton, and no other identity in the registry (served here
+or not, retired or not) having had `old`'s local part as a name, compared by
+skeleton (its name history, or its current name when it records none): a
+name reused by another identity never retargets an alias. An unreadable name
+history ANYWHERE in the registry holds every alias, which is fail-closed and
+broad, deliberately: it cannot be shown that the unreadable one never held
+the name. INACTIVE, deterministically, otherwise: a request
+naming an inactive alias is answered `rejected` / `recipient_unknown` right
+there, before any policy sees it. Matching is exact: the local part as
+written, the domain lowercased, so a case variant is not the alias.
+UNVERIFIABLE when the store cannot be trusted, the target's name history is
+malformed, or the registry cannot be read: the request is NOT consumed. It
+stays in the outbox, is retried every poll, and is listed in `status.json`
+under `aliases.held` with the reason, its age (from a marker the drain
+writes, bound to the request's digest; it restarts in a new generation) and
+the remedy. One unverifiable address holds the whole request, even beside an
+inactive one.
+
+**What aliases change.** Only the evaluated copy of `draft.to` and
+`draft.cc`, before classification and policy; every use logs a WARNING. The
+request's bytes, its snapshot and its digest are never rewritten. An alias
+names only a LOCAL identity, so a request in which an alias was applied
+never takes the external leg: a policy that routes it there is answered
+`queued_for_human` / `transport_anomaly` ("alias-normalised recipients
+cannot take the external leg; nothing was sent") before anything is staged.
+Pending work pins the aliases it used (`aliases` in the record, with each
+target's `address`; a record with any is version 3, which an older router
+holds as damaged rather than misread): a later expiry or table edit never
+retargets or refuses it, and a target rebound since holds as
+`identity_changed`. Pinned work keeps its pin-time target across a §2.4
+domain flip too (each pinned address maps to that target's address in the new
+domain). A pending draft that named its target in a different letter case
+than the pinned address is refused after a flip rather than guessed at. So
+drain pending work before a flip if the old addresses must stop working at
+once.
+
+**Expiry and tombstones.** At or after `expires` an alias is inactive
+whatever else happened. The poll's pre-pass then writes its tombstone to
+`state_dir/aliases/tombstones.json`, so that re-listing it can never revive
+it: a tombstoned address stays unusable even with a new `expires`. A failed
+tombstone write is logged at ERROR, shown as
+`aliases.store.tombstone_errors` with the time the drain first saw it fail and
+its age (kept by the running router, so a restart starts the age again),
+retried every poll, and never stops anything else.
+
+**The store is checked against a floor and a witness** kept outside it, in
+`state_dir/registry/`: `aliases.floor` (the highest seq ever written) and
+`aliases.created` (written LAST at first initialisation, after the store,
+the floor and a durable audit line in `state_dir/registry/aliases.audit.jsonl`).
+Only the empty first store, a missing floor or witness of that store, or a
+floor one behind its store is recovered, and only by the drain's pre-pass;
+every other combination (a store below its floor, a lost store, a foreign
+entry in `aliases/`, anything unreadable) is unverified. Losing or restoring
+everything at once looks like a first start: that residual is the same as
+the registry floor's.
+
+**`router aliases reinit --reason TEXT [--dry-run]`** is the way out of an
+unverified store, with the router stopped. It writes a fresh store that
+tombstones EVERY configured alias, plus every address the audit log records
+as tombstoned and every tombstone of a store that can still be read (trusted
+or not), at a seq above anything seen, and audits it. **reinit
+permanently retires every configured alias; tombstoned addresses can never
+be re-enabled.** Nothing is taken as proof that an alias was still active,
+because a store can commit a tombstone and lose it before its audit line.
+The residual it cannot close: a tombstone lost with the store, for an alias
+since removed from the config.
+
+**Not yet built** (later steps): the hop To and the `to` of a signed
+statement are normalised downstream, not here.
 
 ### Held local delivery
 

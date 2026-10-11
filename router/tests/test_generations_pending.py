@@ -186,8 +186,10 @@ class FencedTests(_Pending):
         path = self.pending_dir() / "00000001.json"
         rec = json.loads(path.read_text())
         rec["v"] = 1
-        for k in ("snapshot", "source_gen", "from_address"):
+        for k in ("snapshot", "source_gen", "from_address", "aliases"):
             rec.pop(k)
+        for t in rec["targets"]:
+            t.pop("address", None)
         path.write_text(json.dumps(rec))
         old = gen_state(self.state_dir, LIDS["alpha"])
         self.put(alpha={"binding_seq": 9})

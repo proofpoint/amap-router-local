@@ -134,10 +134,11 @@ import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from datetime import timedelta
 
+from . import aliases as aliases_mod
 from . import attachments as attachments_mod, binding, firstsight
 from . import generations as generations_mod
 from . import audit as audit_mod
@@ -719,7 +720,8 @@ def _drain_reply(
             cfg, name, req_id, doc, kind="mail", recipients=[bound_instance],
             pin={"in_reply_to": str(in_reply_to), "bound_instance": bound_instance,
                  "record": record, "evaluated_ts": utc_ts(), "window_ok": True},
-            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend)
+            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend,
+            aliases={})
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
     try:
         delivered = backend(
@@ -736,7 +738,8 @@ def _drain_reply(
             cfg, name, req_id, doc, kind="mail", recipients=[bound_instance],
             pin={"in_reply_to": str(in_reply_to), "bound_instance": bound_instance,
                  "record": record, "evaluated_ts": utc_ts(), "window_ok": True},
-            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend)
+            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend,
+            aliases={})
     except Exception as e:  # noqa: BLE001 — must still answer exactly once
         logger.warning(
             "instance %r req %r: reply delivery to %r failed, answering "
@@ -971,6 +974,7 @@ def _drain_peer_route(
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     reply_to_record: Optional[Dict[str, Any]] = None,
     pin: Optional[Dict[str, Any]] = None,
+    aliases: Mapping[str, str],
 ) -> str:
     """Place one peer notice (fresh task or reply) and answer the request
     exactly once — `accepted`/`peer_routed` with the minted peer id, or
@@ -982,7 +986,8 @@ def _drain_peer_route(
     if _any_held(cfg, [recipient]) and req_digest is not None:
         return _begin_pending(
             cfg, name, req_id, doc, kind="peer", recipients=[recipient], pin=pin,
-            req_digest=req_digest, attachments=attachments, deliver_backend=None)
+            req_digest=req_digest, attachments=attachments, deliver_backend=None,
+            aliases=aliases)
     try:
         delivered = deliver_mod.deliver_peer(
             cfg, cfg.state_dir, name, recipient, doc,
@@ -993,7 +998,8 @@ def _drain_peer_route(
             raise
         return _begin_pending(
             cfg, name, req_id, doc, kind="peer", recipients=[recipient], pin=pin,
-            req_digest=req_digest, attachments=attachments, deliver_backend=None)
+            req_digest=req_digest, attachments=attachments, deliver_backend=None,
+            aliases=aliases)
     except Exception as e:  # noqa: BLE001 — must still answer exactly once
         logger.warning(
             "instance %r req %r: peer delivery to %r failed, answering "
@@ -1071,6 +1077,7 @@ def _drain_peer_reply(
         req_digest=req_digest, attachments=attachments, reply_to_record=record,
         pin={"in_reply_to": str(in_reply_to), "bound_instance": bound_instance,
              "record": record, "evaluated_ts": evaluated_ts, "window_ok": window_ok},
+        aliases={},
     )
 
 
@@ -1087,6 +1094,24 @@ def _drain_cold(
     decision (`cold_policy`, default `default_cold_policy` — every caller in
     this repo omits it, and the behaviour is then exactly as before). Returns
     the governing `outcome` string."""
+    # ALIASES first (`router/aliases.py`): every policy, the default or a
+    # custom one, sees only canonical addresses. An address the table names
+    # but cannot decide holds the whole request UNCONSUMED; one whose entry
+    # is inactive is answered here, before any policy can route it.
+    norm = aliases_mod.normalise(cfg, draft)
+    if isinstance(norm, aliases_mod.Hold):
+        aliases_mod.note_held(cfg, name, req_id, req_digest, norm.reason)
+        logger.warning("instance %r req %r: held unconsumed, alias undecidable (%s): %s",
+                       name, req_id, norm.reason, list(norm.addresses))
+        return HELD
+    if isinstance(norm, aliases_mod.Refuse):
+        result = _result_doc(req_id, "rejected", reason_code=REASON_RECIPIENT_UNKNOWN,
+                             detail=f"{len(norm.addresses)} address(es) name an alias that "
+                                    "is no longer active")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    draft, applied = dict(norm.draft), dict(norm.applied)
+    for old, new in sorted(applied.items()):
+        logger.warning("instance %r req %r: alias used: %s -> %s", name, req_id, old, new)
     # Late resolution, like the backend below: a module-level default bound at
     # def-time cannot be patched by a test that imports this module.
     policy = cold_policy if cold_policy is not None else default_cold_policy
@@ -1107,8 +1132,18 @@ def _drain_cold(
     if isinstance(decided, PeerRoute):
         return _drain_peer_route(
             cfg, name, req_id, doc, decided,
-            req_digest=req_digest, attachments=attachments,
+            req_digest=req_digest, attachments=attachments, aliases=applied,
         )
+
+    if isinstance(decided, ExternalRoute) and applied:
+        # The external leg is given the agent's own bytes, never a rewritten
+        # draft, and an alias names only a LOCAL identity: a route that would
+        # carry an alias-normalised recipient there is settled now, before
+        # anything is staged or put in flight.
+        result = _result_doc(
+            req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY, recipients=[],
+            detail="alias-normalised recipients cannot take the external leg; nothing was sent")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
 
     if isinstance(decided, ExternalRoute):
         return _begin_external(
@@ -1138,7 +1173,8 @@ def _drain_cold(
     if _any_held(cfg, recipients) and req_digest is not None:
         return _begin_pending(
             cfg, name, req_id, doc, kind="mail", recipients=recipients, pin=None,
-            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend)
+            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend,
+            aliases=applied)
 
     # Late resolution, as in `_drain_reply` above — see that comment.
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
@@ -1170,7 +1206,8 @@ def _drain_cold(
         return _begin_pending(
             cfg, name, req_id, doc, kind="mail", recipients=recipients, pin=None,
             req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend,
-            settled={**{d["recipient"]: d for d in delivered}, **{r: None for r in failed}})
+            settled={**{d["recipient"]: d for d in delivered}, **{r: None for r in failed}},
+            aliases=applied)
     ok_addrs = [address_for(d["recipient"], cfg.fleet_domain) for d in delivered]
     message_id = delivered[0]["message_id"] if len(delivered) == 1 and not failed else None
 
@@ -1357,6 +1394,7 @@ def _finish(
     replaying a stored verdict — see `REASON_REQ_ID_REUSED`."""
     _write_anchor(cfg, name, req_id, result, req_digest=req_digest,
                   transport_req_id=transport_req_id)
+    aliases_mod.clear_held(cfg, name, req_id)
     if private:
         # Settled PRIVATELY: the file under this id in the outbox is not the
         # request this verdict answers (or no longer this generation's to
@@ -1654,7 +1692,20 @@ PENDING_DIR = "pending"
 #: Version 2 carries a private snapshot of the request and its attachments
 #: (PENDING SNAPSHOTS, below); version 1 records (no snapshot) are still read.
 PENDING_VERSION = 2
-_PENDING_VERSIONS = (1, 2)
+#: A record that pins a NON-EMPTY alias map (`aliases`): an older router
+#: holds it as damaged rather than re-run its policy on the old address.
+PENDING_VERSION_ALIASED = 3
+_PENDING_VERSIONS = (1, 2, 3)
+#: Every member each version's writers and mutators have produced: version 1
+#: as held local delivery first wrote it; version 2 adds the snapshot, the source
+#: generation and the pinned sender (and, since the alias table, `aliases`
+#: with each target's `address`, both or neither); version 3 is version 2
+#: with a non-empty `aliases`. Anything else is damage.
+_PENDING_KEYS_V1 = frozenset({"v", "req_id", "request_sha256", "kind", "sender_lid",
+                              "created_ts", "block", "binding", "targets"})
+_PENDING_KEYS_V2 = _PENDING_KEYS_V1 | {"snapshot", "source_gen", "from_address", "aliases"}
+_TARGET_KEYS = frozenset({"recipient", "kind", "lid", "state", "reason", "notice_id", "ts",
+                          "message_id", "error", "recipient_gen", "address"})
 _TARGET_STATES = frozenset({"held", "ready", "delivering", "delivered", "failed"})
 _PENDING_KINDS = frozenset({"mail", "peer"})
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z")
@@ -1699,6 +1750,8 @@ def _str_or_none(v: Any) -> bool:
 def _check_target(t: Any) -> None:
     if not isinstance(t, dict) or not isinstance(t.get("recipient"), str) or not t["recipient"]:
         raise PendingDamaged("target")
+    if not set(t) <= _TARGET_KEYS:
+        raise PendingDamaged(f"target members {sorted(set(t) - _TARGET_KEYS)}")
     if t.get("state") not in _TARGET_STATES:
         raise PendingDamaged("target state")
     for k in ("lid", "reason", "message_id", "error", "recipient_gen"):
@@ -1726,7 +1779,10 @@ def _check_pending(doc: Any, req_id: str) -> Dict[str, Any]:
     """The record, or PendingDamaged. Strict: anything unexpected is damage."""
     if not isinstance(doc, dict) or doc.get("v") not in _PENDING_VERSIONS:
         raise PendingDamaged("version")
-    if doc["v"] == 2:
+    allowed = _PENDING_KEYS_V1 if doc["v"] == 1 else _PENDING_KEYS_V2
+    if not set(doc) <= allowed:
+        raise PendingDamaged(f"members {sorted(set(doc) - allowed)}")
+    if doc["v"] in (2, 3):
         snap = doc.get("snapshot")
         if not (isinstance(snap, dict) and isinstance(snap.get("nonce"), str)
                 and _HEX32.fullmatch(snap["nonce"])
@@ -1757,6 +1813,28 @@ def _check_pending(doc: Any, req_id: str) -> Dict[str, Any]:
         _check_target(t)
     if len({t["recipient"] for t in targets}) != len(targets):
         raise PendingDamaged("duplicate target")
+    # Aliases: the map and each target's address together or not at all;
+    # each address the target's own; each alias value one of them; and a
+    # non-empty map exactly when the record is version 3.
+    has_map = "aliases" in doc
+    if any(("address" in t) != has_map for t in targets):
+        raise PendingDamaged("aliases and target addresses must come together")
+    if has_map:
+        amap = doc["aliases"]
+        if not (isinstance(amap, dict) and all(isinstance(k, str) and isinstance(v, str)
+                                               for k, v in amap.items())):
+            raise PendingDamaged("aliases")
+        addrs = set()
+        for t in targets:
+            a = t["address"]
+            if not (isinstance(a, str) and a.count("@") == 1
+                    and a.split("@")[0] == t["recipient"] and a.split("@")[1]):
+                raise PendingDamaged("target address")
+            addrs.add(a)
+        if not set(amap.values()) <= addrs:
+            raise PendingDamaged("an alias maps to no target")
+    if (doc["v"] == PENDING_VERSION_ALIASED) != bool(doc.get("aliases")):
+        raise PendingDamaged("a non-empty alias map is version 3, and only it")
     pin = doc.get("binding")
     if pin is not None:
         if (not isinstance(pin, dict) or len(targets) != 1
@@ -1926,6 +2004,7 @@ def _begin_pending(
     req_digest: str, attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     deliver_backend: Optional[deliver_mod.DeliveryBackend],
     settled: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+    aliases: Mapping[str, str],
 ) -> str:
     """At least one target is held: make the request pending (durably, before
     anything is placed) and advance whatever can go now. A reply's target is
@@ -1990,10 +2069,18 @@ def _begin_pending(
         "source_gen": gen[len(generations_mod.GEN_PREFIX):] if gen else None,
         "from_address": address_for(name, cfg.fleet_domain),
         "created_ts": utc_ts(), "block": None, "binding": pin, "targets": targets,
-        "snapshot": snapshot,
+        "snapshot": snapshot, "aliases": dict(aliases),
     }
+    for t in targets:
+        t["address"] = address_for(t["recipient"], cfg.fleet_domain)
+    if aliases:
+        # An older router cannot honour a pinned alias: it would re-run its
+        # policy on the OLD address and refuse it. Version 3 makes it hold the
+        # record as damaged instead.
+        rec["v"] = PENDING_VERSION_ALIASED
     path = _pending_path(cfg, name, req_id)
     _write_pending(cfg, path, rec)
+    aliases_mod.clear_held(cfg, name, req_id)
     for t in targets:
         if t["state"] == "held":
             _audit_held(cfg, name, req_id, t)
@@ -2188,7 +2275,8 @@ def _pending_policy(
     pin = rec.get("binding")
     if pin is None:
         policy = cold_policy if cold_policy is not None else default_cold_policy
-        decided = policy(cfg, name, doc["draft"])
+        decided = policy(cfg, name, aliases_mod.apply_pinned(doc["draft"],
+                                                             _pinned_map(cfg, rec)))
         if isinstance(decided, ColdRefusal):
             return decided
         if rec["kind"] == "peer":
@@ -2209,6 +2297,22 @@ def _pending_policy(
         if not (pin["window_ok"] or binding.check_peer_edge(cfg, name, bound)):
             return ColdRefusal("rejected", REASON_PEER_REPLY_WINDOW_EXPIRED)
     return None
+
+
+def _pinned_map(cfg: RouterConfig, rec: Dict[str, Any]) -> Dict[str, str]:
+    """How a pending record's draft addresses its PINNED targets this poll:
+    each target's pin-time address, and each alias pinned to it, map to that
+    same target's address as the fleet names it NOW. So a later domain flip,
+    expiry or table edit never refuses or retargets the work; the target's
+    identity is still checked against its pinned lid (`identity_changed`).
+    A record made before aliases (no `aliases`, no addresses) maps nothing."""
+    if "aliases" not in rec:
+        return {}
+    now = {t["address"]: address_for(t["recipient"], cfg.fleet_domain) for t in rec["targets"]}
+    out = dict(now)
+    for old, new in (rec.get("aliases") or {}).items():
+        out[old] = now.get(new, new)
+    return out
 
 
 def _block(cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], why: str) -> str:

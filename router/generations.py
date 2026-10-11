@@ -1962,8 +1962,9 @@ def _run_journal(cfg: Any, name: str, journal: Dict[str, Any], report: Any) -> D
         _plan_audit(name, journal)
         _advance(cfg, journal, "complete")
     # complete: the generations file, the attestation (durable, once), then done.
-    # A run that STARTS here re-verifies every conversion outcome first: the
-    # records could have changed since the check before `complete`.
+    # Every adopt run that reaches this point re-verifies every conversion
+    # outcome first (a fresh run and one that resumes here alike): the records
+    # could have changed since the check before `complete`.
     if journal["verb"] == VERB_ADOPT:
         view = keyed(registry_mod.keyed_config(cfg, report), {name: gen_key(lid, journal["gen"])})
         _verify_conversions(view, name, journal, complete=True)

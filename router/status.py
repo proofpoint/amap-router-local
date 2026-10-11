@@ -187,6 +187,11 @@ class StatusTracker:
         None without a registry. Replaced every poll: it is state."""
         self.generations = doc
 
+    def record_aliases(self, doc: Optional[Dict[str, Any]]) -> None:
+        """This poll's alias section (`aliases.status_doc`), or None without
+        a table. Replaced every poll: it is state."""
+        self.aliases = doc
+
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that
         errored — the set the loader accepted is known even when draining it
@@ -251,6 +256,11 @@ class StatusTracker:
         # reused id, with its age and the operator hint (router/generations.py).
         if getattr(self, "generations", None) is not None:
             doc["generations"] = self.generations
+        # Present only with an alias table: each entry's decision, the store,
+        # failed tombstone writes, and every request held unconsumed with its
+        # age and remedy (router/aliases.py).
+        if getattr(self, "aliases", None) is not None:
+            doc["aliases"] = self.aliases
         # Omitted, never defaulted, when this tracker cannot answer. A
         # consumer distinguishes "a router older than this field" from a
         # wrong value only if the absence is real.

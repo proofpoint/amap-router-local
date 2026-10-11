@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import aliases as aliases_mod
 from . import generations, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
 from .config import RouterConfig
 from .config import ConfigError, load
@@ -148,6 +149,9 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
     # its logical_id from here on (`registry.keyed_config`), and its
     # generation-scoped state by its current generation.
     cfg = generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys)
+    # The alias table's decisions for this poll, store settled and expired
+    # entries tombstoned, BEFORE any drain (router/aliases.py).
+    cfg = aliases_mod.attach(cfg, report)
     summary: Dict[str, Dict[str, int]] = {}
     for name in sorted(cfg.instances):
         if report.state != "off" and name not in report.resolved:
@@ -254,6 +258,12 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
                     report))
             except Exception:
                 logger.exception("error reading generations for status — isolated")
+            try:
+                tracker.record_aliases(aliases_mod.status_doc(
+                    generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys),
+                    report))
+            except Exception:
+                logger.exception("error reading aliases for status — isolated")
     except Exception:
         logger.exception(
             "error running a full poll — isolated, continuing the loop"
