@@ -881,8 +881,16 @@ def drain_dsn_queue(cfg: RouterConfig, name: str, summary: Dict[str, Any]) -> Li
         except Exception as e:  # noqa: BLE001 — kept and retried, never dropped
             reason = f"failing: {type(e).__name__}"
             if intent.get("reason") != reason:
-                intent["reason"] = reason
-                _write_intent(cfg, path, intent)
+                updated = dict(intent, reason=reason)
+                try:
+                    _write_intent(cfg, path, updated)
+                except OSError as w:
+                    # The reason could not be recorded: this intent keeps its
+                    # frozen on-disk state, is reported, and the pass goes on
+                    # to its neighbours.
+                    logger.warning("instance %r: could not record why DSN intent %s "
+                                   "failed (%s: %s)", name, fn, type(w).__name__, w)
+                    reason = "barrier_failed"
             logger.warning("instance %r: DSN to %r for peer notice %s failed (%s: %s) — "
                            "kept for retry", name, intent["sender"], intent["notice_id"],
                            type(e).__name__, e)
@@ -890,8 +898,18 @@ def drain_dsn_queue(cfg: RouterConfig, name: str, summary: Dict[str, Any]) -> Li
             waiting.append(_held_entry(intent, reason))
             continue
         summary["peer_dsn_sent"] += 1
-        os.unlink(path)
-        fsync_dir(d)
+        try:
+            os.unlink(path)
+            fsync_dir(d)
+        except OSError as e:
+            # Placed; the removal is not yet durable. A replay offers the SAME
+            # id (at least once); the pass goes on to the neighbours.
+            logger.warning("instance %r: DSN intent %s placed but its removal is not "
+                           "durable (%s: %s)", name, fn, type(e).__name__, e)
     if last is not None and len(names) > MAX_DSN_PER_POLL:
-        atomic_write(cursor_path, last.encode("utf-8"), durable_root=cfg.state_dir)
+        try:
+            atomic_write(cursor_path, last.encode("utf-8"), durable_root=cfg.state_dir)
+        except OSError as e:
+            logger.warning("instance %r: DSN cursor not advanced (%s: %s)",
+                           name, type(e).__name__, e)
     return waiting

@@ -232,6 +232,10 @@ M = [
   '            except OSError:\n                out.append(e.name)            # unreadable: cannot be shown empty\n                break',
   '            except OSError:\n                continue',
   ['router.tests.test_held_local.StrandedFailsClosedTests']),
+ ('N13 failing-DSN reason write not isolated', 'router/outcomes.py',
+  '                try:\n                    _write_intent(cfg, path, updated)\n                except OSError as w:',
+  '                try:\n                    _write_intent(cfg, path, updated)\n                except ZeroDivisionError as w:',
+  ['router.tests.test_held_local.DsnErrorUpdateIsolatedTests']),
 ]
 
 

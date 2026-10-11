@@ -1384,3 +1384,48 @@ class StrandedFailsClosedTests(RouterTestCase):
         # The twins: readable and empty, or missing, is NOT stranded.
         self.assertEqual(registry.report_for(None, self.state_dir, ["alpha"]).state, "off")
         self.assertEqual(registry.report_for(None, self.tmp / "nowhere", ["alpha"]).state, "off")
+
+
+
+class DsnErrorUpdateIsolatedTests(_Fleet):
+    """A failing DSN whose reason cannot be recorded (a backend error, then
+    the update's own write failing BEFORE its rename) is isolated to that
+    intent: its on-disk state stays frozen, it is reported, and a healthy
+    neighbour is still delivered."""
+
+    def test_a_neighbour_is_delivered_while_one_intent_fails_twice_over(self):
+        nids = []
+        for req in ("00000001", "00000002"):
+            write_request(self.cfg, "alpha", req, to=[addr("delta")])
+            self.poll()
+            nids.append(self.result("alpha", req)["message_id"])
+        self.hold("not_registered", "alpha")
+        for nid in nids:
+            write_outcome(self.cfg, "delta", nid, "denied")
+        self.poll()
+        d = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        names = sorted(p.name for p in d.glob("*.json"))
+        first, second = d / names[0], d / names[1]
+        failing_nid = json.loads(first.read_text())["notice_id"]
+        frozen = first.read_bytes()
+        healthy_id = json.loads(second.read_text())["dsn_notice_id"]
+        self.recover("not_registered", "alpha")
+        real_dsn, real_write = outcomes._dsn, outcomes.atomic_write
+
+        def dsn(cfg, sender, recipient, notice_id, outcome, **kw):
+            if notice_id == failing_nid:
+                raise OSError(5, "backend EIO")
+            return real_dsn(cfg, sender, recipient, notice_id, outcome, **kw)
+
+        def write(path, data, **kw):
+            if Path(path) == first and b'"failing:' in data:
+                raise OSError(5, "EIO at the temp file's fsync, before the rename")
+            return real_write(path, data, **kw)
+        with mock.patch.object(outcomes, "_dsn", dsn), \
+                mock.patch.object(outcomes, "atomic_write", write):
+            for _ in range(3):
+                summary = self.poll()
+        self.assertEqual(list_notices(self.cfg, "alpha"), [f"notice-{healthy_id}.json"])
+        self.assertEqual(first.read_bytes(), frozen, "the failing intent's state changed")
+        self.assertIn({"notice_id": failing_nid, "outcome": "denied", "target": "alpha",
+                       "reason": "barrier_failed"}, summary["delta"]["dsn_held"])
