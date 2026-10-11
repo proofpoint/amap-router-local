@@ -2357,6 +2357,18 @@ KEPT_CHANGED = "kept_v1_request_changed"
 KEPT_ATTACHMENTS = "kept_v1_attachments_changed"
 
 
+def pending_version(cfg: RouterConfig, name: str, req_id: str) -> Any:
+    """A pending record's version (1 or 2), "damaged" when it cannot be
+    trusted, or None when there is none."""
+    path = _pending_path(cfg, name, req_id)
+    if not os.path.lexists(path):
+        return None
+    try:
+        return _read_pending(path, req_id)["v"]
+    except PendingDamaged:
+        return "damaged"
+
+
 def convert_v1_pending(cfg: RouterConfig, name: str, req_id: str) -> str:
     """`router generation adopt` only, under the drain lock, with `cfg`
     keyed to the adopted generation: give a version-1 pending record its

@@ -979,7 +979,8 @@ def check_journal(doc: Any, logical_id: str) -> None:
          "source binding")
     known = isinstance(r, dict) and set(r) == {"path", "st_dev", "st_ino"} \
         and isinstance(r["path"], str)
-    need(known and (all(isinstance(r[k], int) for k in ("st_dev", "st_ino"))
+    need(known and (all(isinstance(r[k], int) and not isinstance(r[k], bool)
+                        for k in ("st_dev", "st_ino"))
                     or (verb == VERB_FENCE_LEGACY and r["st_dev"] is None
                         and r["st_ino"] is None)), "source root")
     names = []
@@ -987,9 +988,10 @@ def check_journal(doc: Any, logical_id: str) -> None:
         need(isinstance(p, dict) and p.get("name") in GEN_SCOPED
              and p.get("type") in ("dir", "file")
              and set(p) <= {"name", "type", "digest"}, "a planned path")
-        if "digest" in p:
-            need(p["type"] == "file" and p["name"] in _DIGESTED
-                 and isinstance(p["digest"], str) and bool(_HEX64.fullmatch(p["digest"])),
+        digested = p["type"] == "file" and p["name"] in _DIGESTED
+        need(("digest" in p) == digested, "a digest is planned exactly for a digested file")
+        if digested:
+            need(isinstance(p["digest"], str) and bool(_HEX64.fullmatch(p["digest"])),
                  "a planned digest")
         names.append(p["name"])
     need(len(set(names)) == len(names), "a path planned twice")
@@ -1003,8 +1005,11 @@ def check_journal(doc: Any, logical_id: str) -> None:
              and fs["source"] in ("first-seen.json", "approval.json"), "first_seen")
     if "converted" in doc:
         c = doc["converted"]
-        need(isinstance(c, dict) and all(isinstance(k, str) and isinstance(v, str)
-                                         for k, v in c.items()), "converted")
+        need(isinstance(c, dict) and all(
+            isinstance(k, str) and bool(_REQ_ID.fullmatch(k)) and v in CONVERSION_OUTCOMES
+            for k, v in c.items()), "converted")
+        if phase != "renamed":
+            need(CONVERTING not in c.values(), "a conversion left undecided past its phase")
     if verb == VERB_ADOPT:
         need("first_sight" in doc, "an adopt journal without its first-sight plan")
         f = doc["first_sight"]
@@ -1016,6 +1021,8 @@ def check_journal(doc: Any, logical_id: str) -> None:
                            and isinstance(m["text"], str)
                            and hashlib.sha256(m["text"].encode("utf-8")).hexdigest()
                            == m["sha256"]), "first_sight marker")
+        if m is not None:
+            check_marker_text(m["text"], doc["name"], fs)
         need((m is None) == ("first-seen.json" in names),
              "a marker is planned exactly when none is moved")
     if "blocker" in doc:
@@ -1035,6 +1042,7 @@ def check_journal(doc: Any, logical_id: str) -> None:
         want = planned_fields(doc["name"], doc)
         need(isinstance(planned, dict) and planned.get("event") == audit_mod.EVENT_MIGRATION
              and planned.get("instance") == doc["name"]
+             and parse_utc_ts(planned.get("ts")) is not None
              and {k: planned.get(k) for k in want} == want
              and set(planned) == set(want) | {"ts", "event", "instance"},
              "the planned attestation line does not carry the journal's facts")
@@ -1285,6 +1293,9 @@ _RESULT_OPTIONAL = frozenset({"recipients", "attachments"})
 _OUTCOMES = frozenset({"accepted", "queued_for_human", "rejected"})
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 LOCAL, TRANSPORT, MALFORMED = "local", "transport", "malformed"
+#: A request id (`validate._REQ_ID_RE`) and a manifest line `"<req_id> <sha256>"`.
+_REQ_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+_MANIFEST_LINE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]* [0-9a-f]{64}\Z")
 TRANSPORT_DETAIL_PREFIX = "transport: "
 REASON_TRANSPORT_ANOMALY = "transport_anomaly"
 #: How a migrated generation's transport counter is known (`legacy.basis`).
@@ -1453,7 +1464,8 @@ def check_legacy(rec: Any, manifest: Any) -> None:
         raise ValueError("a count is not a non-negative integer")
     if n["positive_evidence_count"] != n["transport"] + n["inflight"]:
         raise ValueError("positive_evidence_count is not transport + inflight")
-    if not (isinstance(manifest, list) and all(isinstance(x, str) for x in manifest)
+    if not (isinstance(manifest, list)
+            and all(isinstance(x, str) and _MANIFEST_LINE.fullmatch(x) for x in manifest)
             and manifest == sorted(manifest) and len(manifest) == n["local"]
             and manifest_digest(manifest) == rec["manifest_sha256"]):
         raise ValueError("the manifest does not match its record")
@@ -1804,6 +1816,36 @@ def _new_journal(cfg: Any, name: str, verb: str, reason: str, lid: str, entry: A
     return journal
 
 
+def marker_from_approval(approval: Mapping[str, Any], name: str) -> str:
+    """The first-sight marker text a pre-generation router's upgrade made
+    from `approval.json`: the approval's members, with the marker schema,
+    the instance, `first_seen_ts` = `approved_ts` verbatim, and
+    `adopted_from`."""
+    from . import firstsight
+    doc = dict(approval)
+    doc.update(schema=firstsight.SCHEMA, instance=name,
+               first_seen_ts=approval["approved_ts"], adopted_from="approval.json")
+    return json.dumps(doc, sort_keys=True)
+
+
+def check_marker_text(text: str, name: str, first_seen: Optional[Mapping[str, Any]]) -> None:
+    """A planned marker's meaning, not just its hash: a marker for `name`
+    adopted from an approval, carrying the journal's first sight (its ts as
+    the approval's `approved_ts`, its root) and a list snapshot. ValueError
+    otherwise."""
+    from . import firstsight
+    doc = strict_json(text.encode("utf-8"))
+    if not (isinstance(doc, dict) and first_seen is not None
+            and first_seen["source"] == "approval.json"
+            and doc.get("schema") == firstsight.SCHEMA and doc.get("instance") == name
+            and doc.get("adopted_from") == "approval.json"
+            and doc.get("first_seen_ts") == first_seen["first_seen_ts"]
+            and doc.get("approved_ts") == first_seen["first_seen_ts"]
+            and doc.get("declared_root") == first_seen["declared_root"]
+            and isinstance(doc.get("outbox_snapshot"), list)):
+        raise ValueError("the planned marker does not carry the journal's first sight")
+
+
 def _plan_first_sight(cfg: Any, name: str, lid: str, marker: Mapping[str, Any],
                       paths: List[Dict[str, Any]]) -> Dict[str, Any]:
     """adopt: the adopted generation's first-sight record. Its sentinel
@@ -1817,10 +1859,7 @@ def _plan_first_sight(cfg: Any, name: str, lid: str, marker: Mapping[str, Any],
     if any(p["name"] == "first-seen.json" for p in paths):
         return out
     approval = strict_json((lid_dir(cfg.state_dir, lid) / "approval.json").read_bytes())
-    doc = dict(approval)
-    doc.update(schema=firstsight.SCHEMA, instance=name,
-               first_seen_ts=approval["approved_ts"], adopted_from="approval.json")
-    text = json.dumps(doc, sort_keys=True)
+    text = marker_from_approval(approval, name)
     out["marker"] = {"text": text, "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
     return out
 
@@ -1833,6 +1872,12 @@ def _write_first_sight(state_dir: Path, journal: Mapping[str, Any]) -> None:
     plan = journal["first_sight"]
     files = [(d / firstsight.FIRST_SIGHT_TAKEN, plan["sentinel"].encode("utf-8"))]
     if plan["marker"] is not None:
+        try:
+            approval = strict_json((d / "approval.json").read_bytes())
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            raise MigrationConflict(f"the moved approval.json cannot be read: {e}") from None
+        if marker_from_approval(approval, journal["name"]) != plan["marker"]["text"]:
+            raise MigrationConflict("the planned marker is not the one the approval makes")
         files.append((d / "first-seen.json", plan["marker"]["text"].encode("utf-8")))
     for path, data in files:
         kind = _kind(path)
@@ -1906,6 +1951,9 @@ def _run_journal(cfg: Any, name: str, journal: Dict[str, Any], report: Any) -> D
         _place_blocker(state_dir, lid, journal)
         _advance(cfg, journal, "blocked")
     if journal["phase"] == "blocked":
+        if journal["verb"] == VERB_ADOPT:
+            view = keyed(registry_mod.keyed_config(cfg, report), {name: gen_key(lid, journal["gen"])})
+            _verify_conversions(view, name, journal, complete=True)
         if journal["verb"] == VERB_FENCE_LEGACY:
             start = successor_counter(gen_dir(state_dir, lid, journal["gen"]),
                                       journal["legacy"], journal["manifest"])
@@ -1942,6 +1990,40 @@ def _run_journal(cfg: Any, name: str, journal: Dict[str, Any], report: Any) -> D
 
 #: A conversion journaled as begun and not yet decided.
 CONVERTING = "converting"
+#: Every value `converted` may record (`outbound.convert_v1_pending`'s
+#: outcomes, and CONVERTING), and the durable record version each implies.
+_OUTCOME_VERSION = {"converted": 2, "already_v2": 2, "kept_v1_damaged": "damaged",
+                    "kept_v1_request_unreadable": 1, "kept_v1_request_changed": 1,
+                    "kept_v1_attachments_changed": 1}
+CONVERSION_OUTCOMES = frozenset(_OUTCOME_VERSION) | {CONVERTING}
+
+
+def _verify_conversions(view: Any, name: str, journal: Mapping[str, Any], *,
+                        complete: bool) -> None:
+    """Each recorded conversion outcome against the record it describes:
+    "converted" and "already_v2" a version-2 record, a kept one version 1,
+    "kept_v1_damaged" one that cannot be read (`outbound.pending_version`).
+    With `complete`, every pending record has a decided outcome."""
+    from . import outbound as outbound_mod
+    d = gen_dir(view.state_dir, journal["logical_id"], journal["gen"]) / "pending"
+    done = journal.get("converted") or {}
+    try:
+        present = sorted(e.name[:-len(".json")] for e in os.scandir(d)
+                         if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
+    except FileNotFoundError:
+        present = []
+    for req_id, outcome in done.items():
+        if outcome == CONVERTING:
+            if complete:
+                raise MigrationConflict(f"pending {req_id}: its conversion was never decided")
+            continue
+        if outbound_mod.pending_version(view, name, req_id) != _OUTCOME_VERSION[outcome]:
+            raise MigrationConflict(f"pending {req_id}: recorded {outcome!r}, but the record "
+                                    "does not show it")
+    if complete:
+        missing = [r for r in present if r not in done]
+        if missing:
+            raise MigrationConflict(f"pending records with no conversion outcome: {missing}")
 
 
 def _convert_pending(view: Any, name: str, journal: Dict[str, Any]) -> None:
@@ -1953,6 +2035,7 @@ def _convert_pending(view: Any, name: str, journal: Dict[str, Any]) -> None:
     from . import outbound as outbound_mod
     d = gen_dir(view.state_dir, journal["logical_id"], journal["gen"])
     done = journal.setdefault("converted", {})
+    _verify_conversions(view, name, journal, complete=False)
     try:
         names = sorted(e.name for e in os.scandir(d / "pending")
                        if e.name.endswith(".json") and e.is_file(follow_symlinks=False))

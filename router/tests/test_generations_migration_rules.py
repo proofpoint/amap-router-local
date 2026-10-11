@@ -8,6 +8,7 @@ breaks each rule in the source and names the test that must go red.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -801,3 +802,114 @@ class ConversionIntentTests(_Legacy):
         self.assertEqual(self.journal().get("converted"), {REQ: generations.CONVERTING})
         self.migrate()
         self.assertEqual(self.journal()["converted"], {REQ: outbound.CONVERTED})
+
+
+class SchemaRoundThreeTests(_Legacy):
+    """Decision fields bound to what they decide (review round 3)."""
+
+    def write_raw(self, j):
+        generations.journal_path(self.state_dir, LIDS["alpha"]).write_text(json.dumps(j))
+
+    def planned(self, approval_only=False):
+        self.poll()
+        self.to_legacy()
+        if approval_only:
+            m = json.loads((self.lid() / "first-seen.json").read_text())
+            (self.lid() / "first-seen.json").unlink()
+            (self.lid() / "approval.json").write_text(json.dumps(
+                {"approved_ts": "2026-01-01T00:00:00Z", "declared_root": m["declared_root"],
+                 "outbox_snapshot": []}))
+        with mock.patch.object(generations, "_move_paths", side_effect=Crash("after plan")):
+            self.expect(Crash, self.migrate)
+        return self.journal()
+
+    def refused_by_reader(self, j, why):
+        self.write_raw(j)
+        e = self.expect(generations.GenerationHeld, generations.read_journal,
+                        self.state_dir, LIDS["alpha"])
+        self.assertIn(why, str(e))
+
+    def test_a_digested_file_must_carry_its_digest(self):
+        j = self.planned()
+        next(p for p in j["paths"] if p["name"] == "first-seen.json").pop("digest")
+        self.refused_by_reader(j, "digest is planned exactly")
+
+    def test_a_planned_marker_must_mean_the_journals_first_sight(self):
+        j = self.planned(approval_only=True)
+        text = json.dumps({"broken": True})
+        j["first_sight"]["marker"] = {"text": text, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+        self.refused_by_reader(j, "first sight")
+
+    def test_a_planned_marker_must_be_the_one_the_approval_makes(self):
+        j = self.planned(approval_only=True)
+        doc = json.loads(j["first_sight"]["marker"]["text"])
+        doc["extra"] = "not from the approval"
+        text = json.dumps(doc, sort_keys=True)
+        j["first_sight"]["marker"] = {"text": text, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+        self.write_raw(j)
+        self.assertIn("approval makes", str(self.refuse()))
+
+    def pending_v1_stopped_before_conversion(self):
+        self.make_pending()
+        self.to_legacy()
+        self.to_v1()
+        with mock.patch.object(generations, "_convert_pending", side_effect=Crash("before")):
+            self.expect(Crash, self.migrate)
+        return self.journal()
+
+    def test_a_forged_outcome_is_checked_against_the_record(self):
+        j = self.pending_v1_stopped_before_conversion()
+        j["converted"] = {REQ: outbound.CONVERTED}
+        self.write_raw(j)
+        self.assertIn("does not show it", str(self.refuse()))
+
+    def test_outcomes_are_a_closed_vocabulary(self):
+        j = self.pending_v1_stopped_before_conversion()
+        j["converted"] = {REQ: "whatever"}
+        self.refused_by_reader(j, "converted")
+
+    def test_an_undecided_conversion_past_its_phase_is_refused(self):
+        j = self.pending_v1_stopped_before_conversion()
+        j["converted"] = {REQ: generations.CONVERTING}
+        j["phase"] = "converted"
+        self.refused_by_reader(j, "undecided")
+
+    def test_every_pending_record_needs_an_outcome_before_complete(self):
+        self.make_pending()
+        self.to_legacy()
+        self.to_v1()
+        real = generations._advance
+
+        def advance(cfg, journal, phase):
+            real(cfg, journal, phase)
+            if phase == "converted":
+                raise Crash(phase)
+        with mock.patch.object(generations, "_advance", advance):
+            self.expect(Crash, self.migrate)
+        j = self.journal()
+        j["converted"] = {}
+        self.write_raw(j)
+        self.assertIn("no conversion outcome", str(self.refuse()))
+
+    def test_the_planned_line_needs_a_timestamp(self):
+        self.poll()
+        self.to_legacy()
+        with mock.patch.object(generations, "commit_audit", side_effect=OSError(5, "crash")):
+            self.refuse()
+        j = self.journal()
+        line = json.loads(j["audit_line"])
+        line["ts"] = None
+        j["audit_line"] = json.dumps(line, sort_keys=True) + "\n"
+        self.refused_by_reader(j, "carry the journal")
+
+    def test_a_bool_root_identity_is_refused(self):
+        j = self.planned()
+        j["source"]["root"]["st_dev"] = True
+        self.refused_by_reader(j, "source root")
+
+    def test_manifest_lines_are_canonical(self):
+        j = self.planned()
+        j["manifest"] = ["not a canonical line"]
+        j["legacy"].update(local=1, basis="counter",
+                           manifest_sha256=generations.manifest_digest(j["manifest"]))
+        self.refused_by_reader(j, "manifest")
