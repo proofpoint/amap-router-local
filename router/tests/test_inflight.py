@@ -629,9 +629,9 @@ def _fd_target(fd):
     return kind, os.readlink(f"/proc/self/fd/{fd}")
 
 
-class DurabilityBarrierTests(_InflightCase):
-    """Barriers at the real `os.fsync` boundary, not at `_effect`: the bug
-    was that `_effect` ran and NO fsync happened inside it."""
+class _FsyncSpyCase(_InflightCase):
+    """Records each real `os.fsync` (with its target) and each transport
+    write, in order, optionally failing chosen fsyncs."""
 
     def setUp(self):
         super().setUp()
@@ -655,6 +655,11 @@ class DurabilityBarrierTests(_InflightCase):
 
         return (mock.patch("router.util.os.fsync", fsync),
                 mock.patch.object(FakeTransport, "write_request", write_request))
+
+
+class DurabilityBarrierTests(_FsyncSpyCase):
+    """Barriers at the real `os.fsync` boundary, not at `_effect`: the bug
+    was that `_effect` ran and NO fsync happened inside it."""
 
     def test_counter_and_record_are_durable_before_the_transport_write(self):
         """On the commit before this test there were ZERO fsyncs before the
@@ -768,3 +773,100 @@ class DurabilityBarrierTests(_InflightCase):
         self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
         self.assertTrue(processed_path(self.cfg, "alice", "00000001").exists())
         self.assertEqual(len(self.port.writes), 1)
+
+
+class RetryRepairsBarrierTests(_FsyncSpyCase):
+    """A barrier that failed AFTER its rename is repaired by the retry, not
+    taken as done because the name exists."""
+
+    def test_a_settlement_whose_directory_fsync_failed_is_made_durable_before_cleanup(self):
+        """THE WITNESS (P1): the private result's directory fsync fails after
+        its rename. On the commit before this test the next poll saw the
+        file, took it as settled, and removed the record with no fsync of the
+        result at all."""
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        self.port.send_all(recipients=[EXT])
+        private = outbound._private_result_path(self.cfg, "alice", "00000001")
+        state = {"failed": False}
+
+        def fail(target):
+            if target == ("dir", str(private.parent)) and not state["failed"]:
+                state["failed"] = True
+                return True
+            return False
+
+        a, b = self._spy([], fail=fail)
+        with a, b:
+            self.drain()
+        self.assertTrue(state["failed"], "the injected failure never fired")
+        self.assertTrue(private.exists(), "the rename did not happen; wrong boundary")
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
+
+        events = []
+        real_unlink = Path.unlink
+        record = str(inflight.record_path(self.cfg, "alice", "00000001"))
+
+        def unlink(path, *a, **k):
+            if str(path) == record:
+                events.append(("unlink-record",))
+            return real_unlink(path, *a, **k)
+
+        a, b = self._spy(events)
+        with a, b, mock.patch.object(Path, "unlink", unlink):
+            self.drain()
+        cut = events.index(("unlink-record",))
+        synced = [e[1:] for e in events[:cut] if e[0] == "fsync"]
+        self.assertIn(("file", str(private)), synced)
+        self.assertIn(("dir", str(private.parent)), synced)
+        self.assertEqual(self.result()["outcome"], "accepted")
+        self.assertTrue(processed_path(self.cfg, "alice", "00000001").exists())
+        self.assertEqual(self.port.writes, ["00000001"], "sent again")
+
+    def test_an_invalid_anchor_keeps_the_record_and_never_resends(self):
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        self.port.send_all(recipients=[EXT])
+        private = outbound._private_result_path(self.cfg, "alice", "00000001")
+        private.parent.mkdir(parents=True, exist_ok=True)
+        private.write_text("{not json")
+        with self.assertLogs("amap_router_local.outbound", logging.ERROR):
+            self.drain()
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
+        self.assertEqual(private.read_text(), "{not json", "the anchor was rewritten")
+        self.assertEqual(self.port.writes, ["00000001"])
+
+    def test_a_failed_ancestor_barrier_is_repaired_by_the_next_write(self):
+        """THE WITNESS (P2), through the real counter write: the first
+        allocation creates state_dir/alice/transport/ and the fsync of
+        state_dir fails. On the commit before this test the retry synced
+        only the parent of the destination directory, so state_dir's entry
+        for alice/ was never made durable."""
+        state_dir = str(self.cfg.state_dir.resolve())
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        state = {"failed": False}
+
+        def fail(target):
+            if target == ("dir", state_dir) and not state["failed"]:
+                state["failed"] = True
+                return True
+            return False
+
+        a, b = self._spy([], fail=fail)
+        with a, b:
+            self.drain()
+        self.assertTrue(state["failed"], "the injected failure never fired")
+        self.assertEqual(self.port.writes, [])
+
+        events = []
+        a, b = self._spy(events)
+        with a, b:
+            self.drain()
+        self.assertEqual(len(self.port.writes), 1)
+        # Cut at the COUNTER's own file fsync: before it, only the counter
+        # write has run, so the chain cannot have come from the record's.
+        cut = next(i for i, e in enumerate(events) if e[0] == "fsync" and e[1] == "file"
+                   and os.path.basename(e[2]).startswith("next_req_id."))
+        dirs = [e[2] for e in events[:cut] if e[0] == "fsync" and e[1] == "dir"]
+        for d in (state_dir, os.path.join(state_dir, "alice")):
+            self.assertIn(d, dirs)

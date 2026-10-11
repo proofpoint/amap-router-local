@@ -90,8 +90,15 @@ send it twice. Neither guess is safe, so it fails closed: settled
 over again and never settled from the trace.
 
 DURABILITY. Every write here goes through `util.atomic_write`, which fsyncs
-the file and its directory, and the record is removed only after the
-settlement was written that way. That is necessary for durability and is not
+the file and its directory, with `durable_root=state_dir`, so every
+directory between `state_dir` and the file is re-established on each write
+and a barrier that failed on an earlier attempt is repaired by the next.
+The record is removed only after the settlement was written that way. When
+a later poll finds the settlement already there (a crash, or a directory
+fsync that failed after its rename), it validates that private result and
+fsyncs it and its directory again BEFORE removing the record
+(`_redurabilise`); existing is not proof of durable, and the request is
+never sent again. That is necessary for durability and is not
 by itself a claim that this scaffold is power-loss safe: the filesystem
 underneath must honour fsync too, and nothing here measures that. Showing
 it for a real transport is a separate, later step.
@@ -109,6 +116,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
@@ -215,7 +223,8 @@ def allocate_transport_req_id(cfg: RouterConfig, name: str) -> str:
         if not _COUNTER_RE.match(text):
             raise CounterCorrupt(f"{path}: not a positive decimal; refusing to reuse ids")
         n = int(text)
-    _effect("counter", atomic_write, path, str(n + 1).encode("ascii"))
+    _effect("counter", atomic_write, path, str(n + 1).encode("ascii"),
+            durable_root=cfg.state_dir)
     return f"{n:08d}"
 
 
@@ -238,6 +247,7 @@ def begin(
     _effect(
         "record", atomic_write, record_path(cfg, name, req_id),
         json.dumps(record, sort_keys=True).encode("utf-8"),
+        durable_root=cfg.state_dir,
     )
     return record
 
@@ -373,14 +383,20 @@ def advance(
     port: TransportPort,
     *, settle: Callable[[Dict[str, Any], Optional[str]], Any],
     already_settled: bool,
+    anchor: Optional[Path] = None,
 ) -> str:
     """One step for one record (module docstring's table). `settle(verdict,
     digest)` writes the agent's one result; `already_settled` says the
-    private result exists already (a crash after settling). Returns the
-    state reached."""
+    private result exists already (a crash, or a failed barrier, after
+    settling). `anchor` is that private result's path: before the record is
+    removed on its strength, it is validated and made durable again
+    (`_redurabilise`), because its existence alone does not prove it
+    survives a power loss. Returns the state reached."""
     path = record_path(cfg, name, req_id)
     handed = handed_path(cfg, name, req_id)
     if already_settled:
+        if anchor is not None:
+            _effect("anchor", _redurabilise, anchor)
         _effect("unlink", _cleanup, path, handed)
         return CLEANED
 
@@ -432,9 +448,43 @@ def advance(
     if port.has_result(n):
         return from_result()
     data = transport_request_bytes(cfg, name, record)
-    _effect("handed", atomic_write, handed, n.encode("ascii"))
+    _effect("handed", atomic_write, handed, n.encode("ascii"),
+            durable_root=cfg.state_dir)
     _effect("transport", port.write_request, n, data)
     return WRITTEN
+
+
+class AnchorInvalid(Exception):
+    """The private result a record would be cleaned up on is not a frozen
+    `{"digest", "result"}` envelope. Raised, and the record is kept: it is
+    never rewritten here, and the request is never sent again."""
+
+
+def _redurabilise(anchor: Path) -> None:
+    """Validate the existing private result and fsync it, then its
+    directory. A settle whose directory fsync failed AFTER the rename leaves
+    a result that exists and may not survive a power loss; removing the
+    record on the strength of its existence alone would lose both. Any
+    failure raises, so the record stays for the next poll."""
+    fd = os.open(str(anchor), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        try:
+            doc = json.loads(b"".join(chunks).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise AnchorInvalid(f"{anchor}: not JSON") from e
+        if not (isinstance(doc, dict) and "digest" in doc
+                and isinstance(doc.get("result"), dict)):
+            raise AnchorInvalid(f"{anchor}: not a {{digest, result}} envelope")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_dir(anchor.parent)
 
 
 def _was_handed(handed: Path, n: str) -> bool:

@@ -109,6 +109,44 @@ class AtomicWriteBarrierTests(unittest.TestCase):
         self.assertIn(str(self.root), dirs)  # d/ existed before the write
         self.assertIn(str(self.dest.parent), dirs)
 
+    def test_with_a_durable_root_a_failed_ancestor_barrier_is_repaired(self):
+        """Creating root/a/b fails at the FIRST parent fsync and leaves both
+        directories. The retry re-establishes the whole chain from the root,
+        though it creates nothing."""
+        self.dest = self.root / "a" / "b" / "f.json"
+        state = {"failed": False}
+
+        def fail(t):
+            if t == ("dir", str(self.root)) and not state["failed"]:
+                state["failed"] = True
+                return True
+            return False
+
+        events = []
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            t = _target(fd)
+            if fail(t):
+                raise OSError(5, "injected")
+            events.append(t)
+            return real_fsync(fd)
+
+        with mock.patch("router.util.os.fsync", fsync):
+            with self.assertRaises(OSError):
+                util.atomic_write(self.dest, b"new", durable_root=self.root)
+            self.assertTrue((self.root / "a" / "b").is_dir())
+            events.clear()
+            util.atomic_write(self.dest, b"new", durable_root=self.root)
+        dirs = [p for k, p in events if k == "dir"]
+        for d in (self.root, self.root / "a", self.root / "a" / "b"):
+            self.assertIn(str(d), dirs)
+        self.assertEqual(self.dest.read_bytes(), b"new")
+
+    def test_a_durable_root_must_contain_the_destination(self):
+        with self.assertRaises(ValueError):
+            util.atomic_write(self.dest, b"x", durable_root=self.root / "elsewhere")
+
     def test_fsync_dir_propagates_errors(self):
         with mock.patch("router.util.os.fsync", side_effect=OSError(5, "x")):
             with self.assertRaises(OSError):

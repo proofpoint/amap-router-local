@@ -1107,9 +1107,10 @@ def _advance_one(
         result = _result_doc(req_id, **verdict)
         return _finish(cfg, name, req_id, result, req_digest=digest)
 
+    anchor = _private_result_path(cfg, name, req_id)
     return inflight_mod.advance(
         cfg, name, req_id, record, transport, settle=settle,
-        already_settled=_private_result_path(cfg, name, req_id).is_file(),
+        already_settled=anchor.is_file(), anchor=anchor,
     )
 
 
@@ -1192,7 +1193,8 @@ def _finish(
     replaying a stored verdict — see `REASON_REQ_ID_REUSED`."""
     private_path = _private_result_path(cfg, name, req_id)
     envelope = {"digest": req_digest, "result": result}
-    atomic_write(private_path, json.dumps(envelope, sort_keys=True).encode("utf-8"))
+    atomic_write(private_path, json.dumps(envelope, sort_keys=True).encode("utf-8"),
+                 durable_root=cfg.state_dir)
     result_bytes = json.dumps(result, sort_keys=True).encode("utf-8")
     _publish_result_and_archive(cfg, name, req_id, result_bytes)
     return result["outcome"]

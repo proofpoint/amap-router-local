@@ -91,12 +91,31 @@ def fsync_dir(path: Union[str, Path]) -> None:
         os.close(fd)
 
 
-def _mkdir_durable(path: Path) -> None:
-    """`mkdir -p`, then fsync the parent of every directory it created AND of
-    `path` itself, so the directory entry is fsynced along with what is
-    written in it. `path`'s parent is fsynced even when `path` already
-    existed: an earlier creator whose fsync failed leaves a directory that
-    exists but may not be durable, and existing is not proof."""
+def _mkdir_durable(path: Path, durable_root: Optional[Path] = None) -> None:
+    """`mkdir -p`, then make the directory entries durable.
+
+    With `durable_root` (a directory the caller knows is durable, such as a
+    deployment-created `state_dir`): EVERY directory from `durable_root` down
+    to `path` is fsynced into its parent, on every call. Whether this call
+    created them does not matter. An earlier attempt whose fsync failed left
+    directories that exist but may not be durable, at any depth, and only
+    re-establishing the whole chain from a known-durable root repairs that.
+    `path` must be `durable_root` or under it (ValueError otherwise).
+
+    Without it: the parent of every directory this call created, and of
+    `path` itself, is fsynced. That does NOT repair a failed barrier higher
+    up the chain from an earlier attempt; callers that need that pass
+    `durable_root`."""
+    if durable_root is not None:
+        root = Path(os.path.abspath(durable_root))
+        target = Path(os.path.abspath(path))
+        rel = target.relative_to(root)  # ValueError when outside the root
+        target.mkdir(parents=True, exist_ok=True)
+        d = root
+        for part in rel.parts:
+            fsync_dir(d)
+            d = d / part
+        return
     missing = []
     p = path
     while not p.exists():
@@ -113,7 +132,8 @@ def _mkdir_durable(path: Path) -> None:
 
 
 def atomic_write(path: Union[str, Path], data: bytes, *,
-                 make_parents: bool = True, mode: Optional[int] = None) -> None:
+                 make_parents: bool = True, mode: Optional[int] = None,
+                 durable_root: Optional[Union[str, Path]] = None) -> None:
     """Write `data` to `path` atomically, with fsync barriers:
     `tempfile.mkstemp` in the destination directory, write, fsync the file,
     `os.replace`, then fsync the directory. A reader can never observe a
@@ -150,14 +170,23 @@ def atomic_write(path: Union[str, Path], data: bytes, *,
     that, and would put the file somewhere nothing reads. Directories it
     does create are made durable too (`_mkdir_durable`).
 
+    `durable_root` names a directory the caller knows is durable; every
+    directory between it and `path` is then re-established on every write,
+    so a directory barrier that failed on an earlier attempt is repaired by
+    the next one (`_mkdir_durable`). Without it, only the directories this
+    call creates, and the destination's parent, are fsynced into their
+    parents. Requires `make_parents`.
+
     `mode` is applied to the temp file BEFORE the rename, so the file never
     exists at `path` with any other mode. It matters because `mkstemp`
     creates `0600`: right for router-private `state_dir` files, and exactly
     wrong for a file another uid must read — the write succeeds, the content
     is correct, and the reader gets EACCES."""
     dest = Path(path)
+    if durable_root is not None and not make_parents:
+        raise ValueError("durable_root requires make_parents")
     if make_parents:
-        _mkdir_durable(dest.parent)
+        _mkdir_durable(dest.parent, None if durable_root is None else Path(durable_root))
     fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=dest.name + ".")
     try:
         with os.fdopen(fd, "wb") as f:
