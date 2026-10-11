@@ -36,8 +36,13 @@ reimplement something here in a sibling runtime, don't; import it.
 Released under Apache 2.0, at `proofpoint/amap-router-local`, **PUBLIC**
 since 2026-10-07 (verified 2026-10-09). Everything pushed here is published:
 code, commit messages, PR text, CI logs, and commit author and committer
-emails. A personal address in a commit is a disclosure; CI's
-`commit-metadata` job checks for that, with one recorded exception. Three
+emails. A personal address in a commit is a disclosure, and the rule holds
+whether or not anything checks it. CI does NOT enforce it yet: a
+`commit-metadata` job is pending in its own pull request, and until that
+lands the only CI job is the test suite. One commit already published with
+a personal author address (`a6d03d9`, a web squash merge) was accepted as
+published by the owner; it is recorded as that pending job's single
+exact-sha exception, not as anything currently enforced. Three
 things still need a decision each time, and none of them is implied by the
 repo being releasable:
 
