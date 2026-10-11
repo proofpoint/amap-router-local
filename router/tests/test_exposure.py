@@ -68,6 +68,25 @@ class ExposureTests(RouterTestCase):
         self.assertIs(stamp["external_mail_delivered"], True)
         self.assertEqual(stamp["last_external_delivery_ts"], format_utc_ts(written))
 
+    def _foreign_at(self, cfg, when):
+        foreign = notices_dir(cfg, "a") / ("notice-" + "e" * 32 + ".json")
+        foreign.write_text("{}")
+        os.utime(foreign, (when, when))
+        return exposure.assess(cfg, "a", now=NOW)
+
+    def test_a_notice_written_in_the_same_second_as_now_counts(self):
+        """The window's upper edge has whole-second precision: an mtime
+        half a second past `now` is in `now`'s second, and counts."""
+        cfg = self._cfg()
+        stamp = self._foreign_at(cfg, parse_utc_ts(NOW).timestamp() + 0.5)
+        self.assertIs(stamp["external_mail_delivered"], True)
+        self.assertEqual(stamp["last_external_delivery_ts"], NOW)
+
+    def test_a_notice_written_in_the_next_second_does_not_count(self):
+        cfg = self._cfg()
+        stamp = self._foreign_at(cfg, parse_utc_ts(NOW).timestamp() + 1)
+        self.assertIs(stamp["external_mail_delivered"], False)
+
     def test_unledgered_notice_older_than_the_window_does_not_count(self):
         cfg = self._cfg()
         foreign = notices_dir(cfg, "a") / ("notice-" + "e" * 32 + ".json")
