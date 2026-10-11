@@ -82,3 +82,29 @@ jobs:
             # job is still in phase 1.
             python -m unittest $run
           fi
+
+  # Every commit reachable from HEAD -- on a pull request that includes
+  # GitHub's synthetic merge commit -- must carry a no-reply author and
+  # committer. This repository is public and so are those fields. The job
+  # goes red, by design, while any commit with a personal address is
+  # reachable; `tools/check_commit_metadata.py` says why and how exceptions
+  # would be recorded (exact shas, by decision, none yet).
+  commit-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Prove the gate can fail before trusting it to pass: the planted
+      # identities must be caught, and the report must not echo them.
+      - name: self-test (planted identities must fail)
+        run: python -m unittest router.tests.test_commit_metadata -v
+
+      - name: commit metadata
+        run: python tools/check_commit_metadata.py .
