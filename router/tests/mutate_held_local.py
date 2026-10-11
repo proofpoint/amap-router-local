@@ -236,6 +236,14 @@ M = [
   '                try:\n                    _write_intent(cfg, path, updated)\n                except OSError as w:',
   '                try:\n                    _write_intent(cfg, path, updated)\n                except ZeroDivisionError as w:',
   ['router.tests.test_held_local.DsnErrorUpdateIsolatedTests']),
+ ('N14 post-placement removal failure escapes the queue', 'router/outcomes.py',
+  '            os.unlink(path)\n            fsync_dir(d)\n        except OSError as e:',
+  '            os.unlink(path)\n            fsync_dir(d)\n        except ZeroDivisionError as e:',
+  ['router.tests.test_held_local.DsnRemovalFailureIsolatedTests']),
+ ('L1 live race: the sidecar dir pin follows symlinks', 'router/util.py',
+  '        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)',
+  '        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd)',
+  ['router.tests.test_attachments_outbound.TestOutboundSidecarTOCTOU.test_live_race_separate_process_secret_never_leaks']),
 ]
 
 
