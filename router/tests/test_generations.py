@@ -782,4 +782,3 @@ class OutcomeConsumeTests(_Gens):
         with mock.patch.object(service.outbound, "drain_instance", held):
             self.poll()
         self.assertTrue(path.exists(), "outcomes were consumed after a held drain")
-
