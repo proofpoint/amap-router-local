@@ -35,6 +35,16 @@ def result(**over):
     return doc
 
 
+def forge(journal, edit):
+    """`journal` edited and then made self-consistent: its digest and its
+    planned line re-derived from the edited body, so that only the check
+    under test can see the edit."""
+    j = {k: v for k, v in journal.items() if k not in ("audit_line", "journal_sha256")}
+    edit(j)
+    generations._plan_audit(j["name"], j)
+    return j
+
+
 def anchor(res=None, **env):
     e = {"digest": "a" * 64, "result": res if res is not None else result()}
     e.update(env)
@@ -249,8 +259,7 @@ class SuccessorTests(_Legacy):
 
     def test_an_inconsistent_legacy_record_holds(self):
         g = self.adopted()
-        j = self.journal()
-        j["legacy"]["local"] += 1                       # consistent nowhere, equal everywhere
+        j = forge(self.journal(), lambda j: j["legacy"].update(local=j["legacy"]["local"] + 1))
         generations._write_journal(self.state_dir, LIDS["alpha"], j)
         self.edit_entry(lambda e: e["legacy"].update(local=j["legacy"]["local"]))
         e = self.expect(generations.GenerationHeld, generations.next_counter, g)
@@ -335,8 +344,7 @@ class DoneReaderTests(_Legacy):
                 self.assert_held()
 
     def _both_legacy(self, fn):
-        j = self.journal()
-        fn(j["legacy"])
+        j = forge(self.journal(), lambda j: fn(j["legacy"]))
         generations._write_journal(self.state_dir, LIDS["alpha"], j)
         self.raw_entries(lambda gs: fn(gs[0]["legacy"]))
 
@@ -563,3 +571,181 @@ class AdoptEvidenceTests(_Legacy):
         doc["approved_ts"] = doc["first_seen_ts"]
         f.write_text(json.dumps(doc))
         self.migrate()
+
+
+# ---------------------------------------------------------------------------
+# The journal is its own commitment (review round 1)
+# ---------------------------------------------------------------------------
+
+class JournalCommitmentTests(_Legacy):
+
+    def made(self):
+        self.with_traffic()
+        self.to_legacy()
+        (self.lid() / "transport" / "next_req_id").write_text("6")
+        self.migrate()
+        return gen_state(self.state_dir, LIDS["alpha"])
+
+    def write_raw(self, j):
+        generations.journal_path(self.state_dir, LIDS["alpha"]).write_text(json.dumps(j))
+
+    def held_both_ways(self, g):
+        self.expect(generations.GenerationHeld, generations.migration_state,
+                    self.state_dir, LIDS["alpha"], audit=True)
+        e = self.expect(generations.GenerationHeld, generations.next_counter, g)
+        self.assertEqual(e.reason, generations.HELD_COUNTER_UNVERIFIED)
+        self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)
+
+    def test_a_lowered_counter_everywhere_but_the_commitment_holds(self):
+        """The journal's legacy counter, the generation's equal record and
+        the live counter all lowered together: the digest the attestation
+        committed to no longer matches the body, so nothing believes it."""
+        g = self.made()
+        j = self.journal()
+        j["legacy"]["counter"] = "2"
+        self.write_raw(j)
+        f = self.lid() / generations.GEN_FILE
+        doc = json.loads(f.read_text())
+        doc["gens"][0]["legacy"]["counter"] = "2"
+        f.write_text(json.dumps(doc))
+        (g / "transport" / "next_req_id").write_text("2")
+        self.held_both_ways(g)
+
+    def test_a_planned_line_that_does_not_carry_the_body_holds(self):
+        """Even with the digest recomputed to the edited body, the planned
+        line still says what was attested, and it must equal the body."""
+        g = self.made()
+        j = self.journal()
+        j["reason"] = "a different reason"
+        j["journal_sha256"] = generations.journal_digest(j)
+        self.write_raw(j)
+        self.held_both_ways(g)
+
+    def test_a_stored_digest_that_is_not_the_bodys_holds(self):
+        g = self.made()
+        j = self.journal()
+        j["journal_sha256"] = "0" * 64
+        self.write_raw(j)
+        e = self.expect(generations.GenerationHeld, generations.read_journal,
+                        self.state_dir, LIDS["alpha"])
+        self.assertIn("digest", str(e))
+
+    def test_a_malformed_source_holds_and_never_escapes(self):
+        self.made()
+        j = self.journal()
+        j["source"] = {}
+        self.write_raw(j)
+        e = self.expect(generations.GenerationHeld, generations.read_journal,
+                        self.state_dir, LIDS["alpha"])
+        self.assertIn("source", str(e))
+        self.expect(generations.GenerationHeld, generations.migration_state,
+                    self.state_dir, LIDS["alpha"])
+        self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)
+
+    def test_a_journal_for_another_identity_holds(self):
+        self.made()
+        j = self.journal()
+        j["logical_id"] = LIDS["bravo"]
+        self.write_raw(j)
+        e = self.expect(generations.GenerationHeld, generations.read_journal,
+                        self.state_dir, LIDS["alpha"])
+        self.assertIn("another identity", str(e))
+
+    def test_an_unexpected_member_holds(self):
+        """Before `complete` (no digest yet to catch it): a member that is
+        not this phase's is refused by the schema alone."""
+        self.poll()
+        self.to_legacy()
+        with mock.patch.object(generations, "_move_paths", side_effect=Crash("after plan")):
+            self.expect(Crash, self.migrate)
+        j = self.journal()
+        j["extra"] = 1
+        self.write_raw(j)
+        self.expect(generations.GenerationHeld, generations.read_journal,
+                    self.state_dir, LIDS["alpha"])
+
+    def test_a_resume_under_another_name_is_refused(self):
+        self.poll()
+        self.to_legacy()
+        with mock.patch.object(generations, "_move_paths", side_effect=Crash("after plan")):
+            self.expect(Crash, self.migrate)
+        j = self.journal()
+        j["name"] = "bravo-was-here"
+        self.write_raw(j)
+        self.assertIn("begun for", str(self.refuse()))
+
+
+# ---------------------------------------------------------------------------
+# First sight of an adopted generation (review round 1)
+# ---------------------------------------------------------------------------
+
+class AdoptedFirstSightTests(_Legacy):
+
+    def test_an_approval_only_legacy_instance_adopts_and_drains(self):
+        self.poll()
+        self.to_legacy()
+        m = json.loads((self.lid() / "first-seen.json").read_text())
+        (self.lid() / "first-seen.json").unlink()
+        (self.lid() / "approval.json").write_text(json.dumps(
+            {"approved_ts": "2026-01-01T00:00:00Z", "declared_root": m["declared_root"],
+             "outbox_snapshot": [], "mode": m.get("mode")}))
+        self.migrate()
+        g = gen_state(self.state_dir, LIDS["alpha"])
+        marker = read_json(g / "first-seen.json")
+        self.assertEqual((marker["first_seen_ts"], marker["adopted_from"]),
+                         ("2026-01-01T00:00:00Z", "approval.json"))
+        self.assertIsNone(self.held())
+        write_request(self.cfg, "alpha", "00000004", to=[addr("bravo")], body_text="after")
+        self.poll()
+        self.assertIn("after", self.bodies())
+
+    def test_the_adopted_generation_records_first_sight_taken(self):
+        """So a later loss of its marker holds instead of re-snapshotting,
+        even when nothing else in the generation would show it is not new."""
+        self.poll()
+        self.to_legacy()
+        for n in ("results", "pending", "inflight", "quarantine", "held"):
+            shutil.rmtree(self.lid() / n, ignore_errors=True)
+        self.migrate()
+        g = gen_state(self.state_dir, LIDS["alpha"])
+        self.assertEqual((g / "first-sight.taken").read_text(),
+                         self.journal()["first_seen"]["first_seen_ts"])
+        (g / "first-seen.json").unlink()
+        self.assertFalse(generations._is_fresh(g), "the adopted generation reads as fresh")
+
+
+class ReviewWitnessTests(_Legacy):
+
+    def test_a_crash_after_the_generations_file_before_the_line_resumes(self):
+        self.poll()
+        self.to_legacy()
+        with mock.patch.object(audit_mod, "append_bytes", side_effect=OSError(5, "crash")):
+            self.refuse()
+        self.assertTrue((self.lid() / generations.GEN_FILE).is_file())
+        self.assertEqual(self.journal()["phase"], "complete")
+        self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)
+        self.migrate()
+        self.assertEqual(generations.migration_state(self.state_dir, LIDS["alpha"], audit=True),
+                         "done")
+
+    def test_a_crash_part_way_through_conversion_resumes_without_misattributing(self):
+        self.make_pending(body="one")
+        write_request(self.cfg, "alpha", "00000003", to=[addr("bravo")], body_text="two")
+        self.poll()
+        self.to_legacy()
+        for req in (REQ, "00000003"):
+            self.to_v1(req)
+        real = outbound.convert_v1_pending
+        calls = []
+
+        def convert(view, name, req_id):
+            calls.append(req_id)
+            if len(calls) == 2:
+                raise Crash("part-way")
+            return real(view, name, req_id)
+        with mock.patch.object(outbound, "convert_v1_pending", convert):
+            self.expect(Crash, self.migrate)
+        self.assertEqual(self.journal().get("converted"), {REQ: outbound.CONVERTED})
+        self.migrate()
+        self.assertEqual(self.journal()["converted"],
+                         {REQ: outbound.CONVERTED, "00000003": outbound.CONVERTED})

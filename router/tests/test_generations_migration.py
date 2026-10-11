@@ -573,10 +573,19 @@ class BlockerTests(_Legacy):
         self.assertEqual(generations.legacy_entries(self.state_dir, LIDS["alpha"]), [])
 
     def test_an_unrecorded_blocker_shaped_directory_is_legacy(self):
-        self.adopted()
-        j = self.journal()
-        j.pop("blocker")
-        generations._write_journal(self.state_dir, LIDS["alpha"], j)
+        """A journal that has not yet recorded its blocker (stopped before
+        that step) does not vouch for a directory at the marker's path."""
+        self.poll()
+        self.to_legacy()
+        real = generations._advance
+
+        def advance(cfg, journal, phase):
+            real(cfg, journal, phase)
+            if phase == "renamed":
+                raise Crash(phase)
+        with mock.patch.object(generations, "_advance", advance):
+            self.expect(Crash, self.migrate)
+        (self.lid() / generations.BLOCKER).mkdir()
         self.assertEqual(generations.legacy_entries(self.state_dir, LIDS["alpha"]),
                          [generations.BLOCKER])
 

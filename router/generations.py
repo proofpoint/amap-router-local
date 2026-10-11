@@ -385,16 +385,12 @@ def _ordinary_counter(pred_dir: Path) -> int:
 
 def successor_counter(pred_dir: Path, legacy: Any, manifest: Any) -> int:
     """`next_counter` for a predecessor a migration made, given the legacy
-    record its journal holds. The record must be consistent
-    (`check_legacy`). Basis "counter": the counter must exist and not be
+    record its journal holds (already consistent: `read_journal` checks it
+    against the manifest for every consumer). Basis "counter": the counter must exist and not be
     below the migrated value (lower means a rollback that could reuse ids).
     Basis "empty" or "attested": the legacy anchors are known to have handed
     out no id, so only what was written since counts, by the ordinary rule
     (in-flight entries, recorded transport ids, unreadable anchors)."""
-    try:
-        check_legacy(legacy, manifest)
-    except ValueError as e:
-        raise GenerationHeld(HELD_COUNTER_UNVERIFIED, f"the legacy record: {e}") from None
     if legacy["basis"] == BASIS_COUNTER:
         if not _counter_path(pred_dir).exists():
             raise GenerationHeld(HELD_COUNTER_UNVERIFIED,
@@ -891,8 +887,9 @@ def journal_path(state_dir: Path, logical_id: str) -> Path:
 
 
 def read_journal(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
-    """The migration journal, or None when there is none. Anything that is
-    not a well-formed journal raises `GenerationHeld(state_layout_conflict)`."""
+    """The migration journal, or None when there is none. Strict, for every
+    consumer: anything that is not a well-formed journal for THIS identity
+    raises `GenerationHeld(state_layout_conflict)` (`check_journal`)."""
     try:
         raw = journal_path(state_dir, logical_id).read_bytes()
     except FileNotFoundError:
@@ -900,26 +897,147 @@ def read_journal(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
     except OSError as e:
         raise GenerationHeld(HELD_LAYOUT_CONFLICT, f"{MIGRATION_FILE} unreadable: {e}") from None
     try:
-        doc = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        doc = strict_json(raw)
+    except (UnicodeDecodeError, ValueError):
         raise GenerationHeld(HELD_LAYOUT_CONFLICT, f"{MIGRATION_FILE} is not JSON") from None
-    ok = (isinstance(doc, dict) and doc.get("schema") == JOURNAL_SCHEMA
-          and doc.get("verb") in VERBS and doc.get("phase") in PHASES
-          and isinstance(doc.get("gen"), str) and _GEN_ID.fullmatch(doc["gen"])
-          and isinstance(doc.get("source"), dict) and isinstance(doc.get("paths"), list)
-          and all(isinstance(p, dict) and p.get("name") in GEN_SCOPED
-                  and p.get("type") in ("dir", "file") for p in doc["paths"]))
-    if ok:
-        ok = isinstance(doc.get("legacy"), dict) and isinstance(doc.get("manifest"), list)
-    if ok and doc["phase"] in ("complete", "done"):
-        ok = (isinstance(doc.get("audit_line"), str) and doc["audit_line"].endswith("\n")
-              and isinstance(doc.get("journal_sha256"), str)
-              and bool(_HEX64.fullmatch(doc["journal_sha256"])))
-    if ok and doc["verb"] == VERB_FENCE_LEGACY:
-        ok = isinstance(doc.get("fresh_gen"), str) and bool(_GEN_ID.fullmatch(doc["fresh_gen"]))
-    if not ok:
-        raise GenerationHeld(HELD_LAYOUT_CONFLICT, f"{MIGRATION_FILE} is malformed")
+    try:
+        check_journal(doc, logical_id)
+    except (ValueError, KeyError, TypeError) as e:
+        raise GenerationHeld(HELD_LAYOUT_CONFLICT,
+                             f"{MIGRATION_FILE} is malformed: {e}") from None
     return doc
+
+
+_JOURNAL_BASE = frozenset({"schema", "verb", "phase", "planned_ts", "name", "logical_id",
+                           "reason", "gen", "source", "paths", "legacy", "manifest",
+                           "declared_root", "first_seen"})
+_AUDIT_MEMBERS = ("audit_line", "journal_sha256")
+
+
+def journal_digest(journal: Mapping[str, Any]) -> str:
+    """The commitment the attestation line carries: the journal as it stood
+    at `complete`, without the two audit members. Recomputed by every
+    consumer, never taken from the journal's own claim."""
+    body = {k: v for k, v in journal.items() if k not in _AUDIT_MEMBERS}
+    body["phase"] = "complete"
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def planned_fields(name: str, journal: Mapping[str, Any]) -> Dict[str, Any]:
+    """The attestation line's facts, from the journal body (`_plan_audit`)."""
+    legacy = journal["legacy"]
+    return {"verb": journal["verb"], "reason": journal["reason"],
+            "binding": journal["source"]["binding"], "root": journal["source"]["root"],
+            "gen": journal["gen"], "fresh_gen": journal.get("fresh_gen"),
+            "counts": {k: legacy[k] for k in ("basis", "counter", "local", "transport",
+                                              "malformed", "inflight",
+                                              "positive_evidence_count")},
+            "converted": journal.get("converted"), "journal_sha256": journal_digest(journal)}
+
+
+def check_journal(doc: Any, logical_id: str) -> None:
+    """A migration journal, closed and typed per phase, for `logical_id`.
+    From `complete` on, the stored digest must be the one recomputed from
+    the body, and the planned attestation line must carry exactly the
+    body's facts. Raises ValueError (or KeyError/TypeError) on anything
+    else."""
+    from .util import parse_utc_ts
+
+    def need(cond: bool, why: str) -> None:
+        if not cond:
+            raise ValueError(why)
+    need(isinstance(doc, dict), "not an object")
+    phase, verb = doc.get("phase"), doc.get("verb")
+    need(doc.get("schema") == JOURNAL_SCHEMA, "schema")
+    need(verb in VERBS and phase in PHASES, "verb/phase")
+    allowed = set(_JOURNAL_BASE)
+    if verb == VERB_FENCE_LEGACY:
+        allowed.add("fresh_gen")
+    else:
+        allowed.update(("converted", "first_sight"))
+    allowed.add("blocker")
+    late = PHASES.index(phase) >= PHASES.index("complete")
+    if late:
+        allowed.update(_AUDIT_MEMBERS)
+    need(set(doc) <= allowed, f"unexpected members {sorted(set(doc) - allowed)}")
+    need(_JOURNAL_BASE <= set(doc), f"missing members {sorted(_JOURNAL_BASE - set(doc))}")
+    need(doc["logical_id"] == logical_id, "the journal is for another identity")
+    need(isinstance(doc["name"], str) and bool(doc["name"]), "name")
+    need(isinstance(doc["reason"], str) and bool(doc["reason"].strip()), "reason")
+    need(parse_utc_ts(doc["planned_ts"]) is not None, "planned_ts")
+    need(isinstance(doc["gen"], str) and bool(_GEN_ID.fullmatch(doc["gen"])), "gen")
+    if verb == VERB_FENCE_LEGACY:
+        fresh = doc.get("fresh_gen")
+        need(isinstance(fresh, str) and bool(_GEN_ID.fullmatch(fresh))
+             and fresh != doc["gen"], "fresh_gen")
+    src = doc["source"]
+    need(isinstance(src, dict) and set(src) == {"binding", "root"}, "source")
+    b, r = src["binding"], src["root"]
+    need(isinstance(b, dict) and set(b) == {"adapter", "stable_key", "binding_seq"}
+         and isinstance(b["adapter"], str) and isinstance(b["stable_key"], str)
+         and isinstance(b["binding_seq"], int) and not isinstance(b["binding_seq"], bool),
+         "source binding")
+    known = isinstance(r, dict) and set(r) == {"path", "st_dev", "st_ino"} \
+        and isinstance(r["path"], str)
+    need(known and (all(isinstance(r[k], int) for k in ("st_dev", "st_ino"))
+                    or (verb == VERB_FENCE_LEGACY and r["st_dev"] is None
+                        and r["st_ino"] is None)), "source root")
+    names = []
+    for p in doc["paths"] if isinstance(doc["paths"], list) else [None]:
+        need(isinstance(p, dict) and p.get("name") in GEN_SCOPED
+             and p.get("type") in ("dir", "file")
+             and set(p) <= {"name", "type", "digest"}, "a planned path")
+        if "digest" in p:
+            need(p["type"] == "file" and p["name"] in _DIGESTED
+                 and isinstance(p["digest"], str) and bool(_HEX64.fullmatch(p["digest"])),
+                 "a planned digest")
+        names.append(p["name"])
+    need(len(set(names)) == len(names), "a path planned twice")
+    check_legacy(doc["legacy"], doc["manifest"])
+    fs, dr = doc["first_seen"], doc["declared_root"]
+    need(dr is None or isinstance(dr, str), "declared_root")
+    if fs is not None:
+        need(isinstance(fs, dict) and set(fs) == {"first_seen_ts", "declared_root", "source"}
+             and parse_utc_ts(fs["first_seen_ts"]) is not None
+             and fs["declared_root"] == dr
+             and fs["source"] in ("first-seen.json", "approval.json"), "first_seen")
+    if "converted" in doc:
+        c = doc["converted"]
+        need(isinstance(c, dict) and all(isinstance(k, str) and isinstance(v, str)
+                                         for k, v in c.items()), "converted")
+    if verb == VERB_ADOPT:
+        need("first_sight" in doc, "an adopt journal without its first-sight plan")
+        f = doc["first_sight"]
+        need(isinstance(f, dict) and set(f) == {"sentinel", "marker"}
+             and isinstance(f["sentinel"], str) and parse_utc_ts(f["sentinel"]) is not None
+             and fs is not None and f["sentinel"] == fs["first_seen_ts"], "first_sight")
+        m = f["marker"]
+        need(m is None or (isinstance(m, dict) and set(m) == {"text", "sha256"}
+                           and isinstance(m["text"], str)
+                           and hashlib.sha256(m["text"].encode("utf-8")).hexdigest()
+                           == m["sha256"]), "first_sight marker")
+        need((m is None) == ("first-seen.json" in names),
+             "a marker is planned exactly when none is moved")
+    if "blocker" in doc:
+        need(doc["blocker"] is True, "blocker")
+    if PHASES.index(phase) >= PHASES.index("blocked"):
+        need(doc.get("blocker") is True, "a blocked journal without its blocker")
+    if verb == VERB_ADOPT and PHASES.index(phase) >= PHASES.index("converted"):
+        need("converted" in doc, "an adopt journal past conversion without its record")
+    if late:
+        need(_AUDIT_MEMBERS[0] in doc and _AUDIT_MEMBERS[1] in doc, "the planned attestation")
+        digest = journal_digest(doc)
+        need(doc["journal_sha256"] == digest,
+             "the journal does not match the digest its attestation commits to")
+        line = doc["audit_line"]
+        need(isinstance(line, str) and line.endswith("\n"), "audit_line")
+        planned = strict_json(line[:-1].encode("utf-8"))
+        want = planned_fields(doc["name"], doc)
+        need(isinstance(planned, dict) and planned.get("event") == audit_mod.EVENT_MIGRATION
+             and planned.get("instance") == doc["name"]
+             and {k: planned.get(k) for k in want} == want
+             and set(planned) == set(want) | {"ts", "event", "instance"},
+             "the planned attestation line does not carry the journal's facts")
 
 
 def migration_state(state_dir: Path, logical_id: str, *, audit: bool = False) -> str:
@@ -993,10 +1111,6 @@ def _check_made(state_dir: Path, logical_id: str, journal: Mapping[str, Any]) ->
     legacy = journal["legacy"]
     if made.get("legacy") != legacy:
         raise _held("the legacy record differs between the journal and the generation")
-    try:
-        check_legacy(legacy, journal.get("manifest"))
-    except ValueError as e:
-        raise _held(f"the legacy record: {e}") from None
     for line in journal["manifest"]:
         req_id, _, sha = line.partition(" ")
         try:
@@ -1012,6 +1126,17 @@ def _check_made(state_dir: Path, logical_id: str, journal: Mapping[str, Any]) ->
             now = ""
         if not (_COUNTER_RE.fullmatch(now) and int(now) >= int(legacy["counter"])):
             raise _held("the transport counter is missing or below the one migrated")
+    if journal["verb"] == VERB_ADOPT:
+        from . import firstsight
+        plan = journal["first_sight"]
+        try:
+            ok = (d / firstsight.FIRST_SIGHT_TAKEN).read_bytes() == plan["sentinel"].encode()
+            if plan["marker"] is not None:
+                ok = ok and _sha256(d / "first-seen.json") == plan["marker"]["sha256"]
+        except OSError:
+            ok = False
+        if not ok:
+            raise _held("the adopted generation's first-sight record is not what was planned")
     if not is_recorded_blocker(state_dir, logical_id):
         raise _held("done, but its rollback blocker is missing")
 
@@ -1611,6 +1736,9 @@ def operator_migrate(cfg: Any, name: str, verb: str, reason: str, *,
             journal = _new_journal(cfg, name, verb, reason.strip(), lid, entry,
                                    no_transport_history)
         else:
+            if journal["name"] != name:
+                raise OperatorRefused(f"{MIGRATION_FILE} was begun for {journal['name']!r}, "
+                                      f"not {name!r}; it stays held for the operator")
             _verify_source(cfg, name, journal, binding)
         if dry_run:
             return dict(_summary(name, journal), dry_run=True)
@@ -1666,7 +1794,47 @@ def _new_journal(cfg: Any, name: str, verb: str, reason: str, lid: str, entry: A
     }
     if verb == VERB_FENCE_LEGACY:
         journal["fresh_gen"] = secrets.token_hex(16)
+    else:
+        journal["first_sight"] = _plan_first_sight(cfg, name, lid, marker, paths)
     return journal
+
+
+def _plan_first_sight(cfg: Any, name: str, lid: str, marker: Mapping[str, Any],
+                      paths: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """adopt: the adopted generation's first-sight record. Its sentinel
+    always (so a later loss of the marker holds rather than re-snapshots).
+    When the legacy layout has only `approval.json`, its marker too, written
+    FROM that file exactly as a pre-generation router's upgrade did:
+    `first_seen_ts` is the `approved_ts`, verbatim, never synthesised
+    (`legacy_marker` has refused one that is not valid)."""
+    from . import firstsight
+    out: Dict[str, Any] = {"sentinel": marker["first_seen_ts"], "marker": None}
+    if any(p["name"] == "first-seen.json" for p in paths):
+        return out
+    approval = strict_json((lid_dir(cfg.state_dir, lid) / "approval.json").read_bytes())
+    doc = dict(approval)
+    doc.update(schema=firstsight.SCHEMA, instance=name,
+               first_seen_ts=approval["approved_ts"], adopted_from="approval.json")
+    text = json.dumps(doc, sort_keys=True)
+    out["marker"] = {"text": text, "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+    return out
+
+
+def _write_first_sight(state_dir: Path, journal: Mapping[str, Any]) -> None:
+    """adopt: the planned sentinel and (from approval.json) marker, each
+    durable; an existing one must be exactly what was planned."""
+    from . import firstsight
+    d = gen_dir(state_dir, journal["logical_id"], journal["gen"])
+    plan = journal["first_sight"]
+    files = [(d / firstsight.FIRST_SIGHT_TAKEN, plan["sentinel"].encode("utf-8"))]
+    if plan["marker"] is not None:
+        files.append((d / "first-seen.json", plan["marker"]["text"].encode("utf-8")))
+    for path, data in files:
+        kind = _kind(path)
+        if kind is None:
+            atomic_write(path, data, durable_root=state_dir)
+        elif kind != "file" or path.read_bytes() != data:
+            raise MigrationConflict(f"{path.name} in the adopted generation is not what was planned")
 
 
 def _verify_source(cfg: Any, name: str, journal: Mapping[str, Any],
@@ -1691,6 +1859,7 @@ def _summary(name: str, journal: Mapping[str, Any]) -> Dict[str, Any]:
            "legacy": journal["legacy"], "root": journal["source"]["root"]}
     if journal["verb"] == VERB_ADOPT:
         out["generation"] = journal["gen"]
+        out["converted"] = dict(journal.get("converted") or {})
     else:
         out["fenced"] = journal["gen"]
         out["generation"] = journal["fresh_gen"]
@@ -1704,22 +1873,11 @@ def _advance(cfg: Any, journal: Dict[str, Any], phase: str) -> None:
 
 def _plan_audit(name: str, journal: Dict[str, Any]) -> None:
     """The attestation line, planned ONCE (fixed bytes, fixed ts) into the
-    journal before it is `complete`. Its `journal_sha256` is the journal as
-    it stands without the two audit members."""
-    body = {k: v for k, v in journal.items() if k not in ("audit_line", "journal_sha256")}
-    body["phase"] = "complete"
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
-    legacy = journal["legacy"]
-    line = audit_mod.build_line(audit_mod.EVENT_MIGRATION, name, {
-        "verb": journal["verb"], "reason": journal["reason"],
-        "binding": journal["source"]["binding"], "root": journal["source"]["root"],
-        "gen": journal["gen"], "fresh_gen": journal.get("fresh_gen"),
-        "counts": {k: legacy[k] for k in ("basis", "counter", "local", "transport",
-                                          "malformed", "inflight",
-                                          "positive_evidence_count")},
-        "converted": journal.get("converted"), "journal_sha256": digest,
-    })
-    journal["journal_sha256"] = digest
+    journal before it is `complete`. It commits to `journal_digest`, and
+    carries exactly the body's facts (`planned_fields`)."""
+    fields = planned_fields(name, journal)
+    line = audit_mod.build_line(audit_mod.EVENT_MIGRATION, name, fields)
+    journal["journal_sha256"] = fields["journal_sha256"]
     journal["audit_line"] = line.decode("utf-8")
 
 
@@ -1735,8 +1893,9 @@ def _run_journal(cfg: Any, name: str, journal: Dict[str, Any], report: Any) -> D
         _advance(cfg, journal, "renamed")
     if journal["phase"] == "renamed":
         if journal["verb"] == VERB_ADOPT:
+            _write_first_sight(state_dir, journal)
             view = keyed(registry_mod.keyed_config(cfg, report), {name: gen_key(lid, journal["gen"])})
-            journal["converted"] = _convert_pending(view, name, gen_dir(state_dir, lid, journal["gen"]))
+            _convert_pending(view, name, journal)
         _advance(cfg, journal, "converted")
     if journal["phase"] == "converted":
         _place_blocker(state_dir, lid, journal)
@@ -1776,21 +1935,26 @@ def _run_journal(cfg: Any, name: str, journal: Dict[str, Any], report: Any) -> D
     return _summary(name, journal)
 
 
-def _convert_pending(view: Any, name: str, d: Path) -> Dict[str, str]:
+def _convert_pending(view: Any, name: str, journal: Dict[str, Any]) -> None:
     """adopt only: each version-1 pending record gains a snapshot, from the
     live request it names, when those bytes still match its digest
-    (`outbound.convert_v1_pending`). `{req_id: outcome}`."""
+    (`outbound.convert_v1_pending`). Each outcome is journaled as it is
+    decided, so a resume after a crash part-way neither redoes nor
+    misattributes one (`converted: {req_id: outcome}`)."""
     from . import outbound as outbound_mod
-    out: Dict[str, str] = {}
+    d = gen_dir(view.state_dir, journal["logical_id"], journal["gen"])
+    done = journal.setdefault("converted", {})
     try:
         names = sorted(e.name for e in os.scandir(d / "pending")
                        if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
     except FileNotFoundError:
-        return out
+        names = []
     for fn in names:
         req_id = fn[:-len(".json")]
-        out[req_id] = outbound_mod.convert_v1_pending(view, name, req_id)
-    return out
+        if req_id in done:
+            continue
+        done[req_id] = outbound_mod.convert_v1_pending(view, name, req_id)
+        _write_journal(view.state_dir, journal["logical_id"], journal)
 
 
 # ---------------------------------------------------------------------------

@@ -92,9 +92,18 @@ class _Gens(RouterTestCase):
         """A well-formed journal of a migration that has not finished: only
         the migration check can refuse on it (a malformed one is refused by
         every reader of the journal, the transport counter's included)."""
+        legacy = {"basis": "empty", "counter": None, "local": 0, "transport": 0,
+                  "malformed": 0, "inflight": 0, "positive_evidence_count": 0,
+                  "manifest_sha256": generations.manifest_digest([])}
+        ts = "2026-01-01T00:00:00Z"
         (self.state_dir / LIDS[name] / generations.MIGRATION_FILE).write_text(json.dumps({
-            "schema": generations.JOURNAL_SCHEMA, "verb": "adopt", "phase": "planned",
-            "gen": "c" * 32, "source": {}, "paths": [], "legacy": {}, "manifest": []}))
+            "schema": generations.JOURNAL_SCHEMA, "verb": "fence-legacy", "phase": "planned",
+            "planned_ts": ts, "name": name, "logical_id": LIDS[name], "reason": "r",
+            "gen": "c" * 32, "fresh_gen": "d" * 32,
+            "source": {"binding": {"adapter": "sandy", "stable_key": "/k", "binding_seq": 1},
+                       "root": {"path": "/r", "st_dev": None, "st_ino": None}},
+            "paths": [], "legacy": legacy, "manifest": [], "declared_root": None,
+            "first_seen": None}))
 
     def cur(self, name="alpha"):
         return self.doc(name)["current"]

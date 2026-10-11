@@ -1323,11 +1323,20 @@ written: everything moves, exactly, into the first current generation (the
 transport counter included), and each version-1 pending record gains a
 snapshot taken from the live request it names, only when those bytes still
 match its digest (otherwise it stays version 1 and holds as before).
-`fence-legacy` makes the old state a FENCED generation and begins a fresh
-current one: that legacy generation recorded only a path for its root, which
-vouches for nothing, so its work settles privately, and the fresh
-generation's own first sight quarantines whatever is in the outbox (the agent
-resubmits). Use it when the origin cannot be vouched for.
+An adopted generation always records that it took first sight (the
+`first-sight.taken` sentinel), and when the legacy layout has only an old
+`approval.json` its marker is written FROM that file, as a pre-generation
+router's upgrade did: `first_seen_ts` is the `approved_ts`, verbatim, and
+`adopted_from` says so. Both are planned in the journal and checked like
+every moved path. `fence-legacy` makes the old state a FENCED generation and
+begins a fresh current one: that legacy generation recorded only a path for
+its root, which vouches for nothing, so its work settles privately, and the
+fresh generation's own first sight quarantines whatever is in the outbox (the
+agent resubmits). Use it when the origin cannot be vouched for. A generation
+that records no root identity (this one, or one begun while its root could
+not be opened) claims no live file and publishes nothing; before migration
+existed, the root check failed on such a record with a `TypeError`, which the
+fenced drain treated as keep-every-claim.
 
 Both are journaled in `state_dir/<logical_id>/migration.json`: every fact the
 verb depends on is planned there, durably, before the first rename, and
@@ -1376,7 +1385,11 @@ margin for clock skew. The initial binding is not compared: a registry
 imported after the router first saw an instance records that binding later
 than first sight, and the root check and the attestation stand for it.
 
-**What "done" is checked against.** On every poll: the generation chain the
+**What "done" is checked against.** Every reader of the journal first checks
+that it is well-formed for its phase and for this identity, and, from
+`complete` on, that the digest its attestation commits to is the one
+recomputed from its body and that the planned line carries exactly the
+body's facts; anything else holds (`state_layout_conflict`). On every poll: the generation chain the
 verb made, with the binding and root it recorded; every moved path, with its
 type, and the digested files unchanged; the legacy record and every anchor
 its manifest lists, unchanged; the counter floor; the blocker. Not on every
