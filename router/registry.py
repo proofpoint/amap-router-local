@@ -329,6 +329,13 @@ HELD_STATE_CONFLICT = "state_conflict"
 #: The name is one this router can never key state by under a registry: shaped
 #: like a logical_id, or the name of a `state_dir` entry of its own.
 HELD_NAME_SHAPE = "name_shape"
+#: No registry is configured, yet `state_dir/<logical_id>/` still holds
+#: pending deliveries or DSN intents from a time when one was. They cannot
+#: be mapped back to instances without it, so nothing drains until the
+#: operator restores `registry_dir` or drains/migrates that state.
+HELD_STRANDED = "registry_state_without_registry"
+#: The directories under a logical_id whose entries mean work in flight.
+_IN_FLIGHT_DIRS = ("pending", "dsn-pending")
 
 #: `state_dir` entries that are this router's own, never an instance's: the
 #: seq floor's directory and the status file (compared casefolded, for a
@@ -374,6 +381,12 @@ class Report:
     detail: Optional[str] = None
     resolved: Mapping[str, Entry] = None  # type: ignore[assignment]
     held: Mapping[str, str] = None  # type: ignore[assignment]
+    #: name -> logical_id for every configured name with an active entry of
+    #: exactly that name, held or not (`state_not_migrated`, `state_conflict`
+    #: and `skeleton_collision` names still have a known identity). Absent
+    #: only for a name the registry does not know (`not_registered`).
+    #: What a pending delivery pins, so a later rebind of the name is caught.
+    known: Mapping[str, str] = None  # type: ignore[assignment]
 
     def to_doc(self) -> Dict[str, Any]:
         doc: Dict[str, Any] = {"state": self.state}
@@ -397,6 +410,12 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
     cannot be used holds every instance."""
     names = sorted(instances)
     if registry_dir is None:
+        stranded = stranded_state(state_dir)
+        if stranded:
+            return Report(state="stranded", code=HELD_STRANDED,
+                          detail=f"in-flight registry state under {stranded}; restore "
+                                 "registry_dir, or drain/migrate it first",
+                          resolved={}, held={n: HELD_STRANDED for n in names})
         return OFF
     try:
         reg = load(registry_dir, state_dir, persist=persist)
@@ -413,6 +432,10 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
     active, colliding = reg.resolve()
     resolved: Dict[str, Entry] = {}
     held: Dict[str, str] = {}
+    # Every configured name with an ACTIVE entry of exactly that name, held
+    # or not: a skeleton collision holds the name but its identity is known.
+    known = {e.name: e.logical_id for e in reg.entries
+             if e.state == "active" and e.name in set(names)}
     for n in names:
         if n in colliding:
             held[n] = HELD_COLLISION
@@ -424,7 +447,29 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
                 held[n] = why
         else:
             held[n] = HELD_NOT_REGISTERED
-    return Report(state="ok", seq=reg.seq, resolved=resolved, held=held)
+    return Report(state="ok", seq=reg.seq, resolved=resolved, held=held, known=known)
+
+
+def stranded_state(state_dir: Path) -> List[str]:
+    """The logical_id directories under `state_dir` holding in-flight work
+    (pending deliveries, DSN intents). Only ever non-empty after a registry
+    was configured; checked when one is NOT, to fail closed."""
+    out = []
+    try:
+        entries = list(os.scandir(state_dir))
+    except OSError:
+        return out
+    for e in entries:
+        if not (_LOGICAL_ID.fullmatch(e.name) and e.is_dir(follow_symlinks=False)):
+            continue
+        for sub in _IN_FLIGHT_DIRS:
+            try:
+                if any(c.name.endswith(".json") for c in os.scandir(os.path.join(e.path, sub))):
+                    out.append(e.name)
+                    break
+            except OSError:
+                continue
+    return sorted(out)
 
 
 def keyed_config(cfg: Any, report: Report) -> Any:

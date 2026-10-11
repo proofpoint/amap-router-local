@@ -1209,13 +1209,26 @@ transition:
   notice id and ledger path per (request, recipient), offered at least once
   (a crash after the notice can offer the same id again; dedup by id), never
   two ids;
-- a target bound to one logical_id whose name later resolves to another
-  holds as `identity_changed`; it is never rerouted;
+- a target is pinned to a logical_id whenever one is known: for a reply,
+  the identity its task was delivered from (ledger records under a registry
+  carry `from_lid` / `to_lid`); otherwise the identity the registry knows
+  now, held or not (`state_not_migrated`, `state_conflict` and
+  `skeleton_collision` names still have one). Only a target never known is
+  bound at its first resolution. A name that later resolves to another
+  logical_id holds as `identity_changed`; it is never rerouted;
+- an error after a placement began is NOT terminal: the target stays
+  `delivering` (reason `failing: <error>`) and is replayed with the same
+  identity next poll;
 - a reply pins its binding at its first ELIGIBLE evaluation (it resolved,
   and passed the reply window then), so a hold cannot age it out. A reply
   already outside its window is refused at once, never pinned;
-- fresh policy runs every poll: a refusal is terminal and its Result names
-  the recipients already delivered to; a changed route holds;
+- fresh policy runs every poll: a refusal is terminal, but only once every
+  placement already begun is settled (replayed with its identity), so its
+  Result names EVERY recipient whose notice was placed; a changed route
+  holds;
+- an injected delivery backend gets the pre-minted identity (a `preset`
+  keyword); one that cannot take it is held as `backend_no_preset` BEFORE
+  any placement;
 - targets that resolve go at once; completed ones are never re-delivered;
   when none is pending, the request gets its ONE Result, as an unheld drain
   would have answered, and the record goes;
@@ -1223,25 +1236,35 @@ transition:
 
 **DSNs to a held sender.** A DSN is enqueued as a durable intent under the
 RECEIVER (`state_dir/<receiver>/dsn-pending/<tree>-<nid>.<outcome>.json`,
-with a pre-minted DSN id) BEFORE the outcome is recorded or its file
-unlinked; a failure before the record keeps the outcome file for the next
-poll. Intents are drained after fresh outcomes, under their own budget and a
-persisted fair cursor, armed only once the outcome is recorded, and removed
-only after the DSN is placed. Nothing is dropped, timed out or turned into
+with a pre-minted DSN id and the sender's pinned logical_id) BEFORE the
+outcome is recorded or its file unlinked; until the record is durably
+written the outcome file stays for the next poll. An existing intent is
+validated exactly and made durable again before its source is consumed.
+Intents are drained after fresh outcomes, under their own budget and a
+persisted fair cursor (damaged intents count toward it, and are reported),
+armed only on a DURABLE outcome record, rewritten durably before every
+placement, and removed only after the DSN is placed. Nothing is dropped, timed out or turned into
 `queued_for_human`.
 
 An unavailable or rolled-back registry holds every instance, senders
 included, so neither pending requests nor DSN intents advance until it
-recovers. Without `registry_dir` none of this runs: drains, results, DSNs
+recovers.
+
+**Removing `registry_dir` with work in flight is unsupported.** Pending
+records and DSN intents live under logical_ids, which cannot be mapped back
+to instances without the registry. If `registry_dir` is absent and any
+`state_dir/<logical_id>/` holds pending records or intents, every instance
+is held (`status.json` `registry.state: "stranded"`, reason
+`registry_state_without_registry`, and an error in the log) rather than
+re-delivering completed targets with new ids. Restore `registry_dir`, let
+the work drain, and only then remove it. Without `registry_dir` none of this runs: drains, results, DSNs
 and `status.json` are as before.
 
 **Known limits, recorded rather than fixed here:**
 
-- Held delivery: a target first seen held (never resolved) binds its
-  logical_id at its first resolution; an injected delivery backend is
-  offered a replay without the pre-minted identity; removing `registry_dir`
-  while requests are pending strands their records (they live under
-  logical_ids), so let them drain first.
+- Held delivery: a target whose identity was NEVER known (no ledger
+  `from_lid`, no registry entry at the time) binds its logical_id at its
+  first resolution.
 
 - A name the registry has overridden is `not_registered` until aliases exist:
   the snapshot's `names` history is not read yet.

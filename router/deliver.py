@@ -83,7 +83,8 @@ from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
 from . import exposure as exposure_mod
-from .config import RouterConfig, address_for, router_address, state_key, target_hold
+from .config import (RouterConfig, address_for, router_address, state_key, target_hold,
+                     target_known_id)
 from .util import atomic_write, mint_notice_id, utc_ts
 
 #: The two inbound trees this router writes, as the ledger's `tree` names them.
@@ -180,6 +181,20 @@ def _gate(cfg: RouterConfig, recipient: str) -> None:
     reason = target_hold(cfg, recipient)
     if reason is not None:
         raise RecipientHeld(recipient, reason)
+
+
+def _stamp_ids(cfg: RouterConfig, ledger_bytes: bytes, sender: Optional[str],
+               recipient: str) -> bytes:
+    """Under a registry only: the ledger record also names the logical_ids
+    of its sender and recipient as this poll knows them, so a later reply or
+    DSN pins the identity the task was delivered between rather than
+    following a name to whoever holds it then. Unchanged without one."""
+    if cfg.registry_dir is None:
+        return ledger_bytes
+    rec = json.loads(ledger_bytes)
+    rec["from_lid"] = target_known_id(cfg, sender) if sender is not None else None
+    rec["to_lid"] = target_known_id(cfg, recipient)
+    return json.dumps(rec, sort_keys=True).encode("utf-8")
 
 
 def _identity(preset: Optional[Tuple[str, str]]) -> Tuple[str, str]:
@@ -437,6 +452,7 @@ def deliver(
         transport="local",
         tree=TREE_INBOX,
     )
+    ledger_bytes = _stamp_ids(cfg, ledger_bytes, sender, recipient)
     _place(
         root=recipient_cfg.root, tree_root=recipient_cfg.inbox_root, state_dir=state_dir,
         recipient=recipient, notice_id=notice_id, recipient_key=recipient_key,
@@ -515,6 +531,7 @@ def deliver_peer(
         transport="local",
         tree=TREE_PEER,
     )
+    ledger_bytes = _stamp_ids(cfg, ledger_bytes, sender, recipient)
     if in_reply_to is None:
         reply_basis = None
     elif binding.check_peer_edge(cfg, sender, recipient):
@@ -604,6 +621,7 @@ def deliver_router_notice(
         tree=TREE_INBOX,
         authored_by=ROUTER_AUTHOR,
     )
+    ledger_bytes = _stamp_ids(cfg, ledger_bytes, None, recipient)
     fields: Dict[str, Any] = {
         "notice_id": notice_id,
         "tree": TREE_INBOX,

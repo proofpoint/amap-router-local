@@ -586,6 +586,18 @@ def target_logical_id(cfg: "RouterConfig", name: str) -> Optional[str]:
     return entry.logical_id if entry is not None else None
 
 
+def target_known_id(cfg: "RouterConfig", name: str) -> Optional[str]:
+    """`name`'s logical_id as this poll's report KNOWS it, held or not, or
+    None when the registry has no single active entry for it. A pending
+    delivery pins this, so a later rebind of the name to another identity
+    holds instead of rerouting; only a truly unknown identity is bound at
+    its first resolution."""
+    report = cfg.registry_report
+    if cfg.registry_dir is None or report is None:
+        return None
+    return (getattr(report, "known", None) or {}).get(name) or target_logical_id(cfg, name)
+
+
 def instance_state_dir(cfg: "RouterConfig", name: str) -> Path:
     """`state_dir/<state_key>`: where `name`'s private state lives."""
     return cfg.state_dir / state_key(cfg, name)

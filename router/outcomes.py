@@ -168,7 +168,7 @@ from . import binding
 from . import deliver as deliver_mod
 from . import config as config_mod
 from .config import RouterConfig, address_for
-from .util import atomic_write, fsync_dir, mint_notice_id, parse_utc_ts, utc_ts
+from .util import _mkdir_durable, atomic_write, fsync_dir, mint_notice_id, parse_utc_ts, utc_ts
 
 logger = logging.getLogger("amap_router_local.outcomes")
 
@@ -387,12 +387,30 @@ def _consume_one(
         outcome = doc["outcome"]
         rec_path = record_path(cfg.state_dir, name, deliver_mod.TREE_PEER, notice_id, outcome,
                                state_key=config_mod.state_key(cfg, name))
-        if rec_path.exists():
-            raise _Discard("duplicate", f"{outcome} already recorded for this notice")
-
         sender = record.get("from_instance")
         queued = (cfg.registry_dir is not None and outcome in DSN_OUTCOMES
                   and isinstance(sender, str) and sender in cfg.instances)
+        if rec_path.exists():
+            if queued:
+                # Recorded before, but maybe NOT durably (a barrier that failed
+                # after the rename). Before this source goes: the record made
+                # durable, and an intent that is still there validated and
+                # made durable too. Never a NEW intent here: the DSN may
+                # already have been placed and its intent removed.
+                keep_source = True
+                try:
+                    _make_durable(cfg, rec_path)
+                    _repair_intent(cfg, name, notice_id, outcome, doc, sender)
+                except Exception as e:  # noqa: BLE001 — the source is the retry
+                    logger.warning(
+                        "instance %r: outcome %s for peer notice %s not durable yet "
+                        "(%s: %s) — left in place", name, outcome, notice_id,
+                        type(e).__name__, e)
+                    summary["peer_outcome_errored"] += 1
+                    return
+                keep_source = False
+            raise _Discard("duplicate", f"{outcome} already recorded for this notice")
+
         if queued:
             # Registry mode: the DSN is a durable intent, enqueued BEFORE the
             # outcome is recorded or its file unlinked (DSN QUEUE, below).
@@ -403,7 +421,8 @@ def _consume_one(
             # be armed, and the DSN would be lost).
             keep_source = True
             try:
-                _enqueue_dsn(cfg, name, notice_id, outcome, doc, sender)
+                _enqueue_dsn(cfg, name, notice_id, outcome, doc, sender,
+                             task_lid=record.get("from_lid"))
             except Exception as e:  # noqa: BLE001 — the source is the retry
                 logger.warning(
                     "instance %r: could not enqueue the DSN for peer notice %s "
@@ -422,7 +441,10 @@ def _consume_one(
             "to_instance": name,
             "req_id": record.get("req_id"),
         }
-        atomic_write(rec_path, json.dumps(stored, sort_keys=True).encode("utf-8"))
+        # In registry mode durably to the root: the queue arms an intent on
+        # this record, and only on a durable one (`_make_durable` repairs it).
+        atomic_write(rec_path, json.dumps(stored, sort_keys=True).encode("utf-8"),
+                     **({"durable_root": cfg.state_dir} if queued else {}))
         keep_source = False
         audit_mod.append(
             cfg.state_dir, name, audit_mod.EVENT_OUTCOME_CONSUMED,
@@ -687,26 +709,56 @@ def _intent_name(tree: str, notice_id: str, outcome: str) -> str:
 
 
 def _enqueue_dsn(cfg: RouterConfig, name: str, notice_id: str, outcome: str,
-                 doc: Dict[str, Any], sender: str) -> None:
+                 doc: Dict[str, Any], sender: str, *, task_lid: Optional[str] = None) -> None:
     """Durable, idempotent: an intent already there is kept, id and all, but
     only after it is validated EXACTLY against this outcome and made durable
     again (its directory barrier may have failed after the rename). An
     existing intent that does not match raises: the source is then kept."""
     path = _dsn_dir(cfg, name) / _intent_name(deliver_mod.TREE_PEER, notice_id, outcome)
-    if path.exists():
-        existing = _read_intent(path)
-        if existing is None or (existing["receiver"], existing["sender"],
-                                existing["outcome_ts"]) != (name, sender, doc["ts"]):
-            raise ValueError("an existing DSN intent does not match this outcome")
-        _write_intent(cfg, path, existing)
+    if _repair_intent(cfg, name, notice_id, outcome, doc, sender):
         return
     intent = {
         "v": 1, "tree": deliver_mod.TREE_PEER, "notice_id": notice_id,
         "outcome": outcome, "outcome_ts": doc["ts"], "receiver": name, "sender": sender,
-        "sender_lid": None, "dsn_notice_id": mint_notice_id(), "dsn_ts": utc_ts(),
+        # The identity the registry KNOWS for the sender now, held or not; a
+        # later rebind of the name then holds as identity_changed. Only a
+        # truly unknown sender is bound at its first resolution.
+        # `task_lid` is the sender's identity when the task was delivered (its
+        # ledger record), which wins over whatever the name maps to now.
+        "sender_lid": (task_lid if isinstance(task_lid, str) and task_lid
+                       else config_mod.target_known_id(cfg, sender)),
+        "dsn_notice_id": mint_notice_id(), "dsn_ts": utc_ts(),
         "reason": None, "created_ts": utc_ts(),
     }
     _write_intent(cfg, path, intent)
+
+
+def _repair_intent(cfg: RouterConfig, name: str, notice_id: str, outcome: str,
+                   doc: Dict[str, Any], sender: str) -> bool:
+    """An intent already on disk for this outcome: validated EXACTLY against
+    it (a mismatch raises, so the source is kept) and made durable again.
+    True when there was one."""
+    path = _dsn_dir(cfg, name) / _intent_name(deliver_mod.TREE_PEER, notice_id, outcome)
+    if not path.exists():
+        return False
+    existing = _read_intent(path)
+    if existing is None or (existing["receiver"], existing["sender"],
+                            existing["outcome_ts"]) != (name, sender, doc["ts"]):
+        raise ValueError("an existing DSN intent does not match this outcome")
+    _write_intent(cfg, path, existing)
+    return True
+
+
+def _make_durable(cfg: RouterConfig, path: Path) -> None:
+    """Re-establish an existing file's durability: the file, its directory,
+    and every directory up to `state_dir`. Any failure raises."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _mkdir_durable(path.parent, cfg.state_dir)
+    fsync_dir(path.parent)
 
 
 def _read_intent(path: Path) -> Optional[Dict[str, Any]]:
@@ -786,13 +838,14 @@ def drain_dsn_queue(cfg: RouterConfig, name: str, summary: Dict[str, Any]) -> Li
     for i, fn in enumerate(order):
         path = d / fn
         intent = _read_intent(path)
+        if i >= MAX_DSN_PER_POLL:            # reported, not attempted this poll
+            waiting.append(_held_entry(intent, intent.get("reason")) if intent is not None
+                           else {"intent": fn, "reason": "damaged"})
+            continue
+        last = fn                            # damaged ones count toward the fair cursor too
         if intent is None:
             waiting.append({"intent": fn, "reason": "damaged"})
             continue
-        if i >= MAX_DSN_PER_POLL:            # reported, not attempted this poll
-            waiting.append(_held_entry(intent, intent.get("reason")))
-            continue
-        last = fn
         rec = record_path(cfg.state_dir, name, intent["tree"], intent["notice_id"],
                           intent["outcome"], state_key=config_mod.state_key(cfg, name))
         if not rec.exists():
@@ -806,6 +859,9 @@ def drain_dsn_queue(cfg: RouterConfig, name: str, summary: Dict[str, Any]) -> Li
                     _audit_dsn_held(cfg, name, intent)
                 waiting.append(_held_entry(intent, reason))
                 continue
+            # Armed only on a DURABLE outcome record: one visible after a
+            # failed barrier is made durable here first, or nothing happens.
+            _make_durable(cfg, rec)
             if intent.get("sender_lid") is None:
                 intent["sender_lid"] = config_mod.target_logical_id(cfg, intent["sender"])
             # Durable BEFORE the placement, on a replay too (the bound lid may

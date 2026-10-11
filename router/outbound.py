@@ -122,6 +122,7 @@ other instance's.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -137,7 +138,7 @@ from . import attachments as attachments_mod, binding, firstsight
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
 from .config import (RouterConfig, address_for, instance_for, instance_state_dir, state_key,
-                     target_hold, target_logical_id)
+                     target_hold, target_known_id, target_logical_id)
 from .util import (
     DEFAULT_READ_CAP,
     NamespaceEscapeError,
@@ -1513,6 +1514,9 @@ BLOCK_REQUEST_CHANGED = "request_changed"
 BLOCK_ATTACHMENTS_CHANGED = "attachments_changed"
 BLOCK_ROUTE_CHANGED = "route_changed"
 HOLD_IDENTITY_CHANGED = "identity_changed"
+#: An injected delivery backend that cannot take the pre-minted identity:
+#: held, never placed with a fresh one.
+HOLD_BACKEND_NO_PRESET = "backend_no_preset"
 
 
 class PendingDamaged(Exception):
@@ -1650,13 +1654,20 @@ def _begin_pending(
     deliver_backend: Optional[deliver_mod.DeliveryBackend],
 ) -> str:
     """At least one target is held: make the request pending (durably, before
-    anything is placed) and advance whatever can go now."""
+    anything is placed) and advance whatever can go now. A reply's target is
+    pinned to the logical_id its ledger record names (the identity the task
+    came from), else the one the registry knows now."""
+    pinned = {}
+    if pin is not None and isinstance(pin.get("record"), dict) and pin["record"].get("from_lid"):
+        pinned[pin["bound_instance"]] = pin["record"]["from_lid"]
     targets = []
     for r in recipients:
         reason = target_hold(cfg, r) if r in cfg.instances else None
         targets.append({
             "recipient": r, "kind": kind,
-            "lid": target_logical_id(cfg, r) if r in cfg.instances else None,
+            # The identity the registry KNOWS now, held or not: a later rebind
+            # of the name holds as identity_changed instead of rerouting.
+            "lid": pinned.get(r) or (target_known_id(cfg, r) if r in cfg.instances else None),
             "state": "held" if reason else "ready", "reason": reason,
             "notice_id": None, "ts": None, "message_id": None, "error": None,
         })
@@ -1684,31 +1695,81 @@ def _place_target(
         return deliver_mod.deliver_peer(
             cfg, cfg.state_dir, name, target["recipient"], doc,
             reply_to_record=reply_record, attachments=attachments, preset=preset)
-    if deliver_backend is not None:
-        # An injected backend owns its own identity; it is offered the same
-        # request again on a replay, without a preset it may not accept.
-        return deliver_backend(cfg, cfg.state_dir, name, target["recipient"], doc,
-                               reply_to_record=reply_record, attachments=attachments)
-    return deliver_mod.deliver(cfg, cfg.state_dir, name, target["recipient"], doc,
-                               reply_to_record=reply_record, attachments=attachments,
-                               preset=preset)
+    backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
+    # Every backend path places with the PRE-MINTED identity; one that cannot
+    # take it is refused BEFORE placement (a replay would otherwise mint a
+    # second id and a second ledger record).
+    if not _accepts_preset(backend):
+        raise deliver_mod.RecipientHeld(target["recipient"], HOLD_BACKEND_NO_PRESET)
+    return backend(cfg, cfg.state_dir, name, target["recipient"], doc,
+                   reply_to_record=reply_record, attachments=attachments, preset=preset)
+
+
+def _accepts_preset(backend: Callable[..., Any]) -> bool:
+    """True when `backend` takes a `preset` keyword (named, or **kwargs)."""
+    try:
+        params = inspect.signature(backend).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "preset" and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)
+               or p.kind is p.VAR_KEYWORD for p in params)
+
+
+def _place_one(
+    cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], t: Dict[str, Any],
+    doc: Dict[str, Any], attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    deliver_backend: Optional[deliver_mod.DeliveryBackend],
+) -> bool:
+    """One target that this poll's report resolves: durable `delivering`
+    identity FIRST (on a replay too), then the placement with that identity,
+    then `delivered`. A failure after placement began keeps it `delivering`,
+    to be replayed with the SAME identity next poll; nothing here is
+    terminal. Returns True when the record changed without being written."""
+    path = _pending_path(cfg, name, req_id)
+    pin = rec.get("binding")
+    if t["state"] in ("held", "ready"):
+        if t["recipient"] in cfg.instances and t["lid"] is None:
+            t["lid"] = target_logical_id(cfg, t["recipient"])   # never known until now
+        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts())
+    t["reason"] = None
+    # Durable BEFORE the recipient is touched, on a REPLAY too: a record can
+    # be visible after its directory barrier failed, and a placement must
+    # never rest on that. A rewrite with `durable_root` repairs the whole
+    # chain; if it fails again, this raises and nothing is placed.
+    _write_pending(cfg, path, rec)
+    try:
+        delivered = _place_target(cfg, name, t, doc, attachments,
+                                  pin["record"] if pin else None, deliver_backend)
+    except deliver_mod.RecipientHeld as e:
+        t["reason"] = e.reason              # identity kept: a later poll replays it
+        return True
+    except Exception as e:  # noqa: BLE001 — one target must not sink the request
+        logger.warning(
+            "instance %r req %r: delivery to %r failed: %s: %s — kept, replayed next poll "
+            "with the same identity", name, req_id, t["recipient"], type(e).__name__, e)
+        t["reason"] = f"failing: {type(e).__name__}"
+        return True
+    t.update(state="delivered", message_id=delivered.get("message_id"), reason=None)
+    _write_pending(cfg, path, rec)
+    return False
 
 
 def _advance_pending(
     cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], doc: Dict[str, Any],
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     deliver_backend: Optional[deliver_mod.DeliveryBackend],
+    *, settle_only: bool = False,
 ) -> str:
-    """Advance every target that this poll's report resolves (P4': the
-    delivering identity is durable BEFORE any placement; a delivering target
-    replays with the SAME identity), then answer the request iff nothing is
-    still pending."""
+    """Advance every target that this poll's report resolves (P4'), then
+    answer the request iff nothing is still pending. `settle_only` replays
+    only targets already `delivering` (a refusal must first know every
+    placement it would report) and never answers."""
     path = _pending_path(cfg, name, req_id)
-    pin = rec.get("binding")
-    reply_record = pin["record"] if pin else None
     dirty = False
     for t in rec["targets"]:
         if t["state"] in ("delivered", "failed"):
+            continue
+        if settle_only and t["state"] != "delivering":
             continue
         reason = _hold_reason(cfg, t)
         if reason is not None:
@@ -1719,38 +1780,10 @@ def _advance_pending(
                 dirty = True
                 _audit_held(cfg, name, req_id, t)
             continue
-        if t["state"] in ("held", "ready"):
-            t.update(state="delivering", reason=None, notice_id=mint_notice_id(), ts=utc_ts(),
-                     lid=target_logical_id(cfg, t["recipient"]) if t["recipient"] in cfg.instances
-                     else None)
-        else:
-            t["reason"] = None
-        # Durable BEFORE the recipient is touched, on a REPLAY too: a record
-        # can be visible after its directory barrier failed, and a placement
-        # must never rest on that. A rewrite with `durable_root` repairs the
-        # whole chain; if it fails again, this raises and nothing is placed.
+        dirty = _place_one(cfg, name, req_id, rec, t, doc, attachments, deliver_backend) or False
+    if dirty:
         _write_pending(cfg, path, rec)
-        dirty = False
-        try:
-            delivered = _place_target(cfg, name, t, doc, attachments, reply_record, deliver_backend)
-        except deliver_mod.RecipientHeld as e:
-            t["reason"] = e.reason          # identity kept: a later poll replays it
-            dirty = True
-            continue
-        except Exception as e:  # noqa: BLE001 — one target must not sink the request
-            logger.warning(
-                "instance %r req %r: delivery to %r failed: %s: %s",
-                name, req_id, t["recipient"], type(e).__name__, e)
-            t.update(state="failed", error=type(e).__name__)
-            _write_pending(cfg, path, rec)
-            dirty = False
-            continue
-        t.update(state="delivered", message_id=delivered.get("message_id"), reason=None)
-        _write_pending(cfg, path, rec)
-        dirty = False
-    if any(t["state"] not in ("delivered", "failed") for t in rec["targets"]):
-        if dirty:
-            _write_pending(cfg, path, rec)
+    if settle_only or any(t["state"] not in ("delivered", "failed") for t in rec["targets"]):
         return HELD
     outcome = _finish(cfg, name, req_id, _pending_result(cfg, req_id, rec, attachments),
                       req_digest=rec["request_sha256"])
@@ -1881,6 +1914,15 @@ def _drain_pending(
     if decided == BLOCK_ROUTE_CHANGED:
         return _block(cfg, name, req_id, rec, BLOCK_ROUTE_CHANGED)
     if isinstance(decided, ColdRefusal):
+        # Every placement already begun is settled first (replayed with its
+        # identity), so the terminal Result can report EVERY target whose
+        # notice was placed. One that cannot settle now (held, failing)
+        # defers the refusal: a later poll reports it.
+        if any(t["state"] == "delivering" for t in rec["targets"]):
+            _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend,
+                             settle_only=True)
+            if any(t["state"] == "delivering" for t in rec["targets"]):
+                return HELD
         if decided.hold:
             _write_held_copy(cfg, name, req_id)
         if decided.reason_code in _PEER_REFUSALS:
