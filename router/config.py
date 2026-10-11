@@ -169,6 +169,17 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 #: router refuses to run one under a registry.
 ID_SHAPED_NAME_RE = re.compile(r"[0-9a-fA-F]{32}\Z")
 
+#: The entries directly under `state_dir` that are this router's own, never
+#: an instance's: the registry seq floor's directory (`registry.SEQ_DIR`) and
+#: the status file (`status.STATUS_FILENAME`). An instance by one of these
+#: names would have its private state joined onto them. Compared casefolded,
+#: for a case-insensitive `state_dir`. The drain lock (`.router.lock`) and
+#: `atomic_write`'s temporaries (`tmp*`, `mkstemp`'s fresh names, which never
+#: replace an existing entry) need no entry here: the first is not a valid
+#: name, the second cannot take over a directory that exists.
+#: `test_state_rekey` pins this set against the modules that own them.
+RESERVED_STATE_NAMES = frozenset({"registry", "status.json"})
+
 #: Connector ids for `outbound/ext/<id>/outcomes/` — the directories
 #: `outcomes._consume_dir` scans, in this order. The spec ("The Volume
 #: Layout", `outbound/ext/<name>/`) makes `<name>` a stable connector id,
@@ -511,11 +522,29 @@ def _transport_plugin(top: Dict[str, Any]) -> Optional[TransportPluginPin]:
     return TransportPluginPin(path=str(path), sha256=sha)
 
 
+class StateKeyUnresolved(LookupError):
+    """Under a registry, `name` has no resolved state key (the registry holds
+    it), so nothing may be read or written for it under `state_dir`."""
+
+
 def state_key(cfg: "RouterConfig", name: str) -> str:
-    """The directory under `cfg.state_dir` holding `name`'s private state:
-    its logical_id when this poll's registry resolved it, else its own name.
-    Every `state_dir/<instance>` join in the package goes through this."""
-    return cfg.state_keys.get(name, name)
+    """The directory under `cfg.state_dir` holding `name`'s private state.
+    Every `state_dir/<instance>` join in the package goes through this.
+
+    Without a registry: the instance's own name. Under a registry: its
+    logical_id as this poll resolved it, and NOTHING ELSE. A held instance
+    has no key, and this raises `StateKeyUnresolved` rather than fall back
+    to the name: a name directory written under a registry becomes a
+    `state_conflict`, strands what was written there, and for a name like
+    `status.json` would replace a file this router owns."""
+    key = cfg.state_keys.get(name)
+    if key is not None:
+        return key
+    if cfg.registry_dir is not None:
+        raise StateKeyUnresolved(
+            f"{name!r} has no resolved state key under the registry (held); "
+            "no state is read or written for it")
+    return name
 
 
 def instance_state_dir(cfg: "RouterConfig", name: str) -> Path:
@@ -760,6 +789,9 @@ def _discover_instances(
             continue
         if slug.casefold() == ROUTER_LOCAL_PART.casefold():
             skipped[slug] = "this router's own address local-part"
+            continue
+        if slug.casefold() in RESERVED_STATE_NAMES:
+            skipped[slug] = "the name of an entry this router keeps in state_dir"
             continue
         if registry and ID_SHAPED_NAME_RE.fullmatch(slug):
             # Under a registry the host keys its own per-identity directories
@@ -1019,6 +1051,11 @@ def load_obj(
                 f"because the slug IS the instance name (it is also the address "
                 f"local-part and a directory under state_dir)"
             )
+        if name.casefold() in RESERVED_STATE_NAMES:
+            raise ConfigError(
+                f"config.instances: {name!r} is the name of an entry this router "
+                f"keeps directly under state_dir ({sorted(RESERVED_STATE_NAMES)}), and "
+                f"an instance's private state lives there too; rename the instance")
         if name.casefold() == ROUTER_LOCAL_PART.casefold():
             # The router's own local part is not available as an instance
             # name. It used to be unreachable because names could not contain

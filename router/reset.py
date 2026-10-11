@@ -423,15 +423,22 @@ def _enumerate_mailbox_removals(
     return paths
 
 
-def _keyed(cfg: RouterConfig, names: Iterable[str]) -> RouterConfig:
-    """`cfg` with each named instance's state key resolved. Under a registry
-    a reset touches `state_dir/<logical_id>/`, so it reads the registry as a
-    poll does; a named instance the registry HOLDS has no resolved state
-    directory and is refused, never reset by its name."""
+def _keyed(cfg: RouterConfig, names: Iterable[str], *, persist: bool) -> RouterConfig:
+    """`cfg` keyed by a FRESH registry report, whatever `state_keys` it
+    arrived with. Under a registry a reset touches `state_dir/<logical_id>/`,
+    and keys cached from an earlier poll may be stale: since then a legacy
+    name directory may have appeared (`state_conflict`), or the registry may
+    have become unavailable or rolled back. So the registry is read again
+    here, and if ANY named instance is held the whole batch is refused
+    before anything is removed. The caller then uses only the view returned.
+
+    `persist=False` for a plan (`--dry-run`): it takes no lock, so it must
+    not write the seq floor either (the read still refuses a rollback)."""
     names = [n for n in names if n in cfg.instances]
-    if cfg.registry_dir is None or all(n in cfg.state_keys for n in names):
+    if cfg.registry_dir is None:
         return cfg
-    report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances)
+    report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
+                                     persist=persist)
     held = {n: report.held[n] for n in names if n in (report.held or {})}
     if held:
         raise ResetError(
@@ -441,6 +448,17 @@ def _keyed(cfg: RouterConfig, names: Iterable[str]) -> RouterConfig:
 
 
 def plan_reset(cfg: RouterConfig, name: str) -> ResetPlan:
+    """Inspect (never mutate) what a reset of instance `name` would remove;
+    see `_plan_one`. Under a registry, keyed by a fresh, non-persisting
+    read of it (`_keyed`)."""
+    if name not in cfg.instances:
+        raise ResetError(
+            f"reset: {name!r} names no configured instance (known: {sorted(cfg.instances)})"
+        )
+    return _plan_one(_keyed(cfg, [name], persist=False), name)
+
+
+def _plan_one(cfg: RouterConfig, name: str) -> ResetPlan:
     """Inspect (never mutate) what a reset of instance `name` would
     remove. Verifies namespace containment as part of inspection — a
     `--dry-run` must fail exactly the way a real run would, never report a
@@ -454,7 +472,6 @@ def plan_reset(cfg: RouterConfig, name: str) -> ResetPlan:
             f"reset: {name!r} names no configured instance (known: {sorted(cfg.instances)})"
         )
     _verify_containment(cfg, name)
-    cfg = _keyed(cfg, [name])
 
     inst = cfg.instances[name]
     first_seen_marker = firstsight.marker_path(cfg.state_dir, name,
@@ -518,8 +535,8 @@ def plan_resets(cfg: RouterConfig, names: Iterable[str]) -> List[ResetPlan]:
         raise ResetError(
             f"reset: {unknown} names no configured instance (known: {sorted(cfg.instances)})"
         )
-    cfg = _keyed(cfg, names)
-    return [plan_reset(cfg, name) for name in names]
+    cfg = _keyed(cfg, names, persist=False)
+    return [_plan_one(cfg, name) for name in names]
 
 
 # --------------------------------------------------------------------
@@ -827,9 +844,16 @@ def reset_instance(cfg: RouterConfig, name: str) -> Dict[str, Any]:
     Refuses (`ResetError`) if `name` doesn't name a configured instance;
     raises `NamespaceEscapeError` (propagated) on an escaping mailbox
     leaf, in both cases before anything is removed."""
-    if name in cfg.instances:
-        cfg = _keyed(cfg, [name])
-    plan = plan_reset(cfg, name)  # validates name; fast, early containment probe
+    if name not in cfg.instances:
+        raise ResetError(
+            f"reset: {name!r} names no configured instance (known: {sorted(cfg.instances)})"
+        )
+    return _reset_one(_keyed(cfg, [name], persist=True), name)
+
+
+def _reset_one(cfg: RouterConfig, name: str) -> Dict[str, Any]:
+    """`reset_instance` on a view `_keyed` has already validated."""
+    plan = _plan_one(cfg, name)  # validates name; fast, early containment probe
     state_removed = _clear_state(cfg, name)
     mailbox = _empty_mailboxes(cfg, name)
     # Re-sweep, LIVE (not `plan.state_paths`, computed before any of this
@@ -918,7 +942,7 @@ def reset_instances(cfg: RouterConfig, names: Iterable[str]) -> List[Dict[str, A
     try:
         # Under the lock, before anything is removed: a name the registry
         # holds aborts the whole batch (`_keyed`).
-        cfg = _keyed(cfg, names)
-        return [reset_instance(cfg, name) for name in names]
+        cfg = _keyed(cfg, names, persist=True)
+        return [_reset_one(cfg, name) for name in names]
     finally:
         lk.release()

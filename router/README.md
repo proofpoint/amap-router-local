@@ -1141,10 +1141,27 @@ longer be replied to. To migrate, with the router stopped:
 exist, the instance is held as `state_conflict` until the operator removes or
 merges one; this router does not choose. An unreadable entry counts as present.
 
-**`reset` follows the same keys.** Under a registry, `reset <name>` reads the
-registry and clears `state_dir/<logical_id>/`. It refuses, removing nothing,
-for an instance the registry holds: a held instance has no resolved state
-directory.
+**Nothing is written under a name while a registry is configured.** An
+instance the registry holds has no state key at all (`config.state_key`
+raises rather than fall back to the name). A delivery TO a held recipient
+therefore fails through the ordinary failure path (`queued_for_human` /
+`delivery_failed`, or `partial_delivery` beside healthy recipients) and
+creates nothing under `state_dir/<name>/`, which would otherwise come back as
+`state_conflict` once the recipient is registered again.
+
+**`reset` follows the same keys, read fresh.** Under a registry, `reset <name>`
+reads the registry again under the drain lock, whatever keys a caller
+cached, and clears `state_dir/<logical_id>/`. If any named instance is held
+(including a conflict or an unavailable or rolled-back registry since the
+keys were cached) the whole batch is refused before anything is removed.
+`reset --dry-run` reads it without persisting the seq floor, since it takes no
+lock.
+
+**`registry` and `status.json` are never instance names**, with or without a
+registry: they are entries this router keeps directly under `state_dir` (the
+seq floor's directory and the status file), and an instance's private state
+lives beside them. Refused at config load (casefolded) and skipped in
+discovery.
 
 **Names shaped like a logical_id cannot run under a registry.** A static
 instance named with 32 hex digits (either case, for a case-insensitive
@@ -1155,10 +1172,10 @@ name rule itself is unchanged without a registry.
 
 **Known limits, recorded rather than fixed here:**
 
-- An instance the registry holds can still be the TARGET of a local delivery
-  from a resolved sender, and that delivery's ledger is written under the
-  held instance's name. Whether a held recipient should receive at all is a
-  separate decision.
+- A delivery to a held recipient is a `delivery_failed` today (above). The
+  behaviour it should have (held, retried, visible to the sender) is
+  approved and lands separately; until then the
+  sender sees the failure path.
 - A name the registry has overridden is `not_registered` until aliases exist:
   the snapshot's `names` history is not read yet.
 - The casefold incumbency check during discovery still looks for
