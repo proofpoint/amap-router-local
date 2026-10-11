@@ -1421,7 +1421,8 @@ def _recheck(
     now_set = {_canonical_or_none(r) for r in routed.recipients}
     if None in then or then != now_set:
         return refused("the permitted recipient set changed")
-    return inflight_mod.Recheck(True, policy_digest=classify_mod.policy_digest(cfg, name))
+    return inflight_mod.Recheck(True, policy_digest=classify_mod.policy_digest(cfg, name),
+                                route=decided.klass)
 
 
 #: What this process has already warned about, so a 5-second poll does not

@@ -52,7 +52,9 @@ generation and ID the item id. For `control`, NAME and GEN are `-`: the
 `.control/` ENTRIES are candidates another runtime writes there; this
 module only lists them. ID is the candidate's 32-hex DIRECTORY name, and
 `show` gives METADATA ONLY (its `candidate.json`'s size, sha256 and mtime,
-read pinned and bounded) until the inbound step freezes their format. The
+read pinned and bounded) until the inbound step freezes their format. A
+`candidate.json` with exactly two links is a link-commit caught in
+progress: listed IN FLIGHT and not read. Any other link count is DAMAGED. The
 intake's path is the inbound step's to configure; until then the CLI takes
 it as `--control-dir`.
 
@@ -107,6 +109,14 @@ _EVIDENCE_KEY = re.compile(r"[\x20-\x7e]{1,%d}\Z" % EVIDENCE_KEY_MAX)
 class Damaged(ValueError):
     """An entry outside the format. `str(e)` is the reason, and never echoes
     the entry's content."""
+
+
+class Linked(Damaged):
+    """A regular file with more than one link. `nlink` is how many."""
+
+    def __init__(self, nlink: int):
+        super().__init__("a regular file with more than one link")
+        self.nlink = nlink
 
 
 @dataclass
@@ -227,7 +237,7 @@ def read_pinned(dir_fd: int, name: str, cap: int) -> "tuple[bytes, os.stat_resul
         if not stat.S_ISREG(st.st_mode):
             raise Damaged("not a regular file")
         if st.st_nlink != 1:
-            raise Damaged("a regular file with more than one link")
+            raise Linked(st.st_nlink)
         chunks, got = [], 0
         while got <= cap:
             chunk = os.read(fd, min(65536, cap + 1 - got))
@@ -346,6 +356,13 @@ def _control_item(c_fd: int, entry: str, now: datetime) -> Item:
                     damaged="not a directory reachable without a link")
     try:
         raw, st = read_pinned(d_fd, "candidate.json", CANDIDATE_MAX_BYTES)
+    except Linked as e:
+        if e.nlink == 2:
+            # Its writer commits candidate.json by link, then removes the
+            # staged name: two links is a commit caught in progress, listed
+            # as such and never read. Anything else stays DAMAGED.
+            return Item(SOURCE_CONTROL, "-", "-", entry, meta={"in_flight": True})
+        return Item(SOURCE_CONTROL, "-", "-", entry, damaged=f"candidate.json: {e}")
     except Damaged as e:
         return Item(SOURCE_CONTROL, "-", "-", entry, damaged=f"candidate.json: {e}")
     finally:
@@ -362,6 +379,8 @@ def _control_item(c_fd: int, entry: str, now: datetime) -> Item:
 def render_line(item: Item) -> str:
     if item.damaged is not None:
         return f"{item.key()} DAMAGED {display(item.damaged)}"
+    if item.source == SOURCE_CONTROL and item.meta.get("in_flight"):
+        return f"{item.key()} IN FLIGHT (candidate.json is being committed)"
     if item.source == SOURCE_CONTROL:
         return f"{item.key()} candidate age={item.age_s}s bytes={item.meta['candidate_bytes']}"
     causes = ",".join(item.doc["causes"])  # vocabulary-checked: printable as is
@@ -378,6 +397,8 @@ def render_show(item: Item) -> str:
     if item.damaged is not None:
         doc["status"] = "damaged"
         doc["reason"] = item.damaged
+    elif item.source == SOURCE_CONTROL and item.meta.get("in_flight"):
+        doc["status"] = "in_flight"
     elif item.source == SOURCE_CONTROL:
         doc["status"] = "candidate"
         doc.update(item.meta)

@@ -152,6 +152,39 @@ class PublicationRecheckTests(_Case):
         self.assertEqual(self.port.at_write["00000001"]["policy_digest"],
                          classify.policy_digest(cfg, "alice"))
 
+    def route_less(self, cfg):
+        p = inflight.record_path(cfg, "alice", "00000001")
+        rec = json.loads(p.read_text())
+        del rec["policy_digest"], rec["route"]
+        p.write_text(json.dumps(rec))
+
+    def test_a_route_less_record_is_pinned_before_its_first_publication(self):
+        """The route is backfilled with the digest, durably, before the write;
+        then a later change of route while it is pending is caught and marked."""
+        cfg = self.cfg()
+        self.stage(cfg)
+        self.route_less(cfg)
+        self.drain(cfg)
+        self.assertEqual(self.port.writes, ["00000001"])
+        at_write = self.port.at_write["00000001"]
+        self.assertEqual((at_write.get("route"), at_write.get("policy_digest")),
+                         ("internet", classify.policy_digest(cfg, "alice")))
+        moved = self.cfg(top={"egress": True, "fleet_hosts": [T1, T2, HUB2, "example.com"]},
+                         alice={"send_to": [NET], "remote_fleet": ["example.com"]})
+        with self.assertLogs("amap_router_local.inflight", logging.ERROR) as logs:
+            self.drain(moved)
+        self.assertTrue(any("route changed from internet to fleet_host" in m
+                            for m in logs.output))
+        self.assertIn("revocation_unenforceable", self.record(cfg))
+
+    def test_a_route_less_handed_record_is_pinned_on_its_pending_recheck(self):
+        cfg = self.cfg()
+        write_request(cfg, "alice", "00000001", to=[NET])
+        self.drain(cfg)
+        self.route_less(cfg)
+        self.drain(cfg)
+        self.assertEqual(self.record(cfg).get("route"), "internet")
+
     def test_a_record_from_before_the_digest_still_refuses_when_not_permitted(self):
         cfg = self.cfg()
         self.stage(cfg)

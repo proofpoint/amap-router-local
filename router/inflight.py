@@ -163,11 +163,13 @@ class Recheck:
     CURRENT config (`outbound._recheck`). `permitted` means the same class,
     route and recipient set. When permitted, `policy_digest` is the sender's
     digest now; when not, `verdict` is the settlement and `why` says what
-    changed."""
+    changed, and `route` is the route it was permitted on."""
     permitted: bool
     policy_digest: Optional[str] = None
     verdict: Optional[Dict[str, Any]] = None
     why: str = ""
+    #: When permitted: the request's route now (`classify.REMOTE_ROUTES`).
+    route: Optional[str] = None
 
 
 def withdraw_capable(port: Any) -> bool:
@@ -507,8 +509,9 @@ def advance(
     handed-but-unwritten record's re-write alike, and on every poll while
     the request is pending. Not permitted at publication: settled from the
     re-check's verdict, nothing handed over. Permitted with a changed
-    digest: the record's digest is updated durably FIRST, so the digest
-    published with the request is the current one. Not permitted while
+    digest, or with no recorded route (a record from before routes were
+    recorded): the record's digest and route are updated durably FIRST, so
+    what is published with the request is current. Not permitted while
     pending: the request was handed over and cannot be withdrawn through any
     transport this router accepts, so the record is marked
     `revocation_unenforceable` and an ERROR is logged every poll; a result,
@@ -584,13 +587,7 @@ def advance(
             _effect("settle", settle, rc.verdict, record.get("digest"))
             _effect("unlink", _cleanup, path, handed)
             return SETTLED
-        if rc.policy_digest is not None and rc.policy_digest != record.get("policy_digest"):
-            logger.warning(
-                "instance %r req %r: the sender's policy digest changed since the "
-                "request was staged (%s -> %s); still permitted, publishing under "
-                "the new digest", name, req_id, record.get("policy_digest"),
-                rc.policy_digest)
-            record["policy_digest"] = rc.policy_digest
+        if _repin(name, req_id, record, rc):
             _write_record(cfg, name, req_id, record, "repin")
     data = transport_request_bytes(cfg, name, record)
     _effect("handed", atomic_write, handed, n.encode("ascii"),
@@ -617,6 +614,8 @@ def _check_revocation(
         return
     rc = recheck(record)
     if rc.permitted:
+        if record.get("route") is None and _repin(name, req_id, record, rc):
+            _write_record(cfg, name, req_id, record, "repin")
         return
     if not enact:
         logger.error(
@@ -628,6 +627,27 @@ def _check_revocation(
     logger.error(
         "instance %r req %r: REVOKED: %s; it was already handed over and %s, so it "
         "may still be sent", name, req_id, rc.why, how)
+
+
+def _repin(name: str, req_id: str, record: Dict[str, Any], rc: Recheck) -> bool:
+    """Bring a permitted record's digest and route up to date in memory;
+    True when the caller must write it. The route is only ever FILLED IN,
+    for a record written before routes were recorded: a recorded route that
+    differs is a refusal (`outbound._recheck`), never a re-pin. Without the
+    backfill such a record would publish with no route, and a later change
+    of route while it is pending could not be detected."""
+    changed = False
+    if rc.policy_digest is not None and rc.policy_digest != record.get("policy_digest"):
+        logger.warning(
+            "instance %r req %r: the sender's policy digest changed since the request "
+            "was staged (%s -> %s); still permitted, publishing under the new digest",
+            name, req_id, record.get("policy_digest"), rc.policy_digest)
+        record["policy_digest"] = rc.policy_digest
+        changed = True
+    if record.get("route") is None and rc.route is not None:
+        record["route"] = rc.route
+        changed = True
+    return changed
 
 
 def revoked(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:

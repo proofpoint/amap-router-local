@@ -45,7 +45,8 @@ THE TRUSTED-HOST ORDER (item 5):
   a. shape first: more than one recipient, or any cc, cannot be a peer task,
      so it is cold fleet mail: `fleet_mail_disabled`. `peer_single_recipient`
      stays the same-host peer lane's code;
-  b. `task_deny` removes the edge: `peer_denied`;
+  b. `task_deny` removes the edge: `peer_denied`. A deny matches every
+     spelling of its target (the registry's skeleton); permits stay exact;
   c. the sender is under 24 h old by its CURRENT registry entry, its
      `first_registered_ts` lies in the future, or there is no such value:
      `peer_quarantined` (the last with detail "sender age unknown");
@@ -88,6 +89,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from . import config as config_mod
+from . import registry as registry_mod
 from .util import parse_utc_ts
 
 # -- reason codes this module originates ------------------------------------
@@ -411,8 +413,18 @@ def classify(
 
 
 def _denied(entries: Iterable[str], addr: Address) -> bool:
-    canon = addr.canonical()
-    return any(e == canon or e == "@" + addr.domain for e in canonical_entries(entries))
+    """Item 5b. A DENY matches the local part by the registry's skeleton
+    (case, the fixed confusables and separators folded), because the
+    receiving router resolves a local part to an identity that way: an exact
+    compare would let `Bob@host` or `b0b@host` reach the `bob` it denies.
+    Permits (`send_to`, the recipient-set checks) stay exact: a deny must
+    catch every spelling of its target, a permit must name exactly one."""
+    key = registry_mod.skeleton(addr.local)
+    for e in canonical_entries(entries):
+        local, domain = e.rsplit("@", 1)
+        if domain == addr.domain and (not local or registry_mod.skeleton(local) == key):
+            return True
+    return False
 
 
 def sender_age_refusal(cfg: "config_mod.RouterConfig", sender: str,

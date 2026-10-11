@@ -413,11 +413,21 @@ class TrustedHostTests(_Case):
         with mock.patch.object(exposure, "assess", return_value=STAMP):
             self.assertEqual(self.decide(cfg, [TRUSTED]).reason_code, "recipient_unknown")
 
-    def test_task_deny_matches_local_parts_exactly(self):
-        cfg = self.ready(alice={"task_deny": [f"Carol@{T1}"]})
+    def test_a_deny_catches_every_spelling_of_its_target(self):
+        """A deny matches by the registry's skeleton: the receiving router
+        resolves Bob@ and b0b@ to the bob it denies, so they are refused too."""
+        cfg = self.ready(alice={"task_deny": [f"bob@{T1}"]})
+        for spelling in ("bob", "Bob", "BOB", "b0b", "b.o_b"):
+            with self.subTest(spelling), \
+                    mock.patch.object(exposure, "assess", return_value=STAMP):
+                self.assertEqual(self.decide(cfg, [f"{spelling}@{T1}"]).reason_code,
+                                 "peer_denied")
+
+    def test_a_deny_is_still_per_address_and_per_host(self):
+        cfg = self.ready(alice={"task_deny": [f"bob@{T1}"]})
         with mock.patch.object(exposure, "assess", return_value=STAMP):
-            d = self.decide(cfg, [TRUSTED])
-        self.assertNotEqual(d.reason_code, "peer_denied")
+            self.assertNotEqual(self.decide(cfg, [f"rob@{T1}"]).reason_code, "peer_denied")
+            self.assertNotEqual(self.decide(cfg, [f"bob@{T2}"]).reason_code, "peer_denied")
 
     def test_denied_wins_over_quarantine(self):
         cfg = with_age(make_cfg(self, alice={"task_deny": [f"@{T1}"]}), None)
@@ -552,20 +562,18 @@ class FleetAndInternetTests(_Case):
         self.assertEqual(self.code(r), ("queued_for_human", "recipient_not_allowlisted"))
 
     def test_the_route_and_digest_are_recorded_before_anything_is_handed(self):
+        """Read after staging with publication blocked: the re-check at
+        publication also fills in a missing route and digest, so a record
+        read at write time could not tell which step wrote them."""
         cfg = make_cfg(self, top={"egress": True}, alice={"send_to": [NET]})
-        seen = {}
-
-        class Capture(FakeTransport):
-            def write_request(s, n, data):
-                from router import inflight
-                seen["record"] = inflight.read_record(cfg, "alice", "00000001")
-                super().write_request(n, data)
-        self.port = Capture()
+        from router import inflight
         write_request(cfg, "alice", "00000001", to=[NET])
-        outbound.drain_instance(cfg, "alice", transport=self.port)
-        self.assertEqual(seen["record"].get("route"), "internet")
-        self.assertEqual(seen["record"].get("policy_digest"),
-                         classify.policy_digest(cfg, "alice"))
+        outbound.drain_instance(dataclasses.replace(cfg, reload_failed=True), "alice",
+                                transport=self.port)
+        self.assertEqual(self.port.writes, [])
+        rec = inflight.read_record(cfg, "alice", "00000001")
+        self.assertEqual(rec.get("route"), "internet")
+        self.assertEqual(rec.get("policy_digest"), classify.policy_digest(cfg, "alice"))
 
 
 # ---------------------------------------------------------------------------

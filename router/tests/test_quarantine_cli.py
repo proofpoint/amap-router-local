@@ -308,6 +308,16 @@ class ControlTests(_Q):
         self.assertIn("without following a link", items[ID1])
         self.assertIn("larger than", items[ID2])
 
+    def test_a_commit_caught_in_progress_is_in_flight_not_damaged(self):
+        d = self.candidate(ID1)
+        os.link(d / "candidate.json", self.tmp / "staged")      # two links
+        [i] = quarantine.list_control(self.control)
+        self.assertIsNone(i.damaged)
+        self.assertIn("IN FLIGHT", quarantine.render_line(i))
+        os.link(d / "candidate.json", self.tmp / "third")       # three: damaged
+        [i] = quarantine.list_control(self.control)
+        self.assertIn("more than one link", i.damaged or "<not damaged>")
+
     def test_nothing_is_moved_or_written(self):
         self.candidate(ID1)
         before = sorted((str(p), p.stat().st_mtime_ns) for p in self.control.rglob("*"))

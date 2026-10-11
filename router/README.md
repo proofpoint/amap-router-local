@@ -1056,6 +1056,11 @@ classification; both answers are `malformed_request`.
 `tests/vectors/address_grammar.json` holds the cases, shared with the
 external leg's runtime.
 
+A per-address `task_deny` entry matches every spelling of its target, by
+the registry's skeleton (case, the fixed confusables and separators folded),
+because the receiving router resolves local parts that way. Permits
+(`send_to`, the recipient-set checks) stay exact.
+
 **Config.** All optional:
 
 ```json
@@ -1100,7 +1105,10 @@ digest is updated durably BEFORE the request is written, so the digest
 published with it is the current one. Anything else settles
 `queued_for_human`/`recipient_not_allowlisted`, "policy changed before
 publication: …", saying "route changed from X to Y" where that is the
-cause. A different route is refused, never rebuilt.
+cause. A different route is refused, never rebuilt. An alias the table can
+no longer decide is a refusal at this point too, not a hold: the request
+was already consumed, and holding it would leave a staged request with no
+answer.
 
 **Revocation after hand-over.** While a handed request is pending, every
 poll re-checks it. If it is no longer permitted, nothing this router
@@ -1238,7 +1246,8 @@ SOURCE is `ingress` or `control`. `.control/` entries (candidates another
 runtime writes) are listed with `--control-dir`, keyed `- control - ID`
 with ID the candidate's 32-hex directory name, METADATA ONLY (the
 `candidate.json` size, sha256 and mtime) until the inbound step freezes their
-format; their path is not configured yet. Nothing is moved or written, and
+format; their path is not configured yet. A `candidate.json` caught
+mid-commit (exactly two links) is listed IN FLIGHT, not DAMAGED. Nothing is moved or written, and
 the registry is read without recording its seq. Retention is
 `ingress_quarantine_days` (default 14, 1-365). `status` reports a count per
 agent under a registry.
