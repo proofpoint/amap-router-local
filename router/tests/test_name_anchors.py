@@ -42,6 +42,17 @@ class OutboundRequestNameTests(helpers.RouterTestCase):
         self.assertTrue(helpers.result_path(cfg, "alpha", "00000002").is_file())
         self.assertFalse(helpers.result_path(cfg, "alpha", "00000001").exists())
 
+    def test_a_prefixed_name_is_skipped_and_never_drained(self):
+        """A pattern applied with `.search` would find `req-<id>.json` inside
+        `junk-req-<id>.json`; the whole name must match."""
+        cfg = self.make_config({"alpha": []})
+        helpers.write_request(cfg, "alpha", "00000001", filename="junk-req-alpha.json")
+        helpers.write_request(cfg, "alpha", "00000002")             # the twin
+        summary = outbound.drain_instance(cfg, "alpha")
+        self.assertEqual((summary["outbound_skipped_bad_name"], summary["drained"]), (1, 1))
+        results = cfg.instances["alpha"].outbox_root / "results"
+        self.assertEqual(sorted(p.name for p in results.iterdir()), ["00000002.json"])
+
 
 class FirstSightRequestNameTests(unittest.TestCase):
     """`firstsight._REQ_NAME_RE`: the snapshot lists only names the drain
@@ -50,6 +61,7 @@ class FirstSightRequestNameTests(unittest.TestCase):
     def test_a_trailing_newline_is_not_snapshotted(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "req-00000001.json\n").write_text("{}")
+            (Path(d) / "junk-req-gamma.json").write_text("{}")
             (Path(d) / "req-00000002.json").write_text("{}")         # the twin
             names = [e["filename"] for e in firstsight._snapshot_outbox(Path(d))]
         self.assertEqual(names, ["req-00000002.json"])
@@ -70,6 +82,7 @@ class OutcomeFileNameTests(helpers.RouterTestCase):
         d = self.tmp / "outcomes-dir"
         d.mkdir()
         (d / f"peer-{NID}.json\n").write_text("{}")
+        (d / f"x-peer-{NID}.json").write_text("{}")
         (d / f"peer-{'f' * 32}.json").write_text("{}")                # the twin
         fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -119,6 +132,7 @@ class ExposureNoticeFileTests(helpers.RouterTestCase):
         d = binding.ledger_dir(self.cfg.state_dir, "alpha")
         d.mkdir(parents=True)
         (d / "notice-abc.json\n").write_text("{}")
+        (d / "x-notice-ghi.json").write_text("{}")
         (d / "notice-def.json").write_text("{}")                     # the twin
         ids, _ = exposure._scan_ledger(self.cfg.state_dir, "alpha", self.start, self.end)
         self.assertEqual(ids, {"def"})
@@ -176,9 +190,31 @@ def _router_modules():
         yield info.name, importlib.import_module("router." + info.name)
 
 
-#: `$` outside a character class, i.e. used as an anchor.
-_DOLLAR_ANCHOR = re.compile(r"(?<!\\)\$")
-_CHAR_CLASS = re.compile(r"\[(?:\\.|[^\]\\])*\]")
+def dollar_anchors(pattern):
+    """Offsets of every `$` used as an ANCHOR in `pattern`: not escaped (an
+    odd run of backslashes before it) and not inside a character class.
+    Tracks escape parity and class state character by character, so
+    `\\\\$` (an escaped backslash, then an anchor) is found and `\\$` and
+    `[$]` are not."""
+    out, i, in_class = [], 0, False
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            i += 2                      # the escaped character, whatever it is
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+        elif c == "[":
+            in_class = True
+            if pattern[i + 1:i + 2] == "^":
+                i += 1
+            if pattern[i + 1:i + 2] == "]":
+                i += 1                  # a leading ] is literal
+        elif c == "$":
+            out.append(i)
+        i += 1
+    return out
 
 
 class StructuralTests(unittest.TestCase):
@@ -191,15 +227,23 @@ class StructuralTests(unittest.TestCase):
             for attr, value in vars(mod).items():
                 if isinstance(value, re.Pattern):
                     checked += 1
-                    bare = _CHAR_CLASS.sub("", value.pattern)
                     with self.subTest(pattern=f"{mod_name}.{attr}"):
-                        self.assertIsNone(_DOLLAR_ANCHOR.search(bare),
-                                          "anchor with \\Z: `$` matches before a trailing newline")
+                        self.assertEqual(dollar_anchors(value.pattern), [],
+                                         "anchor with \\Z: `$` matches before a trailing newline")
         self.assertGreater(checked, 20, "the sweep found too few patterns to be checking anything")
 
+    def test_the_anchor_scanner(self):
+        """Controls for `dollar_anchors` itself."""
+        for pattern, want in ((r"a$", [1]), (r"a\$", []), (r"a\\$", [3]),
+                              (r"a\\\$", []), (r"[$]", []), (r"[^$]$", [4]),
+                              (r"[\]$]", []), (r"[]$]x$", [5]), (r"(?=.{1}$)", [7]),
+                              (r"a\Z", [])):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(dollar_anchors(pattern), want)
+
     def test_patterns_are_applied_with_fullmatch(self):
-        """No `.match(` call and no `re.match(`/`re.search(` in production
-        code: a validator states the whole value it accepts."""
+        """No `.match(` or `.search(` call in production code, on a compiled
+        pattern or on `re`: a validator states the whole value it accepts."""
         calls = 0
         for path in sorted(ROUTER_DIR.glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -208,10 +252,8 @@ class StructuralTests(unittest.TestCase):
                     if node.func.attr == "fullmatch":
                         calls += 1
                     with self.subTest(at=f"{path.name}:{node.lineno}"):
-                        self.assertNotEqual(node.func.attr, "match",
-                                            "use fullmatch (and anchor with \\Z)")
-                        if isinstance(node.func.value, ast.Name) and node.func.value.id == "re":
-                            self.assertNotIn(node.func.attr, ("search",))
+                        self.assertNotIn(node.func.attr, ("match", "search"),
+                                         "use fullmatch (and anchor with \\Z)")
         self.assertGreater(calls, 20, "the sweep found too few fullmatch calls to be checking anything")
 
 
