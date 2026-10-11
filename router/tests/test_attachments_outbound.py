@@ -614,7 +614,7 @@ class TestOutboundSidecarTOCTOU(RouterTestCase):
         )
         proc.start()
         leaked = False
-        ingests = overlapped = witnessed = 0
+        ingests = overlapped = witnessed = symlink_hits = 0
         try:
             # THE RACE IS REQUIRED, not hoped for. "no race ran" was 150
             # ingests finishing before a freshly started attacker process had
@@ -626,24 +626,31 @@ class TestOutboundSidecarTOCTOU(RouterTestCase):
             # (missing) directory. NOT any refusal: the descriptor declares the
             # secret's size, so every ingest of the real directory is refused
             # for a size mismatch anyway, and counting those certified a race
-            # the reader never met. If the deadline passes first, this FAILS.
+            # the reader never met. (d) At least one of those witnesses met the
+            # SYMLINK: an attacker that only parks the directory and puts it
+            # back satisfies (c) through "missing" alone and never attacks the
+            # pin. If the deadline passes first, this FAILS.
             deadline = time.monotonic() + RACE_DEADLINE_S
             while swaps.value == 0:
                 if time.monotonic() > deadline:
                     self.fail("the attacker process never completed a swap before the deadline")
                 time.sleep(0.001)
-            while not (ingests >= MIN_INGESTS and overlapped >= MIN_OVERLAP and witnessed >= 1):
+            while not (ingests >= MIN_INGESTS and overlapped >= MIN_OVERLAP
+                       and witnessed >= 1 and symlink_hits >= 1):
                 if time.monotonic() > deadline:
                     self.fail(
                         f"the race did not run as required before the deadline: "
                         f"{ingests} ingests, {overlapped} overlapping attacker swaps, "
-                        f"{witnessed} refused on the attacker's swapped or parked state")
+                        f"{witnessed} refused on the attacker's swapped or parked state, "
+                        f"{symlink_hits} of them on the planted symlink")
                 before = swaps.value
                 try:
                     got = _try_ingest(self.cfg, "alice", req_id, [desc])
                 except attachments_mod.AttachmentIngestError as e:
                     if _race_witnessed(e):
                         witnessed += 1
+                    if _symlink_witnessed(e):
+                        symlink_hits += 1
                     got = []
                 ingests += 1
                 if swaps.value != before:
@@ -866,6 +873,15 @@ _RACE_REFUSALS = ("not a real directory", "sidecar dir missing")
 
 def _race_witnessed(error) -> bool:
     return any(marker in str(error.detail) for marker in _RACE_REFUSALS)
+
+
+def _symlink_witnessed(error) -> bool:
+    """The pinned lookup met a non-directory at the name. Only the planted
+    symlink puts one there in this test; the parked state reads "missing".
+    (`open_child_pinned` reports every non-ENOENT open failure, EMFILE
+    included, as the same "other", so this marker cannot tell a symlink from
+    an exhausted descriptor table. A typed refusal vocabulary is what would.)"""
+    return _RACE_REFUSALS[0] in str(error.detail)
 
 
 def _attacker_swap_loop(side_dir: str, secret_dir: str, stop, swaps) -> None:

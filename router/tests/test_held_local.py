@@ -20,7 +20,7 @@ from unittest import mock
 from router import binding, deliver as deliver_mod, outbound, outcomes, registry, service
 from router.config import HELD_REPORT_MISSING
 from router.tests.helpers import (
-    RouterTestCase, list_notices, read_json, result_path, write_request,
+    RouterTestCase, list_notices, notices_dir, read_json, result_path, write_request,
 )
 from router.tests.peer_helpers import addr, list_peer_notices, make_peer_config, write_outcome
 
@@ -1458,6 +1458,14 @@ class DsnRemovalFailureIsolatedTests(_Fleet):
                          sorted(f"notice-{i}.json" for i in ids),
                          "a DSN was lost or offered under a second id")
 
+    def consume(self, nid):
+        """The agent consumes the first DSN's notice, so only a REPLAY can put
+        it back: an unchanged listing after the next poll then proves nothing
+        ran, and the same name reappearing proves the replay used the same id."""
+        notice = notices_dir(self.cfg, "alpha") / f"notice-{nid}.json"
+        notice.unlink()
+        self.assertNotIn(notice.name, list_notices(self.cfg, "alpha"))
+
     def test_unlink_failure(self):
         d, first, ids = self.setup_two()
         real = os.unlink
@@ -1470,6 +1478,7 @@ class DsnRemovalFailureIsolatedTests(_Fleet):
             self.poll()
         self.check(ids)                               # the neighbour went too
         self.assertTrue(first.is_file())              # kept, so it replays
+        self.consume(ids[0])
         self.poll()                                   # replay: the SAME id, then removed
         self.check(ids)
         self.assertEqual(list(d.glob("*.json")), [])
@@ -1493,6 +1502,7 @@ class DsnRemovalFailureIsolatedTests(_Fleet):
         self.assertEqual(calls["n"], 1, "the injected directory-fsync fault never fired")
         self.check(ids)                               # the neighbour went too
         first.write_bytes(frozen)                     # the crash survivor
+        self.consume(ids[0])
         self.poll()                                   # replay: the SAME id, then removed
         self.check(ids)
         self.assertEqual(list(d.glob("*.json")), [])
