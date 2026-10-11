@@ -275,8 +275,13 @@ class HopFsOps(Protocol):
 
       * `mkdir_and_pin`: fsyncs the parent, whether or not this call created
         the directory (an earlier creator's fsync may have failed);
-      * `stage_tree`: the subtree is built complete and fsynced bottom-up,
-        published by a no-replace rename, then the parent is fsynced;
+      * `stage_tree`: creates the staging subtree under `staging_name`,
+        fsyncs it bottom-up and the parent, and returns its root fd
+        UNPUBLISHED. It never renames. The caller commits what must exist
+        before publication inside it (the identity marker), then publishes
+        it with `rename_noreplace` (both directories fsynced). A failure
+        before that rename leaves only a staging name that no reader treats
+        as a tree;
       * `commit_durable`: the stage file and stage dir, then the
         destination dir, then the stage dir again after the unlink (above);
       * `replace_durable`: the file before its rename, the directory after:

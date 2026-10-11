@@ -81,9 +81,17 @@ class HopFsOpsShapeTests(unittest.TestCase):
                        "THE BARRIER EACH METHOD OWES",
                        "whether or not this call created the directory",
                        "no fallback to link-then-unlink",
-                       "published by a no-replace rename"):
+                       "returns its root fd UNPUBLISHED", "It never renames",
+                       "then publishes it with `rename_noreplace`"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, doc)
+
+    def test_stage_tree_never_publishes(self):
+        """Admission commits the identity marker INSIDE the staging subtree
+        before the no-replace rename; `stage_tree` has neither the marker
+        nor the final name, so it must not publish."""
+        doc = " ".join(transport.HopFsOps.__doc__.split())
+        self.assertNotIn("published by a no-replace rename", doc)
 
     def test_entry_kind_precisions(self):
         import router.transport as mod
