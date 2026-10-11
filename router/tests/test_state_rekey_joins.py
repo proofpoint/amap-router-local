@@ -248,20 +248,27 @@ class HeldRecipientWritesNothingTests(_Migrated):
     A delivery to it fails through the ordinary failure path and writes
     nothing under its name, so it does not come back as state_conflict."""
 
-    def test_delivery_to_a_held_recipient_fails_and_writes_no_name_dir(self):
+    def test_delivery_to_a_held_recipient_holds_and_writes_no_name_dir(self):
+        """Held, not failed (router/README.md, "Held local delivery"): no
+        Result, nothing under b's name, and b comes back cleanly."""
         self.put(["a"])                               # b is now not_registered
         write_request(self.cfg, "a", "00000002", to=[addr("b")], body_text="again")
         with self.assertLogs("amap_router_local"):
             service.run_once(self.cfg, None)
-        res = read_json(result_path(self.cfg, "a", "00000002"))
-        self.assertEqual((res["outcome"], res["reason_code"]),
-                         ("queued_for_human", "delivery_failed"))
+        self.assertFalse(result_path(self.cfg, "a", "00000002").exists(),
+                         "a held delivery was answered")
         self.assertNoNameDirs()
         self.assertEqual(len(list_peer_notices(self.cfg, "b")), 1, "only the pre-registry task")
-        # b comes back cleanly: re-registered, it resolves (no state_conflict).
+        # b comes back cleanly: re-registered, it resolves (no state_conflict),
+        # and the held task goes out exactly once.
         self.put(["a", "b"], seq=4)
         r = registry.report_for(self.reg, self.state_dir, self.cfg.instances)
         self.assertEqual(r.held, {})
+        with self.assertLogs("amap_router_local"):
+            service.run_once(self.cfg, None)
+        self.assertEqual(read_json(result_path(self.cfg, "a", "00000002"))["reason_code"],
+                         "peer_routed")
+        self.assertEqual(len(list_peer_notices(self.cfg, "b")), 2)
 
     def test_state_key_fails_closed_for_a_held_name(self):
         k = registry.keyed_config(self.cfg, registry.report_for(

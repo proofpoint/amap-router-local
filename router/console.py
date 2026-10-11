@@ -766,6 +766,15 @@ def _health_section(data: Dict[str, Any]) -> str:
         alerts = inst["status"].get("peer_alerts") or []
         if alerts:
             flags.append(_pill("warn", f"{len(alerts)} alert(s)"))
+        # Registry mode: requests held on a local target, and DSNs waiting
+        # on a held sender (status.json; router/README.md "Held local
+        # delivery").
+        held_local = inst["status"].get("held_local") or []
+        if held_local:
+            flags.append(_pill("warn", f"{len(held_local)} request(s) held"))
+        dsn_held = inst["status"].get("dsn_held") or []
+        if dsn_held:
+            flags.append(_pill("warn", f"{len(dsn_held)} DSN(s) held"))
         rows.append(
             f"<tr><td class='mono'>{_esc(name)}</td>"
             f"<td class='mono'>{_esc(inst['address'])}</td>"

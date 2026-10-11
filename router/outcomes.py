@@ -160,7 +160,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import attachments as attachments_mod
 from . import audit as audit_mod
@@ -168,7 +168,7 @@ from . import binding
 from . import deliver as deliver_mod
 from . import config as config_mod
 from .config import RouterConfig, address_for
-from .util import atomic_write, utc_ts
+from .util import atomic_write, fsync_dir, mint_notice_id, parse_utc_ts, utc_ts
 
 logger = logging.getLogger("amap_router_local.outcomes")
 
@@ -321,6 +321,7 @@ def _parse_outcome(raw: bytes, notice_id: str) -> Dict[str, Any]:
 
 def _dsn(
     cfg: RouterConfig, sender: str, recipient: str, notice_id: str, outcome: Dict[str, Any],
+    *, preset: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, str]:
     """Author and place the DSN in `sender`'s inbox (module docstring).
     Body is router-authored only; `detail` is not consulted."""
@@ -351,6 +352,7 @@ def _dsn(
             "peer_notice_id": notice_id,
             "peer_recipient": recipient,
         },
+        preset=preset,
     )
 
 
@@ -374,6 +376,7 @@ def _consume_one(
         summary["peer_outcome_errored"] += 1
         return
 
+    keep_source = False
     try:
         doc = _parse_outcome(raw, notice_id)
         record = binding.read_ledger_record(cfg.state_dir, name, notice_id,
@@ -388,6 +391,26 @@ def _consume_one(
             raise _Discard("duplicate", f"{outcome} already recorded for this notice")
 
         sender = record.get("from_instance")
+        queued = (cfg.registry_dir is not None and outcome in DSN_OUTCOMES
+                  and isinstance(sender, str) and sender in cfg.instances)
+        if queued:
+            # Registry mode: the DSN is a durable intent, enqueued BEFORE the
+            # outcome is recorded or its file unlinked (DSN QUEUE, below).
+            # If the enqueue or its barrier fails, the source stays for the
+            # next poll and nothing here is recorded.
+            # The source is the retry from here until the outcome is recorded:
+            # a failure in between must not unlink it (the intent would never
+            # be armed, and the DSN would be lost).
+            keep_source = True
+            try:
+                _enqueue_dsn(cfg, name, notice_id, outcome, doc, sender)
+            except Exception as e:  # noqa: BLE001 — the source is the retry
+                logger.warning(
+                    "instance %r: could not enqueue the DSN for peer notice %s "
+                    "(%s: %s) — outcome left in place for the next poll",
+                    name, notice_id, type(e).__name__, e)
+                summary["peer_outcome_errored"] += 1
+                return
         stored = {
             "tree": deliver_mod.TREE_PEER,
             "notice_id": notice_id,
@@ -400,6 +423,7 @@ def _consume_one(
             "req_id": record.get("req_id"),
         }
         atomic_write(rec_path, json.dumps(stored, sort_keys=True).encode("utf-8"))
+        keep_source = False
         audit_mod.append(
             cfg.state_dir, name, audit_mod.EVENT_OUTCOME_CONSUMED,
             state_key=config_mod.state_key(cfg, name),
@@ -415,7 +439,7 @@ def _consume_one(
                 "sender": sender, "recipient": name, "ts": doc["ts"],
             })
 
-        if outcome in DSN_OUTCOMES:
+        if outcome in DSN_OUTCOMES and not queued:
             if isinstance(sender, str) and sender in cfg.instances:
                 try:
                     _dsn(cfg, sender, name, notice_id, doc)
@@ -448,7 +472,10 @@ def _consume_one(
     finally:
         # Consumed, in every sense that reached here: the daemon re-creates
         # the name on a later transition and never assumes it is still there.
+        # EXCEPT when the DSN could not be enqueued: then it is the retry.
         try:
+            if keep_source:
+                raise FileNotFoundError
             os.unlink(filename, dir_fd=dir_fd)
         except FileNotFoundError:
             pass
@@ -546,6 +573,8 @@ def consume_instance(cfg: RouterConfig, name: str) -> Dict[str, Any]:
     if inst.peer_root is None:
         return summary
     _consume_dir(cfg, name, inst, summary)
+    if cfg.registry_dir is not None:
+        summary["dsn_held"] = drain_dsn_queue(cfg, name, summary)
     summary["peer_placed_denied"] = placed_but_denied(cfg, name)
     return summary
 
@@ -617,3 +646,178 @@ def _consume_names(
             )
             summary["peer_outcome_errored"] += 1
     return examined
+
+
+# ---------------------------------------------------------------------------
+# DSN QUEUE (registry mode only)
+#
+# A DSN goes to the original SENDER, who may be held by the registry. So in
+# registry mode a DSN is never placed inline: `_consume_one` first enqueues a
+# durable router-private INTENT under the RECEIVER (resolved: it is being
+# drained), `state_dir/<receiver>/dsn-pending/<tree>-<nid>.<outcome>.json`,
+# keyed exactly like the outcome record (denied and refused each get their
+# own), with a PRE-MINTED DSN notice id and ts; only then is the outcome
+# recorded and its file unlinked. A crash or failed barrier before the
+# enqueue leaves the source for the next poll; after it, the retry finds and
+# reuses the SAME intent (same DSN id). A duplicate outcome from another
+# connector maps onto the same intent, then is discarded as a duplicate.
+#
+# `drain_dsn_queue` runs AFTER fresh outcomes, under its own budget, with a
+# persisted fair cursor, so held or failing intents can neither take the
+# outcome budget nor starve a later intent whose target has resolved. An
+# intent is only ARMED once its outcome record exists. It binds its target's
+# logical_id durably before placement, replays with the same identity, and
+# is removed only after the DSN is placed. Held intents are reported.
+# Nothing is ever dropped or turned into a queued_for_human.
+# ---------------------------------------------------------------------------
+
+DSN_DIR = "dsn-pending"
+DSN_CURSOR = ".cursor"
+#: Intents examined per poll per receiver.
+MAX_DSN_PER_POLL = 100
+_DSN_NAME_RE = re.compile(r"[a-z]+-[a-f0-9]{32}\.[a-z_]+\.json\Z")
+
+
+def _dsn_dir(cfg: RouterConfig, name: str) -> Path:
+    return config_mod.instance_state_dir(cfg, name) / DSN_DIR
+
+
+def _intent_name(tree: str, notice_id: str, outcome: str) -> str:
+    return f"{tree}-{notice_id}.{outcome}.json"
+
+
+def _enqueue_dsn(cfg: RouterConfig, name: str, notice_id: str, outcome: str,
+                 doc: Dict[str, Any], sender: str) -> None:
+    """Durable, idempotent: an intent already there is kept, id and all."""
+    path = _dsn_dir(cfg, name) / _intent_name(deliver_mod.TREE_PEER, notice_id, outcome)
+    if path.exists():
+        return
+    intent = {
+        "v": 1, "tree": deliver_mod.TREE_PEER, "notice_id": notice_id,
+        "outcome": outcome, "outcome_ts": doc["ts"], "receiver": name, "sender": sender,
+        "sender_lid": None, "dsn_notice_id": mint_notice_id(), "dsn_ts": utc_ts(),
+        "reason": None, "created_ts": utc_ts(),
+    }
+    _write_intent(cfg, path, intent)
+
+
+def _read_intent(path: Path) -> Optional[Dict[str, Any]]:
+    """The intent, or None when it cannot be trusted (it then stays, held)."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(doc, dict) or doc.get("v") != 1:
+        return None
+    for k in ("tree", "notice_id", "outcome", "outcome_ts", "receiver", "sender",
+              "dsn_notice_id", "dsn_ts"):
+        if not isinstance(doc.get(k), str) or not doc[k]:
+            return None
+    if path.name != _intent_name(doc["tree"], doc["notice_id"], doc["outcome"]):
+        return None
+    if parse_utc_ts(doc["dsn_ts"]) is None or doc["outcome"] not in DSN_OUTCOMES:
+        return None
+    if not re.fullmatch(r"[a-f0-9]{32}", doc["dsn_notice_id"]):
+        return None
+    return doc
+
+
+def _write_intent(cfg: RouterConfig, path: Path, intent: Dict[str, Any]) -> None:
+    atomic_write(path, json.dumps(intent, sort_keys=True).encode("utf-8"),
+                 durable_root=cfg.state_dir)
+
+
+def _audit_dsn_held(cfg: RouterConfig, name: str, intent: Dict[str, Any]) -> None:
+    try:
+        audit_mod.append(
+            cfg.state_dir, name, audit_mod.EVENT_DSN_HELD,
+            state_key=config_mod.state_key(cfg, name),
+            peer_notice_id=intent["notice_id"], outcome=intent["outcome"],
+            target=intent["sender"], reason=intent["reason"],
+        )
+    except (audit_mod.AuditError, OSError) as e:
+        logger.warning("instance %r: could not audit a held DSN (%s: %s)",
+                       name, type(e).__name__, e)
+
+
+def _dsn_hold(cfg: RouterConfig, intent: Dict[str, Any]) -> Optional[str]:
+    sender = intent["sender"]
+    if sender not in cfg.instances:
+        return "not_configured"
+    reason = config_mod.target_hold(cfg, sender)
+    if reason is None and intent.get("sender_lid") is not None and \
+            config_mod.target_logical_id(cfg, sender) != intent["sender_lid"]:
+        return "identity_changed"
+    return reason
+
+
+def _held_entry(intent: Dict[str, Any], reason: Optional[str]) -> Dict[str, Any]:
+    return {"notice_id": intent["notice_id"], "outcome": intent["outcome"],
+            "target": intent["sender"], "reason": reason}
+
+
+def drain_dsn_queue(cfg: RouterConfig, name: str, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One bounded, fair pass over receiver `name`'s DSN intents. Returns the
+    ones still waiting, with why, for status.json."""
+    d = _dsn_dir(cfg, name)
+    try:
+        names = sorted(e.name for e in os.scandir(d) if _DSN_NAME_RE.fullmatch(e.name))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    if not names:
+        return []
+    cursor_path = d / DSN_CURSOR
+    try:
+        cursor = cursor_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        cursor = ""
+    start = next((i for i, n in enumerate(names) if n > cursor), 0)
+    order = names[start:] + names[:start]
+    waiting: List[Dict[str, Any]] = []
+    last = None
+    for i, fn in enumerate(order):
+        path = d / fn
+        intent = _read_intent(path)
+        if intent is None:
+            waiting.append({"intent": fn, "reason": "damaged"})
+            continue
+        if i >= MAX_DSN_PER_POLL:            # reported, not attempted this poll
+            waiting.append(_held_entry(intent, intent.get("reason")))
+            continue
+        last = fn
+        rec = record_path(cfg.state_dir, name, intent["tree"], intent["notice_id"],
+                          intent["outcome"], state_key=config_mod.state_key(cfg, name))
+        if not rec.exists():
+            continue                         # not armed until the outcome is recorded
+        reason = _dsn_hold(cfg, intent)
+        if reason is not None:
+            if intent.get("reason") != reason:
+                intent["reason"] = reason
+                _write_intent(cfg, path, intent)
+                _audit_dsn_held(cfg, name, intent)
+            waiting.append(_held_entry(intent, reason))
+            continue
+        if intent.get("sender_lid") is None:
+            intent["sender_lid"] = config_mod.target_logical_id(cfg, intent["sender"])
+            _write_intent(cfg, path, intent)  # durable BEFORE the placement
+        try:
+            _dsn(cfg, intent["sender"], name, intent["notice_id"],
+                 {"outcome": intent["outcome"], "ts": intent["outcome_ts"]},
+                 preset=(intent["dsn_notice_id"], intent["dsn_ts"]))
+        except Exception as e:  # noqa: BLE001 — kept and retried, never dropped
+            reason = f"failing: {type(e).__name__}"
+            if intent.get("reason") != reason:
+                intent["reason"] = reason
+                _write_intent(cfg, path, intent)
+            logger.warning("instance %r: DSN to %r for peer notice %s failed (%s: %s) — "
+                           "kept for retry", name, intent["sender"], intent["notice_id"],
+                           type(e).__name__, e)
+            summary["peer_dsn_failed"] += 1
+            waiting.append(_held_entry(intent, reason))
+            continue
+        summary["peer_dsn_sent"] += 1
+        os.unlink(path)
+        fsync_dir(d)
+    if last is not None and len(names) > MAX_DSN_PER_POLL:
+        atomic_write(cursor_path, last.encode("utf-8"), durable_root=cfg.state_dir)
+    return waiting

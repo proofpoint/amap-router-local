@@ -77,13 +77,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
 from . import exposure as exposure_mod
-from .config import RouterConfig, address_for, router_address, state_key
+from .config import RouterConfig, address_for, router_address, state_key, target_hold
 from .util import atomic_write, mint_notice_id, utc_ts
 
 #: The two inbound trees this router writes, as the ledger's `tree` names them.
@@ -158,6 +158,37 @@ class DeliveryBackend(Protocol):
 
 
 PREVIEW_LEN = 200
+
+
+class RecipientHeld(Exception):
+    """A local delivery to `recipient` must HOLD this poll: under a registry
+    its report does not resolve the recipient (`config.target_hold`), with
+    `reason` naming why. Raised before anything is read or written on the
+    recipient's side. Not a delivery failure: the caller keeps the request
+    pending and asks again next poll."""
+
+    def __init__(self, recipient: str, reason: str):
+        super().__init__(f"delivery to {recipient!r} held: {reason}")
+        self.recipient = recipient
+        self.reason = reason
+
+
+def _gate(cfg: RouterConfig, recipient: str) -> None:
+    """The local-delivery gate, FIRST in every placement function: a direct
+    call under a registry with no report, or for a held recipient, places
+    nothing."""
+    reason = target_hold(cfg, recipient)
+    if reason is not None:
+        raise RecipientHeld(recipient, reason)
+
+
+def _identity(preset: Optional[Tuple[str, str]]) -> Tuple[str, str]:
+    """`(notice_id, ts)`: the caller's PRE-MINTED pair when it has one (a
+    pending delivery replays the same identity after a crash), else fresh."""
+    if preset is not None:
+        notice_id, ts = preset
+        return notice_id, ts
+    return mint_notice_id(), utc_ts()
 
 
 def _collapse_control(s: str, limit: int) -> str:
@@ -341,6 +372,7 @@ def deliver(
     *,
     reply_to_record: Optional[Dict[str, Any]] = None,
     attachments: Optional[List[attachments_mod.VerifiedAttachment]] = None,
+    preset: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, str]:
     """Deliver `request` (a validated submit-request document) from
     instance `sender` to instance `recipient` on the MAIL lane. `reply_to_
@@ -364,15 +396,14 @@ def deliver(
             "the local backend delivers only to fleet instances; an external "
             "reply needs a runtime with an SMTP arm"
         )
-    # FIRST, before anything is written: the recipient's state key. Under a
-    # registry a held recipient has none and this raises, failing this one
-    # delivery through the caller's ordinary failure path; nothing is ever
-    # written under a NAME there (`config.state_key`).
+    # FIRST, before anything is read or written on the recipient's side: the
+    # registry gate (`RecipientHeld`), then the state key, which can then
+    # only fail as a backstop (`config.state_key`).
+    _gate(cfg, recipient)
     recipient_key = state_key(cfg, recipient)
     attachments = attachments or []
-    notice_id = mint_notice_id()
+    notice_id, ts = _identity(preset)
     message_id = notice_id  # PICKED: no external provider exists; coincide the two.
-    ts = utc_ts()
 
     draft = request.get("draft") or {}
     from_address = address_for(sender, cfg.fleet_domain)
@@ -434,6 +465,7 @@ def deliver_peer(
     *,
     reply_to_record: Optional[Dict[str, Any]] = None,
     attachments: Optional[List[attachments_mod.VerifiedAttachment]] = None,
+    preset: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, str]:
     """`deliver`'s twin on the PEER lane: place `request` from `sender` into
     `recipient`'s `peer/` tree as a `kind: "peer"` notice (module
@@ -444,16 +476,16 @@ def deliver_peer(
     and a reply can name it. `sender_exposure` is assessed over the SENDER
     (`exposure.assess`) at `ts` and stamped under `message`; when the
     assessment cannot be made the member is omitted, never guessed."""
-    recipient_key = state_key(cfg, recipient)  # first, as in `deliver`
+    _gate(cfg, recipient)                      # first, as in `deliver`
+    recipient_key = state_key(cfg, recipient)
     attachments = attachments or []
     recipient_cfg = cfg.instances[recipient]
     if recipient_cfg.peer_root is None:
         raise PeerLaneUnavailable(
             f"instance {recipient!r} has no peer tree (namespace mode, or no fleet_domain)"
         )
-    notice_id = mint_notice_id()
+    notice_id, ts = _identity(preset)
     message_id = notice_id
-    ts = utc_ts()
 
     draft = request.get("draft") or {}
     from_address = address_for(sender, cfg.fleet_domain)
@@ -529,6 +561,7 @@ def deliver_router_notice(
     body_text: str,
     in_reply_to: Optional[str],
     audit_fields: Optional[Dict[str, Any]] = None,
+    preset: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, str]:
     """A notice THIS ROUTER authors, into `recipient`'s MAIL tree: `kind:
     "deliver"`, `mailbox: "inbox"`, `from` = `amap.router@<fleet_domain>`,
@@ -544,11 +577,11 @@ def deliver_router_notice(
     from_address = router_address(cfg.fleet_domain)
     if from_address is None:
         raise PeerLaneUnavailable("no fleet_domain: the router has no address to author from")
-    recipient_key = state_key(cfg, recipient)  # first, as in `deliver`
+    _gate(cfg, recipient)                      # first, as in `deliver`
+    recipient_key = state_key(cfg, recipient)
     recipient_cfg = cfg.instances[recipient]
-    notice_id = mint_notice_id()
+    notice_id, ts = _identity(preset)
     message_id = notice_id
-    ts = utc_ts()
     to_address = address_for(recipient, cfg.fleet_domain)
 
     message_doc, notice_doc = _message_and_notice(

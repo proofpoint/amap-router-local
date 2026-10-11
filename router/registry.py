@@ -428,13 +428,17 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
 
 
 def keyed_config(cfg: Any, report: Report) -> Any:
-    """`cfg` with `state_keys` set from `report`: every RESOLVED instance's
-    private state is keyed by its logical_id. Unchanged when no registry is
-    configured. A held instance has no key here and is never drained."""
+    """`cfg` with `state_keys` set from `report`, and `report` itself
+    attached as THE poll's report (`config.target_hold`): every RESOLVED
+    instance's private state is keyed by its logical_id, and every local
+    delivery of the poll gates on this same report. Unchanged when no
+    registry is configured. A held instance has no key here and is never
+    drained."""
     if report.state == "off":
         return cfg
     keys = {n: e.logical_id for n, e in (report.resolved or {}).items()}
-    return dataclasses.replace(cfg, state_keys=types.MappingProxyType(keys))
+    return dataclasses.replace(cfg, state_keys=types.MappingProxyType(keys),
+                               registry_report=report)
 
 
 def state_key(report: Report, name: str) -> str:

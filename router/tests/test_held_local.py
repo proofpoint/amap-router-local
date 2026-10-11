@@ -1,0 +1,842 @@
+"""Held local delivery under a registry (router/README.md, "Held local
+delivery"): a local target the poll's report does not resolve HOLDS the
+request — no Result, nothing on the recipient's side, the request kept —
+and on recovery it is delivered exactly once.
+
+The fleet: alpha <-> bravo and alpha <-> charlie are mail pairs, and alpha
+may task delta on the peer lane. Everything is migrated under a registry
+before each test, so every resolved instance's private state is under its
+logical_id.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from dataclasses import replace
+from pathlib import Path
+from unittest import mock
+
+from router import binding, deliver as deliver_mod, outbound, outcomes, registry, service
+from router.config import HELD_REPORT_MISSING
+from router.tests.helpers import (
+    RouterTestCase, list_notices, read_json, result_path, write_request,
+)
+from router.tests.peer_helpers import addr, list_peer_notices, make_peer_config, write_outcome
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "registry"
+NAMES = ("alpha", "bravo", "charlie", "delta")
+LIDS = {"alpha": "a1" * 16, "bravo": "b2" * 16, "charlie": "c3" * 16, "delta": "d4" * 16,
+        "brav0": "e5" * 16}
+REASONS = ("not_registered", "skeleton_collision", "registry_unavailable",
+           "registry_rolled_back", "state_not_migrated", "state_conflict")
+GLOBAL = ("registry_unavailable", "registry_rolled_back")
+
+
+class Crash(BaseException):
+    """A crash: nothing in the router catches it."""
+
+
+def snapshot(names, seq):
+    doc = json.loads((FIXTURES / "snapshot.json").read_text())
+    proto = next(e for e in doc["entries"] if e["state"] == "active")
+    entries = []
+    for n in names:
+        e = json.loads(json.dumps(proto))
+        e.update(logical_id=LIDS[n], name=n, stable_key=f"/srv/work/{n}")
+        e["names"][0]["name"] = n
+        e["bindings"][0]["stable_key"] = f"/srv/work/{n}"
+        entries.append(e)
+    doc["entries"] = entries
+    doc["seq"] = seq
+    return doc
+
+
+class _Fleet(RouterTestCase):
+
+    def setUp(self):
+        super().setUp()
+        plain = make_peer_config(self, {
+            "alpha": {"peers": ["bravo", "charlie"]},
+            "bravo": {"peers": ["alpha"]},
+            "charlie": {"peers": ["alpha"]},
+            "delta": {"peer_senders": ["alpha"]},
+        })
+        for n in NAMES:
+            if (self.state_dir / n).exists():
+                (self.state_dir / n).rename(self.state_dir / LIDS[n])
+        self.reg = self.tmp / "registry"
+        self.reg.mkdir()
+        self.seq = 2
+        self.put()
+        self.cfg = replace(plain, registry_dir=self.reg)
+        service._REGISTRY_LOGGED.clear()
+
+    # -- the registry ---------------------------------------------------
+
+    def put(self, names=NAMES, seq=None):
+        if seq is None:
+            self.seq += 1
+            seq = self.seq
+        (self.reg / registry.SNAPSHOT).write_text(json.dumps(snapshot(list(names), seq)))
+
+    def hold(self, reason, target):
+        others = [n for n in NAMES if n != target]
+        if reason == "not_registered":
+            self.put(others)
+        elif reason == "skeleton_collision":
+            assert target == "bravo"
+            self.put(list(NAMES) + ["brav0"])
+        elif reason == "registry_unavailable":
+            (self.reg / registry.SNAPSHOT).unlink()
+        elif reason == "registry_rolled_back":
+            registry.report_for(self.reg, self.state_dir, NAMES)   # a poll accepted self.seq
+            self.put(seq=self.seq - 2)
+        elif reason == "state_not_migrated":
+            (self.state_dir / LIDS[target]).rename(self.state_dir / target)
+        elif reason == "state_conflict":
+            (self.state_dir / target).mkdir()
+
+    def recover(self, reason, target):
+        if reason == "state_not_migrated":
+            (self.state_dir / target).rename(self.state_dir / LIDS[target])
+        elif reason == "state_conflict":
+            (self.state_dir / target).rmdir()
+        elif reason == "registry_rolled_back":
+            self.seq += 5
+        self.put()
+
+    # -- polls and observations ----------------------------------------
+
+    def poll(self):
+        log = logging.getLogger("amap_router_local")
+        log.disabled = True
+        try:
+            return service.run_once(self.cfg, None)
+        finally:
+            log.disabled = False
+
+    def keyed(self):
+        return registry.keyed_config(self.cfg, registry.report_for(
+            self.reg, self.state_dir, self.cfg.instances))
+
+    def recipient_side(self, name):
+        """Every file a delivery to `name` could create: its trees, and its
+        ledger under its logical_id."""
+        out = []
+        for base in (self.cfg.instances[name].root, self.state_dir / LIDS[name] / "delivered"):
+            for root, _dirs, files in os.walk(base):
+                out += [os.path.join(root, f) for f in files]
+        return sorted(out)
+
+    def pending(self, sender, req_id):
+        return self.state_dir / LIDS[sender] / outbound.PENDING_DIR / f"{req_id}.json"
+
+    def assertRetained(self, sender, req_id):
+        outbox = self.cfg.instances[sender].outbox_root
+        self.assertTrue((outbox / f"req-{req_id}.json").is_file(), "the request was consumed")
+        self.assertFalse(result_path(self.cfg, sender, req_id).exists(), "a Result was written")
+        self.assertFalse((self.state_dir / LIDS[sender] / "results" / f"{req_id}.json").exists())
+
+    def result(self, sender, req_id):
+        return read_json(result_path(self.cfg, sender, req_id))
+
+
+class EveryHoldReasonTests(_Fleet):
+    """For each hold reason, on the mail lane and the peer lane: nothing on
+    the recipient's side and the request kept while held; exactly one
+    delivery after recovery."""
+
+    def run_case(self, reason, lane):
+        target = "bravo" if lane == "mail" else "delta"
+        if reason == "skeleton_collision" and lane == "peer":
+            return                                   # the collider is bravo's
+        before = self.recipient_side(target)
+        self.hold(reason, target)
+        write_request(self.cfg, "alpha", "00000001", to=[addr(target)], body_text="go")
+        self.poll()
+        self.poll()                                  # repeated held polls
+        self.assertRetained("alpha", "00000001")
+        self.assertEqual(self.recipient_side(target), before,
+                         "a held delivery touched the recipient's side")
+        if reason not in GLOBAL:
+            rec = json.loads(self.pending("alpha", "00000001").read_text())
+            self.assertEqual([(t["recipient"], t["state"], t["reason"]) for t in rec["targets"]],
+                             [(target, "held", reason)])
+        self.recover(reason, target)
+        self.poll()
+        res = self.result("alpha", "00000001")
+        self.assertEqual(res["outcome"], "accepted", res)
+        notices = list_notices(self.cfg, target) if lane == "mail" else \
+            list_peer_notices(self.cfg, target)
+        self.assertEqual(len(notices), 1, "not exactly one delivery after recovery")
+        self.assertFalse(self.pending("alpha", "00000001").exists())
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, target) if lane == "mail" else
+                             list_peer_notices(self.cfg, target)), 1, "re-delivered")
+
+    def test_mail(self):
+        for reason in REASONS:
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.run_case(reason, "mail")
+
+    def test_peer(self):
+        for reason in REASONS:
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.run_case(reason, "peer")
+
+
+class RepliesTests(_Fleet):
+    """Replies hold on a held target with their binding PINNED."""
+
+    def mail_task(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        self.poll()
+        return self.result("alpha", "00000001")["message_id"]
+
+    def peer_task(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        res = self.result("alpha", "00000001")
+        self.assertEqual(res["reason_code"], "peer_routed")
+        return res["message_id"]
+
+    def test_mail_reply_to_a_held_sender_holds_then_binds(self):
+        for reason in REASONS:
+            if reason == "skeleton_collision":
+                continue
+            with self.subTest(reason=reason):
+                self.setUp()
+                task = self.mail_task()
+                before = self.recipient_side("alpha")
+                self.hold(reason, "alpha")
+                write_request(self.cfg, "bravo", "00000002", in_reply_to=task,
+                              to=[addr("alpha")], body_text="re")
+                self.poll()
+                self.assertRetained("bravo", "00000002")
+                self.assertEqual(self.recipient_side("alpha"), before)
+                self.recover(reason, "alpha")
+                self.poll()
+                res = self.result("bravo", "00000002")
+                self.assertEqual((res["outcome"], res["reason_code"]),
+                                 ("accepted", "recipient_bound"))
+                self.assertEqual(len(list_notices(self.cfg, "alpha")), 1)
+
+    def test_peer_reply_to_a_held_sender_holds_then_binds(self):
+        for reason in REASONS:
+            if reason == "skeleton_collision":
+                continue
+            with self.subTest(reason=reason):
+                self.setUp()
+                task = self.peer_task()
+                before = self.recipient_side("alpha")
+                self.hold(reason, "alpha")
+                write_request(self.cfg, "delta", "00000002", in_reply_to=task,
+                              to=[addr("alpha")], body_text="re")
+                self.poll()
+                self.assertRetained("delta", "00000002")
+                self.assertEqual(self.recipient_side("alpha"), before)
+                self.recover(reason, "alpha")
+                self.poll()
+                res = self.result("delta", "00000002")
+                self.assertEqual((res["outcome"], res["reason_code"]), ("accepted", "peer_routed"))
+                self.assertEqual(len(list_peer_notices(self.cfg, "alpha")), 1)
+
+    def test_peer_reply_eligible_at_first_evaluation_survives_the_wait(self):
+        task = self.peer_task()
+        self.hold("not_registered", "alpha")
+        write_request(self.cfg, "delta", "00000002", in_reply_to=task, to=[addr("alpha")])
+        self.poll()
+        self.assertRetained("delta", "00000002")
+        rec = json.loads(self.pending("delta", "00000002").read_text())
+        self.assertTrue(rec["binding"]["window_ok"])
+        # The window passes while held: the pinned eligibility still stands.
+        self.cfg = replace(self.cfg, peer_reply_window_seconds=1)
+        led = binding.ledger_path(self.state_dir, "delta", task, state_key=LIDS["delta"])
+        doc = json.loads(led.read_text())
+        doc["ts"] = "2000-01-01T00:00:00Z"
+        led.write_text(json.dumps(doc))
+        self.recover("not_registered", "alpha")
+        self.poll()
+        res = self.result("delta", "00000002")
+        self.assertEqual((res["outcome"], res["reason_code"]), ("accepted", "peer_routed"))
+        self.assertEqual(len(list_peer_notices(self.cfg, "alpha")), 1)
+
+    def test_peer_reply_expired_at_first_evaluation_is_refused_not_pinned(self):
+        task = self.peer_task()
+        led = binding.ledger_path(self.state_dir, "delta", task, state_key=LIDS["delta"])
+        doc = json.loads(led.read_text())
+        doc["ts"] = "2000-01-01T00:00:00Z"
+        led.write_text(json.dumps(doc))
+        self.hold("not_registered", "alpha")
+        write_request(self.cfg, "delta", "00000002", in_reply_to=task, to=[addr("alpha")])
+        self.poll()
+        res = self.result("delta", "00000002")
+        self.assertEqual((res["outcome"], res["reason_code"]),
+                         ("rejected", "peer_reply_window_expired"))
+        self.assertFalse(self.pending("delta", "00000002").exists())
+
+
+class RouterNoticeTests(_Fleet):
+    """A DSN to a held sender is queued (durably, before the outcome is
+    recorded) and placed exactly once after recovery."""
+
+    def denied_task(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        nid = self.result("alpha", "00000001")["message_id"]
+        write_outcome(self.cfg, "delta", nid, "denied")
+        return nid
+
+    def intents(self):
+        d = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        return sorted(p.name for p in d.iterdir() if not p.name.startswith(".")) \
+            if d.is_dir() else []
+
+    def test_every_hold_reason(self):
+        for reason in REASONS:
+            if reason == "skeleton_collision":
+                continue
+            with self.subTest(reason=reason):
+                self.setUp()
+                nid = self.denied_task()
+                before = self.recipient_side("alpha")
+                self.hold(reason, "alpha")
+                self.poll()
+                self.poll()
+                self.assertEqual(self.recipient_side("alpha"), before,
+                                 "a DSN reached a held sender")
+                self.recover(reason, "alpha")
+                self.poll()
+                dsns = list_notices(self.cfg, "alpha")
+                self.assertEqual(len(dsns), 1, "not exactly one DSN after recovery")
+                self.assertEqual(self.intents(), [])
+                self.poll()
+                self.assertEqual(len(list_notices(self.cfg, "alpha")), 1)
+
+    def test_the_dsn_carries_the_pre_minted_id(self):
+        nid = self.denied_task()
+        self.hold("not_registered", "alpha")
+        self.poll()
+        [name] = self.intents()
+        intent = json.loads((self.state_dir / LIDS["delta"] / outcomes.DSN_DIR / name).read_text())
+        self.recover("not_registered", "alpha")
+        self.poll()
+        self.assertEqual(list_notices(self.cfg, "alpha"), [f"notice-{intent['dsn_notice_id']}.json"])
+
+
+class NoReportFailsClosedTests(_Fleet):
+    """A placement under a registry with no report attached places nothing."""
+
+    def test_every_placement_function(self):
+        cfg = self.cfg                                 # registry_dir set, no report
+        doc = {"contract_version": "2", "req_id": "00000001",
+               "draft": {"to": [addr("bravo")], "subject": "s", "body_text": "b"}}
+        before = {n: self.recipient_side(n) for n in ("bravo", "delta", "alpha")}
+        calls = (
+            lambda: deliver_mod.deliver(cfg, cfg.state_dir, "alpha", "bravo", doc),
+            lambda: deliver_mod.deliver_peer(cfg, cfg.state_dir, "alpha", "delta", doc),
+            lambda: deliver_mod.deliver_router_notice(cfg, cfg.state_dir, "alpha", subject="s",
+                                                      body_text="b", in_reply_to=None),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                with self.assertRaises(deliver_mod.RecipientHeld) as cm:
+                    call()
+                self.assertEqual(cm.exception.reason, HELD_REPORT_MISSING)
+        self.assertEqual({n: self.recipient_side(n) for n in before}, before)
+
+
+class MixedRecipientsTests(_Fleet):
+    """alpha -> {bravo (held), charlie}: charlie is delivered at once and
+    never again; bravo after recovery; then ONE Result naming both."""
+
+    def test_completed_recipients_are_never_redelivered(self):
+        self.hold("not_registered", "bravo")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo"), addr("charlie")])
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "charlie")), 1)
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        self.assertRetained("alpha", "00000001")
+        self.poll()
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "charlie")), 1, "charlie re-delivered")
+        self.recover("not_registered", "bravo")
+        self.poll()
+        self.assertEqual((len(list_notices(self.cfg, "bravo")),
+                          len(list_notices(self.cfg, "charlie"))), (1, 1))
+        res = self.result("alpha", "00000001")
+        self.assertEqual((res["outcome"], res["reason_code"]), ("accepted", "allowlisted"))
+        self.assertEqual(sorted(res["recipients"]), [addr("bravo"), addr("charlie")])
+
+
+class FreshPolicyTests(_Fleet):
+    """Fresh policy applies to a pending request every poll; a refusal is
+    terminal and reports what was already delivered."""
+
+    def unpair(self):
+        doc = {"state_dir": str(self.state_dir), "fleet_domain": "example.invalid",
+               "registry_dir": str(self.reg), "instances": {}}
+        for n in NAMES:
+            entry = {"handoff_dir": str(self.tmp / "instances" / n)}
+            if n == "alpha":
+                entry["peers"] = ["charlie"]
+            elif n == "charlie":
+                entry["peers"] = ["alpha"]
+            elif n == "delta":
+                entry["peer_senders"] = ["alpha"]
+            doc["instances"][n] = entry
+        from router.config import load_obj
+        self.cfg = load_obj(doc)
+
+    def test_a_refusal_wins_and_keeps_the_delivered_history(self):
+        self.hold("not_registered", "bravo")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo"), addr("charlie")])
+        self.poll()
+        self.unpair()                                 # alpha <-> bravo is no longer a pair
+        self.recover("not_registered", "bravo")
+        self.poll()
+        res = self.result("alpha", "00000001")
+        self.assertEqual((res["outcome"], res["reason_code"]),
+                         ("queued_for_human", "recipient_not_allowlisted"))
+        self.assertEqual(res["recipients"], [addr("charlie")])
+        self.assertIn("already delivered", res["detail"])
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        self.assertFalse(self.pending("alpha", "00000001").exists())
+
+
+class RequestIdentityTests(_Fleet):
+
+    def make_pending(self):
+        self.hold("not_registered", "bravo")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        self.poll()
+        self.assertTrue(self.pending("alpha", "00000001").is_file())
+
+    def test_a_changed_request_blocks_and_delivers_nothing(self):
+        self.make_pending()
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="CHANGED")
+        self.recover("not_registered", "bravo")
+        self.poll()
+        self.assertRetained("alpha", "00000001")
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        rec = json.loads(self.pending("alpha", "00000001").read_text())
+        self.assertEqual(rec["block"], outbound.BLOCK_REQUEST_CHANGED)
+        held = outbound.held_report(self.keyed(), "alpha")
+        self.assertEqual(held[0]["block"], outbound.BLOCK_REQUEST_CHANGED)
+
+    def test_a_damaged_record_fails_closed(self):
+        self.make_pending()
+        self.pending("alpha", "00000001").write_text("{not json")
+        self.recover("not_registered", "bravo")
+        self.poll()
+        self.assertRetained("alpha", "00000001")
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        held = outbound.held_report(self.keyed(), "alpha")
+        self.assertIn("damaged", held[0])
+
+    def test_a_reused_name_never_reroutes_a_bound_delivery(self):
+        """bravo is bound (delivering, logical_id recorded) when the process
+        crashes; the name then resolves to ANOTHER identity: held as
+        identity_changed, nothing placed for the newcomer."""
+        self.hold("not_registered", "bravo")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        self.poll()
+        self.recover("not_registered", "bravo")
+        with mock.patch.object(outbound, "_place_target", side_effect=Crash):
+            with self.assertRaises(Crash):
+                self.poll()
+        rec = json.loads(self.pending("alpha", "00000001").read_text())
+        self.assertEqual((rec["targets"][0]["state"], rec["targets"][0]["lid"]),
+                         ("delivering", LIDS["bravo"]))
+        LIDS["bravo"], old = "f6" * 16, LIDS["bravo"]
+        try:
+            (self.state_dir / old).rename(self.state_dir / LIDS["bravo"])
+            self.put()
+            self.poll()
+        finally:
+            LIDS["bravo"] = old
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        rec = json.loads(self.pending("alpha", "00000001").read_text())
+        self.assertEqual(rec["targets"][0]["reason"], outbound.HOLD_IDENTITY_CHANGED)
+
+
+class RepeatedHeldPollsTests(_Fleet):
+    def test_one_audit_line_and_no_rewrite_per_quiet_poll(self):
+        self.hold("not_registered", "bravo")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        self.poll()
+        path = self.pending("alpha", "00000001")
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        for _ in range(5):
+            self.poll()
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        from router import audit
+        lines = [e for e in audit.read_events(self.state_dir, "alpha", state_key=LIDS["alpha"])
+                 if e.get("event") == "delivery_held"]
+        self.assertEqual(len(lines), 1)
+        held = outbound.held_report(self.keyed(), "alpha")
+        self.assertEqual(held[0]["targets"],
+                         [{"recipient": "bravo", "state": "held", "reason": "not_registered"}])
+
+
+class CrashAndBarrierTests(_Fleet):
+    """P4': whatever stage a crash or a failed barrier hits, recovery offers
+    exactly one notice id to the target, and the request gets one Result."""
+
+    def start(self):
+        self.hold("not_registered", "bravo")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        self.poll()
+        self.recover("not_registered", "bravo")
+
+    def finish_and_check(self):
+        self.poll()
+        res = self.result("alpha", "00000001")
+        self.assertEqual(res["outcome"], "accepted", res)
+        notices = list_notices(self.cfg, "bravo")
+        self.assertEqual(len(notices), 1, notices)
+        ledger = sorted((self.state_dir / LIDS["bravo"] / "delivered").glob("notice-*.json"))
+        self.assertEqual([p.name for p in ledger], notices, "a second ledger record or id")
+        self.assertFalse(self.pending("alpha", "00000001").exists())
+        return notices[0]
+
+    def crash_at(self, target, attr, nth=1):
+        real = getattr(target, attr)
+        calls = {"n": 0}
+
+        def boom(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == nth:
+                raise Crash
+            return real(*a, **kw)
+        return mock.patch.object(target, attr, boom)
+
+    def test_failed_barrier_on_the_delivering_write_places_nothing(self):
+        self.start()
+        with mock.patch.object(outbound, "_write_pending", side_effect=OSError("EIO")):
+            self.poll()
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        self.finish_and_check()
+
+    def test_crash_after_delivering_before_placement(self):
+        self.start()
+        with self.crash_at(outbound, "_place_target"):
+            with self.assertRaises(Crash):
+                self.poll()
+        nid = json.loads(self.pending("alpha", "00000001").read_text())["targets"][0]["notice_id"]
+        self.assertEqual(self.finish_and_check(), f"notice-{nid}.json")
+
+    def test_crash_at_each_placement_stage(self):
+        stages = (
+            (deliver_mod.attachments_mod, "publish_attachment_blobs", 1),
+            (deliver_mod.attachments_mod, "write_agent_visible", 1),   # message spool
+            (deliver_mod, "atomic_write", 1),                         # ledger
+            (deliver_mod.attachments_mod, "write_agent_visible", 2),   # notice
+        )
+        for target, attr, nth in stages:
+            with self.subTest(stage=f"{attr}#{nth}"):
+                self.setUp()
+                self.start()
+                with self.crash_at(target, attr, nth):
+                    with self.assertRaises(Crash):
+                        self.poll()
+                nid = json.loads(self.pending("alpha", "00000001").read_text())["targets"][0]["notice_id"]
+                self.assertEqual(self.finish_and_check(), f"notice-{nid}.json")
+
+    def test_crash_after_placement_before_the_delivered_update(self):
+        self.start()
+        real = outbound._write_pending
+
+        def boom(cfg, path, rec):
+            if any(t["state"] == "delivered" for t in rec["targets"]):
+                raise Crash
+            return real(cfg, path, rec)
+        with mock.patch.object(outbound, "_write_pending", boom):
+            with self.assertRaises(Crash):
+                self.poll()
+        nid = json.loads(self.pending("alpha", "00000001").read_text())["targets"][0]["notice_id"]
+        self.assertEqual(list_notices(self.cfg, "bravo"), [f"notice-{nid}.json"])
+        self.assertEqual(self.finish_and_check(), f"notice-{nid}.json")
+
+    def test_crash_at_the_result_or_the_record_removal(self):
+        for target, attr in ((outbound, "_finish"), (outbound, "_remove_pending")):
+            with self.subTest(at=attr):
+                self.setUp()
+                self.start()
+                with self.crash_at(target, attr):
+                    with self.assertRaises(Crash):
+                        self.poll()
+                self.finish_and_check()
+
+
+class DsnCrashTests(_Fleet):
+    """P6': the intent is durable BEFORE the outcome is recorded or unlinked;
+    every crash point recovers to exactly one DSN, with the pre-minted id."""
+
+    def denied(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        nid = self.result("alpha", "00000001")["message_id"]
+        self.hold("not_registered", "alpha")
+        write_outcome(self.cfg, "delta", nid, "denied")
+        return nid
+
+    def outcome_file(self, nid):
+        from router.tests.peer_helpers import outcomes_dir
+        return outcomes_dir(self.cfg, "delta") / f"peer-{nid}.json"
+
+    def record(self, nid, outcome="denied"):
+        return outcomes.record_path(self.state_dir, "delta", "peer", nid, outcome,
+                                    state_key=LIDS["delta"])
+
+    def intent_dir(self):
+        return self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+
+    def recover_and_count(self):
+        self.recover("not_registered", "alpha")
+        self.poll()
+        self.poll()
+        dsns = list_notices(self.cfg, "alpha")
+        self.assertEqual(len(dsns), 1, dsns)
+        self.assertEqual([p for p in self.intent_dir().glob("*.json")], [])
+        return dsns[0]
+
+    def test_a_failed_enqueue_keeps_the_source_and_records_nothing(self):
+        nid = self.denied()
+        with mock.patch.object(outcomes, "_enqueue_dsn", side_effect=OSError("EIO")):
+            self.poll()
+        self.assertTrue(self.outcome_file(nid).is_file(), "the source was unlinked")
+        self.assertFalse(self.record(nid).exists(), "the outcome was recorded")
+        self.recover_and_count()
+
+    def test_crash_after_the_enqueue_before_the_record(self):
+        nid = self.denied()
+        real = outcomes.atomic_write
+
+        def boom(path, data, **kw):
+            if Path(path) == self.record(nid):
+                raise Crash
+            return real(path, data, **kw)
+        with mock.patch.object(outcomes, "atomic_write", boom):
+            with self.assertRaises(Crash):
+                self.poll()
+        [intent] = list(self.intent_dir().glob("*.json"))
+        dsn_id = json.loads(intent.read_text())["dsn_notice_id"]
+        self.assertTrue(self.outcome_file(nid).is_file())
+        self.assertEqual(self.recover_and_count(), f"notice-{dsn_id}.json")
+
+    def test_crash_after_the_record_before_the_unlink(self):
+        nid = self.denied()
+        real = os.unlink
+
+        def boom(path, *a, **kw):
+            if str(path).startswith("peer-") and kw.get("dir_fd") is not None:
+                raise Crash
+            return real(path, *a, **kw)
+        with mock.patch.object(outcomes.os, "unlink", boom):
+            with self.assertRaises(Crash):
+                self.poll()
+        self.assertTrue(self.record(nid).exists())
+        self.recover_and_count()
+
+    def test_crash_after_the_dsn_before_the_intent_is_removed(self):
+        nid = self.denied()
+        self.poll()
+        [intent] = list(self.intent_dir().glob("*.json"))
+        dsn_id = json.loads(intent.read_text())["dsn_notice_id"]
+        self.recover("not_registered", "alpha")
+        real = os.unlink
+
+        def boom(path, *a, **kw):
+            if Path(path) == intent:
+                raise Crash
+            return real(path, *a, **kw)
+        with mock.patch.object(outcomes.os, "unlink", boom):
+            with self.assertRaises(Crash):
+                self.poll()
+        self.assertEqual(list_notices(self.cfg, "alpha"), [f"notice-{dsn_id}.json"])
+        self.poll()
+        self.assertEqual(list_notices(self.cfg, "alpha"), [f"notice-{dsn_id}.json"])
+        self.assertEqual(list(self.intent_dir().glob("*.json")), [])
+
+
+class DsnKeyingTests(_Fleet):
+
+    def task(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        return self.result("alpha", "00000001")["message_id"]
+
+    def test_duplicate_connectors_map_to_one_intent_and_one_dsn(self):
+        self.cfg = replace(self.cfg, connector_outcome_ids=("claude-code", "codex"))
+        nid = self.task()
+        self.hold("not_registered", "alpha")
+        from router.tests.peer_helpers import outcomes_dir
+        write_outcome(self.cfg, "delta", nid, "denied")
+        d2 = outcomes_dir(self.cfg, "delta", "codex")
+        d2.mkdir(parents=True, exist_ok=True)
+        (d2 / f"peer-{nid}.json").write_text(json.dumps(
+            {"outcome": "denied", "ts": "2026-09-03T12:00:00Z", "tree": "peer", "notice_id": nid}))
+        self.poll()
+        self.assertEqual(len(list((self.state_dir / LIDS["delta"] / outcomes.DSN_DIR).glob("*.json"))), 1)
+        self.recover("not_registered", "alpha")
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "alpha")), 1)
+
+    def test_denied_then_refused_are_two_intents_and_two_dsns(self):
+        nid = self.task()
+        self.hold("not_registered", "alpha")
+        write_outcome(self.cfg, "delta", nid, "denied")
+        self.poll()
+        write_outcome(self.cfg, "delta", nid, "refused", ts="2026-09-03T12:00:05Z")
+        self.poll()
+        names = sorted(p.name for p in (self.state_dir / LIDS["delta"] / outcomes.DSN_DIR).glob("*.json"))
+        self.assertEqual(names, [f"peer-{nid}.denied.json", f"peer-{nid}.refused.json"])
+        self.recover("not_registered", "alpha")
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "alpha")), 2)
+
+
+class DsnFairnessTests(_Fleet):
+    """1000+ held intents: a fresh outcome is still consumed in the same
+    poll, and a healthy intent behind the held prefix is delivered within a
+    bounded number of polls."""
+
+    def test_held_prefix_neither_blocks_outcomes_nor_starves_a_healthy_dsn(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        nid = self.result("alpha", "00000001")["message_id"]
+        d = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        d.mkdir(parents=True)
+        # 1100 intents for a target the registry never resolves, every one armed,
+        # all sorting BEFORE the healthy one.
+        for i in range(1100):
+            fake = f"{i:032x}"
+            (d / f"peer-{fake}.denied.json").write_text(json.dumps({
+                "v": 1, "tree": "peer", "notice_id": fake, "outcome": "denied",
+                "outcome_ts": "2026-09-03T12:00:00Z", "receiver": "delta", "sender": "ghost",
+                "sender_lid": None, "dsn_notice_id": f"{i:032x}", "dsn_ts": "2026-09-03T12:00:00Z",
+                "reason": None, "created_ts": "2026-09-03T12:00:00Z"}))
+            rec = outcomes.record_path(self.state_dir, "delta", "peer", fake, "denied",
+                                       state_key=LIDS["delta"])
+            rec.parent.mkdir(parents=True, exist_ok=True)
+            rec.write_text("{}")
+        write_outcome(self.cfg, "delta", nid, "denied")
+        polls = 0
+        while not list_notices(self.cfg, "alpha"):
+            self.poll()
+            polls += 1
+            if polls == 1:
+                self.assertTrue(outcomes.record_path(
+                    self.state_dir, "delta", "peer", nid, "denied", state_key=LIDS["delta"]).exists(),
+                    "the fresh outcome waited behind the queue")
+            self.assertLessEqual(polls, 1100 // outcomes.MAX_DSN_PER_POLL + 2,
+                                 "the healthy DSN was starved")
+        self.assertEqual(len(list_notices(self.cfg, "alpha")), 1)
+
+
+class NoRegistryUnchangedTests(RouterTestCase):
+    """Without a registry: no pending records, no DSN queue, and the drain
+    and outcome summaries carry exactly the keys they always did."""
+
+    def test_summaries_and_state_are_unchanged(self):
+        cfg = make_peer_config(self, {"alpha": {}, "delta": {"peer_senders": ["alpha"]}})
+        write_request(cfg, "alpha", "00000001", to=[addr("delta")])
+        summary = service.run_once(cfg, None)
+        self.assertNotIn("outbound_held", summary["alpha"])
+        self.assertNotIn("held_local", summary["alpha"])
+        nid = read_json(result_path(cfg, "alpha", "00000001"))["message_id"]
+        write_outcome(cfg, "delta", nid, "denied")
+        summary = service.run_once(cfg, None)
+        self.assertNotIn("dsn_held", summary["delta"])
+        self.assertEqual(summary["delta"]["peer_dsn_sent"], 1)       # inline, as before
+        self.assertFalse((self.state_dir / "delta" / outcomes.DSN_DIR).exists())
+        self.assertFalse((self.state_dir / "alpha" / outbound.PENDING_DIR).exists())
+
+
+class GlobalHoldSuppressesRecoveryTests(_Fleet):
+    """An unavailable or rolled-back registry holds every instance, senders
+    included: an existing pending request is not advanced."""
+
+    def test_pending_waits(self):
+        for reason in GLOBAL:
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.hold("not_registered", "bravo")
+                write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+                self.poll()
+                path = self.pending("alpha", "00000001")
+                before = path.read_bytes()
+                self.recover("not_registered", "bravo")
+                self.hold(reason, "bravo")
+                self.poll()
+                self.assertEqual(path.read_bytes(), before, "advanced under a global hold")
+                self.assertEqual(list_notices(self.cfg, "bravo"), [])
+                self.recover(reason, "bravo")
+                self.poll()
+                self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
+
+
+class DsnArmingAndIdentityTests(_Fleet):
+
+    def task(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        return self.result("alpha", "00000001")["message_id"]
+
+    def test_an_intent_is_not_armed_until_its_outcome_is_recorded(self):
+        """The record write fails (an ordinary error, so the poll goes on to
+        the queue): the intent must not be delivered then, or the retry of
+        the kept source would enqueue a SECOND DSN with a new id."""
+        nid = self.task()
+        write_outcome(self.cfg, "delta", nid, "denied")
+        rec = outcomes.record_path(self.state_dir, "delta", "peer", nid, "denied",
+                                   state_key=LIDS["delta"])
+        real = outcomes.atomic_write
+
+        def fail_once(path, data, **kw):
+            if Path(path) == rec and not fail_once.done:
+                fail_once.done = True
+                raise OSError("EIO")
+            return real(path, data, **kw)
+        fail_once.done = False
+        with mock.patch.object(outcomes, "atomic_write", fail_once):
+            self.poll()
+        self.assertEqual(list_notices(self.cfg, "alpha"), [])
+        self.poll()
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "alpha")), 1)
+
+    def test_a_dsn_never_follows_a_reused_name(self):
+        nid = self.task()
+        self.hold("not_registered", "alpha")
+        write_outcome(self.cfg, "delta", nid, "denied")
+        self.poll()
+        d = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        [path] = list(d.glob("*.json"))
+        intent = json.loads(path.read_text())
+        intent["sender_lid"] = "9" * 32                # bound to another identity
+        path.write_text(json.dumps(intent))
+        self.recover("not_registered", "alpha")
+        summary = self.poll()
+        self.assertEqual(list_notices(self.cfg, "alpha"), [])
+        self.assertEqual(summary["delta"]["dsn_held"],
+                         [{"notice_id": nid, "outcome": "denied", "target": "alpha",
+                           "reason": "identity_changed"}])
+
+    def test_held_dsns_and_held_requests_are_reported(self):
+        nid = self.task()
+        self.hold("not_registered", "alpha")
+        write_outcome(self.cfg, "delta", nid, "denied")
+        write_request(self.cfg, "delta", "00000002", in_reply_to=nid, to=[addr("alpha")])
+        summary = self.poll()
+        self.assertEqual(summary["delta"]["dsn_held"],
+                         [{"notice_id": nid, "outcome": "denied", "target": "alpha",
+                           "reason": "not_registered"}])
+        [held] = summary["delta"]["held_local"]
+        self.assertEqual((held["req_id"], held["targets"]),
+                         ("00000002", [{"recipient": "alpha", "state": "held",
+                                        "reason": "not_registered"}]))
