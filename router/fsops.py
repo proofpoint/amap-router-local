@@ -14,6 +14,9 @@ ROOTS. An `FsOps` knows the directories it may open, by kind:
     `.runtime/<gen>/` are generation trees, and a staging subtree made by
     `stage_tree` is a generation tree that is not yet published;
   * `private_roots`: this writer's own state directories, each one tree.
+    They are opened, read and `replace_durable`d here, but they have no
+    stage directory, so `commit_durable` is for hop trees and host intakes
+    only (this router's private writes use `util.atomic_write`).
 
 `open_root_nofollow` refuses any other path. There is no "anywhere" mode.
 
@@ -179,7 +182,7 @@ class Binding:
     def is_stage(self) -> bool:
         if self.kind == GENERATION:
             return self.rel in (("up", "stage"), ("down", "stage"))
-        if self.kind in (INTAKE, PRIVATE):
+        if self.kind == INTAKE:
             return self.rel == (".stage",)
         return False
 
@@ -232,6 +235,10 @@ class FsOps:
         self._by_fd: Dict[int, Binding] = {}
         self._by_dir: Dict[Tuple[int, int], Binding] = {}
         self._stage_cache: Dict[Tuple[Tuple[int, int], str], int] = {}
+        #: (dev, ino) of every stage directory `open_stage_dir` validated.
+        #: Only those are accepted as `stage_dirfd`: a stage reached any other
+        #: way (`descend_pinned` to `up/stage`) skipped the owner and 0700 check.
+        self._validated_stages: set = set()
         self._lock = threading.RLock()
         self._dest_locks: Dict[Tuple[int, int], threading.Lock] = {}
 
@@ -474,6 +481,8 @@ class FsOps:
             os.close(parent_fd)
         with self._lock:
             self._stage_cache[key] = fd
+            st = os.fstat(fd)
+            self._validated_stages.add((st.st_dev, st.st_ino))
         return fd
 
     # -- the commit -----------------------------------------------------------
@@ -490,8 +499,8 @@ class FsOps:
         _check_name(name)
         if not isinstance(data, bytes):
             raise FsOpsError("data must be the frozen bytes")
-        if not stage.is_stage:
-            raise BindingError("stage_dirfd is not a stage directory")
+        if not stage.is_stage or (stage.dev, stage.ino) not in self._validated_stages:
+            raise BindingError("stage_dirfd is not a stage directory opened by open_stage_dir")
         if _inside_stage(dest):
             raise BindingError("a stage directory is never a destination")
         if stage.tree != dest.tree or stage.kind != dest.kind:
@@ -573,13 +582,19 @@ class FsOps:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
         except OSError as e:
             if e.errno == errno.ELOOP:
+                os.fsync(dfd)
                 return self._different(dfd, name, "a symlink")
             raise
         try:
             st = os.fstat(fd)
+            # Before returning either exists_*, the existing entry and the
+            # destination are made durable (B §e.2), refusals included.
             if not stat.S_ISREG(st.st_mode):
+                os.fsync(dfd)
                 return self._different(dfd, name, "not a regular file")
             if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != mode:
+                os.fsync(fd)
+                os.fsync(dfd)
                 return self._different(dfd, name, "owner or mode")
             if st.st_nlink == 1:
                 stale = self._exists(sfd, sname)
@@ -710,7 +725,13 @@ class FsOps:
 
     def open_regular_pinned(self, dir_fd: int, name: str, *, max_bytes: int):
         """Committed bytes, or NOT_YET for a commit in flight on a hop-tree
-        or host-intake binding; anything else raises."""
+        or host-intake binding; anything else raises.
+
+        It checks the file is regular and its link count; it does NOT check
+        the owner. A reader that needs an owner rule (contract §4.2 markers)
+        calls `stat_owner_pinned` as well, which is a separate lookup and so
+        is sound only in a single-owner directory, where nothing else can
+        replace the name between the two."""
         b = self.binding(dir_fd)
         _check_name(name)
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
@@ -752,7 +773,7 @@ class FsOps:
 def _inside_stage(b: Binding) -> bool:
     if b.kind == GENERATION:
         return b.rel[:2] in (("up", "stage"), ("down", "stage"))
-    if b.kind in (INTAKE, PRIVATE):
+    if b.kind == INTAKE:
         return b.rel[:1] == (".stage",)
     return False
 

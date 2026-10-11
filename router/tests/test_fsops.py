@@ -125,6 +125,22 @@ class CommitTests(_HopCase):
         with self.assertLogs("amap_router_local.fsops", logging.ERROR):
             self.assertEqual(self.commit(name="link.json"), "exists_different")
 
+    def test_a_refused_existing_file_is_made_durable_before_the_answer(self):
+        self.commit()
+        os.chmod(self.final(), 0o600)
+        synced = []
+        real = os.fsync
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            synced.append("dir" if stat.S_ISDIR(st.st_mode) else "file")
+            return real(fd)
+
+        with mock.patch("router.fsops.os.fsync", fsync), \
+                self.assertLogs("amap_router_local.fsops", logging.ERROR):
+            self.assertEqual(self.commit(), "exists_different")
+        self.assertEqual(synced, ["file", "dir"])
+
     def test_a_stale_own_stage_with_no_final_is_cleaned_and_the_commit_retried(self):
         self.stage_path().write_bytes(b"stale")
         self.assertEqual(self.commit(), "created")
@@ -389,6 +405,18 @@ class BindingAndTagTests(_HopCase):
     def test_a_path_under_no_configured_root_is_refused(self):
         with self.assertRaises(fsops.BindingError):
             self.ops.open_root_nofollow(self._tmp.name)
+
+    def test_only_a_stage_opened_by_open_stage_dir_is_accepted(self):
+        """Reached by descend_pinned, `up/stage` skipped the owner and 0700
+        check, so it is refused as a stage even when it would pass it."""
+        lid = self.ops.descend_pinned(self.ops.open_root_nofollow(str(self.hop)), LID)
+        root = self.ops.stage_tree(lid, ".adm-v")
+        sneaky = self.ops.descend_pinned(root, "up/stage")
+        up = self.ops.descend_pinned(root, "up")
+        with self.assertRaises(fsops.BindingError):
+            self.ops.commit_durable(sneaky, up, "identity", b"{}", 0o640)
+        good = self.ops.open_stage_dir(root, "up")
+        self.assertEqual(self.ops.commit_durable(good, up, "identity", b"{}", 0o640), "created")
 
     def test_the_stage_and_destination_must_share_a_tree_and_a_stage_is_never_a_dest(self):
         intake = self.ops.open_root_nofollow(str(self.hop / ".unresolved"))
