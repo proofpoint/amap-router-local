@@ -266,9 +266,10 @@ class FsOps:
         if not stat.S_ISDIR(st.st_mode):
             raise BindingError("a binding must be a directory")
         b = Binding(kind, tree, rel, st.st_dev, st.st_ino, st.st_uid)
-        tag = b.tag
-        if rel and len(tag) + 2 > NAME_MAX:
-            raise BindingError(f"destination tag for {'/'.join(rel)!r} is too long")
+        # The tag is derived, and its charset and length checked, only when a
+        # commit uses this directory as a destination (`commit_durable`), so
+        # a stray out-of-charset directory blocks commits into it and never a
+        # read-only walk past it.
         with self._lock:
             prior = self._by_dir.get((b.dev, b.ino))
             if prior is not None and (prior.kind, prior.tree, prior.rel) != (kind, tree, rel):
@@ -292,7 +293,9 @@ class FsOps:
         recorded for `b` before, that record is stale (the number was closed
         and reused), so it cannot show `b` is still held."""
         for fd, other in list(self._by_fd.items()):
-            if other is not b or fd == exclude_fd:
+            # Every holder of the same directory counts, including an older,
+            # equivalent Binding object from an earlier opening (Codex F3).
+            if (other.dev, other.ino) != (b.dev, b.ino) or fd == exclude_fd:
                 continue
             try:
                 st = os.fstat(fd)
@@ -303,10 +306,13 @@ class FsOps:
         return False
 
     def _forget(self, b: Binding) -> None:
-        self._by_dir.pop((b.dev, b.ino), None)
-        for fd in [fd for fd, other in self._by_fd.items() if other is b]:
+        """Drop every record of `b`'s directory: the canonical binding and
+        every descriptor bound to it through any equivalent opening."""
+        key = (b.dev, b.ino)
+        self._by_dir.pop(key, None)
+        for fd in [fd for fd, other in self._by_fd.items() if (other.dev, other.ino) == key]:
             del self._by_fd[fd]
-        self._validated_stages.discard((b.dev, b.ino))
+        self._validated_stages.discard(key)
 
     def _forget_under(self, parent: Binding, name: str) -> None:
         """Drop every binding at or under `name` in `parent` (it is being
@@ -562,7 +568,11 @@ class FsOps:
             raise BindingError("a stage directory is never a destination")
         if stage.tree != dest.tree or stage.kind != dest.kind:
             raise BindingError("the stage and the destination are in different trees")
-        stage_name = f"{dest.tag}.{name}"
+        tag = dest.tag  # BindingError for a name outside the tag charset
+        stage_name = f"{tag}.{name}"
+        if len(stage_name.encode("utf-8", "surrogateescape")) > NAME_MAX:
+            raise BindingError(f"the stage name for {name!r} in {'/'.join(dest.rel)!r} "
+                               "exceeds NAME_MAX")
         _check_name(stage_name)
         lock = self._dest_lock(stage)
         with lock:

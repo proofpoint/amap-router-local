@@ -470,12 +470,34 @@ class BindingAndTagTests(_HopCase):
         self.assertEqual(ops.binding(direct).tag, tag)
         self.assertEqual(ops.binding(direct).tree, ops.binding(out).tree)
 
-    def test_tag_components_outside_the_charset_are_refused(self):
+    def test_tag_components_outside_the_charset_are_refused_at_commit_only(self):
+        """The charset is checked when a tag is derived for a commit, so a
+        stray directory blocks commits into it and never a walk past it."""
         with self.assertRaises(fsops.BindingError):
             fsops.dest_tag(("outbound", "a b"))
-        with self.assertRaises(fsops.BindingError):
-            self.ops.mkdir_and_pin(self.tree, "we irdé", 0o750)
         self.assertEqual(fsops.dest_tag(("a-b_c.d",)), "7-a-b_c.d")
+        weird = self.ops.mkdir_and_pin(self.tree, "we irdé", 0o750)  # walking is fine
+        os.mkdir(self.hop / LID / GEN / "we irdé" / "ok", 0o750)
+        inner = self.ops.descend_pinned(self.tree, "we irdé/ok")
+        self.assertIsNotNone(inner)
+        with self.assertRaises(fsops.BindingError):
+            self.commit(dest=weird, name="x")
+        self.assertFalse((self.hop / LID / GEN / "we irdé" / "x").exists())
+
+    def test_an_older_equivalent_holder_keeps_a_directory_live(self):
+        """Codex F3: the original fd A is held; an equivalent opening B is
+        made and closed; the directory is renamed. Descending into the new
+        name must still be ambiguous while A is held, and allowed once A
+        closes."""
+        a = self.outbound
+        b = self.ops.descend_pinned(self.tree, "outbound")
+        os.close(b)
+        os.rename(self.hop / LID / GEN / "outbound", self.hop / LID / GEN / "moved")
+        with self.assertRaises(fsops.BindingError):
+            self.ops.descend_pinned(self.tree, "moved")
+        os.close(a)
+        c = self.ops.descend_pinned(self.tree, "moved")
+        self.assertEqual(self.ops.binding(c).rel, ("moved",))
 
     def test_a_prior_binding_no_descriptor_holds_is_replaced_not_ambiguous(self):
         """RE's B2: once nothing holds the prior directory, its inode may be
