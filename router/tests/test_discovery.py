@@ -1066,7 +1066,9 @@ class ConfigIsReReadEveryPollTests(_Tree):
         cfgp.write_text("{not json at all")
         with self.assertLogs("amap_router_local", level="ERROR") as logs:
             kept = reload_config(cfgp, cfg)
-        self.assertIs(kept, cfg)
+        self.assertEqual(kept, cfg)  # the last good config, with the failure flagged
+        self.assertTrue(kept.reload_failed)
+        self.assertFalse(cfg.reload_failed)
         self.assertIn("last good", "\n".join(logs.output))
 
     def test_an_unreadable_config_keeps_the_last_good_one(self):
@@ -1079,7 +1081,9 @@ class ConfigIsReReadEveryPollTests(_Tree):
         cfg = load(cfgp)
         cfgp.unlink()
         with self.assertLogs("amap_router_local", level="ERROR"):
-            self.assertIs(reload_config(cfgp, cfg), cfg)
+            kept = reload_config(cfgp, cfg)
+            self.assertEqual(kept, cfg)  # the last good config, with the failure flagged
+            self.assertTrue(kept.reload_failed)
 
     def test_a_CHANGED_state_dir_is_refused_not_adopted(self):
         """This process holds that directory's drain lock, and its ledgers,
@@ -1097,7 +1101,9 @@ class ConfigIsReReadEveryPollTests(_Tree):
         cfgp.write_text(json.dumps({**base, "state_dir": str(self.root / "ELSEWHERE")}))
         with self.assertLogs("amap_router_local", level="ERROR") as logs:
             kept = reload_config(cfgp, cfg)
-        self.assertIs(kept, cfg)
+        self.assertEqual(kept, cfg)  # the last good config, with the failure flagged
+        self.assertTrue(kept.reload_failed)
+        self.assertFalse(cfg.reload_failed)
         self.assertEqual(kept.state_dir, self.state)
         self.assertIn("REFUSED", "\n".join(logs.output))
 

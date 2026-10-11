@@ -416,7 +416,9 @@ class StartupTests(_PluginDir):
         with mock.patch.object(service, "load", return_value=replace(cfg, transport_plugin=changed)):
             with self.assertLogs("amap_router_local", logging.ERROR):
                 kept = service.reload_config("/unused", cfg)
-        self.assertIs(kept, cfg)
+        self.assertEqual(kept, cfg)  # the last good config, with the failure flagged
+        self.assertTrue(kept.reload_failed)
+        self.assertFalse(cfg.reload_failed)
 
 
 class ClaimedIsPendingTests(_InflightCase):

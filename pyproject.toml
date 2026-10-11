@@ -56,3 +56,4 @@ packages = ["router", "router.tests"]
 
 [tool.setuptools.package-data]
 router = ["py.typed"]
+"router.tests" = ["vectors/*.json"]

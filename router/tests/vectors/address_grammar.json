@@ -1,0 +1,170 @@
+{
+ "description": "The one address grammar (router/classify.py parse_address). Each case: `in`, and either `out` (the canonical form: the domain lowercased, the local part exactly as given) or `malformed: true`. Shared with the external leg's runtime so the two parsers cannot drift. The fleet-name rule (a local part at a fleet domain must also match the registry name grammar) is context-dependent and is not in these vectors.",
+ "cases": [
+  {
+   "in": "alice@example.com",
+   "out": "alice@example.com",
+   "why": "plain"
+  },
+  {
+   "in": "Alice@Example.COM",
+   "out": "Alice@example.com",
+   "why": "upper case: the domain folds, the local part is kept exactly"
+  },
+  {
+   "in": "a.b+c@x-y.example",
+   "out": "a.b+c@x-y.example",
+   "why": "dot-atom local part, hyphenated label"
+  },
+  {
+   "in": "agent.bob@local",
+   "out": "agent.bob@local",
+   "why": "the legacy single-label domain"
+  },
+  {
+   "in": "o'neil{x}@example.org",
+   "out": "o'neil{x}@example.org",
+   "why": "atext specials"
+  },
+  {
+   "in": "a@xn--bcher-kva.example",
+   "out": "a@xn--bcher-kva.example",
+   "why": "an A-label is LDH and is not decoded"
+  },
+  {
+   "in": "llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll@example.com",
+   "out": "llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll@example.com",
+   "why": "a 64-character local part"
+  },
+  {
+   "in": "llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "out": "llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "why": "254 characters in all"
+  },
+  {
+   "in": "a@1example.com",
+   "out": "a@1example.com",
+   "why": "a label may start with a digit"
+  },
+  {
+   "in": "a@b@example.com",
+   "malformed": true,
+   "why": "two @"
+  },
+  {
+   "in": "noat.example.com",
+   "malformed": true,
+   "why": "no @"
+  },
+  {
+   "in": "@example.com",
+   "malformed": true,
+   "why": "empty local part"
+  },
+  {
+   "in": "a@",
+   "malformed": true,
+   "why": "empty domain"
+  },
+  {
+   "in": "a@example.com.",
+   "malformed": true,
+   "why": "a trailing dot"
+  },
+  {
+   "in": "a@[192.0.2.1]",
+   "malformed": true,
+   "why": "an IP literal"
+  },
+  {
+   "in": "a@192.0.2.1",
+   "malformed": true,
+   "why": "a dotted numeric address"
+  },
+  {
+   "in": "\"a b\"@example.com",
+   "malformed": true,
+   "why": "a quoted local part"
+  },
+  {
+   "in": "a(comment)@example.com",
+   "malformed": true,
+   "why": "a comment"
+  },
+  {
+   "in": "a@ex\u0430mple.com",
+   "malformed": true,
+   "why": "a homoglyph domain (Cyrillic a)"
+  },
+  {
+   "in": "\u00e4@example.com",
+   "malformed": true,
+   "why": "a non-ASCII local part"
+  },
+  {
+   "in": " a@example.com",
+   "malformed": true,
+   "why": "leading whitespace"
+  },
+  {
+   "in": "a@example.com ",
+   "malformed": true,
+   "why": "trailing whitespace"
+  },
+  {
+   "in": "a\n@example.com",
+   "malformed": true,
+   "why": "a newline"
+  },
+  {
+   "in": "a..b@example.com",
+   "malformed": true,
+   "why": "a doubled dot"
+  },
+  {
+   "in": ".a@example.com",
+   "malformed": true,
+   "why": "a leading dot"
+  },
+  {
+   "in": "a.@example.com",
+   "malformed": true,
+   "why": "a trailing dot in the local part"
+  },
+  {
+   "in": "a@-ex.example",
+   "malformed": true,
+   "why": "a label starting with a hyphen"
+  },
+  {
+   "in": "a@ex-.example",
+   "malformed": true,
+   "why": "a label ending with a hyphen"
+  },
+  {
+   "in": "a@ex..example",
+   "malformed": true,
+   "why": "an empty label"
+  },
+  {
+   "in": "a@exa_mple.com",
+   "malformed": true,
+   "why": "an underscore in a label"
+  },
+  {
+   "in": "lllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll@example.com",
+   "malformed": true,
+   "why": "a 65-character local part"
+  },
+  {
+   "in": "a@xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.example",
+   "malformed": true,
+   "why": "a 64-character label"
+  },
+  {
+   "in": "llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "malformed": true,
+   "why": "255 characters in all"
+  }
+ ]
+}

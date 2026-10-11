@@ -112,8 +112,8 @@ M = [
   [T + 'TombstoneTests.test_a_relisted_tombstoned_alias_stays_inactive']),
  # -- the external leg ------------------------------------------------------------
  ('X1 an aliased draft may take the external leg', OB,
-  '    if isinstance(decided, ExternalRoute) and applied:\n',
-  '    if isinstance(decided, ExternalRoute) and False:\n',
+  '        decided = default_cold_policy(cfg, name, draft)\n',
+  '        decided = (cold_policy or default_cold_policy)(cfg, name, draft)\n',
   [T + 'ExternalTests.test_an_aliased_draft_never_reaches_the_external_leg']),
  # -- tombstones ------------------------------------------------------------------
  ('T1 expired aliases are never tombstoned', AL,

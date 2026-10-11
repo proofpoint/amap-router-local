@@ -140,6 +140,7 @@ from datetime import timedelta
 
 from . import aliases as aliases_mod
 from . import attachments as attachments_mod, binding, firstsight
+from . import classify as classify_mod
 from . import generations as generations_mod
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
@@ -909,6 +910,40 @@ ColdPolicy = Callable[
     Union[List[str], ColdRefusal, PeerRoute, ExternalRoute],
 ]
 
+def default_remote_policy(
+    cfg: RouterConfig, sender: str, draft: Dict[str, Any]
+) -> Union[ColdRefusal, ExternalRoute]:
+    """This router's own decision for a request whose recipients are all in
+    ONE cross-host class of item 6 or item 7 (`classify.remote_rule`). The
+    only decision a custom `ColdPolicy` replaces."""
+    remote = classify_mod.remote_of(cfg, draft)
+    d = classify_mod.remote_rule(cfg, sender, remote)
+    if isinstance(d, classify_mod.Refuse):
+        return ColdRefusal(d.outcome, d.reason_code, detail=d.detail, hold=d.hold)
+    return ExternalRoute(d.recipients)
+
+
+def _remote_decision(
+    cfg: RouterConfig, sender: str, draft: Dict[str, Any], remote: "classify_mod.Remote",
+    cold_policy: Optional[ColdPolicy],
+) -> Union[ColdRefusal, ExternalRoute]:
+    """Items 6 and 7: the custom policy if one was supplied, else
+    `default_remote_policy`. A policy cannot route a recipient into a class
+    it is not in: only a refusal, or an external route naming recipients of
+    THIS request's class, is accepted, and anything else is answered
+    `queued_for_human`/`transport_anomaly` with nothing sent."""
+    policy = cold_policy if cold_policy is not None else default_remote_policy
+    decided = policy(cfg, sender, draft)
+    if isinstance(decided, ColdRefusal):
+        return decided
+    if isinstance(decided, ExternalRoute) and all(
+            _canonical_or_none(r) in remote.canonical for r in decided.recipients):
+        return decided
+    return ColdRefusal("queued_for_human", REASON_TRANSPORT_ANOMALY,
+                       detail="the cold policy routed outside this request's recipient "
+                              "class; nothing was sent")
+
+
 #: Refusals that belong to the peer lane and are therefore audited
 #: (`audit.EVENT_PEER_REFUSED`) under the refused SENDER.
 _PEER_REFUSALS = frozenset({REASON_PEER_SINGLE_RECIPIENT, REASON_PEER_REPLY_WINDOW_EXPIRED})
@@ -1112,10 +1147,33 @@ def _drain_cold(
     draft, applied = dict(norm.draft), dict(norm.applied)
     for old, new in sorted(applied.items()):
         logger.warning("instance %r req %r: alias used: %s -> %s", name, req_id, old, new)
-    # Late resolution, like the backend below: a module-level default bound at
-    # def-time cannot be patched by a test that imports this module.
-    policy = cold_policy if cold_policy is not None else default_cold_policy
-    decided = policy(cfg, name, draft)
+    # THE ORDER (`router/classify.py`), outside any custom policy: steps 2-5
+    # and item 5 are this router's, always. Only a single cross-host class
+    # of item 6 or item 7 that passed them reaches a policy, and its answer
+    # is checked against that class (`_remote_decision`).
+    classified = classify_mod.classify(cfg, name, draft, plugin=transport is not None,
+                                       now=utc_ts())
+    klass: Optional[str] = None
+    if isinstance(classified, classify_mod.Refuse):
+        decided: Any = ColdRefusal(classified.outcome, classified.reason_code,
+                                   detail=classified.detail, hold=classified.hold)
+    elif isinstance(classified, classify_mod.PeerRemote):
+        # Item 5 passed in full. No production path gets here: item 5e
+        # refuses first while this router cannot sign a cross-host peer
+        # statement. Answered, never dropped, and nothing is published.
+        decided = ColdRefusal("queued_for_human", REASON_TRANSPORT_ANOMALY,
+                              detail="the cross-host peer lane is not built; nothing was sent")
+    elif isinstance(classified, classify_mod.Remote):
+        klass = classified.klass
+        decided = _remote_decision(cfg, name, draft, classified, cold_policy)
+    else:
+        # Every recipient is an instance here. An alias names only a LOCAL
+        # identity, so an alias-normalised draft always lands in this branch
+        # or in a step-5 refusal, and never reaches a custom policy or the
+        # external leg: the agent's own bytes are what the external leg is
+        # given, never a rewritten draft. Late resolution: a module-level
+        # default bound at def-time cannot be patched by a test.
+        decided = default_cold_policy(cfg, name, draft)
 
     if isinstance(decided, ColdRefusal):
         result = _result_doc(req_id, decided.outcome,
@@ -1135,20 +1193,11 @@ def _drain_cold(
             req_digest=req_digest, attachments=attachments, aliases=applied,
         )
 
-    if isinstance(decided, ExternalRoute) and applied:
-        # The external leg is given the agent's own bytes, never a rewritten
-        # draft, and an alias names only a LOCAL identity: a route that would
-        # carry an alias-normalised recipient there is settled now, before
-        # anything is staged or put in flight.
-        result = _result_doc(
-            req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY, recipients=[],
-            detail="alias-normalised recipients cannot take the external leg; nothing was sent")
-        return _finish(cfg, name, req_id, result, req_digest=req_digest)
-
     if isinstance(decided, ExternalRoute):
         return _begin_external(
             cfg, name, req_id, doc, decided,
             req_digest=req_digest, attachments=attachments, transport=transport,
+            klass=klass, cold_policy=cold_policy,
         )
 
     recipients = list(decided)
@@ -1249,6 +1298,7 @@ def _begin_external(
     *, req_digest: Optional[str],
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     transport: Optional[inflight_mod.TransportPort],
+    klass: Optional[str] = None, cold_policy: Optional[ColdPolicy] = None,
 ) -> str:
     """Put a request in flight and take its first step (which writes the
     transport request). Two cases settle at once instead, both
@@ -1272,14 +1322,16 @@ def _begin_external(
     record = inflight_mod.begin(
         cfg, name, req_id, digest=req_digest, request_doc=doc,
         recipients=list(route.recipients),
+        policy_digest=classify_mod.policy_digest(cfg, name), route=klass,
     )
-    _advance_one(cfg, name, req_id, record, transport)
+    _advance_one(cfg, name, req_id, record, transport, cold_policy=cold_policy)
     return INFLIGHT
 
 
 def _advance_one(
     cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
     transport: inflight_mod.TransportPort, *, fenced: bool = False,
+    cold_policy: Optional[ColdPolicy] = None,
 ) -> str:
     """`inflight.advance` with `_finish` as the settle step.
 
@@ -1311,7 +1363,66 @@ def _advance_one(
     return inflight_mod.advance(
         cfg, name, req_id, record, transport, settle=settle,
         already_settled=anchor.is_file(), anchor=anchor,
+        recheck=lambda rec: _recheck(cfg, name, rec, transport, cold_policy),
+        publish_blocked=cfg.reload_failed,
     )
+
+
+def _canonical_or_none(raw: Any) -> Optional[str]:
+    try:
+        return classify_mod.parse_address(raw).canonical()
+    except classify_mod.Malformed:
+        return None
+
+
+def _recheck(
+    cfg: RouterConfig, name: str, record: Dict[str, Any],
+    transport: Optional[inflight_mod.TransportPort], cold_policy: Optional[ColdPolicy],
+) -> inflight_mod.Recheck:
+    """Re-classify a record's STAGED request under the current config, the
+    whole order from alias normalisation on (`router/classify.py`). Still
+    permitted means the same class, route and recipient set; anything else
+    is `queued_for_human`/`recipient_not_allowlisted`, "policy changed before
+    publication", saying what changed. A different route is refused, never
+    rebuilt for the new one. The digest is not consulted to decide: what
+    decides a permit is wider than what the digest covers."""
+    def refused(why: str) -> inflight_mod.Recheck:
+        return inflight_mod.Recheck(False, verdict={
+            "outcome": "queued_for_human", "reason_code": REASON_RECIPIENT_NOT_ALLOWLISTED,
+            "detail": f"policy changed before publication: {why}", "recipients": []},
+            why=why)
+
+    draft = record.get("request", {}).get("draft")
+    if not isinstance(draft, dict):
+        return refused("the staged request has no draft")
+    norm = aliases_mod.normalise(cfg, draft)
+    if not isinstance(norm, aliases_mod.Normalised) or norm.applied:
+        return refused("an alias now names a recipient")
+    old = record.get("route")
+    kinds = set()
+    for raw in classify_mod.recipients(draft):
+        try:
+            kinds.add(classify_mod.address_class(cfg, raw)[0])
+        except classify_mod.Malformed:
+            kinds.add(None)
+    if old is not None and len(kinds) == 1 and None not in kinds and kinds != {old}:
+        return refused(f"route changed from {old} to {next(iter(kinds))}")
+    decided = classify_mod.classify(cfg, name, draft, plugin=transport is not None,
+                                    now=utc_ts())
+    if isinstance(decided, classify_mod.Refuse):
+        return refused(f"now {decided.reason_code}")
+    if not isinstance(decided, classify_mod.Remote):
+        return refused(f"route changed from {old or 'external'} to "
+                       f"{classify_mod.CLASS_LOCAL if isinstance(decided, classify_mod.Local) else classify_mod.CLASS_TRUSTED}")
+    routed = _remote_decision(cfg, name, draft, decided, cold_policy)
+    if isinstance(routed, ColdRefusal):
+        return refused(f"now {routed.reason_code}")
+    then = {_canonical_or_none(r) for r in record.get("recipients", [])}
+    now_set = {_canonical_or_none(r) for r in routed.recipients}
+    if None in then or then != now_set:
+        return refused("the permitted recipient set changed")
+    return inflight_mod.Recheck(True, policy_digest=classify_mod.policy_digest(cfg, name),
+                                route=decided.klass)
 
 
 #: What this process has already warned about, so a 5-second poll does not
@@ -1323,6 +1434,7 @@ _STALE_WARNED: set = set()
 def _advance_inflight(
     cfg: RouterConfig, name: str, transport: Optional[inflight_mod.TransportPort],
     outcomes: Dict[str, int], *, fenced: bool = False,
+    cold_policy: Optional[ColdPolicy] = None,
 ) -> Dict[str, int]:
     """One step for every in-flight record of `name`, isolated per record.
     Runs BEFORE the outbox listing, so a request settled here is seen by the
@@ -1343,7 +1455,8 @@ def _advance_inflight(
                 record = inflight_mod.read_record(cfg, name, req_id)
                 if record is None:
                     continue
-                state = _advance_one(cfg, name, req_id, record, transport, fenced=fenced)
+                state = _advance_one(cfg, name, req_id, record, transport, fenced=fenced,
+                                     cold_policy=cold_policy)
             except Exception:
                 logger.exception(
                     "instance %r: error advancing in-flight request %r — isolated, "
@@ -2635,7 +2748,8 @@ def _drain_fenced(
         if transport is not None:
             try:
                 if inflight_mod.list_records(view, name):
-                    _advance_inflight(view, name, transport, {}, fenced=True)
+                    _advance_inflight(view, name, transport, {}, fenced=True,
+                                      cold_policy=cold_policy)
             except Exception:
                 logger.exception("instance %r: error stepping fenced in-flight work — "
                                  "isolated, its files stay claimed", name)
@@ -2929,7 +3043,8 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # router without one reports exactly the summary it always did.
     inflight_summary: Dict[str, int] = {}
     if transport is not None or inflight_mod.list_records(cfg, name):
-        inflight_summary = _advance_inflight(cfg, name, transport, outcomes)
+        inflight_summary = _advance_inflight(cfg, name, transport, outcomes,
+                                             cold_policy=cold_policy)
 
     if cfg.registry_dir is not None:
         _sweep_answered_pending(cfg, name)

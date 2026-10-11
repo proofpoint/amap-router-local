@@ -30,14 +30,17 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import aliases as aliases_mod
+from . import inflight as inflight_mod, quarantine as quarantine_mod
 from . import generations, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
 from .config import RouterConfig
 from .config import ConfigError, load
 from .status import StatusTracker, render_discovery
+from .util import parse_utc_ts, utc_ts
 
 logger = logging.getLogger("amap_router_local")
 
@@ -242,6 +245,11 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
     # accepted; whether draining it worked is a different claim with its own
     # counters. An errored poll must still report the set it was working on.
     tracker.record_admitted(cfg.instances)
+    if cfg.reload_failed:
+        logger.error(
+            "the config reload is failing: running on the last good config, and the "
+            "external leg is closed (nothing new is published, no revocation is "
+            "enacted) until a reload succeeds")
     try:
         # The no-plugin call keeps its exact shape (`run_once(cfg)`), so a
         # router without a plugin runs precisely the code it ran before.
@@ -250,8 +258,16 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
         tracker.record_registry(report.to_doc() if report.state != "off" else None)
         if report.state == "off":
             summary = run_once(cfg) if transport is _LOAD else run_once(cfg, transport)
+            keyed_cfg = cfg
         else:
             summary = run_once(cfg, transport, report, gen_keys)
+            keyed_cfg = generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys)
+        try:
+            tracker.record_classification(classification_status(
+                keyed_cfg, report, None if transport is _LOAD else transport))
+        except Exception:
+            logger.exception("error reading the cross-host state for status — isolated")
+        if report.state != "off":
             try:
                 tracker.record_generations(generations.status_doc(
                     generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys),
@@ -296,6 +312,40 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
     return summary
 
 
+def classification_status(cfg: RouterConfig, report: Any,
+                          transport: Any) -> Optional[Dict[str, Any]]:
+    """The `classification` section of status.json, or None when it would be
+    empty: whether the config reload is failing, every in-flight request
+    revoked after it was handed over (with its age; `inflight.revoked`), and,
+    under a registry, the ingress quarantine's count per agent."""
+    doc: Dict[str, Any] = {}
+    if cfg.reload_failed:
+        doc["config_reload_failed"] = True
+    now = parse_utc_ts(utc_ts())
+    revoked: Dict[str, List[Dict[str, Any]]] = {}
+    for name in sorted(cfg.instances):
+        try:
+            rows = inflight_mod.revoked(cfg, name)
+        except Exception:  # noqa: BLE001 -- an unkeyed name has no records to show
+            continue
+        for row in rows:
+            since = parse_utc_ts(row["since"])
+            row["age_s"] = None if since is None or now is None else int(
+                (now - since).total_seconds())
+        if rows:
+            revoked[name] = rows
+    if revoked:
+        doc["revocation_unenforceable"] = revoked
+        doc["withdraw_capable"] = inflight_mod.withdraw_capable(transport)
+    known = getattr(report, "known", None) or {}
+    if report is not None and getattr(report, "state", "off") != "off":
+        doc["ingress_quarantine"] = {
+            name: quarantine_mod.counts(quarantine_mod.list_ingress(
+                cfg.state_dir, lid, name, days=cfg.ingress_quarantine_days))
+            for name, lid in sorted(known.items())}
+    return doc or None
+
+
 def reload_config(config_path, current: RouterConfig) -> RouterConfig:
     """Re-read the config for the next poll, or keep `current` and say why.
 
@@ -303,6 +353,13 @@ def reload_config(config_path, current: RouterConfig) -> RouterConfig:
     reason to take down a fleet that is draining correctly on the last good
     one — it is a reason to be loud. The alternative turns a half-written
     file, caught between a renderer's write and its rename, into an outage.
+
+    EVERY FAILED OR REFUSED RELOAD RETURNS `current` WITH `reload_failed`
+    SET (`RouterConfig.reload_failed`, process state). The local lane keeps
+    running on it unchanged; the external leg fails closed while it is set:
+    no new publication, no re-write of a handed-but-unwritten request, and no
+    revocation enacted (`inflight.advance`). The next good reload returns a
+    fresh config, which clears it.
 
     REFUSES A CHANGED `state_dir`, and this one is not a style choice. The
     running process holds `state_dir`'s drain lock and its private ledgers,
@@ -317,25 +374,25 @@ def reload_config(config_path, current: RouterConfig) -> RouterConfig:
         logger.error(
             "config reload FAILED — continuing on the last good config, which "
             "may now be stale: %s", e)
-        return current
+        return replace(current, reload_failed=True)
     except OSError as e:
         logger.error(
             "config reload could not READ %s — continuing on the last good "
             "config, which may now be stale: %s", config_path, e)
-        return current
+        return replace(current, reload_failed=True)
     if fresh.state_dir != current.state_dir:
         logger.error(
             "config reload changed state_dir (%s -> %s) — REFUSED and ignored. "
             "This process holds that directory's drain lock and all of its "
             "private state; moving it needs a restart, not a reload.",
             current.state_dir, fresh.state_dir)
-        return current
+        return replace(current, reload_failed=True)
     if fresh.transport_plugin != current.transport_plugin:
         logger.error(
             "config reload changed transport_plugin — REFUSED and ignored. The "
             "plugin is loaded once at startup and never hot-swapped; changing "
             "it needs a restart, not a reload.")
-        return current
+        return replace(current, reload_failed=True)
     return fresh
 
 

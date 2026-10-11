@@ -236,16 +236,18 @@ class PeerColdSendTests(RouterTestCase):
         self.assertEqual(summary["drained"], 0)
         self.assertEqual(list_peer_notices(cfg, "b"), [])
 
-    def test_injected_cold_policy_seam_still_wins(self):
-        """A caller's policy replaces the whole decision, peer lane included."""
+    def test_an_injected_cold_policy_never_decides_the_peer_lane(self):
+        """The peer lane is same-host and the classification order's own; a
+        caller's policy decides only a cross-host item 6 or item 7 request."""
         cfg = self._fleet()
         write_request(cfg, "a", "00000001", to=[addr("b")])
         outbound.drain_instance(
             cfg, "a",
             cold_policy=lambda c, s, d: outbound.ColdRefusal("rejected", "custom"),
         )
-        self.assertEqual(read_json(result_path(cfg, "a", "00000001"))["reason_code"], "custom")
-        self.assertEqual(list_peer_notices(cfg, "b"), [])
+        self.assertEqual(read_json(result_path(cfg, "a", "00000001"))["reason_code"],
+                         "peer_routed")
+        self.assertEqual(len(list_peer_notices(cfg, "b")), 1)
 
     def test_ids_unique_across_both_trees_for_one_writer(self):
         cfg = make_peer_config(self, {

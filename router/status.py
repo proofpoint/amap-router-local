@@ -192,6 +192,11 @@ class StatusTracker:
         a table. Replaced every poll: it is state."""
         self.aliases = doc
 
+    def record_classification(self, doc: Optional[Dict[str, Any]]) -> None:
+        """This poll's cross-host section (`service.classification_status`),
+        or None when there is nothing to report. Replaced every poll."""
+        self.classification = doc
+
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that
         errored — the set the loader accepted is known even when draining it
@@ -261,6 +266,12 @@ class StatusTracker:
         # age and remedy (router/aliases.py).
         if getattr(self, "aliases", None) is not None:
             doc["aliases"] = self.aliases
+        # Present only when there is something to say: a failing config
+        # reload (the external leg is closed), requests revoked after they
+        # were handed over, and, under a registry, the ingress quarantine's
+        # count per agent (router/quarantine.py).
+        if getattr(self, "classification", None) is not None:
+            doc["classification"] = self.classification
         # Omitted, never defaulted, when this tracker cannot answer. A
         # consumer distinguishes "a router older than this field" from a
         # wrong value only if the absence is real.
@@ -472,7 +483,28 @@ def render(doc: Dict[str, Any]) -> str:
         ))
     if not instances:
         lines.append("(no instances polled yet)")
+    lines.extend(_classification_banners(doc.get("classification") or {}))
     return "\n".join(lines)
+
+
+def _classification_banners(section: Dict[str, Any]) -> List[str]:
+    """The cross-host section (`service.classification_status`), loudly:
+    each line is something an operator must act on or knowingly accept."""
+    lines = []
+    if section.get("config_reload_failed"):
+        lines.append("** CONFIG RELOAD FAILING — running on the last good config; the "
+                     "external leg is closed (nothing new published) **")
+    for name, rows in sorted((section.get("revocation_unenforceable") or {}).items()):
+        for row in rows:
+            lines.append(f"** {name}: req {row.get('req_id')} REVOKED after hand-over "
+                         f"({row.get('age_s')}s ago) and cannot be withdrawn; it may "
+                         f"still be sent **")
+    for name, c in sorted((section.get("ingress_quarantine") or {}).items()):
+        if c.get("items"):
+            lines.append(f"{name}: ingress quarantine holds {c['items']} item(s)"
+                         + (f", {c['damaged']} DAMAGED" if c.get("damaged") else "")
+                         + " (router quarantine list)")
+    return lines
 
 
 def _peer_banners(name: str, totals: Dict[str, Any], alerts: list,

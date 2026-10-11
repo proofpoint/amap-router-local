@@ -205,8 +205,10 @@ _TOP_KEYS = {
     "instances_dir", "selected_json",
     "peer_senders", "peers",
     "transport_plugin", "registry_dir", "aliases",
+    "trusted_fleet_hosts", "fleet_hosts", "egress", "ingress_quarantine_days",
 }
-_INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders"}
+_INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders",
+                  "task_deny", "send_to", "remote_fleet"}
 
 #: The only value `task_graph` takes. A fleet-level statement that every
 #: handoff-mode instance may task every other.
@@ -335,6 +337,11 @@ ATTACHMENT_MAX_BYTES_DEFAULT = 8 * 1024 * 1024        # per-file cap
 ATTACHMENT_MAX_COUNT_DEFAULT = 16                     # per-request attachment count cap
 ATTACHMENT_MAX_TOTAL_BYTES_DEFAULT = 32 * 1024 * 1024  # per-request combined cap
 
+#: Days an ingress-quarantine item is kept before its writer sweeps it
+#: (`router/quarantine.py`). Defined here; the writer reads it.
+INGRESS_QUARANTINE_DAYS_DEFAULT = 14
+INGRESS_QUARANTINE_DAYS_MAX = 365
+
 # Which config key maps to which mode, and the leaf names it derives.
 _ROOT_KEY_MODE = {"handoff_dir": MODE_HANDOFF, "namespace": MODE_NAMESPACE}
 
@@ -403,6 +410,15 @@ class InstanceConfig:
     # equal. It stays in `__eq__`.
     extra: Mapping[str, Any] = field(
         default_factory=lambda: MappingProxyType({}), hash=False)
+    # Cross-host classification inputs (`router/classify.py`), each a tuple
+    # of CANONICAL entries, empty when absent. `task_deny`: addresses or
+    # `@domain` entries at trusted fleet hosts, removed from the trusted
+    # default edge. `send_to`: addresses or `@domain` entries this agent may
+    # send to on the internet. `remote_fleet`: fleet hosts outside the
+    # trusted list this agent may send fleet mail to.
+    task_deny: Tuple[str, ...] = ()
+    send_to: Tuple[str, ...] = ()
+    remote_fleet: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -510,6 +526,21 @@ class RouterConfig:
     #: directory relative to `state_dir` (`<logical_id>/gen-<g>`), set by the
     #: generation pre-pass (`router/generations.py`), never by a config file.
     gen_keys: Mapping[str, str] = field(default_factory=dict)
+    #: Cross-host classification (`router/classify.py`): the trusted fleet
+    #: hosts, every fleet host (a superset of the trusted ones), and whether
+    #: this host has internet egress. Canonical; empty and False when absent,
+    #: which reproduces the behaviour before them ONLY without a transport
+    #: plugin (with one, an absent `egress` makes every internet address
+    #: `no_route`).
+    trusted_fleet_hosts: Tuple[str, ...] = ()
+    fleet_hosts: Tuple[str, ...] = ()
+    egress: bool = False
+    ingress_quarantine_days: int = INGRESS_QUARANTINE_DAYS_DEFAULT
+    #: PROCESS state, never read from a file: the last reload of the config
+    #: failed or was refused (`service.reload_config`), and this is the last
+    #: good config kept in its place. While it is set the external leg fails
+    #: closed: nothing new is published and no revocation is enacted.
+    reload_failed: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -1148,6 +1179,7 @@ def load_obj(
     peers_raw: Dict[str, List[str]] = {}
     peer_senders_raw: Dict[str, List[str]] = {}
     extras: Dict[str, Dict[str, Any]] = {}  # name -> caller-validated extra keys
+    classify_raw: Dict[str, Dict[str, Any]] = {}  # name -> task_deny/send_to/remote_fleet
     for name, spec in instances_raw.items():
         if not _NAME_RE.fullmatch(name):
             raise ConfigError(
@@ -1213,6 +1245,8 @@ def load_obj(
                 f"config.instances.{name}.peer_senders: expected an array of strings"
             )
         peer_senders_raw[name] = ps_val
+        classify_raw[name] = {k: spec_obj[k] for k in _CLASSIFY_INSTANCE_KEYS
+                              if k in spec_obj}
 
     _check_casefold(list(instances_raw))
 
@@ -1474,8 +1508,15 @@ def load_obj(
                 "state_dir/<logical_id>/, so such a name cannot be told from an "
                 "identity's state; rename the instance")
 
+    trusted, fleet_hosts, egress, per_instance = _classification(
+        top, fleet_domain, classify_raw)
+    for name, values in per_instance.items():
+        instances[name] = replace(instances[name], **values)
+
     cfg = RouterConfig(
         state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
+        trusted_fleet_hosts=trusted, fleet_hosts=fleet_hosts, egress=egress,
+        ingress_quarantine_days=_ingress_quarantine_days(top),
         attachment_max_bytes=attachment_max_bytes,
         attachment_max_count=attachment_max_count,
         attachment_max_total_bytes=attachment_max_total_bytes,
@@ -1507,6 +1548,102 @@ def load_obj(
                     f"per ordered pair, or the sender could choose its lane"
                 )
     return cfg
+
+
+_CLASSIFY_INSTANCE_KEYS = ("task_deny", "send_to", "remote_fleet")
+
+
+def _ingress_quarantine_days(top: Dict[str, Any]) -> int:
+    if "ingress_quarantine_days" not in top:
+        return INGRESS_QUARANTINE_DAYS_DEFAULT
+    v = top["ingress_quarantine_days"]
+    if isinstance(v, bool) or not isinstance(v, int) or not (
+            1 <= v <= INGRESS_QUARANTINE_DAYS_MAX):
+        raise ConfigError(
+            f"config.ingress_quarantine_days: expected an integer from 1 to "
+            f"{INGRESS_QUARANTINE_DAYS_MAX}, got {v!r}")
+    return v
+
+
+def _canonical_list(value: Any, where: str, canon) -> Tuple[str, ...]:
+    """A list of strings, each canonical per `canon`, no two the same after
+    canonicalisation. Returned canonical and sorted."""
+    from . import classify as classify_mod  # local: classify imports this module
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ConfigError(f"{where}: expected an array of strings")
+    try:
+        dups = classify_mod.duplicates(value, canon)
+        out = tuple(sorted({canon(v) for v in value}))
+    except classify_mod.Malformed as e:
+        raise ConfigError(f"{where}: {e}") from None
+    if dups:
+        raise ConfigError(f"{where}: duplicate entries after canonicalisation: {dups}")
+    return out
+
+
+def _classification(
+    top: Dict[str, Any], fleet_domain: Optional[str], raw: Dict[str, Dict[str, Any]],
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], bool, Dict[str, Dict[str, Tuple[str, ...]]]]:
+    """The cross-host classification inputs (`router/classify.py`), checked
+    with the same canonicaliser the policy digest uses. Every refusal here
+    stops startup: a config this router cannot classify under is not run on
+    a guess."""
+    from . import classify as classify_mod  # local: classify imports this module
+    hosts = classify_mod.canonical_host
+    entries = classify_mod.canonical_entry
+    trusted = _canonical_list(top.get("trusted_fleet_hosts", []),
+                              "config.trusted_fleet_hosts", hosts)
+    fleet = _canonical_list(top.get("fleet_hosts", []), "config.fleet_hosts", hosts)
+    own = fleet_domain or classify_mod.LEGACY_DOMAIN
+    for key, values in (("trusted_fleet_hosts", trusted), ("fleet_hosts", fleet)):
+        if own in values:
+            raise ConfigError(
+                f"config.{key}: names this router's own domain {own!r}; its "
+                "addresses are local, never a fleet host's")
+    missing = sorted(set(trusted) - set(fleet))
+    if missing:
+        raise ConfigError(
+            f"config.trusted_fleet_hosts: {missing} not in config.fleet_hosts; every "
+            "trusted host is a fleet host")
+    egress = top.get("egress", False)
+    if not isinstance(egress, bool):
+        raise ConfigError(f"config.egress: expected true or false, got {egress!r}")
+
+    per: Dict[str, Dict[str, Tuple[str, ...]]] = {}
+    for name, spec in raw.items():
+        where = f"config.instances.{name}"
+        values: Dict[str, Tuple[str, ...]] = {}
+        if "task_deny" in spec:
+            deny = _canonical_list(spec["task_deny"], f"{where}.task_deny", entries)
+            outside = [e for e in deny if classify_mod.entry_domain(e) not in trusted]
+            if outside:
+                raise ConfigError(
+                    f"{where}.task_deny: {outside} not at a trusted fleet host; "
+                    "task_deny only removes trusted-host edges")
+            values["task_deny"] = deny
+        if "send_to" in spec:
+            send_to = _canonical_list(spec["send_to"], f"{where}.send_to", entries)
+            named = [e for e in send_to if classify_mod.entry_domain(e) in trusted]
+            if named:
+                raise ConfigError(
+                    f"{where}.send_to: {named} name a trusted fleet host, which is "
+                    "reached only on the peer lane")
+            values["send_to"] = send_to
+        if "remote_fleet" in spec:
+            remote = _canonical_list(spec["remote_fleet"], f"{where}.remote_fleet", hosts)
+            named = [h for h in remote if h in trusted]
+            if named:
+                raise ConfigError(
+                    f"{where}.remote_fleet: {named} are trusted fleet hosts, which "
+                    "are reached only on the peer lane")
+            unknown = [h for h in remote if h not in fleet]
+            if unknown:
+                raise ConfigError(
+                    f"{where}.remote_fleet: {unknown} not in config.fleet_hosts")
+            values["remote_fleet"] = remote
+        if values:
+            per[name] = values
+    return trusted, fleet, egress, per
 
 
 @dataclass(frozen=True)
