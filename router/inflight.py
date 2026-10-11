@@ -13,7 +13,7 @@ WHAT THIS MODULE OWNS, and nothing else:
 
   * The RECORD, `state_dir/<name>/inflight/<req_id>.json`: the digest of the
     agent's request bytes, the transport req_id, the evaluated recipients and
-    the staged copy of the request document. Every later step acts on the
+    the staged copy of the request document, plus its HANDED marker (below). Every later step acts on the
     staged copy, never on the agent's file again (ingest by copy).
   * The COUNTER, `state_dir/<name>/transport/next_req_id`. Transport req_ids
     are monotonic per transport namespace and never reused; the draft's
@@ -40,6 +40,10 @@ BEFORE it archives the request):
   | archived, and still no result        | settle `queued_for_human`/`transport_anomaly`; never resubmit |
   | none of them, and still no result    | write it now, under the SAME `n`        |
 
+Before that table, a record that was never handed over (no HANDED marker)
+is checked twice: a transport trace under `n` is a collision (`COLLIDED`),
+and a draft whose `to` ∪ `cc` is not the evaluated set settles at once.
+
 The two "still no result" re-checks are not redundant. Between this step's
 first probe and its later ones the downstream runtime may write the result
 and archive the request; without the re-check that interleaving reads as
@@ -57,6 +61,32 @@ EXACTLY ONE RESULT. Settling is the caller's `settle` callback (in practice
 anchor). The record is deleted only AFTER settling. A crash between the two
 leaves a record whose request is already settled; the next step sees
 `already_settled` and only deletes the record.
+
+RECIPIENTS: EXACTLY THE EVALUATED SET, OR NOBODY. The transport request
+carries the staged draft, and the downstream runtime sends to everything in
+its `to` and `cc`. So before anything is handed over, `recipient_mismatch`
+requires the draft's `to` ∪ `cc` to be exactly the evaluated recipients
+(case-insensitively); any difference settles `queued_for_human`/
+`transport_anomaly` with nothing sent, because cold sends are all-or-nothing
+and narrowing the draft to the authorised part would be a partial send.
+`transport_request_bytes` refuses a mismatched record as well, so no caller
+can build a request that skips the check.
+
+THE HANDED MARKER, `inflight/<req_id>.handed`, is written (empty) after the
+record and BEFORE the transport request. It is how a record tells its own
+transport request from someone else's: if the transport already shows
+anything under `n` and this record was never handed over, the counter went
+backwards (for example a restored state volume), and settling from that
+would answer this request with another request's result. The record is
+dropped instead (`COLLIDED`, logged as an ERROR) and the request is processed
+afresh under a later id.
+
+DURABILITY. Every write here goes through `util.atomic_write`, which fsyncs
+the file and its directory, and the record is removed only after the
+settlement was written that way. That is necessary for durability and is not
+by itself a claim that this scaffold is power-loss safe: the filesystem
+underneath must honour fsync too, and nothing here measures that. Showing
+it for a real transport is a separate, later step.
 
 `_effect` is the one seam every side effect here passes through, so a test
 can crash the sequence after any single write and prove the next poll
@@ -76,11 +106,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from .config import RouterConfig
-from .util import atomic_write, parse_utc_ts, utc_ts
+from .util import atomic_write, fsync_dir, parse_utc_ts, utc_ts
 
 logger = logging.getLogger("amap_router_local.inflight")
 
 INFLIGHT_DIR = "inflight"
+#: Suffix of the HANDED marker beside a record (module docstring).
+HANDED_SUFFIX = ".handed"
 #: Preserved by `reset`: the counter must never restart (module docstring).
 TRANSPORT_STATE_DIR = "transport"
 COUNTER_FILE = "next_req_id"
@@ -102,6 +134,7 @@ SETTLED = "settled"
 PENDING = "pending"
 WRITTEN = "written"
 CLEANED = "cleaned"
+COLLIDED = "collided"
 
 
 class TransportPort(Protocol):
@@ -132,6 +165,10 @@ def _inflight_dir(cfg: RouterConfig, name: str) -> Path:
 
 def record_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
     return _inflight_dir(cfg, name) / f"{req_id}.json"
+
+
+def handed_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
+    return _inflight_dir(cfg, name) / f"{req_id}{HANDED_SUFFIX}"
 
 
 def counter_path(cfg: RouterConfig, name: str) -> Path:
@@ -201,16 +238,55 @@ def begin(
 def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]) -> bytes:
     """The Submit Request this router hands to the transport, built from the
     STAGED copy. `req_id` is the transport id and `agent_id` the namespace.
-    `draft.to`/`draft.cc` are left exactly as evaluated (recipient-set
-    integrity). Any threading key is dropped: mapping one to the downstream
-    runtime's notice id is the re-placement step's, and until it exists an
-    unmapped id is dropped rather than passed to the transport."""
+    `draft.to`/`draft.cc` go out unchanged, and ONLY when together they are
+    exactly the evaluated set (`recipient_mismatch`); otherwise this raises
+    `RecipientSetMismatch` and produces no bytes. Any threading key is
+    dropped: mapping one to the downstream runtime's notice id is the
+    re-placement step's, and until it exists an unmapped id is dropped
+    rather than passed to the transport."""
+    mismatch = recipient_mismatch(record)
+    if mismatch is not None:
+        raise RecipientSetMismatch(mismatch)
     doc = json.loads(json.dumps(record["request"]))
     doc["req_id"] = record["transport_req_id"]
     doc["agent_id"] = name
     doc.pop("in_reply_to", None)
     doc.get("draft", {}).pop("reply_to_message_id", None)
     return json.dumps(doc, sort_keys=True).encode("utf-8")
+
+
+class RecipientSetMismatch(Exception):
+    """The draft's `to`/`cc` are not exactly the evaluated recipients. Raised
+    by `transport_request_bytes` so no transport request can carry them."""
+
+
+def recipient_mismatch(record: Dict[str, Any]) -> Optional[str]:
+    """None when the staged draft's `to` ∪ `cc` is EXACTLY the evaluated set
+    (case-insensitively), else why not.
+
+    The transport request carries the draft, and the downstream runtime
+    sends to every address in it. So a policy that authorised only part of
+    the draft would, without this check, still have the rest sent: the
+    evaluated set was recorded and never applied. Narrowing the draft to the
+    authorised part is not the answer either, because cold sends are
+    all-or-nothing (`outbound`'s module docstring): a request whose
+    recipients are not all authorised goes to nobody. So any difference, in
+    either direction, fails closed."""
+    draft = record.get("request", {}).get("draft")
+    if not isinstance(draft, dict):
+        return "the staged request has no draft"
+    addrs = []
+    for key in ("to", "cc"):
+        value = draft.get(key) or []
+        if not isinstance(value, list) or not all(isinstance(a, str) for a in value):
+            return f"the staged draft's {key} is not a list of addresses"
+        addrs.extend(value)
+    evaluated = record.get("recipients")
+    if not isinstance(evaluated, list) or not all(isinstance(a, str) for a in evaluated):
+        return "the record's evaluated recipients are malformed"
+    if {a.casefold() for a in addrs} != {a.casefold() for a in evaluated}:
+        return "the draft's to/cc differ from the authorised recipients"
+    return None
 
 
 def _anomaly(detail: str) -> Dict[str, Any]:
@@ -296,16 +372,41 @@ def advance(
     private result exists already (a crash after settling). Returns the
     state reached."""
     path = record_path(cfg, name, req_id)
+    handed = handed_path(cfg, name, req_id)
     if already_settled:
-        _effect("unlink", _unlink, path)
+        _effect("unlink", _cleanup, path, handed)
         return CLEANED
 
     n = record["transport_req_id"]
 
+    if not handed.exists():
+        # Nothing was ever handed over under `n` for THIS request, so any
+        # trace of `n` on the transport belongs to another one: the counter
+        # went backwards (a restored or rolled-back state volume). Settling
+        # from that trace would answer this request with someone else's
+        # result, with nothing sent. Drop the record instead; the request
+        # is still unsettled and is processed afresh under a new id (the
+        # counter is already past `n`).
+        if port.has_result(n) or port.has_pending(n) or port.has_archived(n):
+            logger.error(
+                "instance %r req %r: transport req_id %r already exists on the "
+                "transport but was never handed over for this request — the "
+                "transport counter went backwards; discarding the id",
+                name, req_id, n,
+            )
+            _effect("unlink", _cleanup, path, handed)
+            return COLLIDED
+        mismatch = recipient_mismatch(record)
+        if mismatch is not None:
+            _effect("settle", settle, _anomaly(mismatch + "; nothing was sent"),
+                    record.get("digest"))
+            _effect("unlink", _cleanup, path, handed)
+            return SETTLED
+
     def from_result() -> str:
         verdict = verdict_from_result(port.read_result(n), n, record)
         _effect("settle", settle, verdict, record.get("digest"))
-        _effect("unlink", _unlink, path)
+        _effect("unlink", _cleanup, path, handed)
         return SETTLED
 
     if port.has_result(n):
@@ -318,19 +419,26 @@ def advance(
         _effect("settle", settle,
                 _anomaly("the transport request was archived without a result"),
                 record.get("digest"))
-        _effect("unlink", _unlink, path)
+        _effect("unlink", _cleanup, path, handed)
         return SETTLED
     if port.has_result(n):
         return from_result()
-    _effect("transport", port.write_request, n, transport_request_bytes(cfg, name, record))
+    data = transport_request_bytes(cfg, name, record)
+    _effect("handed", atomic_write, handed, b"")
+    _effect("transport", port.write_request, n, data)
     return WRITTEN
 
 
-def _unlink(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+def _cleanup(record: Path, handed: Path) -> None:
+    """Remove a settled record, then its marker, durably. The record goes
+    FIRST: a record left without its marker by a crash here is already
+    settled (`already_settled`), so the missing marker is never consulted."""
+    for p in (record, handed):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    fsync_dir(record.parent)
 
 
 def summarize(

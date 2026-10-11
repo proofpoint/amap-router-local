@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
+from pathlib import Path
 from unittest import mock
 
 from router import inflight, outbound, reset, validate as validate_mod
@@ -419,7 +422,7 @@ class CrashPointTests(_InflightCase):
     off the published file: a second settle rewrites that file with the same
     verdict, so the file alone cannot tell one result from two."""
 
-    EXPECTED_EFFECTS = ["counter", "record", "transport", "settle", "unlink"]
+    EXPECTED_EFFECTS = ["counter", "record", "handed", "transport", "settle", "unlink"]
 
     def lifecycle(self, injector):
         write_request(self.cfg, "alice", "00000001", to=[EXT])
@@ -475,3 +478,253 @@ class CrashPointTests(_InflightCase):
                     self.lifecycle(crash)
                     self.assertEqual(fired, [label], "the crash never fired")
                     self.assert_settled_once(taken)
+
+
+ALLOWED = "allowed@example.org"
+DENIED = "denied@example.org"
+DENIED_CC = "denied-cc@example.org"
+
+
+class RecipientIntegrityTests(_InflightCase):
+    """The transport request carries the draft, and the downstream runtime
+    sends to everything in it. So the draft's `to` ∪ `cc` must be EXACTLY
+    the evaluated set, or nothing goes out (cold sends are all-or-nothing).
+    Each refusal is checked against `self.port.writes`, the one surface only
+    a transport write can produce."""
+
+    def _only(self, *allowed):
+        return lambda cfg, sender, draft: outbound.ExternalRoute(tuple(allowed))
+
+    def test_a_policy_allowing_part_of_the_draft_sends_to_nobody(self):
+        """THE WITNESS: on the commit before this test, the policy allowed
+        only ALLOWED and the transport request still carried DENIED and
+        DENIED_CC."""
+        write_request(self.cfg, "alice", "00000001", to=[ALLOWED, DENIED], cc=[DENIED_CC])
+        self.drain(cold_policy=self._only(ALLOWED))
+        self.assertEqual(self.port.writes, [])
+        r = self.result()
+        self.assertEqual((r["outcome"], r["reason_code"]),
+                         ("queued_for_human", "transport_anomaly"))
+        self.assertEqual(r["recipients"], [])
+        self.assertIn("nothing was sent", r["detail"])
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
+        self.drain(cold_policy=self._only(ALLOWED))
+        self.assertEqual(self.port.writes, [])
+
+    def test_an_authorised_address_missing_from_the_draft_also_fails_closed(self):
+        write_request(self.cfg, "alice", "00000001", to=[ALLOWED])
+        self.drain(cold_policy=self._only(ALLOWED, DENIED))
+        self.assertEqual(self.port.writes, [])
+        self.assertEqual(self.result()["reason_code"], "transport_anomaly")
+
+    def test_the_exact_set_goes_out_case_insensitively(self):
+        """The positive twin: without it, a check refusing everything would
+        pass both tests above."""
+        write_request(self.cfg, "alice", "00000001", to=["Allowed@Example.ORG"], cc=[DENIED])
+        self.drain(cold_policy=self._only(ALLOWED, DENIED.upper()))
+        self.assertEqual(self.port.writes, ["00000001"])
+        sent = json.loads(self.port.pending["00000001"])
+        self.assertEqual(sent["draft"]["to"], ["Allowed@Example.ORG"])
+        self.assertEqual(sent["draft"]["cc"], [DENIED])
+
+    def test_the_request_bytes_cannot_be_built_for_a_mismatched_record(self):
+        """Defence in depth: the builder itself refuses, so no caller can
+        produce a transport request that skips the check."""
+        rec = {"transport_req_id": "00000003", "recipients": [ALLOWED],
+               "request": {"contract_version": "2", "req_id": "00000009",
+                           "draft": {"to": [ALLOWED, DENIED], "subject": "s",
+                                     "body_text": "b"}}}
+        with self.assertRaises(inflight.RecipientSetMismatch):
+            inflight.transport_request_bytes(self.cfg, "alice", rec)
+        rec["request"]["draft"]["to"] = [ALLOWED]
+        inflight.transport_request_bytes(self.cfg, "alice", rec)
+
+
+class CounterRollbackTests(_InflightCase):
+    """THE DURABILITY WITNESS, as a model. The counter's successor was
+    written without any fsync, so a power loss could roll it back AFTER a
+    request had used the id and finished. The next, DIFFERENT request then
+    got the same transport id, found the old request's result, and settled
+    from it: accepted, with nothing sent. The fsyncs in `atomic_write` are
+    the first barrier (`DurabilityBarrierTests`); this test rolls the file
+    back by hand, so it proves the second one, the HANDED marker, which
+    holds whatever made the counter go backwards (a restored state volume,
+    too)."""
+
+    def test_a_rolled_back_counter_never_settles_a_request_from_another_ones_result(self):
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        self.port.send_all(recipients=[EXT])
+        self.drain()
+        self.assertEqual(self.result("00000001")["outcome"], "accepted")
+        before = inflight.counter_path(self.cfg, "alice").read_text()
+        self.assertEqual(before, "2")
+
+        inflight.counter_path(self.cfg, "alice").write_text("1")  # the rollback
+
+        write_request(self.cfg, "alice", "00000002", to=[EXT], subject="different")
+        with self.assertLogs("amap_router_local.inflight", logging.ERROR) as logs:
+            self.drain()
+        self.assertTrue(any("went backwards" in m for m in logs.output))
+        self.assertFalse(self.has_result("00000002"),
+                         "settled from another request's downstream result")
+        self.assertEqual(self.port.writes, ["00000001"])
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
+
+        self.drain()  # processed afresh, under the next id
+        self.assertFalse(self.has_result("00000002"))
+        self.assertEqual(self.port.writes, ["00000001", "00000002"])
+        self.assertEqual(json.loads(self.port.pending["00000002"])["draft"]["subject"],
+                         "different")
+
+        self.port.send_all(recipients=[EXT])
+        self.drain()
+        self.assertEqual(self.result("00000002")["outcome"], "accepted")
+        self.assertEqual(self.port.writes, ["00000001", "00000002"])
+
+
+def _fd_target(fd):
+    """What an fsync'd descriptor names: ('dir'|'file', path)."""
+    kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+    return kind, os.readlink(f"/proc/self/fd/{fd}")
+
+
+class DurabilityBarrierTests(_InflightCase):
+    """Barriers at the real `os.fsync` boundary, not at `_effect`: the bug
+    was that `_effect` ran and NO fsync happened inside it."""
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("needs /proc/self/fd to name fsync targets")
+
+    def _spy(self, events, fail=None):
+        real_fsync = os.fsync
+        real_write = FakeTransport.write_request
+
+        def fsync(fd):
+            target = _fd_target(fd)
+            if fail is not None and fail(target):
+                raise OSError(5, "injected fsync failure")
+            events.append(("fsync",) + target)
+            return real_fsync(fd)
+
+        def write_request(port, n, data):
+            events.append(("transport", n))
+            return real_write(port, n, data)
+
+        return (mock.patch("router.util.os.fsync", fsync),
+                mock.patch.object(FakeTransport, "write_request", write_request))
+
+    def test_counter_and_record_are_durable_before_the_transport_write(self):
+        """On the commit before this test there were ZERO fsyncs before the
+        transport write."""
+        events = []
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        a, b = self._spy(events)
+        with a, b:
+            self.drain()
+        cut = events.index(("transport", "00000001"))
+        before = events[:cut]
+        counter = str(inflight.counter_path(self.cfg, "alice"))
+        record = str(inflight.record_path(self.cfg, "alice", "00000001"))
+        inflight_dir = os.path.dirname(record)
+        file_syncs = [p for e, k, p in before if k == "file"]
+        dir_syncs = [p for e, k, p in before if k == "dir"]
+        # The file fsync happens on the temp, before the rename: match the prefix.
+        self.assertTrue(any(os.path.basename(p).startswith("next_req_id.") for p in file_syncs))
+        self.assertTrue(any(os.path.basename(p).startswith("00000001.json.") for p in file_syncs))
+        self.assertIn(os.path.dirname(counter), dir_syncs)
+        self.assertIn(inflight_dir, dir_syncs)
+
+    def test_the_settlement_is_durable_before_the_record_is_removed(self):
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        self.port.send_all(recipients=[EXT])
+        events = []
+        real_unlink = Path.unlink
+        record = str(inflight.record_path(self.cfg, "alice", "00000001"))
+
+        def unlink(path, *a, **k):
+            if str(path) == record:
+                events.append(("unlink-record",))
+            return real_unlink(path, *a, **k)
+
+        a, b = self._spy(events)
+        with a, b, mock.patch.object(Path, "unlink", unlink):
+            self.drain()
+        self.assertEqual(self.result()["outcome"], "accepted")
+        cut = events.index(("unlink-record",))
+        private = outbound._private_result_path(self.cfg, "alice", "00000001")
+        synced = [e[1:] for e in events[:cut] if e[0] == "fsync"]
+        self.assertTrue(any(k == "file" and os.path.basename(p).startswith(private.name + ".")
+                            for k, p in synced), synced)
+        self.assertIn(("dir", str(private.parent)), synced)
+
+    def test_a_failed_fsync_of_the_record_means_no_transport_write(self):
+        """Injected at the real boundary. The poll fails; the next one
+        recovers with one transport request and one result."""
+        events = []
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+
+        def fail(target):
+            kind, path = target
+            return kind == "file" and os.path.basename(path).startswith("00000001.json.")
+
+        a, b = self._spy(events, fail=fail)
+        with a, b:
+            self.drain()
+        self.assertEqual(self.port.writes, [])
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
+        self.drain()
+        self.port.send_all(recipients=[EXT])
+        self.drain()
+        self.assertEqual(len(self.port.writes), 1)
+        self.assertEqual(self.result()["outcome"], "accepted")
+
+    def test_a_failed_directory_fsync_of_the_counter_means_no_transport_write(self):
+        events = []
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        counter_dir = str(inflight.counter_path(self.cfg, "alice").parent)
+        state = {"failed": False}
+
+        def fail(target):
+            if target == ("dir", counter_dir) and not state["failed"]:
+                state["failed"] = True
+                return True
+            return False
+
+        a, b = self._spy(events, fail=fail)
+        with a, b:
+            self.drain()
+        self.assertTrue(state["failed"], "the injected failure never fired")
+        self.assertEqual(self.port.writes, [])
+        self.drain()
+        self.assertEqual(len(self.port.writes), 1)
+        self.assertNotIn("00000001", self.port.writes, "a possibly-lost id was used")
+
+    def test_a_failed_fsync_of_the_settlement_keeps_the_record(self):
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        self.port.send_all(recipients=[EXT])
+        events = []
+        state = {"failed": False}
+
+        def fail(target):
+            kind, path = target
+            if (kind == "file" and os.path.basename(path).startswith("00000001.json.")
+                    and "inflight" not in path and not state["failed"]):
+                state["failed"] = True
+                return True
+            return False
+
+        a, b = self._spy(events, fail=fail)
+        with a, b:
+            self.drain()
+        self.assertTrue(state["failed"], "the injected failure never fired")
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
+        self.drain()
+        self.assertEqual(self.result()["outcome"], "accepted")
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
+        self.assertTrue(processed_path(self.cfg, "alice", "00000001").exists())
+        self.assertEqual(len(self.port.writes), 1)

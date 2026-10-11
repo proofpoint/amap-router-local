@@ -1,9 +1,12 @@
 """router/util.py — small shared primitives with no policy content.
 
-- `atomic_write`: `.tmp` + `os.replace` discipline, verbatim in spirit from
-  an equivalent helper in a second connector implementation — every
-  protocol artifact this router produces (result, message spool, notice)
-  goes through this so a reader never observes a partial file.
+- `atomic_write`: `.tmp` + fsync + `os.replace` + directory fsync, in
+  spirit from an equivalent helper in a second connector implementation —
+  every protocol artifact this router produces (result, message spool,
+  notice) goes through this so a reader never observes a partial file, and
+  each write is fsynced (file, then directory) before it returns.
+  `fsync_dir` is the directory half on its own, for a rename or unlink made
+  elsewhere.
 - `verify_namespace_containment`: an agent owns its own namespace and can
   replace any subdirectory of it (`inbound/`, `outbound/results/`, ...)
   with a symlink pointing anywhere the router process can write — including
@@ -77,11 +80,53 @@ def verify_namespace_containment(namespace: Union[str, Path], target: Union[str,
         )
 
 
+def fsync_dir(path: Union[str, Path]) -> None:
+    """Make `path`'s entries durable: a rename, create or unlink inside a
+    directory is not durable until the DIRECTORY is fsynced, whatever was
+    done to the file. Errors propagate: a barrier that failed is not one."""
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _mkdir_durable(path: Path) -> None:
+    """`mkdir -p`, then fsync the parent of every directory it CREATED, so a
+    new directory entry is fsynced along with what is written in it."""
+    missing = []
+    p = path
+    while not p.exists():
+        missing.append(p)
+        if p.parent == p:
+            break
+        p = p.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for d in reversed(missing):
+        fsync_dir(d.parent)
+
+
 def atomic_write(path: Union[str, Path], data: bytes, *,
                  make_parents: bool = True, mode: Optional[int] = None) -> None:
-    """Write `data` to `path` atomically: `tempfile.mkstemp` in the
-    destination directory, then `os.replace`. Creates parent directories
-    as needed. A reader can never observe a partial file at `path`.
+    """Write `data` to `path` atomically, with fsync barriers:
+    `tempfile.mkstemp` in the destination directory, write, fsync the file,
+    `os.replace`, then fsync the directory. A reader can never observe a
+    partial file at `path`.
+
+    The barriers are what a durable write needs from THIS process; whether a
+    power loss then preserves the write also depends on the filesystem and
+    the storage under it honouring fsync, which nothing here can check. So
+    this is necessary for durability, and no claim of power-loss safety is
+    made on its strength alone. Without the barriers a crash could roll a
+    completed write back after something else had acted on it: the in-flight
+    counter (`inflight.allocate_transport_req_id`) could return an id that
+    the counter then handed out AGAIN. Order: file
+    fsync BEFORE the rename (else the rename can be durable over an empty
+    file), directory fsync AFTER it (else the rename itself can be lost).
+    Any failure raises; nothing here reports success it did not get. A
+    failure before the rename leaves `path` untouched and removes the temp;
+    a failure of the directory fsync AFTER the rename leaves the new
+    contents in place and still raises, because they are not yet durable.
 
     Does NOT itself check namespace containment — callers writing into an
     instance namespace must call `verify_namespace_containment` first (see
@@ -96,7 +141,8 @@ def atomic_write(path: Union[str, Path], data: bytes, *,
     missing one raises `FileNotFoundError` from `mkstemp` itself, with no
     check-then-create window. For a directory that belongs to someone else,
     whose absence is THEIR failure to report — creating it here would hide
-    that, and would put the file somewhere nothing reads.
+    that, and would put the file somewhere nothing reads. Directories it
+    does create are made durable too (`_mkdir_durable`).
 
     `mode` is applied to the temp file BEFORE the rename, so the file never
     exists at `path` with any other mode. It matters because `mkstemp`
@@ -105,13 +151,15 @@ def atomic_write(path: Union[str, Path], data: bytes, *,
     is correct, and the reader gets EACCES."""
     dest = Path(path)
     if make_parents:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        _mkdir_durable(dest.parent)
     fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=dest.name + ".")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             if mode is not None:
                 os.fchmod(f.fileno(), mode)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_name, dest)
     except BaseException:
         try:
@@ -119,6 +167,7 @@ def atomic_write(path: Union[str, Path], data: bytes, *,
         except OSError:
             pass
         raise
+    fsync_dir(dest.parent)
 
 
 def mint_notice_id() -> str:
