@@ -81,8 +81,11 @@ from typing import (Any, Callable, Iterable, Literal, Mapping, Optional, Protoco
 #: seam: `TransportPort`, `InboundPort`, `HopFsOps`, `KeyOps`, `Signer`,
 #: `Verifier` and the factory signatures. Changing any of them (a method,
 #: a parameter, a return vocabulary) is a major bump; adding an optional
-#: factory is a minor one.
-PLUGIN_API: Tuple[int, int] = (1, 0)
+#: factory is a minor one. `(2, 0)` is amendment E5: `HopFsOps` gained
+#: `open_private_stage_dir`, `commit_durable`'s keyword-only `deps` and the
+#: `UnsafeRead` attribute, so a `(1, x)` plugin is refused here and a
+#: `(2, x)` plugin by a `(1, x)` runtime, before any factory is called.
+PLUGIN_API: Tuple[int, int] = (2, 0)
 
 #: The factories this runtime calls. A plugin may define more; it must
 #: define these. `make_sender(settings, fsops) -> TransportPort` and
@@ -198,6 +201,11 @@ EntryKind = Literal["file", "dir", "other"]
 #: the writer's lifetime: a second call for the same (tree, side) returns an
 #: fd to the same inode.
 StageSide = Literal["up", "down", "intake"]
+#: One dependency of a `commit_durable` sentinel: `(dir_fd, name, size,
+#: sha256)`, the sha256 as lowercase hex (`HopFsOps`, DEPENDENCIES).
+Dependency = Tuple[int, str, int, str]
+#: `fsops.UnsafeRead.reason`: exactly one of these (`HopFsOps`, READS).
+UNSAFE_READ_REASONS = ("not_regular", "link_count", "too_large")
 
 
 @runtime_checkable
@@ -208,8 +216,8 @@ class HopFsOps(Protocol):
     `PLUGIN_API`'s major. Every failed barrier RAISES, and the caller's
     dependent step does not run.
 
-    `commit_durable(stage_dirfd, dest_dirfd, name, data, mode)` publishes
-    `data` (the writer's FROZEN bytes, journalled before the call) under
+    `commit_durable(stage_dirfd, dest_dirfd, name, data, mode, *, deps=())`
+    publishes `data` (the writer's FROZEN bytes, journalled before the call) under
     `name` in `dest_dirfd`, by writing a deterministic stage in the
     writer-private `stage_dirfd`, fsyncing it, linking it in, fsyncing the
     destination and unlinking the stage. Equality is byte equality.
@@ -258,14 +266,55 @@ class HopFsOps(Protocol):
         tag from the binding's role and path, never from registration
         order, so recovery in a fresh instance derives the same stage name.
 
+    DEPENDENCIES (`deps`, on a publication's sentinel only). Each
+    `(dir_fd, name, size, sha256)` is an earlier commit of the same
+    publication, in commit order; its directory may differ from the
+    sentinel's. For each one the implementation checks:
+
+      * the binding guard: `dir_fd`'s directory is still at its recorded
+        path in its tree, by a fresh `O_NOFOLLOW` walk from the tree root,
+        with the same (`st_dev`, `st_ino`);
+      * the content: through that walk, `name` is a regular file at link
+        count 1 (count 2 is an anomaly here, never NOT_YET: the
+        dependency's own commit already returned), read pinned and bounded
+        to `size + 1` bytes, with exactly `size` bytes whose SHA-256 is
+        `sha256`.
+
+    They are checked BEFORE any stage, compare, recovery or `exists_*`
+    answer, and AGAIN after the link or the compare, before the barrier or
+    the result, on every path. A failure RAISES the implementation's
+    dependency anomaly, naming its cause (binding moved, missing, not
+    regular, link count, size, digest); it is never `created` or
+    `exists_same`, and the stage is kept. These are point-in-time
+    observations, not a guarantee through the commit point: `created` and
+    `exists_same` mean the sentinel is physically committed and both
+    observations passed. Whether a publication is complete is for its
+    READER to establish, on the immutable snapshot it consumes.
+
+    `open_private_stage_dir(root_fd)` returns the writer-private stage of a
+    configured PRIVATE root: `<private_root>/.stage/`. `root_fd` must be
+    the private root itself (not a directory inside one, and never a hop
+    tree or intake): anything else raises before anything is created. A
+    missing `.stage/` is created 0700 (`fchmod` after `mkdir`, so the umask
+    cannot widen it); an existing one must be a real directory owned by the
+    calling writer's uid with mode exactly 0700, and is otherwise refused,
+    never repaired. The private root is fsynced before the descriptor is
+    returned, whether this call created `.stage/` or found it. The
+    descriptor is pinned once; only a stage opened this way is accepted by
+    `commit_durable`, whose same-tree rule then confines it to its own
+    private tree. `.stage/` is never a destination and must never be swept
+    while the writer runs. An implementation is constructed with its hop
+    root and private roots, which must be pairwise disjoint (none equal to
+    or containing another); otherwise construction raises.
+
     `open_regular_pinned` returns the file's bytes (`bytes`, exactly) once
     it is committed (link count 1), and `self.NOT_YET` for a commit still
     in flight (link count 2), ON A HOP-TREE OR HOST-INTAKE BINDING ONLY:
     both are written only by trusted runtimes (a generation tree's sides,
     and a host intake's `.stage/` publications), so a link count of 2 there
-    is a commit in flight. On any other binding (an agent-writable source),
-    a link count of 2 raises like any other count but 1. Any other link
-    count raises. `NOT_YET` is one
+    is a commit in flight. On any other binding (an agent-writable source,
+    or a writer's private tree), a link count of 2 raises like any other
+    count but 1. Any other link count raises. `NOT_YET` is one
     object per implementation, never a `bytes` instance and identical
     across calls; the two runtimes do not import each other, so there is
     no shared sentinel. Callers dispatch three ways, and the third is a
@@ -282,10 +331,40 @@ class HopFsOps(Protocol):
     Reading anything else as "not yet" would turn a bug (a `None`, a `str`,
     a forgotten return) into a silent retry forever.
 
+    READS: WHAT A REFUSAL IS. `open_regular_pinned` raises `self.UnsafeRead`
+    (an exception class, one per implementation, defined the way `NOT_YET`
+    is) for a deterministic finding about the file, with `.reason` exactly
+    one of `UNSAFE_READ_REASONS`:
+
+      * `"not_regular"`: not a regular file after the `fstat`, or ELOOP or
+        ENXIO from the single-component `O_NOFOLLOW | O_NONBLOCK` open (a
+        symlink gives ELOOP and a socket ENXIO; a FIFO or a device opens,
+        and fails the regular-file check), with the `OSError` kept as
+        `__cause__`;
+      * `"link_count"`: a count other than 1 on a binding without trusted
+        links, or other than 1 or 2 on a generation tree or host intake
+        (including 0: the name unlinked after the open);
+      * `"too_large"`: more than `max_bytes`.
+
+    A missing name raises a raw `FileNotFoundError`, never `UnsafeRead`.
+    Anything else (EACCES, EIO, EMFILE, ...) propagates as itself, and
+    means no verdict. Callers dispatch on `isinstance(e, fsops.UnsafeRead)`
+    and `e.reason` only, never on a class name or module. The reason
+    classifies the error; the CALLER's contract decides whether it is
+    terminal.
+
     THE BARRIER EACH METHOD OWES before it returns (a failed barrier raises):
 
       * `mkdir_and_pin`: fsyncs the parent, whether or not this call created
-        the directory (an earlier creator's fsync may have failed);
+        the directory (an earlier creator's fsync may have failed). Before
+        it returns, the FINAL `fstat` of the descriptor it pins must show a
+        directory owned by the writer's uid, permission bits equal to
+        `mode & 0o777`, no setuid or sticky bit, and a setgid bit equal to
+        the pinned parent's (from `fstat` of the parent descriptor; a
+        requested setgid bit means nothing). A new directory is made with
+        `mode & 0o777`; only if the umask removed bits is it `fchmod`ed to
+        `(its setgid bit) | (mode & 0o777)`. An existing directory is
+        checked the same way and never repaired. A failure raises;
       * `stage_tree`: creates the staging subtree under `staging_name`,
         fsyncs it bottom-up and the parent, and returns its root fd
         UNPUBLISHED. It never renames. The caller commits what must exist
@@ -306,15 +385,18 @@ class HopFsOps(Protocol):
 
     #: This implementation's "committed not yet" result (above).
     NOT_YET: object
-
+    #: This implementation's refusal class for `open_regular_pinned` (READS).
+    UnsafeRead: type
 
     def open_root_nofollow(self, path: str) -> int: ...
     def descend_pinned(self, root_fd: int, rel: str) -> Optional[int]: ...
     def mkdir_and_pin(self, parent_fd: int, name: str, mode: int) -> int: ...
     def stage_tree(self, parent_fd: int, staging_name: str) -> int: ...
     def commit_durable(self, stage_dirfd: int, dest_dirfd: int, name: str,
-                       data: bytes, mode: int) -> CommitResult: ...
+                       data: bytes, mode: int, *,
+                       deps: Sequence[Dependency] = ()) -> CommitResult: ...
     def open_stage_dir(self, tree_fd: int, side: StageSide) -> int: ...
+    def open_private_stage_dir(self, root_fd: int) -> int: ...
     def replace_durable(self, dir_fd: int, name: str, data: bytes, mode: int) -> None: ...
     def rename_noreplace(self, src_fd: int, src: str,
                          dst_fd: int, dst: str) -> RenameResult: ...
@@ -326,13 +408,17 @@ class HopFsOps(Protocol):
     def fsync_dir(self, fd: int) -> None: ...
 
 
-#: `HopFsOps`'s methods, in the contract's order (B §e.2).
+#: `HopFsOps`'s methods, in the contract's order (B §e.2, as amended by E5).
+#: Methods only: its attributes are `HOPFSOPS_ATTRIBUTES`.
 HOPFSOPS_METHODS = (
     "open_root_nofollow", "descend_pinned", "mkdir_and_pin", "stage_tree",
-    "commit_durable", "open_stage_dir", "replace_durable", "rename_noreplace",
+    "commit_durable", "open_stage_dir", "open_private_stage_dir",
+    "replace_durable", "rename_noreplace",
     "open_regular_pinned", "stat_owner_pinned", "remove_pinned",
     "fsync_file", "fsync_dir",
 )
+#: `HopFsOps`'s non-method members.
+HOPFSOPS_ATTRIBUTES = ("NOT_YET", "UnsafeRead")
 
 
 @runtime_checkable

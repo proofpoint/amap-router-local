@@ -25,7 +25,7 @@ from router.tests.helpers import write_request
 from router.tests.test_inflight import EXT, FakeTransport, _InflightCase
 
 GOOD = b'''
-PLUGIN_API = (1, 0)
+PLUGIN_API = (2, 0)
 LOADS = []
 LOADS.append("executed")
 
@@ -84,7 +84,7 @@ class LoaderTests(_PluginDir):
     def test_a_valid_plugin_loads(self):
         """The twin every refusal below is measured against."""
         p = self.load()
-        self.assertEqual(p.api, (1, 0))
+        self.assertEqual(p.api, (2, 0))
         self.assertEqual(p.sha256, self.sha)
         self.assertEqual(p.path, str(self.path))
         self.assertEqual(p.make_sender({"k": 1}, "fs")[0], "sender")
@@ -104,22 +104,41 @@ class LoaderTests(_PluginDir):
 
     # -- PLUGIN_API -----------------------------------------------------
 
-    def test_a_different_major_is_refused(self):
-        self.write(GOOD.replace(b"PLUGIN_API = (1, 0)", b"PLUGIN_API = (2, 0)"))
+    def _calls_marker(self):
+        """A factory that leaves a file behind if it is ever called, so a
+        refusal can be shown to have called none."""
+        marker = self.path.parent / "factory-called"
+        return marker, (b"\ndef make_sender(settings, fsops):\n"
+                        b"    open(%r, 'w').close()\n" % str(marker).encode())
+
+    def test_a_major_1_plugin_is_refused_by_this_major_2_runtime(self):
+        """E5 (`open_private_stage_dir`, `deps`, `UnsafeRead`) made the
+        HopFsOps change a MAJOR one: a plugin written for (1, x) would call
+        a port that differs from the one it was written against."""
+        self.assertEqual(transport.PLUGIN_API, (2, 0))
+        marker, factory = self._calls_marker()
+        self.write(GOOD.replace(b"PLUGIN_API = (2, 0)", b"PLUGIN_API = (1, 9)") + factory)
         self.refused("api_mismatch")
+        self.assertFalse(marker.exists(), "a factory was called despite the refusal")
+
+    def test_a_major_2_plugin_is_refused_by_a_major_1_runtime(self):
+        marker, factory = self._calls_marker()
+        self.write(GOOD + factory)
+        self.refused("api_mismatch", api=(1, 0))
+        self.assertFalse(marker.exists(), "a factory was called despite the refusal")
 
     def test_an_older_minor_is_refused(self):
-        self.refused("api_mismatch", api=(1, 1))
+        self.refused("api_mismatch", api=(2, 1))
 
     def test_a_newer_minor_is_accepted(self):
-        self.write(GOOD.replace(b"PLUGIN_API = (1, 0)", b"PLUGIN_API = (1, 7)"))
-        self.assertEqual(self.load().api, (1, 7))
+        self.write(GOOD.replace(b"PLUGIN_API = (2, 0)", b"PLUGIN_API = (2, 7)"))
+        self.assertEqual(self.load().api, (2, 7))
 
     def test_a_malformed_or_missing_api_is_refused(self):
         for bad in (b"PLUGIN_API = '1.0'", b"PLUGIN_API = (1,)", b"PLUGIN_API = (True, 0)",
-                    b"NOT_THE_API = (1, 0)"):
+                    b"NOT_THE_API = (2, 0)"):
             with self.subTest(bad=bad):
-                self.write(GOOD.replace(b"PLUGIN_API = (1, 0)", bad))
+                self.write(GOOD.replace(b"PLUGIN_API = (2, 0)", bad))
                 self.refused("api_mismatch")
 
     # -- the hash, and which bytes run ----------------------------------
@@ -262,7 +281,7 @@ class LoaderTests(_PluginDir):
     # -- the plugin's own content ---------------------------------------
 
     def test_a_plugin_that_fails_to_run_is_refused(self):
-        self.write(b"PLUGIN_API = (1, 0)\ndef broken(:\n")
+        self.write(b"PLUGIN_API = (2, 0)\ndef broken(:\n")
         self.refused("exec_failed")
         self.write(b"raise RuntimeError('no')\n")
         self.refused("exec_failed")

@@ -15,14 +15,15 @@ import unittest
 
 from router import transport
 
-#: B §e.2, verbatim: method -> parameter names (excluding self).
+#: B §e.2, verbatim, as amended by E5: method -> parameter names (excluding self).
 CONTRACT_HOPFSOPS = {
     "open_root_nofollow": ["path"],
     "descend_pinned": ["root_fd", "rel"],
     "mkdir_and_pin": ["parent_fd", "name", "mode"],
     "stage_tree": ["parent_fd", "staging_name"],
-    "commit_durable": ["stage_dirfd", "dest_dirfd", "name", "data", "mode"],
+    "commit_durable": ["stage_dirfd", "dest_dirfd", "name", "data", "mode", "deps"],
     "open_stage_dir": ["tree_fd", "side"],
+    "open_private_stage_dir": ["root_fd"],
     "replace_durable": ["dir_fd", "name", "data", "mode"],
     "rename_noreplace": ["src_fd", "src", "dst_fd", "dst"],
     "open_regular_pinned": ["dir_fd", "name", "max_bytes"],
@@ -57,6 +58,45 @@ class HopFsOpsShapeTests(unittest.TestCase):
         self.assertIn("type(r) is bytes", doc)
         self.assertIn("protocol violation, never a skip", doc)
 
+    def test_the_attributes_are_exactly_not_yet_and_unsafe_read(self):
+        """E5: `UnsafeRead` is a member beside `NOT_YET`, not a method, and
+        `HOPFSOPS_METHODS` stays methods only."""
+        self.assertEqual(tuple(transport.HopFsOps.__annotations__),
+                         transport.HOPFSOPS_ATTRIBUTES)
+        self.assertEqual(transport.HOPFSOPS_ATTRIBUTES, ("NOT_YET", "UnsafeRead"))
+        self.assertFalse(set(transport.HOPFSOPS_ATTRIBUTES) & set(transport.HOPFSOPS_METHODS))
+
+    def test_deps_is_keyword_only_and_empty_by_default(self):
+        p = inspect.signature(transport.HopFsOps.commit_durable).parameters["deps"]
+        self.assertIs(p.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(p.default, ())
+        self.assertEqual(typing.get_type_hints(transport.HopFsOps.commit_durable)["deps"],
+                         typing.Sequence[transport.Dependency])
+
+    def test_the_e5_rules_are_stated(self):
+        self.assertEqual(transport.UNSAFE_READ_REASONS, ("not_regular", "link_count", "too_large"))
+        doc = " ".join(transport.HopFsOps.__doc__.split())
+        for phrase in ("a fresh `O_NOFOLLOW` walk from the tree root",
+                       "count 2 is an anomaly here, never NOT_YET",
+                       "bounded to `size + 1` bytes",
+                       "BEFORE any stage, compare, recovery or `exists_*` answer",
+                       "AGAIN after the link or the compare",
+                       "the stage is kept", "point-in-time observations",
+                       "`root_fd` must be the private root itself",
+                       "whether this call created `.stage/` or found it",
+                       "pairwise disjoint",
+                       "a FIFO or a device opens, and fails the regular-file check",
+                       "including 0: the name unlinked after the open",
+                       "A missing name raises a raw `FileNotFoundError`, never `UnsafeRead`",
+                       "never on a class name or module",
+                       "the CALLER's contract decides whether it is terminal",
+                       "the FINAL `fstat` of the descriptor it pins",
+                       "a setgid bit equal to the pinned parent's",
+                       "only if the umask removed bits",
+                       "An existing directory is checked the same way and never repaired"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, doc)
+
     def test_the_stage_sides(self):
         self.assertEqual(typing.get_args(transport.StageSide), ("up", "down", "intake"))
         hints = typing.get_type_hints(transport.HopFsOps.open_stage_dir)
@@ -77,7 +117,7 @@ class HopFsOpsShapeTests(unittest.TestCase):
                        "`[A-Za-z0-9._-]+`", "NAME_MAX",
                        "RELATIVE TO THE `stage_tree` ROOT",
                        "ON A HOP-TREE OR HOST-INTAKE BINDING ONLY",
-                       "(an agent-writable source)",
+                       "(an agent-writable source, or a writer's private tree)",
                        "a link count of 2 raises like any other count but 1",
                        "THE BARRIER EACH METHOD OWES",
                        "whether or not this call created the directory",
@@ -174,12 +214,15 @@ class AnnotationsResolveTests(unittest.TestCase):
 
 class _CompleteFsOps:
     NOT_YET = object()
+    UnsafeRead = type("UnsafeRead", (Exception,), {})
     def open_root_nofollow(self, path): return 3
     def descend_pinned(self, root_fd, rel): return None
     def mkdir_and_pin(self, parent_fd, name, mode): return 4
     def stage_tree(self, parent_fd, staging_name): return 5
-    def commit_durable(self, stage_dirfd, dest_dirfd, name, data, mode): return "created"
+    def commit_durable(self, stage_dirfd, dest_dirfd, name, data, mode, *, deps=()):
+        return "created"
     def open_stage_dir(self, tree_fd, side): return 6
+    def open_private_stage_dir(self, root_fd): return 7
     def replace_durable(self, dir_fd, name, data, mode): return None
     def rename_noreplace(self, src_fd, src, dst_fd, dst): return "moved"
     def open_regular_pinned(self, dir_fd, name, *, max_bytes): return b""
@@ -197,7 +240,7 @@ class ConformanceTests(unittest.TestCase):
     def test_each_missing_member_breaks_conformance(self):
         """Paired with the positive case: a check that accepted everything
         would pass that one alone. NOT_YET is a member like the methods."""
-        for name in list(CONTRACT_HOPFSOPS) + ["NOT_YET"]:
+        for name in list(CONTRACT_HOPFSOPS) + list(transport.HOPFSOPS_ATTRIBUTES):
             with self.subTest(missing=name):
                 cls = type("Partial", (), {k: v for k, v in vars(_CompleteFsOps).items()
                                            if k != name and not k.startswith("__")})
@@ -251,7 +294,7 @@ class InterfaceOnlyTests(unittest.TestCase):
                         self.assertEqual(len(body), 1, item.name)
                         self.assertIsInstance(body[0], ast.Expr, item.name)
                         self.assertIs(body[0].value.value, Ellipsis, item.name)
-        self.assertEqual(seen, 13 + 2 + 1 + 1 + 5 + 2)
+        self.assertEqual(seen, 14 + 2 + 1 + 1 + 5 + 2)
 
 
 class PluginApiCoversThePortsTests(unittest.TestCase):
