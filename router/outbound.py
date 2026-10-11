@@ -135,7 +135,7 @@ from datetime import timedelta
 
 from . import attachments as attachments_mod, binding, firstsight
 from . import audit as audit_mod
-from . import deliver as deliver_mod, validate as validate_mod
+from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
 from .config import RouterConfig, address_for, instance_for
 from .util import (
     DEFAULT_READ_CAP,
@@ -183,6 +183,7 @@ REASON_QUARANTINED = "quarantined_pre_approval"
 REASON_PEER_ROUTED = "peer_routed"
 REASON_PEER_SINGLE_RECIPIENT = "peer_single_recipient"
 REASON_PEER_REPLY_WINDOW_EXPIRED = "peer_reply_window_expired"
+REASON_TRANSPORT_ANOMALY = inflight_mod.REASON_TRANSPORT_ANOMALY
 
 
 def _outbox_dir(cfg: RouterConfig, name: str) -> Path:
@@ -391,6 +392,7 @@ def _drain_one(
     cfg: RouterConfig, name: str, filename: str, req_id: str,
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
     cold_policy: Optional[ColdPolicy] = None,
+    transport: Optional[inflight_mod.TransportPort] = None,
 ) -> str:
     """Validate, decide policy, and deliver (or refuse) exactly one
     request — everything between the idempotency check and the private
@@ -507,6 +509,7 @@ def _drain_one(
         req_digest=req_digest, attachments=verified_attachments,
         deliver_backend=deliver_backend,
         cold_policy=cold_policy,
+        transport=transport,
     )
 
 
@@ -771,6 +774,17 @@ class PeerRoute:
     recipient: str
 
 
+@dataclass(frozen=True)
+class ExternalRoute:
+    """A cold send the policy routed to the EXTERNAL leg: handed to a second
+    runtime through a transport port and settled from that runtime's result,
+    polls later (`router/inflight.py`). `recipients` is the evaluated set,
+    and the transport request carries exactly it. No policy in this repo
+    returns one yet: classification is a later step of the external-leg design,
+    and this type exists so the in-flight state can be driven before it."""
+    recipients: Tuple[str, ...]
+
+
 # The cold-send POLICY seam, sibling to the delivery seam in `deliver.py`.
 #
 # The delivery seam alone was not enough, and the reason is worth stating: a
@@ -789,7 +803,8 @@ class PeerRoute:
 # you MUST also supply a `deliver_backend` that can carry them. The default
 # `deliver.deliver` resolves `cfg.instances[recipient]` and will raise.
 ColdPolicy = Callable[
-    [RouterConfig, str, Dict[str, Any]], Union[List[str], ColdRefusal, PeerRoute]
+    [RouterConfig, str, Dict[str, Any]],
+    Union[List[str], ColdRefusal, PeerRoute, ExternalRoute],
 ]
 
 #: Refusals that belong to the peer lane and are therefore audited
@@ -946,6 +961,7 @@ def _drain_cold(
     attachments: Optional[List[attachments_mod.VerifiedAttachment]] = None,
     deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
     cold_policy: Optional[ColdPolicy] = None,
+    transport: Optional[inflight_mod.TransportPort] = None,
 ) -> str:
     """Cold-send routing: recipient set = `to ∪ cc`, one governing outcome,
     never a partial delivery. WHICH recipients are permitted is the policy's
@@ -973,6 +989,12 @@ def _drain_cold(
         return _drain_peer_route(
             cfg, name, req_id, doc, decided,
             req_digest=req_digest, attachments=attachments,
+        )
+
+    if isinstance(decided, ExternalRoute):
+        return _begin_external(
+            cfg, name, req_id, doc, decided,
+            req_digest=req_digest, attachments=attachments, transport=transport,
         )
 
     recipients = list(decided)
@@ -1038,6 +1060,122 @@ def _drain_cold(
     return _finish(cfg, name, req_id, result, req_digest=req_digest)
 
 
+#: `_drain_cold`'s return for a request handed to the external leg: consumed,
+#: not settled. `drain_instance` counts it apart from the three outcomes.
+INFLIGHT = "inflight"
+
+
+def _begin_external(
+    cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], route: ExternalRoute,
+    *, req_digest: Optional[str],
+    attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    transport: Optional[inflight_mod.TransportPort],
+) -> str:
+    """Put a request in flight and take its first step (which writes the
+    transport request). Two cases settle at once instead, both
+    `queued_for_human`/`transport_anomaly`, because neither is the agent's
+    fault and neither may be dropped: no transport configured, and
+    attachments, whose staging to the transport is not built yet (the
+    sidecars sit in the agent-writable outbox; ingest by copy needs them
+    staged first)."""
+    if transport is None:
+        result = _result_doc(
+            req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
+            recipients=[], detail="the external leg is not configured for this instance",
+        )
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    if attachments:
+        result = _result_doc(
+            req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
+            recipients=[], detail="attachments on the external leg are not supported yet",
+        )
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    record = inflight_mod.begin(
+        cfg, name, req_id, digest=req_digest, request_doc=doc,
+        recipients=list(route.recipients),
+    )
+    _advance_one(cfg, name, req_id, record, transport)
+    return INFLIGHT
+
+
+def _advance_one(
+    cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
+    transport: inflight_mod.TransportPort,
+) -> str:
+    """`inflight.advance` with `_finish` as the settle step."""
+    def settle(verdict: Dict[str, Any], digest: Optional[str]) -> str:
+        result = _result_doc(req_id, **verdict)
+        return _finish(cfg, name, req_id, result, req_digest=digest)
+
+    anchor = _private_result_path(cfg, name, req_id)
+    return inflight_mod.advance(
+        cfg, name, req_id, record, transport, settle=settle,
+        already_settled=anchor.is_file(), anchor=anchor,
+    )
+
+
+#: What this process has already warned about, so a 5-second poll does not
+#: repeat it: (instance, req_id) for a stale request, (instance, None) for
+#: records left with no transport.
+_STALE_WARNED: set = set()
+
+
+def _advance_inflight(
+    cfg: RouterConfig, name: str, transport: Optional[inflight_mod.TransportPort],
+    outcomes: Dict[str, int],
+) -> Dict[str, int]:
+    """One step for every in-flight record of `name`, isolated per record.
+    Runs BEFORE the outbox listing, so a request settled here is seen by the
+    listing as already answered. Without a transport, records are left
+    exactly as they are and only counted: nothing here may guess a verdict."""
+    settled = errored = 0
+    req_ids = inflight_mod.list_records(cfg, name)
+    if req_ids and transport is None:
+        if (name, None) not in _STALE_WARNED:
+            _STALE_WARNED.add((name, None))
+            logger.warning(
+                "instance %r has %d in-flight request(s) and no transport "
+                "configured; leaving them unsettled", name, len(req_ids),
+            )
+    elif transport is not None:
+        for req_id in req_ids:
+            try:
+                record = inflight_mod.read_record(cfg, name, req_id)
+                if record is None:
+                    continue
+                state = _advance_one(cfg, name, req_id, record, transport)
+            except Exception:
+                logger.exception(
+                    "instance %r: error advancing in-flight request %r — isolated, "
+                    "retried next poll", name, req_id,
+                )
+                errored += 1
+                continue
+            if state == inflight_mod.SETTLED:
+                settled += 1
+                result = json.loads(
+                    _private_result_path(cfg, name, req_id).read_text(encoding="utf-8")
+                )["result"]
+                if result["outcome"] in outcomes:
+                    outcomes[result["outcome"]] += 1
+    return {"inflight_settled": settled, "inflight_errored": errored}
+
+
+def _inflight_report(cfg: RouterConfig, name: str) -> Dict[str, int]:
+    """The in-flight counts at the END of a drain (so a request handed off
+    this poll is counted), warning once per process about each stale one."""
+    summary, stale = inflight_mod.summarize(cfg, name)
+    for req_id in stale:
+        if (name, req_id) not in _STALE_WARNED:
+            _STALE_WARNED.add((name, req_id))
+            logger.warning(
+                "instance %r: request %r has been in flight past %ds with no "
+                "transport result; it stays pending (no timeout settles it)",
+                name, req_id, inflight_mod.STALE_AFTER_S,
+            )
+    return summary
+
+
 def _finish(
     cfg: RouterConfig, name: str, req_id: str, result: Dict[str, Any],
     *, req_digest: Optional[str],
@@ -1055,7 +1193,8 @@ def _finish(
     replaying a stored verdict — see `REASON_REQ_ID_REUSED`."""
     private_path = _private_result_path(cfg, name, req_id)
     envelope = {"digest": req_digest, "result": result}
-    atomic_write(private_path, json.dumps(envelope, sort_keys=True).encode("utf-8"))
+    atomic_write(private_path, json.dumps(envelope, sort_keys=True).encode("utf-8"),
+                 durable_root=cfg.state_dir)
     result_bytes = json.dumps(result, sort_keys=True).encode("utf-8")
     _publish_result_and_archive(cfg, name, req_id, result_bytes)
     return result["outcome"]
@@ -1285,6 +1424,7 @@ def drain_instance(
     cfg: RouterConfig, name: str,
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
     cold_policy: Optional[ColdPolicy] = None,
+    transport: Optional[inflight_mod.TransportPort] = None,
 ) -> Dict[str, int]:
     """Drain instance `name`'s `outbound/` once. Returns a summary dict for
     logging (mirrors `gate.outbound.drain_outbound`'s shape).
@@ -1320,7 +1460,15 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     must never abort the whole drain (this instance's remaining requests,
     or any OTHER instance's — see `service.run_once`'s matching per-
     instance isolation). A failure is logged and counted as
-    `outbound_errored`."""
+    `outbound_errored`.
+
+    IN FLIGHT (`router/inflight.py`): a request handed to the external leg
+    stays in the outbox, unanswered, until the transport's result arrives.
+    Every record is stepped BEFORE the outbox is listed, and a listed request
+    that has a record is skipped (`outbound_inflight_waiting`) rather than
+    processed again — the record, not the agent's file, carries it from
+    then on. `transport` is the port to the external leg; omitted, as every
+    caller in this repo omits it today, nothing is ever put in flight."""
     # FIRST SIGHT, BEFORE ANY DRAIN OF THIS ROOT. The snapshot has to precede
     # the first drain in the same poll, or the window it exists to close is
     # open for exactly one poll. `record_first_sight` is idempotent after the
@@ -1329,11 +1477,18 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     marker_doc, first_sight = firstsight.record_first_sight(cfg, name)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)
 
+    outcomes: Dict[str, int] = {"accepted": 0, "rejected": 0, "queued_for_human": 0}
+    # The in-flight keys appear only where the external leg is in play, so a
+    # router without one reports exactly the summary it always did.
+    inflight_summary: Dict[str, int] = {}
+    if transport is not None or inflight_mod.list_records(cfg, name):
+        inflight_summary = _advance_inflight(cfg, name, transport, outcomes)
+
     filenames, skipped_symlinks = list_outbound(cfg, name)
 
     drained = resumed = errored = reused = quarantined = 0
+    inflight_begun = inflight_waiting = 0
     skipped_bad_name = skipped_symlinks
-    outcomes: Dict[str, int] = {"accepted": 0, "rejected": 0, "queued_for_human": 0}
     for filename in filenames:
         if not REQ_NAME_RE.match(filename):
             skipped_bad_name += 1
@@ -1445,6 +1600,11 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                     )
                     reused += 1
                     outcomes["rejected"] += 1
+            elif inflight_mod.record_path(cfg, name, req_id).exists():
+                # In flight: the record carries it now (docstring, IN
+                # FLIGHT). Not drained this poll.
+                inflight_waiting += 1
+                continue
             elif filename in quarantine_set:
                 try:
                     raw = _read_request_pinned(cfg, name, filename)
@@ -1469,9 +1629,11 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
             else:
                 outcome = _drain_one(
                     cfg, name, filename, req_id, deliver_backend=deliver_backend,
-                        cold_policy=cold_policy,
+                        cold_policy=cold_policy, transport=transport,
                 )
-                if outcome in outcomes:
+                if outcome == INFLIGHT:
+                    inflight_begun += 1
+                elif outcome in outcomes:
                     outcomes[outcome] += 1
         except Exception:
             logger.exception(
@@ -1496,4 +1658,8 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
         "rejected": outcomes["rejected"],
         "queued_for_human": outcomes["queued_for_human"],
         "quarantined": quarantined,
+        **({"outbound_inflight_begun": inflight_begun,
+            "outbound_inflight_waiting": inflight_waiting,
+            **inflight_summary,
+            **_inflight_report(cfg, name)} if transport is not None or inflight_summary else {}),
     }

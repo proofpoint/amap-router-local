@@ -46,8 +46,10 @@ WHAT GETS TOUCHED, PER INSTANCE:
       those and leave them behind)
     - everything else under `state_dir/<name>` (`results/`, `delivered/`,
       `held/`, `quarantine/`, `outcomes/`) — removed after — EXCEPT
-      `audit/`, the append-only audit log (`router/audit.py`), which is
-      the one piece of router-private state a reset preserves. It is the
+      `audit/`, the append-only audit log (`router/audit.py`), and
+      `transport/`, the transport req_id counter (`router/inflight.py`:
+      ids already handed to the external leg must never be reused, so it
+      must never restart). The audit log is the
       record of what the router did, and the one evidence-destroying
       command must not destroy the evidence; instead `reset_instance`
       APPENDS a `reset` line to it (what was removed, whether the instance
@@ -241,6 +243,7 @@ import logging
 
 from . import firstsight
 from . import audit as audit_mod
+from . import inflight as inflight_mod
 from . import lock as lock_mod
 from .config import RouterConfig
 from .util import (
@@ -270,8 +273,11 @@ _OUTBOX_PRESERVE = ("ext",)
 _EXT = "ext"
 _OUTCOMES = "outcomes"
 
-# The one `state_dir/<name>` entry a reset preserves (module docstring).
-_STATE_KEEP = (audit_mod.AUDIT_DIR,)
+# The `state_dir/<name>` entries a reset preserves (module docstring): the
+# audit log, and the transport req_id counter, which must never restart —
+# the ids it already handed to the external leg must not be reused
+# (`router/inflight.py`). In-flight RECORDS are not preserved.
+_STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR)
 
 
 class ResetError(Exception):
