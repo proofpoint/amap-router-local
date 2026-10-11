@@ -1475,7 +1475,11 @@ class DsnRemovalFailureIsolatedTests(_Fleet):
         self.assertEqual(list(d.glob("*.json")), [])
 
     def test_directory_fsync_failure(self):
+        """The unlink happened but its directory barrier failed: after a crash
+        the intent may come back. Restored as that crash survivor, it is
+        replayed with the SAME id and only then removed."""
         d, first, ids = self.setup_two()
+        frozen = first.read_bytes()
         real = outcomes.fsync_dir
         calls = {"n": 0}
 
@@ -1486,7 +1490,9 @@ class DsnRemovalFailureIsolatedTests(_Fleet):
             return real(path)
         with mock.patch.object(outcomes, "fsync_dir", fsync_dir):
             self.poll()
-        self.check(ids)
-        self.poll()
+        self.assertEqual(calls["n"], 1, "the injected directory-fsync fault never fired")
+        self.check(ids)                               # the neighbour went too
+        first.write_bytes(frozen)                     # the crash survivor
+        self.poll()                                   # replay: the SAME id, then removed
         self.check(ids)
         self.assertEqual(list(d.glob("*.json")), [])

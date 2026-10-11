@@ -244,6 +244,14 @@ M = [
   '        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)',
   '        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd)',
   ['router.tests.test_attachments_outbound.TestOutboundSidecarTOCTOU.test_live_race_separate_process_secret_never_leaks']),
+ ('N15 no directory fsync after a DSN intent removal', 'router/outcomes.py',
+  '            os.unlink(path)\n            fsync_dir(d)\n        except OSError as e:',
+  '            os.unlink(path)\n        except OSError as e:',
+  ['router.tests.test_held_local.DsnRemovalFailureIsolatedTests.test_directory_fsync_failure']),
+ ('L2 live race: the attacker never changes the tree', 'router/tests/test_attachments_outbound.py',
+  '        os.rename(side_dir, parked)\n        os.symlink(secret_dir, side_dir)\n        os.unlink(side_dir)\n        os.rename(parked, side_dir)\n',
+  '',
+  ['router.tests.test_attachments_outbound.TestOutboundSidecarTOCTOU.test_live_race_separate_process_secret_never_leaks']),
 ]
 
 
