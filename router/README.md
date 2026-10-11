@@ -1027,6 +1027,19 @@ configured plugin stops startup, so no transport is used before its
 durability work is done. `TransportPort.has_pending` is true for a request
 the downstream runtime has claimed as well as one it has not.
 
+**The ports a plugin receives** are Protocols in the same module, interface
+only: `HopFsOps` (every filesystem operation a plugin may make, on pinned
+descriptors; a plugin makes no filesystem call of its own), `KeyOps` (the
+signing key as bytes; the signer never opens a path), `Signer` and
+`Verifier`, plus the factory signatures (`make_sender`, `make_intake_reader`,
+`make_signer`, `make_verifier`, and the sibling runtime's four).
+`PLUGIN_API`'s major covers all of them. Two contracts on `HopFsOps` are
+worth knowing before implementing it: `commit_durable` derives its stage
+name's destination tag from a binding the implementation holds, never from
+a parameter or a bare descriptor number; and `open_regular_pinned` returns
+`bytes` or the port's own `NOT_YET`, with anything else a protocol
+violation that callers raise on, never skip.
+
 ## Retention / deletion rights (v2.2.0)
 
 AMAP v2.2.0 §2 names, for the first time, who may delete each artifact class

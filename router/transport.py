@@ -65,12 +65,15 @@ import stat
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence,
-                    Tuple)
+from typing import (Any, Callable, Iterable, Literal, Mapping, Optional, Protocol,
+                    Sequence, Tuple, Union, runtime_checkable)
 
 #: `(major, minor)`. A plugin must have the same major and at least this
-#: minor. The interfaces the factories receive (the filesystem and key
-#: ports) are part of the major.
+#: minor. The MAJOR covers every interface in this module that crosses the
+#: seam: `TransportPort`, `InboundPort`, `HopFsOps`, `KeyOps`, `Signer`,
+#: `Verifier` and the factory signatures. Changing any of them (a method,
+#: a parameter, a return vocabulary) is a major bump; adding an optional
+#: factory is a minor one.
 PLUGIN_API: Tuple[int, int] = (1, 0)
 
 #: The factories this runtime calls. A plugin may define more; it must
@@ -147,6 +150,189 @@ class InboundPort(Protocol):
 INBOUND_KINDS = ("notice", "candidate", "unresolved")
 
 
+# --------------------------------------------------------------------------
+# The ports a plugin's factories RECEIVE. Interface only: no implementation
+# lives in this module. A plugin makes no filesystem call of its own; every
+# one goes through `HopFsOps`, and the signer never opens a path (`KeyOps`).
+# --------------------------------------------------------------------------
+
+#: `commit_durable`'s results.
+CommitResult = Literal["created", "exists_same", "exists_different"]
+#: `rename_noreplace`'s results.
+RenameResult = Literal["moved", "src_gone", "dst_exists"]
+#: `stat_owner_pinned`'s kinds, from a NON-following stat (`O_NOFOLLOW` /
+#: lstat semantics): `"file"` is a regular file only (`S_ISREG`), `"dir"` is
+#: `S_ISDIR`, and everything else (symlink, FIFO, socket, device) is
+#: `"other"`. The uid and mode come from that same stat. A missing name
+#: raises `FileNotFoundError`; any other failure propagates as its own
+#: `OSError` and is never folded into a kind.
+EntryKind = Literal["file", "dir", "other"]
+
+
+@runtime_checkable
+class HopFsOps(Protocol):
+    """Every filesystem operation a plugin may perform, on descriptors the
+    implementation pinned. The method list, parameters and result
+    vocabularies are exactly the contract's (B §e.2); changing them bumps
+    `PLUGIN_API`'s major. Every failed barrier RAISES, and the caller's
+    dependent step does not run.
+
+    `commit_durable(stage_dirfd, dest_dirfd, name, data, mode)` publishes
+    `data` (the writer's FROZEN bytes, journalled before the call) under
+    `name` in `dest_dirfd`, by writing a deterministic stage in the
+    writer-private `stage_dirfd`, fsyncing it, linking it in, fsyncing the
+    destination and unlinking the stage. Equality is byte equality.
+    `exists_same` is returned for identical existing bytes or for this
+    writer's own interrupted commit, recovered with the stage still present
+    until everything is durable. `exists_different` is an anomaly; the
+    existing file is never replaced.
+
+    THE DESTINATION TAG IS THE IMPLEMENTATION'S, AND IT IS AN INVARIANT,
+    NOT A PARAMETER. The stage name is `<dest-tag>.<name>`, and the call
+    does not carry the tag. The implementation derives it from a canonical
+    BINDING it holds for `dest_dirfd`:
+
+      * every destination is registered through the implementation's own
+        trusted opening paths (`open_root_nofollow` when the root is itself
+        a destination, as for private ledgers; `descend_pinned`;
+        `mkdir_and_pin`; and `stage_tree` for an admitted subtree), with
+        its writer, tree and stage scope and its directory identity;
+      * a bare descriptor number is never the binding: after a close and
+        fd-number reuse the binding is stale, so the live descriptor is
+        verified against the recorded identity (device and inode, plus the
+        directory, owner and mode checks);
+      * the tag is a canonical layout role (`outbound`, `results`,
+        `notices`, ...) in its tree scope: stable across restarts and
+        reopening, never derived from fd numbers, random traversal ids or
+        an opening's spelling, and unique among destinations sharing one
+        stage directory. An admitted tree keeps its FINAL role; a
+        temporary `.adm-*` name never reaches a tag;
+      * an unknown, closed, mismatched, conflicting or ambiguous binding
+        RAISES before anything is staged or published. Ambiguous means two
+        bindings resolving to the same directory (`st_dev`, `st_ino`) with
+        different tags. There is no best-effort fallback to a basename;
+      * the binding registry belongs to the `HopFsOps` instance and never
+        outlives the process. Restart stability comes from deriving the
+        tag from the binding's role and path, never from registration
+        order, so recovery in a fresh instance derives the same stage name.
+
+    `open_regular_pinned` returns the file's bytes (`bytes`, exactly) once
+    it is committed (link count 1), and `self.NOT_YET` for a commit still
+    in flight (link count 2). Any other link count raises. `NOT_YET` is one
+    object per implementation, never a `bytes` instance and identical
+    across calls; the two runtimes do not import each other, so there is
+    no shared sentinel. Callers dispatch three ways, and the third is a
+    protocol violation, never a skip:
+
+        r = fsops.open_regular_pinned(dir_fd, name, max_bytes=cap)
+        if r is fsops.NOT_YET:   # in flight: skip, retry on a later pump
+            ...
+        elif type(r) is bytes:   # committed
+            ...
+        else:                    # an implementation bug: raise
+            ...
+
+    Reading anything else as "not yet" would turn a bug (a `None`, a `str`,
+    a forgotten return) into a silent retry forever."""
+
+    #: This implementation's "committed not yet" result (above).
+    NOT_YET: object
+
+
+    def open_root_nofollow(self, path: str) -> int: ...
+    def descend_pinned(self, root_fd: int, rel: str) -> Optional[int]: ...
+    def mkdir_and_pin(self, parent_fd: int, name: str, mode: int) -> int: ...
+    def stage_tree(self, parent_fd: int, staging_name: str) -> int: ...
+    def commit_durable(self, stage_dirfd: int, dest_dirfd: int, name: str,
+                       data: bytes, mode: int) -> CommitResult: ...
+    def open_stage_dir(self, tree_fd: int, side: str) -> int: ...
+    def replace_durable(self, dir_fd: int, name: str, data: bytes, mode: int) -> None: ...
+    def rename_noreplace(self, src_fd: int, src: str,
+                         dst_fd: int, dst: str) -> RenameResult: ...
+    def open_regular_pinned(self, dir_fd: int, name: str, *,
+                            max_bytes: int) -> Union[bytes, object]: ...  # bytes or self.NOT_YET
+    def stat_owner_pinned(self, dir_fd: int, name: str) -> Tuple[int, int, EntryKind]: ...
+    def remove_pinned(self, dir_fd: int, name: str) -> None: ...
+    def fsync_file(self, fd: int) -> None: ...
+    def fsync_dir(self, fd: int) -> None: ...
+
+
+#: `HopFsOps`'s methods, in the contract's order (B §e.2).
+HOPFSOPS_METHODS = (
+    "open_root_nofollow", "descend_pinned", "mkdir_and_pin", "stage_tree",
+    "commit_durable", "open_stage_dir", "replace_durable", "rename_noreplace",
+    "open_regular_pinned", "stat_owner_pinned", "remove_pinned",
+    "fsync_file", "fsync_dir",
+)
+
+
+@runtime_checkable
+class KeyOps(Protocol):
+    """The signing key, as the signer receives it. The implementation reads
+    the key through a pinned, owner-checked read (mode 0400, owned by this
+    runtime's uid) and hands over BYTES; the signer never opens a path, and
+    an out-of-process signer receives the key over a pipe descriptor, never
+    a path. One Ed25519 key per host.
+
+    `signing_key()` is the 32-byte Ed25519 private seed. `key_id()` is the
+    key's identifier, fingerprint-derived and so globally unique."""
+
+    def signing_key(self) -> bytes: ...
+    def key_id(self) -> str: ...
+
+
+@runtime_checkable
+class Signer(Protocol):
+    """`sign(msg)` is a 64-byte Ed25519 signature over exactly `msg`.
+    `key_id` names the key it signs with."""
+
+    key_id: str
+
+    def sign(self, msg: bytes) -> bytes: ...
+
+
+@runtime_checkable
+class Verifier(Protocol):
+    """`verify(pub, msg, sig)` is strict RFC 8032 Ed25519 verification: it
+    rejects S >= L and non-canonical point encodings, and never raises for
+    a bad signature (it returns False). Key-table validation (canonical,
+    not small order, unique key ids, ordered validity) happens when the
+    table is LOADED, not here."""
+
+    def verify(self, pub: bytes, msg: bytes, sig: bytes) -> bool: ...
+
+
+#: The plugin's settings: what the runtime chooses to hand a factory.
+Settings = Mapping[str, Any]
+
+# The factory signatures (contract §6.2 P4). Each takes only the settings
+# and the one port it needs.
+MakeSender = Callable[[Settings, HopFsOps], TransportPort]
+MakeIntakeReader = Callable[[Settings, HopFsOps], InboundPort]
+MakeSigner = Callable[[Settings, KeyOps], Signer]
+MakeVerifier = Callable[[Settings], Verifier]
+#: The sibling runtime's factories. What they return is that runtime's
+#: concern, so this module types the call, not the result.
+MakeHopReceiver = Callable[[Settings, HopFsOps], Any]
+MakeIntakeWriter = Callable[[Settings, HopFsOps], Any]
+MakeMarkerStore = Callable[[Settings, HopFsOps], Any]
+MakeHopSender = Callable[[Settings, HopFsOps], Any]
+
+#: Every factory a plugin may define, with the port it receives (None for
+#: settings only). This runtime calls the first four; the sibling runtime
+#: calls the rest.
+FACTORY_PORTS: Mapping[str, Optional[str]] = {
+    "make_sender": "HopFsOps",
+    "make_intake_reader": "HopFsOps",
+    "make_signer": "KeyOps",
+    "make_verifier": None,
+    "make_hop_receiver": "HopFsOps",
+    "make_intake_writer": "HopFsOps",
+    "make_marker_store": "HopFsOps",
+    "make_hop_sender": "HopFsOps",
+}
+
+
 class NullTransport:
     """The plugin in force when none is configured: every factory returns
     `None`, so the drain runs with `transport=None` exactly as it did before
@@ -156,10 +342,10 @@ class NullTransport:
     sha256: Optional[str] = None
     api: Tuple[int, int] = PLUGIN_API
 
-    def make_sender(self, settings: Mapping[str, Any], fsops: Any) -> None:
+    def make_sender(self, settings: Settings, fsops: Optional[HopFsOps]) -> None:
         return None
 
-    def make_intake_reader(self, settings: Mapping[str, Any], fsops: Any) -> None:
+    def make_intake_reader(self, settings: Settings, fsops: Optional[HopFsOps]) -> None:
         return None
 
 
@@ -176,10 +362,10 @@ class LoadedPlugin:
     def _factory(self, name: str) -> Callable[..., Any]:
         return self.namespace[name]
 
-    def make_sender(self, settings: Mapping[str, Any], fsops: Any) -> TransportPort:
+    def make_sender(self, settings: Settings, fsops: HopFsOps) -> TransportPort:
         return self._factory("make_sender")(settings, fsops)
 
-    def make_intake_reader(self, settings: Mapping[str, Any], fsops: Any) -> InboundPort:
+    def make_intake_reader(self, settings: Settings, fsops: HopFsOps) -> InboundPort:
         return self._factory("make_intake_reader")(settings, fsops)
 
 
