@@ -2078,6 +2078,11 @@ def _pin_own_root(cfg: RouterConfig, name: str) -> Tuple[RouterConfig, Optional[
     if expected is None:
         return cfg, None
     inst = cfg.instances[name]
+    if not os.path.isdir(generations_mod.PINNED_PREFIX):
+        raise generations_mod.GenerationHeld(
+            generations_mod.HELD_CONNECTOR_UNVERIFIED,
+            f"registry mode needs {generations_mod.PINNED_PREFIX} (Linux /proc) to pin "
+            "an instance's root; it is not available here")
     try:
         fd = os.open(str(inst.root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as e:
@@ -2103,6 +2108,20 @@ def _pin_own_root(cfg: RouterConfig, name: str) -> Tuple[RouterConfig, Optional[
     instances = dict(cfg.instances)
     instances[name] = view_inst
     return dataclasses.replace(cfg, instances=instances), fd
+
+
+def with_pinned_root(cfg: RouterConfig, name: str,
+                     fn: Callable[[RouterConfig, str], Any]) -> Any:
+    """`fn(view, name)` on `_pin_own_root`'s view: anything that reads or
+    writes inside an instance's root (the outcome consume, as the drain)
+    does it through the verified descriptor. Raises `GenerationHeld` when
+    the root does not check out; without a registry, `fn(cfg, name)`."""
+    view, fd = _pin_own_root(cfg, name)
+    try:
+        return fn(view, name)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def drain_instance(

@@ -748,3 +748,38 @@ class ReuseCountTests(_Gens):
         service.poll_once(self.cfg, tracker, None)
         doc = tracker.to_doc()["generations"]["alpha"]
         self.assertEqual(doc.get("req_id_reused"), {self.cur(): 1})
+
+
+class OutcomeConsumeTests(_Gens):
+    """The peer outcome consume reads and deletes files inside an instance's
+    root: it runs through the same verified descriptor as the drain, and not
+    at all after a drain held for the root."""
+
+    def outcome(self):
+        from router.tests.peer_helpers import write_outcome
+        self.assertIsNotNone(self.cfg.instances["alpha"].peer_root, "precondition: peer lane")
+        return write_outcome(self.cfg, "alpha", "0" * 32, "delivered")
+
+    def test_outcomes_are_consumed_only_through_the_verified_root(self):
+        path = self.outcome()
+        real = outbound.drain_instance
+
+        def drain_then_swap(cfg, name, **kw):
+            out = real(cfg, name, **kw)
+            if name == "alpha":
+                self.replace_root("alpha")      # the copy carries the outcome file
+            return out
+        with mock.patch.object(service.outbound, "drain_instance", drain_then_swap):
+            summary = self.poll()
+        self.assertTrue(path.exists(), "an outcome was consumed through a replaced root")
+        self.assertEqual(summary["alpha"].get("peer_outcome_errored"), 1)
+
+    def test_no_consume_after_a_drain_held_for_its_root(self):
+        path = self.outcome()
+
+        def held(cfg, name, **kw):
+            raise generations.GenerationHeld(generations.HELD_CONNECTOR_UNVERIFIED, "test")
+        with mock.patch.object(service.outbound, "drain_instance", held):
+            self.poll()
+        self.assertTrue(path.exists(), "outcomes were consumed after a held drain")
+

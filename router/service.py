@@ -152,17 +152,29 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
     for name in sorted(cfg.instances):
         if report.state != "off" and name not in report.resolved:
             continue  # held by the registry (`registry_report` says why)
+        root_held = False
         try:
             result = outbound.drain_instance(cfg, name, transport=transport)
+        except generations.GenerationHeld as e:
+            # The instance's root no longer checks out against its
+            # generation: NOTHING more is done on its side this poll, the
+            # outcome consume included. The next pre-pass decides.
+            logger.warning("instance %r held for this poll: %s", name, e)
+            result = {"instance_errored": 1}
+            root_held = True
         except Exception:
             logger.exception(
                 "error draining instance %r — isolated, continuing with "
                 "the next instance", name,
             )
             result = {"instance_errored": 1}
-        if cfg.instances[name].peer_root is not None:
+        if cfg.instances[name].peer_root is not None and not root_held:
             try:
-                result.update(outcomes.consume_instance(cfg, name))
+                result.update(outbound.with_pinned_root(
+                    cfg, name, outcomes.consume_instance))
+            except generations.GenerationHeld as e:
+                logger.warning("instance %r: outcomes not consumed this poll: %s", name, e)
+                result = {**result, "peer_outcome_errored": 1}
             except Exception:
                 logger.exception(
                     "error consuming delivery outcomes for instance %r — "
