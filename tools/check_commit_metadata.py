@@ -30,11 +30,16 @@ ALLOWED_DOMAIN = "users.noreply.github.com"
 ALLOWED_EXACT = frozenset({"noreply@github.com"})
 
 #: Commits exempted by an explicit, recorded decision, as FULL 40-hex shas,
-#: matched exactly: never a prefix, a pattern or a branch. Empty: no
-#: exception has been decided. An entry here does not make an address
-#: acceptable; it records that one already-published commit was accepted
-#: as it is, by name.
-EXCEPTED_SHAS: frozenset = frozenset()
+#: matched exactly: never a prefix, a pattern or a branch. An entry here does
+#: not make an address acceptable; it records that one already-published
+#: commit was accepted as it is, by name.
+EXCEPTED_SHAS: frozenset = frozenset({
+    # The squash merge of PR #2 into hop-integration, whose author address
+    # GitHub took from the merging account's settings. Accepted as published
+    # by the repository owner on 2026-10-11, rather than rewriting a
+    # protected public branch.
+    "a6d03d918369d33f25c01cba46726549fd17456c",
+})
 
 
 def email_allowed(email: str) -> bool:

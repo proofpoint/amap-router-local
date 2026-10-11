@@ -129,9 +129,13 @@ class CheckerTests(unittest.TestCase):
         with mock.patch.object(cm, "identities", return_value=[]):
             self.assertEqual(cm.main([self.repo]), 2)
 
-    def test_the_exception_list_is_empty_and_exact(self):
-        """No exception has been decided. The hook matches whole shas only."""
-        self.assertEqual(cm.EXCEPTED_SHAS, frozenset())
+    def test_the_exception_list_is_exact(self):
+        """Only the one decided exception, as a full sha; the hook matches
+        whole shas only."""
+        self.assertEqual(cm.EXCEPTED_SHAS,
+                         frozenset({"a6d03d918369d33f25c01cba46726549fd17456c"}))
+        for sha in cm.EXCEPTED_SHAS:
+            self.assertRegex(sha, r"^[0-9a-f]{40}$")
         sha = self.commit("one", author=("Jane", PLANTED), committer=CLEAN)
         rows = cm.identities(self.repo)
         self.assertEqual(len(cm.findings(rows)), 1)
