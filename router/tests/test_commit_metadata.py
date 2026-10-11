@@ -1,5 +1,6 @@
 """`tools/check_commit_metadata.py`: every commit reachable from HEAD carries
-a no-reply author and committer.
+a no-reply author and committer, its trailers name only no-reply addresses,
+and so does every annotated tag's tagger.
 
 Each test builds a throwaway repository with exact identities, so the
 checker is proved against histories it can be wrong about, not only against
@@ -49,10 +50,11 @@ class CheckerTests(unittest.TestCase):
         return subprocess.run(["git", "-C", self.repo, *args], env=env,
                               capture_output=True, check=True).stdout.decode()
 
-    def commit(self, msg, **kw):
+    def commit(self, msg, body=None, **kw):
         Path(self.repo, msg).write_text(msg)
         self.git("add", msg, **kw)
-        self.git("commit", "-q", "-m", msg, **kw)
+        extra = ["-m", body] if body else []
+        self.git("commit", "-q", "-m", msg, *extra, **kw)
         return self.git("rev-parse", "HEAD").strip()
 
     def run_tool(self):
@@ -66,7 +68,7 @@ class CheckerTests(unittest.TestCase):
         self.commit("two", author=CLEAN, committer=WEB)
         out = self.run_tool()
         self.assertEqual(out.returncode, 0, out.stdout)
-        self.assertIn("2 commit(s) checked, 0 finding(s)", out.stdout)
+        self.assertIn("2 commit(s) and 0 annotated tag(s) checked, 0 finding(s)", out.stdout)
 
     # -- planted identities ------------------------------------------------
 
@@ -115,6 +117,79 @@ class CheckerTests(unittest.TestCase):
                     ""):
             with self.subTest(email=bad):
                 self.assertFalse(cm.email_allowed(bad))
+
+    # -- the local part, not only the domain ------------------------------
+
+    def test_real_noreply_forms_pass(self):
+        """The twin of the refusals below: the strict pattern must keep
+        admitting what GitHub actually issues, mixed-case logins included."""
+        for good in ("12345+someone" + "@" + "users.noreply.github.com",
+                     "210863+SomeUser" + "@" + "users.noreply.github.com",
+                     "someone" + "@" + "users.noreply.github.com",
+                     "41898282+github-actions[bot]" + "@" + "users.noreply.github.com",
+                     "1+" + "a" * 39 + "@" + "users.noreply.github.com",
+                     "noreply" + "@" + "github.com"):
+            with self.subTest(email=good):
+                self.assertTrue(cm.email_allowed(good))
+
+    def test_a_second_at_sign_in_the_local_part_is_refused(self):
+        """Checking only what follows the LAST `@` admitted a personal
+        address as the local part."""
+        self.assertFalse(cm.email_allowed(
+            "jane" + "@" + "corp.example" + "@" + "users.noreply.github.com"))
+
+    def test_a_real_name_local_part_is_refused(self):
+        self.assertFalse(cm.email_allowed("jane.doe" + "@" + "users.noreply.github.com"))
+
+    def test_an_uppercased_domain_is_refused(self):
+        """No case folding: GitHub never issues it, and folding is what let
+        the domain check be the whole check."""
+        self.assertFalse(cm.email_allowed("12345+someone" + "@" + "USERS.NOREPLY.GITHUB.COM"))
+
+    def test_surrounding_whitespace_is_refused(self):
+        self.assertFalse(cm.email_allowed(" " + CLEAN[1]))
+        self.assertFalse(cm.email_allowed(CLEAN[1] + "\n"))
+
+    def test_an_over_long_or_hyphen_led_login_is_refused(self):
+        for bad in ("1+" + "a" * 40 + "@" + "users.noreply.github.com",
+                    "1+-someone" + "@" + "users.noreply.github.com",
+                    "+someone" + "@" + "users.noreply.github.com"):
+            with self.subTest(email=bad):
+                self.assertFalse(cm.email_allowed(bad))
+
+    # -- trailers and tags --------------------------------------------------
+
+    def test_a_personal_trailer_fails_and_is_redacted(self):
+        base = self.commit("base")
+        for key in ("Co-authored-by", "Signed-off-by"):
+            with self.subTest(key=key):
+                sha = self.commit(f"t-{key}", body=f"{key}: Jane <{PLANTED}>")
+                out = self.run_tool()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn(f"commit {sha[:12]} trailer", out.stdout)
+                self.assertNotIn(PLANTED, out.stdout + out.stderr)
+                self.git("reset", "-q", "--hard", base)
+
+    def test_the_co_author_trailer_address_passes_only_as_a_trailer(self):
+        coauthor = "noreply" + "@" + "anthropic.com"
+        self.commit("one", body=f"Co-Authored-By: Claude <{coauthor}>")
+        self.assertEqual(self.run_tool().returncode, 0)
+        self.commit("two", author=("Claude", coauthor), committer=CLEAN)
+        self.assertEqual(self.run_tool().returncode, 1)
+
+    def test_a_personal_tagger_fails_and_a_lightweight_tag_is_ignored(self):
+        self.commit("one")
+        self.git("tag", "light")
+        self.git("tag", "-a", "-m", "clean", "clean-tag")
+        out = self.run_tool()
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("1 annotated tag(s)", out.stdout)
+        self.git("tag", "-a", "-m", "planted", "bad-tag", author=CLEAN, committer=("Jane", PLANTED))
+        tag = self.git("rev-parse", "bad-tag").strip()
+        out = self.run_tool()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(f"tag {tag[:12]} tagger", out.stdout)
+        self.assertNotIn(PLANTED, out.stdout + out.stderr)
 
     # -- the empty answer is not a clean one ------------------------------
 
