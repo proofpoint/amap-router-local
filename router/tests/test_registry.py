@@ -22,7 +22,7 @@ from router.tests import helpers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "registry"
 ALPHA_LID = "72a96bbced1aa04414517b96ebbb6179"  # snapshot.json's active entry
-#: amap-host 3f28c782b41df5b701e259c535732e859553ddef:tests/fixtures/skeleton_vectors.json
+#: The host registry's skeleton vectors, at this source commit (fixtures/registry/SOURCE.md).
 SKELETON_SOURCE_SHA = "3f28c782b41df5b701e259c535732e859553ddef"
 SKELETON_SHA256 = "7d4088dc1686aa8daa9a65a4a820ec118bf214ebd51ed112880a81a2955a6d1c"
 SNAPSHOT_SHA256 = "98e5fd3f521e89a4d1ab74574e33a1a2cdb030652ba9c56402f6f16ef7a8e81d"

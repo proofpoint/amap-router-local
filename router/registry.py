@@ -46,7 +46,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from .util import atomic_write
 
 SNAPSHOT = "registry.json"
-#: Schema tokens this reader understands, checked by membership only.
+#: Schema tokens this reader understands, checked by membership only. Each is
+#: an opaque wire identifier written by the registry; its text is never parsed.
 SUPPORTED_SCHEMAS = frozenset({"amap-host.registry/1"})
 #: A larger snapshot is refused before it is read.
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
