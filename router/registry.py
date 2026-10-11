@@ -453,22 +453,36 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
 def stranded_state(state_dir: Path) -> List[str]:
     """The logical_id directories under `state_dir` holding in-flight work
     (pending deliveries, DSN intents). Only ever non-empty after a registry
-    was configured; checked when one is NOT, to fail closed."""
+    was configured; checked when one is NOT, to fail closed.
+
+    Fails CLOSED: a directory that cannot be read (anything but "it does not
+    exist") cannot be shown to be empty, so it is reported as stranded too.
+    A missing `state_dir` or sub-directory is simply empty."""
     out = []
     try:
         entries = list(os.scandir(state_dir))
-    except OSError:
+    except FileNotFoundError:
         return out
+    except OSError as e:
+        return [f"<state_dir unreadable: {type(e).__name__}>"]
     for e in entries:
-        if not (_LOGICAL_ID.fullmatch(e.name) and e.is_dir(follow_symlinks=False)):
+        try:
+            is_lid_dir = _LOGICAL_ID.fullmatch(e.name) and e.is_dir(follow_symlinks=False)
+        except OSError:
+            out.append(e.name)
+            continue
+        if not is_lid_dir:
             continue
         for sub in _IN_FLIGHT_DIRS:
             try:
                 if any(c.name.endswith(".json") for c in os.scandir(os.path.join(e.path, sub))):
                     out.append(e.name)
                     break
-            except OSError:
+            except (FileNotFoundError, NotADirectoryError):
                 continue
+            except OSError:
+                out.append(e.name)            # unreadable: cannot be shown empty
+                break
     return sorted(out)
 
 

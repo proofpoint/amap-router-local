@@ -224,6 +224,14 @@ M = [
   '                if isinstance(held, list):\n                    inst[key] = [h for h in held if isinstance(h, dict)]',
   '                if False:\n                    inst[key] = [h for h in held if isinstance(h, dict)]',
   ['router.tests.test_held_local_status']),
+ ('N11 unreadable state_dir fails open', 'router/registry.py',
+  '    except OSError as e:\n        return [f"<state_dir unreadable: {type(e).__name__}>"]',
+  '    except OSError as e:\n        return out',
+  ['router.tests.test_held_local.StrandedFailsClosedTests']),
+ ('N12 unreadable in-flight dir fails open', 'router/registry.py',
+  '            except OSError:\n                out.append(e.name)            # unreadable: cannot be shown empty\n                break',
+  '            except OSError:\n                continue',
+  ['router.tests.test_held_local.StrandedFailsClosedTests']),
 ]
 
 

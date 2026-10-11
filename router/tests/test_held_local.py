@@ -1358,3 +1358,29 @@ class CollisionPinTests(_Fleet):
         self.assertEqual(list_notices(self.cfg, "bravo"), [])
         rec = json.loads(self.pending("alpha", "00000001").read_text())
         self.assertEqual(rec["targets"][0]["reason"], outbound.HOLD_IDENTITY_CHANGED)
+
+
+
+class StrandedFailsClosedTests(RouterTestCase):
+    """An unreadable state directory cannot be shown empty: held, never
+    read as "nothing stranded"."""
+
+    def test_unreadable_state_dir_and_subdir_are_stranded(self):
+        lid = "a1" * 16
+        (self.state_dir / lid / outbound.PENDING_DIR).mkdir(parents=True)
+        real = os.scandir
+
+        def deny(target):
+            def scandir(path="."):
+                if Path(path) == target:
+                    raise PermissionError(13, "denied")
+                return real(path)
+            return scandir
+        for target in (self.state_dir, self.state_dir / lid / outbound.PENDING_DIR):
+            with self.subTest(target=target.name):
+                with mock.patch.object(registry.os, "scandir", deny(target)):
+                    r = registry.report_for(None, self.state_dir, ["alpha"])
+                self.assertEqual((r.state, r.held), ("stranded", {"alpha": registry.HELD_STRANDED}))
+        # The twins: readable and empty, or missing, is NOT stranded.
+        self.assertEqual(registry.report_for(None, self.state_dir, ["alpha"]).state, "off")
+        self.assertEqual(registry.report_for(None, self.tmp / "nowhere", ["alpha"]).state, "off")

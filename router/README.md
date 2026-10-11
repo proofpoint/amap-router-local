@@ -1257,7 +1257,10 @@ to instances without the registry. If `registry_dir` is absent and any
 is held (`status.json` `registry.state: "stranded"`, reason
 `registry_state_without_registry`, and an error in the log) rather than
 re-delivering completed targets with new ids. Restore `registry_dir`, let
-the work drain, and only then remove it. Without `registry_dir` none of this runs: drains, results, DSNs
+the work drain, and only then remove it. A state directory that cannot be read is
+treated as stranded too (it cannot be shown empty). Only the documented
+path is detected: moving logical_id directories back to names by hand and
+then removing `registry_dir` is not, and re-delivers. Without `registry_dir` none of this runs: drains, results, DSNs
 and `status.json` are as before.
 
 **Known limits, recorded rather than fixed here:**
