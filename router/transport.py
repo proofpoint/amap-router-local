@@ -252,9 +252,12 @@ class HopFsOps(Protocol):
 
     `open_regular_pinned` returns the file's bytes (`bytes`, exactly) once
     it is committed (link count 1), and `self.NOT_YET` for a commit still
-    in flight (link count 2), ON A HOP-TREE BINDING ONLY. Outside a hop
-    tree (an agent-writable volume), a link count of 2 raises like any
-    other count but 1. Any other link count raises. `NOT_YET` is one
+    in flight (link count 2), ON A HOP-TREE OR HOST-INTAKE BINDING ONLY:
+    both are written only by trusted runtimes (a generation tree's sides,
+    and a host intake's `.stage/` publications), so a link count of 2 there
+    is a commit in flight. On any other binding (an agent-writable source),
+    a link count of 2 raises like any other count but 1. Any other link
+    count raises. `NOT_YET` is one
     object per implementation, never a `bytes` instance and identical
     across calls; the two runtimes do not import each other, so there is
     no shared sentinel. Callers dispatch three ways, and the third is a
