@@ -94,19 +94,48 @@ def identities(repo: str) -> List[Tuple[str, str, str, List[str]]]:
     return rows
 
 
+def _tag_object(repo: str, sha: str) -> Tuple[str, str, str]:
+    """`(target_sha, target_type, tagger_email)` from one tag object. A tag
+    object with no tagger line yields "" (a finding: the address cannot be
+    shown to be a no-reply one). An unreadable object raises, and the run
+    fails closed (exit 2)."""
+    raw = subprocess.run(["git", "-C", repo, "cat-file", "tag", sha],
+                         capture_output=True, check=True).stdout.decode("utf-8", "replace")
+    header = raw.split("\n\n", 1)[0]
+    target = kind = email = None
+    for line in header.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "object" and target is None:
+            target = value
+        elif key == "type" and kind is None:
+            kind = value
+        elif key == "tagger" and email is None:
+            lt, gt = value.rfind("<"), value.rfind(">")
+            email = value[lt + 1:gt] if 0 <= lt < gt else ""
+    if target is None or kind is None:
+        raise subprocess.CalledProcessError(1, ["git", "cat-file", "tag", sha])
+    return target, kind, email if email is not None else ""
+
+
 def tags(repo: str) -> List[Tuple[str, str]]:
-    """`(tag_object_sha, tagger_email)` for every annotated tag in the clone."""
+    """`(tag_object_sha, tagger_email)` for EVERY tag object reachable from
+    the tag refs, each once. A tag may point at another tag, and the inner
+    tag object is published through the outer ref even when no ref names it,
+    so each chain is walked to its first non-tag object."""
     out = subprocess.run(
         ["git", "-C", repo, "for-each-ref", "refs/tags",
-         "--format=%(objectname)%00%(objecttype)%00%(taggeremail)"],
+         "--format=%(objectname)%00%(objecttype)"],
         capture_output=True, check=True,
     ).stdout.decode("utf-8", "replace")
-    rows = []
+    rows: List[Tuple[str, str]] = []
+    seen = set()
     for line in out.splitlines():
-        sha, kind, email = line.split("\0")
-        if kind == "tag":
-            rows.append((sha, email[1:-1] if email.startswith("<") and email.endswith(">")
-                         else email))
+        sha, kind = line.split("\0")
+        while kind == "tag" and sha not in seen:
+            seen.add(sha)
+            target, target_kind, email = _tag_object(repo, sha)
+            rows.append((sha, email))
+            sha, kind = target, target_kind
     return rows
 
 

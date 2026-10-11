@@ -191,6 +191,67 @@ class CheckerTests(unittest.TestCase):
         self.assertIn(f"tag {tag[:12]} tagger", out.stdout)
         self.assertNotIn(PLANTED, out.stdout + out.stderr)
 
+    # -- nested tag chains ------------------------------------------------
+
+    def nested(self, inner_tagger):
+        """A bare clone holding ONLY an outer annotated tag whose target is an
+        inner annotated tag (tagged by `inner_tagger`) on a clean commit.
+        Returns (clone path, inner tag object sha)."""
+        self.commit("one")
+        self.git("tag", "-a", "-m", "inner", "inner", author=CLEAN, committer=inner_tagger)
+        inner = self.git("rev-parse", "inner").strip()
+        self.git("tag", "-a", "-m", "outer", "outer", "inner")
+        self.git("tag", "-d", "inner")
+        clone = Path(self._tmp.name) / "clone.git"
+        subprocess.run(["git", "clone", "-q", "--bare", self.repo, str(clone)],
+                       capture_output=True, check=True)
+        refs = subprocess.run(["git", "-C", str(clone), "for-each-ref", "refs/tags",
+                               "--format=%(refname)"], capture_output=True, text=True,
+                              check=True).stdout.split()
+        self.assertEqual(refs, ["refs/tags/outer"], "the clone must name only the outer tag")
+        return clone, inner
+
+    def run_on(self, repo):
+        return subprocess.run([sys.executable, str(TOOL), str(repo)],
+                              capture_output=True, text=True)
+
+    def test_a_clean_nested_chain_passes_and_counts_both_tag_objects(self):
+        clone, _ = self.nested(CLEAN)
+        out = self.run_on(clone)
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("2 annotated tag(s)", out.stdout)
+        # A second ref to the same outer tag object: each object once.
+        outer = subprocess.run(["git", "-C", str(clone), "rev-parse", "refs/tags/outer"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+        subprocess.run(["git", "-C", str(clone), "update-ref", "refs/tags/again", outer],
+                       capture_output=True, check=True)
+        out = self.run_on(clone)
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("2 annotated tag(s)", out.stdout)
+
+    def test_a_personal_inner_tagger_behind_a_clean_outer_tag_fails(self):
+        """The inner tag object is published through the outer ref although
+        no ref names it."""
+        clone, inner = self.nested(("Jane", PLANTED))
+        out = self.run_on(clone)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn(f"tag {inner[:12]} tagger", out.stdout)
+        self.assertNotIn(PLANTED, out.stdout + out.stderr)
+
+    def test_an_unreadable_tag_in_a_chain_fails_closed(self):
+        """A tag object naming a tag object the clone does not have: the run
+        cannot be checked, so it exits 2, never 0."""
+        self.commit("one")
+        missing = "1" * 40
+        body = (f"object {missing}\ntype tag\ntag broken\n"
+                f"tagger Someone <{CLEAN[1]}> 0 +0000\n\nbroken\n")
+        sha = subprocess.run(["git", "-C", self.repo, "hash-object", "-t", "tag", "-w",
+                              "--literally", "--stdin"], input=body.encode(),
+                             capture_output=True, check=True).stdout.decode().strip()
+        self.git("update-ref", "refs/tags/broken", sha)
+        out = self.run_tool()
+        self.assertEqual(out.returncode, 2, out.stdout)
+
     # -- the empty answer is not a clean one ------------------------------
 
     def test_a_repository_with_no_commits_fails_loudly(self):
