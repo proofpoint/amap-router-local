@@ -121,6 +121,7 @@ other instance's.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import json
@@ -204,6 +205,13 @@ def _held_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
     return instance_state_dir(cfg, name) / "held" / f"req-{req_id}.json"
 
 
+class UnreadableRequest(OSError):
+    """`_read_request_pinned` refused the entry for what it IS: not a
+    regular file, or a hard link. An `OSError` so every existing `except
+    OSError` keeps catching it; its own type so a caller can tell this
+    deterministic refusal from a fault (`_unreadable_now`)."""
+
+
 def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
                           cap: int = DEFAULT_READ_CAP) -> bytes:
     """Contract v3.0.0 §2's read-side rule, applied to `outbound/<filename>`
@@ -229,10 +237,10 @@ def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
 
     Raises `ReadTooLargeError` — the SAME type `read_capped` raises — when
     the file exceeds `cap`, so every existing caller's `except
-    ReadTooLargeError` clause keeps working unchanged. Every other
-    refusal (missing file, outbox root not currently a real directory,
-    not a regular file, an `nlink > 1` hard link, ...) raises plain
-    `OSError` (often a natural subtype like `FileNotFoundError` straight
+    ReadTooLargeError` clause keeps working unchanged. Not a regular file,
+    or an `nlink > 1` hard link, raises `UnreadableRequest` (an `OSError`).
+    Every other refusal (missing file, outbox root not currently a real
+    directory, ...) raises plain `OSError` (often a natural subtype like `FileNotFoundError` straight
     from the failing syscall, never re-wrapped into a fresh generic type —
     callers that specifically catch `FileNotFoundError` to distinguish a
     benign concurrent-archive race from a real failure, see
@@ -257,9 +265,9 @@ def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
             try:
                 st = os.fstat(fd)
                 if not stat.S_ISREG(st.st_mode):
-                    raise OSError(f"{filename!r} is not a regular file")
+                    raise UnreadableRequest(f"{filename!r} is not a regular file")
                 if st.st_nlink != 1:
-                    raise OSError(f"{filename!r} has nlink={st.st_nlink} (expected 1)")
+                    raise UnreadableRequest(f"{filename!r} has nlink={st.st_nlink} (expected 1)")
                 limit = cap + 1
                 chunks: List[bytes] = []
                 got = 0
@@ -279,6 +287,43 @@ def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
             os.close(outbox_fd)
     finally:
         os.close(root_fd)
+
+
+#: Errnos from opening the live request that say what the entry IS (a symlink,
+#: a socket), not that reading it failed. Every other errno is a fault that
+#: decides nothing about reuse (`_unreadable_now`).
+_KIND_ERRNOS = frozenset({errno.ELOOP, errno.ENXIO})
+
+
+def _unreadable_now(e: BaseException) -> bool:
+    """True when `_read_request_pinned` refused the live entry for what it
+    is: over the cap, not a regular file or a hard link (`UnreadableRequest`),
+    or a kind the open itself names (ELOOP, ENXIO). False for anything else
+    (EIO, EACCES, EMFILE, ...), which must decide nothing. Positive
+    identification only: an errno-less `OSError` from anywhere else is a
+    fault, not a verdict."""
+    if isinstance(e, (ReadTooLargeError, UnreadableRequest)):
+        return True
+    return isinstance(e, OSError) and e.errno in _KIND_ERRNOS
+
+
+def _live_differs(cfg: RouterConfig, name: str, req_id: str,
+                  stored_digest: Optional[str]) -> bool:
+    """Does `outbound/req-<req_id>.json` now hold a DIFFERENT request from
+    the one whose digest this router stored (an in-flight record's)? An
+    absent entry differs from nothing: there is no other request to answer.
+    An entry that cannot be read for what it is cannot be the readable
+    original, so it differs. A transient fault RAISES: no settlement, no
+    archive and no refusal may be decided on it."""
+    try:
+        raw = _read_request_pinned(cfg, name, f"req-{req_id}.json")
+    except FileNotFoundError:
+        return False
+    except (ReadTooLargeError, OSError) as e:
+        if _unreadable_now(e):
+            return True
+        raise
+    return stored_digest is None or hashlib.sha256(raw).hexdigest() != stored_digest
 
 
 def list_outbound(cfg: RouterConfig, name: str) -> Tuple[List[str], int]:
@@ -1139,9 +1184,26 @@ def _advance_one(
     cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
     transport: inflight_mod.TransportPort,
 ) -> str:
-    """`inflight.advance` with `_finish` as the settle step."""
+    """`inflight.advance` with `_finish` as the settle step.
+
+    A record settles PRIVATELY when the live entry under its req_id is now a
+    different request (a connector reset reused the id): the anchor is
+    written, so this request has its one verdict, and nothing is published
+    into `outbound/results/` or archived from `outbound/`. Publishing it
+    would answer the new file with the old verdict and archive it unsent.
+    The listing then finds the anchor, compares digests, and refuses the
+    new file as `req_id_reused`."""
     def settle(verdict: Dict[str, Any], digest: Optional[str]) -> str:
         result = _result_doc(req_id, **verdict)
+        if _live_differs(cfg, name, req_id, digest):
+            logger.warning(
+                "instance %r req_id %r: the in-flight request settled %r, but "
+                "the outbox now holds a different request under this id; the "
+                "verdict is kept privately and the new request is refused as %s",
+                name, req_id, result["outcome"], REASON_REQ_ID_REUSED,
+            )
+            _write_anchor(cfg, name, req_id, result, req_digest=digest)
+            return result["outcome"]
         return _finish(cfg, name, req_id, result, req_digest=digest)
 
     anchor = _private_result_path(cfg, name, req_id)
@@ -1228,13 +1290,21 @@ def _finish(
     even be read, e.g. it exceeded the read cap). `drain_instance`'s resume
     path compares this against the CURRENT on-disk bytes before ever
     replaying a stored verdict — see `REASON_REQ_ID_REUSED`."""
-    private_path = _private_result_path(cfg, name, req_id)
-    envelope = {"digest": req_digest, "result": result}
-    atomic_write(private_path, json.dumps(envelope, sort_keys=True).encode("utf-8"),
-                 durable_root=cfg.state_dir)
+    _write_anchor(cfg, name, req_id, result, req_digest=req_digest)
     result_bytes = json.dumps(result, sort_keys=True).encode("utf-8")
     _publish_result_and_archive(cfg, name, req_id, result_bytes)
     return result["outcome"]
+
+
+def _write_anchor(
+    cfg: RouterConfig, name: str, req_id: str, result: Dict[str, Any],
+    *, req_digest: Optional[str],
+) -> None:
+    """The private idempotency anchor alone (`_finish`'s first step)."""
+    envelope = {"digest": req_digest, "result": result}
+    atomic_write(_private_result_path(cfg, name, req_id),
+                 json.dumps(envelope, sort_keys=True).encode("utf-8"),
+                 durable_root=cfg.state_dir)
 
 
 def _publish_result_and_archive(
@@ -2049,7 +2119,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     filenames, skipped_symlinks = list_outbound(cfg, name)
 
     drained = resumed = errored = reused = quarantined = held = 0
-    inflight_begun = inflight_waiting = 0
+    inflight_begun = inflight_waiting = reused_pending = 0
     skipped_bad_name = skipped_symlinks
     for filename in filenames:
         if not REQ_NAME_RE.fullmatch(filename):
@@ -2070,12 +2140,28 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                 stored_result = envelope["result"]
 
                 if stored_digest is None:
-                    # D4, rare corner case: the original processing attempt
-                    # never got far enough to read the request bytes (e.g.
-                    # it exceeded the read cap), so no digest exists to
-                    # compare against. Resume as before rather than
-                    # refusing forever on an id we can't disambiguate.
-                    resume_ok = True
+                    # D4: the original could not be read (over the cap, or
+                    # not a readable regular file), so there is no digest.
+                    # It resumes ONLY while the live entry still cannot be
+                    # read for what it is: a readable file under this id is
+                    # a different request, and resuming would answer it with
+                    # the old verdict. A transient fault decides nothing.
+                    try:
+                        _read_request_pinned(cfg, name, filename)
+                    except FileNotFoundError:
+                        resume_ok = True
+                    except (ReadTooLargeError, OSError) as e:
+                        if not _unreadable_now(e):
+                            logger.warning(
+                                "instance %r req_id %r: transient error re-reading "
+                                "the request under a digest-less anchor, skipping "
+                                "this poll: %s: %s", name, req_id, type(e).__name__, e,
+                            )
+                            errored += 1
+                            continue
+                        resume_ok = True
+                    else:
+                        resume_ok = False
                 else:
                     # FIXED: distinguish an ACTUAL digest mismatch from a
                     # transient failure to re-read the bytes at all — the
@@ -2111,22 +2197,30 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                         # ever reading the (oversized) bytes.
                         resume_ok = False
                     except OSError as e:
-                        # A genuine transient read failure (permission
-                        # hiccup, disk error, ...) — not evidence of reuse
-                        # either. Do not commit a false `rejected`/
-                        # `req_id_reused` verdict here; skip this filename
-                        # for THIS poll and let the next drain take a
-                        # fresh read with a fair chance to resolve
-                        # normally.
-                        logger.warning(
-                            "instance %r req_id %r: transient error "
-                            "re-reading the request to verify its digest "
-                            "against the resume anchor, skipping this poll "
-                            "(NOT reporting req_id_reused): %s: %s",
-                            name, req_id, type(e).__name__, e,
-                        )
-                        errored += 1
-                        continue
+                        if _unreadable_now(e):
+                            # Refused for what it IS (a hard link, not a
+                            # regular file). The original was readable, or
+                            # its anchor would have no digest, so this is a
+                            # different request under the id, exactly as a
+                            # now-oversized file is.
+                            resume_ok = False
+                        else:
+                            # A genuine transient read failure (permission
+                            # hiccup, disk error, ...) — not evidence of
+                            # reuse either. Do not commit a false
+                            # `rejected`/`req_id_reused` verdict here; skip
+                            # this filename for THIS poll and let the next
+                            # drain take a fresh read with a fair chance to
+                            # resolve normally.
+                            logger.warning(
+                                "instance %r req_id %r: transient error "
+                                "re-reading the request to verify its digest "
+                                "against the resume anchor, skipping this poll "
+                                "(NOT reporting req_id_reused): %s: %s",
+                                name, req_id, type(e).__name__, e,
+                            )
+                            errored += 1
+                            continue
                     else:
                         resume_ok = current_digest == stored_digest
 
@@ -2180,7 +2274,19 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                     outcomes[outcome] += 1
             elif inflight_mod.record_path(cfg, name, req_id).exists():
                 # In flight: the record carries it now (docstring, IN
-                # FLIGHT). Not drained this poll.
+                # FLIGHT). Not drained this poll. A DIFFERENT request under
+                # the id (a reset connector) is held, never consumed, until
+                # the record settles; it is then refused as req_id_reused.
+                record = inflight_mod.read_record(cfg, name, req_id)
+                if record is not None and _live_differs(
+                        cfg, name, req_id, record.get("digest")):
+                    logger.warning(
+                        "instance %r req_id %r: a different request sits under "
+                        "an id still in flight; held until that settles",
+                        name, req_id,
+                    )
+                    reused_pending += 1
+                    continue
                 inflight_waiting += 1
                 continue
             elif filename in quarantine_set:
@@ -2245,6 +2351,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
            if cfg.registry_dir is not None else {}),
         **({"outbound_inflight_begun": inflight_begun,
             "outbound_inflight_waiting": inflight_waiting,
+            "outbound_req_id_reused_pending": reused_pending,
             **inflight_summary,
             **_inflight_report(cfg, name)} if transport is not None or inflight_summary else {}),
     }
