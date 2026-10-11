@@ -33,9 +33,13 @@ reimplement something here in a sibling runtime, don't; import it.
 
 ## Publication
 
-Released under Apache 2.0, at `proofpoint/amap-router-local`, currently
-PRIVATE. Three things still need a decision each time, and none of them is
-implied by the repo being releasable:
+Released under Apache 2.0, at `proofpoint/amap-router-local`, **PUBLIC**
+since 2026-10-07 (verified 2026-10-09). Everything pushed here is published:
+code, commit messages, PR text, CI logs, and commit author and committer
+emails. A personal address in a commit is a disclosure; CI's
+`commit-metadata` job checks for that, with one recorded exception. Three
+things still need a decision each time, and none of them is implied by the
+repo being releasable:
 
 - **Other repositories in the family.** The release decision named this repo
   and the connector. It is not family-wide, and in particular it does not
@@ -82,7 +86,8 @@ behaviour.
 python3 -m pytest router/tests -q
 ```
 
-**667 tests, ~3 s** (measured 2026-09-24). No docker and no network:
+**893 tests, ~3 s** (measured 2026-10-11, on the registry-consumption
+branch). No docker and no network:
 `router/tests/test_docker.py` pins properties of `docker/` by *reading* it —
 it never builds an image.
 
@@ -393,9 +398,25 @@ dependency has to be a visible diff there rather than a quiet import.
 
 ### Instance names are path components
 
-`_NAME_RE` in `config.py` is `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` — the sandy
-slug alphabet, so **the instance name IS the slug**, spelled the same way.
+`_NAME_RE` in `config.py` is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z`, applied
+with `fullmatch` — the sandy slug alphabet. It was `^...$` applied with
+`match`, which accepted `"name\n"` (`$` also matches before a final newline)
+and handed it on as a path component; other `$`-anchored filename patterns
+in the package still have that shape and are queued for the same fix.
+
+**Without a registry, the instance name IS the slug**, spelled the same way.
 Nothing derives one name from another and nothing holds a mapping.
+
+**With `registry_dir`, the host registry is that mapping** (contract §2.1).
+The registry (written by the host-level owner, read-only here,
+`router/registry.py`) maps each identity's permanent `logical_id` to its
+current name. A configured instance is drained only when its name is an
+active, uncontested registry entry; anything else is HELD and shown in
+`status.json`. Private state moves to `state_dir/<logical_id>/` so that an
+operator name override never moves a directory or orphans state; until that
+re-keying lands, state is still name-keyed. The registry's `skeleton()`
+(casefold, a fixed confusables fold, separators removed) is the collision
+rule there, pinned to the registry owner's fixture vectors.
 
 It was `^[a-z0-9][a-z0-9-]{0,63}$` until the widening, and the two properties
 that charset gave away for free are now checks, both written BEFORE the
