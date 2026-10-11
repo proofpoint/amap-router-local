@@ -23,7 +23,7 @@
 # first; without it those rows render as UNKNOWN.
 #
 # Environment overrides: AMAP_ROUTER_CONTAINER, AMAP_ROUTER_CONFIG,
-# AMAP_CONSOLE_OUT, AMAP_HOST_FACTS, AMAP_SANDY.
+# AMAP_CONSOLE_OUT, AMAP_FACTS_FILE, AMAP_SANDY.
 #
 # The page carries real addresses and real message bodies. It is written
 # readable by you alone (umask 077) and served by nothing. Do not publish it
@@ -35,7 +35,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 container="${AMAP_ROUTER_CONTAINER:-amap-router-local}"
 config="${AMAP_ROUTER_CONFIG:-}"
 out="${AMAP_CONSOLE_OUT:-$HOME/.sandy/console.html}"
-host_facts="${AMAP_HOST_FACTS:-}"
+host_facts="${AMAP_FACTS_FILE:-}"
 open_it=1
 
 usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
