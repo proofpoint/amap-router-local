@@ -30,6 +30,10 @@
                                  (for a connector counter reset the router cannot see). Needs the router
                                  stopped (the drain lock is fail-fast); --dry-run prints the plan and
                                  writes nothing.
+  aliases reinit --reason TEXT [--dry-run]
+                                 rebuild an unverified alias tombstone store (the router must be
+                                 stopped). It PERMANENTLY retires every configured alias:
+                                 tombstoned addresses can never be re-enabled.
   generation adopt NAME --reason TEXT [--dry-run] [--no-transport-history=N]
   generation fence-legacy NAME --reason TEXT [--dry-run] [--no-transport-history=N]
                                  under a registry: migrate NAME's pre-generation state, held as
@@ -165,6 +169,15 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="attest that this instance never had a transport route, when "
                               "its transport counter is absent and exactly N local anchors "
                               "remain (refused if N differs)")
+
+    p_al = sub.add_parser("aliases", help="operator verbs on the alias table's tombstone store")
+    al_sub = p_al.add_subparsers(dest="aliases_command", required=True)
+    p_ri = al_sub.add_parser(
+        "reinit", help="rebuild an unverified tombstone store; PERMANENTLY retires every "
+                       "configured alias")
+    p_ri.add_argument("--reason", required=True, help="why (written to the store's audit log)")
+    p_ri.add_argument("--dry-run", action="store_true",
+                      help="list what would be tombstoned; take no lock and write nothing")
 
     return parser
 
@@ -494,6 +507,17 @@ def main(argv=None) -> int:
         except OperatorRefused as e:
             print(f"router: generation {args.gen_command}: refused: {e}", file=sys.stderr)
             return 1
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+
+    if args.command == "aliases":
+        from . import aliases as aliases_mod
+        try:
+            plan = aliases_mod.reinit(cfg, args.reason, dry_run=args.dry_run)
+        except aliases_mod.ReinitRefused as e:
+            print(f"router: aliases reinit: refused: {e}", file=sys.stderr)
+            return 1
+        print(f"router: aliases reinit: {aliases_mod.REINIT_WARNING}", file=sys.stderr)
         print(json.dumps(plan, sort_keys=True))
         return 0
 

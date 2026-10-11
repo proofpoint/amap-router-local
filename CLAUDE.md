@@ -406,8 +406,10 @@ dependency has to be a visible diff there rather than a quiet import.
 `_NAME_RE` in `config.py` is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z`, applied
 with `fullmatch` — the sandy slug alphabet. It was `^...$` applied with
 `match`, which accepted `"name\n"` (`$` also matches before a final newline)
-and handed it on as a path component; other `$`-anchored filename patterns
-in the package still have that shape and are queued for the same fix.
+and handed it on as a path component. Every validator pattern in the
+package is now anchored with `\Z` and applied with `fullmatch`, and
+`router/tests/test_name_anchors.py` pins both rules structurally, across the
+package, beside a behavioural witness per site.
 
 **Without a registry, the instance name IS the slug**, spelled the same way.
 Nothing derives one name from another and nothing holds a mapping.
@@ -417,9 +419,16 @@ The registry (written by the host-level owner, read-only here,
 `router/registry.py`) maps each identity's permanent `logical_id` to its
 current name. A configured instance is drained only when its name is an
 active, uncontested registry entry; anything else is HELD and shown in
-`status.json`. Private state moves to `state_dir/<logical_id>/` so that an
-operator name override never moves a directory or orphans state; until that
-re-keying lands, state is still name-keyed. The registry's `skeleton()`
+`status.json`. Private state lives under `state_dir/<logical_id>/`, so an
+operator name override never moves a directory or orphans state. Within it,
+state that belongs to one life of the connector lives under a GENERATION,
+`gen-<g>/` (`router/generations.py`): a new one begins on a registry rebind
+or a change of the instance root's identity (path, device and inode, read
+from the descriptor the drain then uses), or by the operator, and the old
+one is fenced, never deleted. An old address keeps working only through the
+alias table in the router config (`router/aliases.py`), which maps an exact
+old address to the identity's current one before any routing decision, until
+it expires and is tombstoned. The registry's `skeleton()`
 (casefold, a fixed confusables fold, separators removed) is the collision
 rule there, pinned to the registry owner's fixture vectors.
 

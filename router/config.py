@@ -89,6 +89,9 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
     registry entry; every other instance is HELD and reported. Absent,
     nothing changes. It must not be inside `state_dir` or any instance
     root: an agent-reachable registry would let an agent choose identities.
+  - `aliases` — the alias table, `[{"old", "new", "expires"}]`, under a
+    registry and a fleet domain only (`router/aliases.py`; README,
+    "Aliases"). What does not depend on the registry is checked here.
   - `transport_plugin` — `{"path": <absolute path>, "sha256": <64 hex>}`,
     the optional transport plugin, pinned by path and content hash, never
     by import name (`router/transport.py`). Both members or the key absent:
@@ -178,7 +181,7 @@ ID_SHAPED_NAME_RE = re.compile(r"[0-9a-fA-F]{32}\Z")
 #: replace an existing entry) need no entry here: the first is not a valid
 #: name, the second cannot take over a directory that exists.
 #: `test_state_rekey` pins this set against the modules that own them.
-RESERVED_STATE_NAMES = frozenset({"registry", "status.json"})
+RESERVED_STATE_NAMES = frozenset({"registry", "status.json", "aliases"})
 
 #: Connector ids for `outbound/ext/<id>/outcomes/` — the directories
 #: `outcomes._consume_dir` scans, in this order. The spec ("The Volume
@@ -201,7 +204,7 @@ _TOP_KEYS = {
     "task_graph", "mail_graph",
     "instances_dir", "selected_json",
     "peer_senders", "peers",
-    "transport_plugin", "registry_dir",
+    "transport_plugin", "registry_dir", "aliases",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders"}
 
@@ -486,6 +489,13 @@ class RouterConfig:
     #: The host registry's directory, or None for none (`registry_dir` in
     #: the module docstring).
     registry_dir: Optional[Path] = None
+    #: The alias table (`aliases` in the module docstring; `router/aliases.py`),
+    #: validated at load. Empty without one.
+    aliases: Tuple["AliasEntry", ...] = ()
+    #: Per poll: this poll's alias decisions (`aliases.AliasView`), attached by
+    #: the service's pre-pass. None means none was computed: aliases are then
+    #: never applied (and a table-named address is held, `aliases.normalise`).
+    alias_view: Any = field(default=None, compare=False)
     #: Per poll, under a registry: instance name -> the directory name its
     #: private state lives under (its logical_id). Empty otherwise, and a
     #: name absent from it keeps its own name (`state_key`). Set by the
@@ -1477,6 +1487,7 @@ def load_obj(
         selected_json=selected_json,
         transport_plugin=transport_plugin,
         registry_dir=registry_dir,
+        aliases=_aliases(top, registry_dir, fleet_domain),
     )
 
     # The two lanes are DISJOINT per ordered pair. A pair that is both a
@@ -1496,6 +1507,89 @@ def load_obj(
                     f"per ordered pair, or the sender could choose its lane"
                 )
     return cfg
+
+
+@dataclass(frozen=True)
+class AliasEntry:
+    """One row of the alias table: exact `old` address, canonical `new`
+    address (`<name>@<fleet_domain>`), and when it stops (`expires`, a UTC
+    timestamp string as written)."""
+    old: str
+    new: str
+    expires: str
+
+
+_ALIAS_KEYS = frozenset({"old", "new", "expires"})
+
+
+def _alias_parts(addr: Any, where: str) -> Tuple[str, str]:
+    """`(local, domain)` of an exact, normalised address: the local part a
+    valid instance name (ASCII, `_NAME_RE`), the domain a lowercase label
+    sequence. Anything else is a ConfigError."""
+    if not isinstance(addr, str) or addr.count("@") != 1:
+        raise ConfigError(f"{where}: expected one exact address, got {addr!r}")
+    local, domain = addr.split("@")
+    if not _NAME_RE.fullmatch(local):
+        raise ConfigError(f"{where}: the local part {local!r} is not a valid name "
+                          "(ASCII letters, digits, '.', '_' and '-')")
+    if not _FLEET_DOMAIN_RE.fullmatch(domain):
+        raise ConfigError(f"{where}: the domain {domain!r} is not a normalised "
+                          "(lowercase) domain")
+    return local, domain
+
+
+def _aliases(top: Dict[str, Any], registry_dir: Optional[Path],
+             fleet_domain: Optional[str]) -> Tuple[AliasEntry, ...]:
+    """`aliases`: a list of `{old, new, expires}` (contract §2.3). Checked
+    here, once, for everything that does not depend on the registry: the
+    shapes; `new` a canonical address in this fleet's domain; a parseable
+    `expires`; no `old` twice; no chain or cycle (no `new` is any `old`);
+    `old` never `new`; `old`'s local part never a reserved name's skeleton;
+    and a same-domain alias whose local part has its own target's skeleton
+    (a case or confusable variant, which the registry would refuse as a
+    name). Everything that depends on the registry is decided per poll
+    (`router/aliases.py`). Needs a registry and a fleet domain."""
+    from .registry import RESERVED_LOCAL_PARTS, skeleton
+    from .util import parse_utc_ts
+    if "aliases" not in top:
+        return ()
+    raw = top["aliases"]
+    if registry_dir is None or not fleet_domain:
+        raise ConfigError("config.aliases: needs registry_dir and fleet_domain (an alias "
+                          "maps to an identity's current canonical address)")
+    if not isinstance(raw, list):
+        raise ConfigError("config.aliases: expected a list of {old, new, expires}")
+    out: List[AliasEntry] = []
+    reserved = {skeleton(r) for r in RESERVED_LOCAL_PARTS}
+    for i, e in enumerate(raw):
+        where = f"config.aliases[{i}]"
+        if not isinstance(e, dict) or set(e) != _ALIAS_KEYS:
+            raise ConfigError(f"{where}: expected exactly {{old, new, expires}}")
+        old_local, old_domain = _alias_parts(e["old"], f"{where}.old")
+        new_local, new_domain = _alias_parts(e["new"], f"{where}.new")
+        if new_domain != fleet_domain:
+            raise ConfigError(f"{where}.new: must be a canonical address in "
+                              f"{fleet_domain!r}, got {e['new']!r}")
+        if not isinstance(e["expires"], str) or parse_utc_ts(e["expires"]) is None:
+            raise ConfigError(f"{where}.expires: expected a UTC timestamp, got "
+                              f"{e['expires']!r}")
+        if e["old"] == e["new"]:
+            raise ConfigError(f"{where}: old and new are the same address")
+        if skeleton(old_local) in reserved:
+            raise ConfigError(f"{where}.old: {old_local!r} collides with a reserved name")
+        if old_domain == new_domain and skeleton(old_local) == skeleton(new_local):
+            raise ConfigError(f"{where}: {e['old']!r} is a variant of its own target "
+                              f"{e['new']!r} in the same domain")
+        out.append(AliasEntry(e["old"], e["new"], e["expires"]))
+    olds = [a.old for a in out]
+    dup = sorted({o for o in olds if olds.count(o) > 1})
+    if dup:
+        raise ConfigError(f"config.aliases: {dup} listed more than once")
+    chained = sorted({a.new for a in out} & set(olds))
+    if chained:
+        raise ConfigError(f"config.aliases: {chained} is both a target and an old address "
+                          "(no chains or cycles)")
+    return tuple(out)
 
 
 def _connector_outcome_ids(top: Dict[str, Any]) -> Tuple[str, ...]:
