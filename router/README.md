@@ -306,6 +306,19 @@ slate, not a clean one:
   with the stored verdict without being delivered again. `ts` is optional,
   so a template-like request can repeat exactly. Telling the two apart
   needs a connector incarnation id, which AMAP does not carry.
+
+  **Residual, accepted:** the comparison and the archive are two steps. A
+  different file written at the name between the digest check and the
+  archive rename still receives the stored verdict and is archived. The
+  same window exists on the anchor-resume path. Closing it needs the
+  archive to verify what it moves, which is not done here.
+
+  The same rule answers an agent that REWRITES its own request while it is
+  in flight: the staged copy was handed over and may well have been sent,
+  but the rewritten file is refused as `req_id_reused`. Nothing here can
+  tell a rewrite from a reset connector's reuse. An agent that reads that
+  refusal as "not sent" and resubmits the content under a new id may send
+  it twice.
 - **Stale first-sight snapshot.** `state_dir/<name>/first-seen.json` carries
   the `outbox_snapshot` that gates the staged-request quarantine (above).
   Keep it across a mailbox wipe and a genuinely NEW post-reset file that

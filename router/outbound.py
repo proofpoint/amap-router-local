@@ -205,6 +205,13 @@ def _held_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
     return instance_state_dir(cfg, name) / "held" / f"req-{req_id}.json"
 
 
+class UnreadableRequest(OSError):
+    """`_read_request_pinned` refused the entry for what it IS: not a
+    regular file, or a hard link. An `OSError` so every existing `except
+    OSError` keeps catching it; its own type so a caller can tell this
+    deterministic refusal from a fault (`_unreadable_now`)."""
+
+
 def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
                           cap: int = DEFAULT_READ_CAP) -> bytes:
     """Contract v3.0.0 §2's read-side rule, applied to `outbound/<filename>`
@@ -230,10 +237,10 @@ def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
 
     Raises `ReadTooLargeError` — the SAME type `read_capped` raises — when
     the file exceeds `cap`, so every existing caller's `except
-    ReadTooLargeError` clause keeps working unchanged. Every other
-    refusal (missing file, outbox root not currently a real directory,
-    not a regular file, an `nlink > 1` hard link, ...) raises plain
-    `OSError` (often a natural subtype like `FileNotFoundError` straight
+    ReadTooLargeError` clause keeps working unchanged. Not a regular file,
+    or an `nlink > 1` hard link, raises `UnreadableRequest` (an `OSError`).
+    Every other refusal (missing file, outbox root not currently a real
+    directory, ...) raises plain `OSError` (often a natural subtype like `FileNotFoundError` straight
     from the failing syscall, never re-wrapped into a fresh generic type —
     callers that specifically catch `FileNotFoundError` to distinguish a
     benign concurrent-archive race from a real failure, see
@@ -258,9 +265,9 @@ def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
             try:
                 st = os.fstat(fd)
                 if not stat.S_ISREG(st.st_mode):
-                    raise OSError(f"{filename!r} is not a regular file")
+                    raise UnreadableRequest(f"{filename!r} is not a regular file")
                 if st.st_nlink != 1:
-                    raise OSError(f"{filename!r} has nlink={st.st_nlink} (expected 1)")
+                    raise UnreadableRequest(f"{filename!r} has nlink={st.st_nlink} (expected 1)")
                 limit = cap + 1
                 chunks: List[bytes] = []
                 got = 0
@@ -290,12 +297,14 @@ _KIND_ERRNOS = frozenset({errno.ELOOP, errno.ENXIO})
 
 def _unreadable_now(e: BaseException) -> bool:
     """True when `_read_request_pinned` refused the live entry for what it
-    is: over the cap, not a regular file, a hard link (plain `OSError`, no
-    errno), or a kind the open itself names. False for a transient fault
-    (EIO, EACCES, EMFILE, ...), which must decide nothing."""
-    if isinstance(e, ReadTooLargeError):
+    is: over the cap, not a regular file or a hard link (`UnreadableRequest`),
+    or a kind the open itself names (ELOOP, ENXIO). False for anything else
+    (EIO, EACCES, EMFILE, ...), which must decide nothing. Positive
+    identification only: an errno-less `OSError` from anywhere else is a
+    fault, not a verdict."""
+    if isinstance(e, (ReadTooLargeError, UnreadableRequest)):
         return True
-    return isinstance(e, OSError) and (e.errno is None or e.errno in _KIND_ERRNOS)
+    return isinstance(e, OSError) and e.errno in _KIND_ERRNOS
 
 
 def _live_differs(cfg: RouterConfig, name: str, req_id: str,
@@ -2188,22 +2197,30 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                         # ever reading the (oversized) bytes.
                         resume_ok = False
                     except OSError as e:
-                        # A genuine transient read failure (permission
-                        # hiccup, disk error, ...) — not evidence of reuse
-                        # either. Do not commit a false `rejected`/
-                        # `req_id_reused` verdict here; skip this filename
-                        # for THIS poll and let the next drain take a
-                        # fresh read with a fair chance to resolve
-                        # normally.
-                        logger.warning(
-                            "instance %r req_id %r: transient error "
-                            "re-reading the request to verify its digest "
-                            "against the resume anchor, skipping this poll "
-                            "(NOT reporting req_id_reused): %s: %s",
-                            name, req_id, type(e).__name__, e,
-                        )
-                        errored += 1
-                        continue
+                        if _unreadable_now(e):
+                            # Refused for what it IS (a hard link, not a
+                            # regular file). The original was readable, or
+                            # its anchor would have no digest, so this is a
+                            # different request under the id, exactly as a
+                            # now-oversized file is.
+                            resume_ok = False
+                        else:
+                            # A genuine transient read failure (permission
+                            # hiccup, disk error, ...) — not evidence of
+                            # reuse either. Do not commit a false
+                            # `rejected`/`req_id_reused` verdict here; skip
+                            # this filename for THIS poll and let the next
+                            # drain take a fresh read with a fair chance to
+                            # resolve normally.
+                            logger.warning(
+                                "instance %r req_id %r: transient error "
+                                "re-reading the request to verify its digest "
+                                "against the resume anchor, skipping this poll "
+                                "(NOT reporting req_id_reused): %s: %s",
+                                name, req_id, type(e).__name__, e,
+                            )
+                            errored += 1
+                            continue
                     else:
                         resume_ok = current_digest == stored_digest
 

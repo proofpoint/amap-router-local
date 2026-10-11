@@ -27,6 +27,7 @@ pins that.
 from __future__ import annotations
 
 import errno
+import os
 import shutil
 from unittest import mock
 
@@ -101,6 +102,57 @@ class InflightReuseTests(_InflightCase):
         self.drain()
         r = self.result()
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
+        self.assertEqual(_anchor(self.cfg, "alice")["result"]["outcome"], "accepted")
+
+    def test_a_hard_linked_reuse_is_refused(self):
+        """A hard link at the name is refused for what it is (no errno), so
+        it differs from the readable original: settled privately, then
+        refused. It must not be skipped as a transient fault forever."""
+        self._in_flight()
+        _connector_reset(self.cfg, "alice")
+        live = self.cfg.instances["alice"].outbox_root / "req-00000001.json"
+        other = self.tmp / "elsewhere.json"
+        other.write_bytes(live.read_bytes())
+        live.unlink()
+        os.link(other, live)
+        self.port.send_all()
+        s = self.drain()
+        r = self.result()
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
+        self.assertEqual(s["outbound_errored"], 0)
+        self.assertEqual(_anchor(self.cfg, "alice")["result"]["outcome"], "accepted")
+
+    def test_a_directory_at_the_name_settles_privately(self):
+        """Not a regular file: refused for what it is, so the readable
+        original's verdict is kept privately and nothing is published. The
+        listing never offers a non-regular entry, so no refusal follows; the
+        point is that the record settles instead of stalling."""
+        self._in_flight()
+        _connector_reset(self.cfg, "alice")
+        live = self.cfg.instances["alice"].outbox_root / "req-00000001.json"
+        live.unlink()
+        live.mkdir()
+        self.port.send_all()
+        s = self.drain()
+        self.assertEqual(s["inflight_errored"], 0)
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
+        self.assertEqual(_anchor(self.cfg, "alice")["result"]["outcome"], "accepted")
+        self.assertFalse(self.has_result())
+        self.assertTrue(live.is_dir())
+
+    def test_a_symlink_kind_at_the_open_is_refused(self):
+        """ELOOP from the open names what the entry is: a verdict, not a
+        transient fault."""
+        self._in_flight()
+        self.port.send_all()
+
+        def eloop(cfg, name, filename, *a, **kw):
+            raise OSError(errno.ELOOP, "a symlink at the name")
+        with mock.patch.object(outbound, "_read_request_pinned", eloop):
+            s = self.drain()
+        r = self.result()
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
+        self.assertEqual(s["inflight_errored"], 0)
         self.assertEqual(_anchor(self.cfg, "alice")["result"]["outcome"], "accepted")
 
     def test_an_absent_live_entry_settles_as_before(self):
@@ -189,3 +241,18 @@ class DigestlessAnchorReuseTests(RouterTestCase):
         self.assertTrue(self.live.is_file())
         s = outbound.drain_instance(self.cfg, "alice")
         self.assertEqual(s["outbound_req_id_reused"], 1)
+
+    def test_a_hard_link_under_a_digestless_anchor_resumes(self):
+        """Still unreadable for what it is (a hard link), so the stored
+        refusal resumes; it is never skipped as a transient fault. (A
+        directory or FIFO at the name is never listed, so this path sees
+        only regular files and hard links.)"""
+        self._settle_oversized()
+        other = self.tmp / "elsewhere.json"
+        other.write_bytes(b"{}")
+        os.link(other, self.live)
+        s = outbound.drain_instance(self.cfg, "alice")
+        self.assertEqual((s["outbound_resumed"], s["outbound_req_id_reused"],
+                          s["outbound_errored"]), (1, 0, 0))
+        r = read_json(result_path(self.cfg, "alice", "00000001"))
+        self.assertEqual(r["reason_code"], "malformed_request")
