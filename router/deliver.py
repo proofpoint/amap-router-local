@@ -83,6 +83,7 @@ from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
 from . import exposure as exposure_mod
+from . import generations as generations_mod
 from .config import (RouterConfig, address_for, router_address, state_key, target_hold,
                      target_known_id)
 from .util import atomic_write, mint_notice_id, utc_ts
@@ -328,7 +329,7 @@ def _place(
     message_doc: Dict[str, Any], notice_doc: Dict[str, Any], ledger_bytes: bytes,
     attachments: List[attachments_mod.VerifiedAttachment],
     audit_line: Optional[bytes] = None, audit_instance: Optional[str] = None,
-    recipient_key: Optional[str] = None,
+    recipient_key: Optional[str] = None, cfg: Optional[RouterConfig] = None,
 ) -> None:
     """THE commit routine, for every tree this router writes: blobs ->
     message spool -> ledger -> [audit] -> notice LAST (module docstring).
@@ -357,7 +358,29 @@ def _place(
     # could reference them (§2 "Byte-absence is the gate"). Pinned-fd
     # discipline all the way from `root` (see `attachments.py`'s module
     # docstring); a no-op when `attachments` is empty.
-    attachments_mod.publish_attachment_blobs(root, tree_root, notice_id, attachments)
+    # Under a registry, every write goes through a root descriptor that must
+    # be the directory the recipient's CURRENT generation recorded: a root
+    # replaced since the poll's pre-pass gets nothing (`generations`).
+    try:
+        expect_root = generations_mod.expected_root(cfg, recipient) if cfg is not None else None
+    except (LookupError, generations_mod.GenerationHeld):
+        raise RecipientHeld(recipient, generations_mod.HELD_RECIPIENT_UNRESOLVED) from None
+    try:
+        _commit(root=root, tree_root=tree_root, state_dir=state_dir, recipient=recipient,
+                notice_id=notice_id, message_doc=message_doc, notice_doc=notice_doc,
+                ledger_bytes=ledger_bytes, attachments=attachments, audit_line=audit_line,
+                audit_instance=audit_instance, recipient_key=recipient_key,
+                expect_root=expect_root)
+    except attachments_mod.RootChanged:
+        raise RecipientHeld(recipient, generations_mod.HELD_RECIPIENT_ROOT) from None
+
+
+def _commit(*, root, tree_root, state_dir, recipient, notice_id, message_doc, notice_doc,
+            ledger_bytes, attachments, audit_line, audit_instance, recipient_key,
+            expect_root) -> None:
+    """`_place`'s writes, in its order, each through a verified root."""
+    attachments_mod.publish_attachment_blobs(root, tree_root, notice_id, attachments,
+                                             expect_root=expect_root)
 
     message_path = tree_root / "messages" / f"notice-{notice_id}.json"
     notice_path = tree_root / "notices" / f"notice-{notice_id}.json"
@@ -368,13 +391,15 @@ def _place(
 
     # 2. Message spool -> 3. ledger -> [audit] -> 4. notice LAST.
     attachments_mod.write_agent_visible(
-        root, message_path, json.dumps(message_doc, sort_keys=True).encode("utf-8")
+        root, message_path, json.dumps(message_doc, sort_keys=True).encode("utf-8"),
+        expect_root=expect_root,
     )
     atomic_write(ledger_path, ledger_bytes)
     if audit_line is not None and audit_instance is not None:
         audit_mod.append_bytes(state_dir, audit_instance, audit_line, state_key=recipient_key)
     attachments_mod.write_agent_visible(
-        root, notice_path, json.dumps(notice_doc, sort_keys=True).encode("utf-8")
+        root, notice_path, json.dumps(notice_doc, sort_keys=True).encode("utf-8"),
+        expect_root=expect_root,
     )
 
 
@@ -454,7 +479,7 @@ def deliver(
     )
     ledger_bytes = _stamp_ids(cfg, ledger_bytes, sender, recipient)
     _place(
-        root=recipient_cfg.root, tree_root=recipient_cfg.inbox_root, state_dir=state_dir,
+        cfg=cfg, root=recipient_cfg.root, tree_root=recipient_cfg.inbox_root, state_dir=state_dir,
         recipient=recipient, notice_id=notice_id, recipient_key=recipient_key,
         message_doc=message_doc, notice_doc=notice_doc, ledger_bytes=ledger_bytes,
         attachments=attachments,
@@ -557,7 +582,7 @@ def deliver_peer(
         },
     )
     _place(
-        root=recipient_cfg.root, tree_root=recipient_cfg.peer_root, state_dir=state_dir,
+        cfg=cfg, root=recipient_cfg.root, tree_root=recipient_cfg.peer_root, state_dir=state_dir,
         recipient=recipient, notice_id=notice_id, recipient_key=recipient_key,
         message_doc=message_doc, notice_doc=notice_doc, ledger_bytes=ledger_bytes,
         attachments=attachments,
@@ -634,7 +659,7 @@ def deliver_router_notice(
     fields.update(audit_fields or {})
     audit_line = audit_mod.build_line(audit_mod.EVENT_DSN_SENT, recipient, fields)
     _place(
-        root=recipient_cfg.root, tree_root=recipient_cfg.inbox_root, state_dir=state_dir,
+        cfg=cfg, root=recipient_cfg.root, tree_root=recipient_cfg.inbox_root, state_dir=state_dir,
         recipient=recipient, notice_id=notice_id, recipient_key=recipient_key,
         message_doc=message_doc, notice_doc=notice_doc, ledger_bytes=ledger_bytes,
         attachments=[],

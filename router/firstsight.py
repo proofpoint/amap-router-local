@@ -71,6 +71,9 @@ FIRST_SEEN_FILENAME = "first-seen.json"
 #: The pre-retirement marker. Adopted once, on upgrade, so an existing
 #: deployment does not take a fresh snapshot and quarantine a live outbox.
 LEGACY_APPROVAL_FILENAME = "approval.json"
+#: Under a registry, written in the generation BEFORE the marker: proof that
+#: first sight was taken there, which a lost marker cannot erase.
+FIRST_SIGHT_TAKEN = "first-sight.taken"
 
 
 # Verbatim from outbound.py's REQ_NAME_RE — duplicated rather than imported
@@ -203,7 +206,7 @@ def record_first_sight(cfg: RouterConfig, name: str) -> Tuple[Dict[str, Any], bo
             f"first sight: {name!r} names no configured instance "
             f"(known: {sorted(cfg.instances)})"
         )
-    key = config_mod.state_key(cfg, name)
+    key = config_mod.gen_key(cfg, name)
     existing = read_marker(cfg.state_dir, name, state_key=key)
     if existing is not None:
         return existing, False
@@ -243,6 +246,13 @@ def record_first_sight(cfg: RouterConfig, name: str) -> Tuple[Dict[str, Any], bo
             "on is an ordinary send. Remedy for a false positive: resubmit under "
             "a fresh req_id.", name, len(snapshot),
         )
+    if cfg.registry_dir is not None:
+        # Under a registry, first sight is recorded TWICE, the sentinel first:
+        # a generation whose marker is later lost still shows it took first
+        # sight, so it is held (`generations`, first_sight_marker_lost) and
+        # never re-snapshotted, which would move the quarantine line forward.
+        atomic_write(cfg.state_dir / key / FIRST_SIGHT_TAKEN, doc["first_seen_ts"].encode(),
+                     durable_root=cfg.state_dir)
     atomic_write(
         marker_path(cfg.state_dir, name, state_key=key),
         json.dumps(doc, sort_keys=True).encode("utf-8"),

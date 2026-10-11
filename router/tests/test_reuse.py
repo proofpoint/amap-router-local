@@ -184,21 +184,40 @@ class InflightReuseTests(_InflightCase):
         self.assertEqual(s["outbound_req_id_reused"], 0)
 
     def test_a_transient_read_fault_at_settle_decides_nothing(self):
+        """EIO, EACCES and EMFILE each decide nothing: no anchor, the record
+        kept, and a clean poll completes it."""
+        real = outbound._read_request_pinned
+        for code in (errno.EIO, errno.EACCES, errno.EMFILE):
+            with self.subTest(errno=errno.errorcode[code]):
+                self.setUp()
+                self._in_flight()
+                self.port.send_all()
+
+                def fault(cfg, name, filename, *a, _code=code, **kw):
+                    raise OSError(_code, os.strerror(_code))
+                with mock.patch.object(outbound, "_read_request_pinned", fault):
+                    s = self.drain()
+                self.assertFalse(self.has_result())
+                self.assertFalse(
+                    outbound._private_result_path(self.cfg, "alice", "00000001").exists())
+                self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
+                self.assertEqual(s["inflight_errored"], 1)
+                self.assertIs(outbound._read_request_pinned, real)
+                self.drain()
+                self.assertEqual(_published(self, self.cfg, "alice")["outcome"], "accepted")
+
+    def test_a_socket_kind_at_the_open_is_refused(self):
+        """ENXIO from the open names what the entry is (a socket): a verdict."""
         self._in_flight()
         self.port.send_all()
-        real = outbound._read_request_pinned
 
-        def eio(cfg, name, filename, *a, **kw):
-            raise OSError(errno.EIO, "EIO reading the live entry")
-        with mock.patch.object(outbound, "_read_request_pinned", eio):
+        def enxio(cfg, name, filename, *a, **kw):
+            raise OSError(errno.ENXIO, "a socket at the name")
+        with mock.patch.object(outbound, "_read_request_pinned", enxio):
             s = self.drain()
-        self.assertFalse(self.has_result())
-        self.assertFalse(outbound._private_result_path(self.cfg, "alice", "00000001").exists())
-        self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
-        self.assertEqual(s["inflight_errored"], 1)
-        self.assertIs(outbound._read_request_pinned, real)
-        self.drain()
-        self.assertEqual(_published(self, self.cfg, "alice")["outcome"], "accepted")
+        r = _published(self, self.cfg, "alice")
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
+        self.assertEqual(s["inflight_errored"], 0)
 
 
 class DigestlessAnchorReuseTests(RouterTestCase):
@@ -239,12 +258,18 @@ class DigestlessAnchorReuseTests(RouterTestCase):
         self.assertEqual((s["outbound_req_id_reused"], s["outbound_resumed"]), (0, 1))
 
     def test_a_transient_fault_under_a_digestless_anchor_decides_nothing(self):
+        for code in (errno.EIO, errno.EACCES, errno.EMFILE):
+            with self.subTest(errno=errno.errorcode[code]):
+                self.setUp()
+                self._one_transient_under_a_digestless_anchor(code)
+
+    def _one_transient_under_a_digestless_anchor(self, code):
         self._settle_oversized()
         write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], body_text="new")
 
-        def eio(cfg, name, filename, *a, **kw):
-            raise OSError(errno.EIO, "EIO reading the live entry")
-        with mock.patch.object(outbound, "_read_request_pinned", eio):
+        def fault(cfg, name, filename, *a, **kw):
+            raise OSError(code, os.strerror(code))
+        with mock.patch.object(outbound, "_read_request_pinned", fault):
             s = outbound.drain_instance(self.cfg, "alice")
         self.assertEqual((s["outbound_req_id_reused"], s["outbound_resumed"],
                           s["outbound_errored"]), (0, 0, 1))

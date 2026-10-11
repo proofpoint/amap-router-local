@@ -80,6 +80,10 @@ EVENT_RESET = "reset"
 EVENT_DELIVERY_HELD = "delivery_held"
 #: A router-authored DSN queued because its target is held; same rule.
 EVENT_DSN_HELD = "dsn_held"
+#: Under a registry, a generation began (router/generations.py): its id, why,
+#: the generation it fenced, the carried transport counter, and the binding
+#: and root it records; an operator's `--reason` as `note`.
+EVENT_GENERATION_MINTED = "generation_minted"
 
 
 class AuditError(Exception):

@@ -1151,12 +1151,16 @@ event to check against the registry, not a routine restart.
 
 ### Private state is keyed by logical_id
 
-Under a registry, every resolved instance's private state lives at
-`state_dir/<logical_id>/`, not `state_dir/<name>/`: the first-sight marker,
-the reply ledger (`delivered/`), private results, held and quarantined
-requests, in-flight counters, outcome records and the audit log. Renaming an
-identity (an operator override in the registry) therefore moves none of it.
-Without `registry_dir`, everything stays keyed by name, exactly as before.
+Under a registry, every resolved instance's private state lives under
+`state_dir/<logical_id>/`, not `state_dir/<name>/`. The per-identity part
+(the reply ledger `delivered/`, outcome records, DSN intents and the audit
+log) is directly there; everything that belongs to one life of the
+instance's connector (private results, in-flight records and the transport
+counter, held local deliveries, held and quarantined requests, the
+first-sight marker) is in its current GENERATION, `gen-<g>/` ("Generations",
+below). Renaming an identity (an operator override in the registry)
+therefore moves none of it. Without `registry_dir`, everything stays keyed
+by name, exactly as before, and there are no generations.
 
 **Moving private state under a registry is an operator step, and the router
 holds until it is done.** An instance whose `state_dir/<name>` exists (in any
@@ -1180,7 +1184,12 @@ back as `state_conflict` once the recipient is registered again.
 
 **`reset` follows the same keys, read fresh.** Under a registry, `reset <name>`
 reads the registry again under the drain lock, whatever keys a caller
-cached, and clears `state_dir/<logical_id>/`. If any named instance is held
+cached, clears the per-identity state under `state_dir/<logical_id>/` and the
+mailbox, and then FENCES the current generation and begins the next: it
+never deletes a generation, the generations file or a migration journal
+(the fenced generation keeps what it held, and the new one carries the
+transport counter forward and takes its own first sight). A reset of an
+instance still in the pre-generation layout is refused. If any named instance is held
 (including a conflict or an unavailable or rolled-back registry since the
 keys were cached) the whole batch is refused before anything is removed.
 `reset --dry-run` reads it without persisting the seq floor, since it takes no
@@ -1198,6 +1207,51 @@ instance named with 32 hex digits (either case, for a case-insensitive
 discovery skips such a directory (the host keys its own per-identity
 directories that way; the registry never issues that shape as a name). The
 name rule itself is unchanged without a registry.
+
+### Generations
+
+A GENERATION is one continuous life of an instance's connector state: one
+registry binding (adapter, stable_key, binding_seq) and one instance root
+(path, st_dev, st_ino). `state_dir/<logical_id>/generations.json` lists them;
+exactly one is current, the rest are FENCED and never current again.
+
+**A generation begins only on positive evidence**, checked for every instance
+BEFORE any instance of the poll drains (`router/generations.py`):
+
+- the registry binding changed (a rebind), or the root's identity changed
+  (re-created, or a new root), read from the descriptor an `O_NOFOLLOW` open
+  returns, never from a path stat;
+- or the operator says so: `router generation new <name> --reason <text>`
+  (needs the router stopped; `--dry-run` writes nothing), or `router reset`.
+
+A same-root connector counter reset is NOT inferred: AMAP gives a connector
+no incarnation id. Within a generation a reused id fails closed instead
+(`req_id_reused`, or `req_id_reused_pending` while the earlier work is in
+flight, shown in `status.json` with its age and a hint). A `name_seq` or
+`enrollment_epoch` change never begins one.
+
+**The new generation's transport counter starts at its predecessor's next
+unused id**, written durably before it becomes current; a fenced generation
+never allocates. A predecessor whose counter is missing although it handed
+ids out, or corrupt, holds the instance (`transport_counter_unverified`).
+
+**Holds, never guesses.** An instance is held for the poll, with a reason in
+`status.json`'s registry section, when its root cannot be opened
+(`connector_state_unverified`), when it has state in the pre-generation
+layout (`legacy_state_unadopted`), when its generations file or current
+generation is unreadable or inconsistent or a migration is unfinished
+(`state_layout_conflict`), or when its current generation has taken first
+sight but its marker is gone (`first_sight_marker_lost`; it is never
+re-snapshotted, which would move the quarantine line forward). A delivery to
+a held instance holds (below), and so does one whose root was replaced after
+the poll's check: every placement writes through a root descriptor that must
+be the directory the recipient's current generation recorded.
+
+**Not yet built** (later steps): a fenced generation's
+in-flight and pending records are kept and shown in `status.json`
+(`generations.<name>.fenced_work`) but not stepped; the operator verbs that
+adopt or fence pre-generation state are not here yet, so such an instance
+stays held.
 
 ### Held local delivery
 

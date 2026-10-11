@@ -171,7 +171,7 @@ def _effect(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> An
 
 
 def _inflight_dir(cfg: RouterConfig, name: str) -> Path:
-    return config_mod.instance_state_dir(cfg, name) / INFLIGHT_DIR
+    return config_mod.gen_state_dir(cfg, name) / INFLIGHT_DIR
 
 
 def record_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
@@ -183,7 +183,7 @@ def handed_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
 
 
 def counter_path(cfg: RouterConfig, name: str) -> Path:
-    return config_mod.instance_state_dir(cfg, name) / TRANSPORT_STATE_DIR / COUNTER_FILE
+    return config_mod.gen_state_dir(cfg, name) / TRANSPORT_STATE_DIR / COUNTER_FILE
 
 
 def read_record(cfg: RouterConfig, name: str, req_id: str) -> Optional[Dict[str, Any]]:

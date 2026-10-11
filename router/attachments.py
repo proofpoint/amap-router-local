@@ -71,7 +71,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import reset as reset_mod
 from .util import open_child_pinned
@@ -488,7 +488,27 @@ def _write_blob_pinned(dir_fd: int, name: Any, data: bytes) -> None:
         raise
 
 
-def write_agent_visible(root: Path, target_path: Path, data: bytes) -> None:
+class RootChanged(Exception):
+    """The root opened for a write is not the directory the caller expected
+    (`expect_root`): it was replaced since its identity was recorded. Raised
+    before anything is written through it."""
+
+
+def _check_root(root_fd: int, expect_root: Optional[Tuple[int, int]]) -> None:
+    """Under a registry the recipient's generation records its root's
+    (st_dev, st_ino); the descriptor every placement writes through must be
+    that directory (`router/generations.py`). No expectation, no check."""
+    if expect_root is None:
+        return
+    st = os.fstat(root_fd)
+    if (st.st_dev, st.st_ino) != tuple(expect_root):
+        raise RootChanged(
+            f"the root opened for this write is ({st.st_dev}, {st.st_ino}), not the "
+            f"recorded {tuple(expect_root)}")
+
+
+def write_agent_visible(root: Path, target_path: Path, data: bytes, *,
+                        expect_root: Optional[Tuple[int, int]] = None) -> None:
     """Pinned equivalent of `util.atomic_write`, for any write whose
     destination lives inside an agent-owned namespace — `deliver.py`'s
     message-spool doc and deliver-notice (v3.0.0 write-side path
@@ -523,6 +543,7 @@ def write_agent_visible(root: Path, target_path: Path, data: bytes) -> None:
     rel_dir = target_path.parent.relative_to(root)
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
+        _check_root(root_fd, expect_root)
         dir_fd = _mkdir_descend_pinned(root_fd, rel_dir)
         try:
             _write_blob_pinned(dir_fd, target_path.name, data)
@@ -568,6 +589,7 @@ def content_ref_for(notice_id: str, index: int) -> str:
 
 def publish_attachment_blobs(
     root: Path, tree_root: Path, notice_id: str, attachments: List[VerifiedAttachment],
+    *, expect_root: Optional[Tuple[int, int]] = None,
 ) -> None:
     """§5 inbound publication. Writes every verified attachment's bytes to
     `tree_root/notices/<notice_id>.attachments/<index>`,
@@ -590,6 +612,7 @@ def publish_attachment_blobs(
     notices_rel = (tree_root / "notices").relative_to(root)
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
+        _check_root(root_fd, expect_root)
         notices_fd = _mkdir_descend_pinned(root_fd, notices_rel)
         try:
             side_dir_name = sidecar_dir_name(notice_id)

@@ -182,6 +182,11 @@ class StatusTracker:
         when no registry is configured. Replaced every poll: it is state."""
         self.registry = doc
 
+    def record_generations(self, doc: Optional[Dict[str, Any]]) -> None:
+        """This poll's generations section (`generations.status_doc`), or
+        None without a registry. Replaced every poll: it is state."""
+        self.generations = doc
+
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that
         errored — the set the loader accepted is known even when draining it
@@ -241,6 +246,11 @@ class StatusTracker:
         # state_dir/registry/seq (router/README.md).
         if getattr(self, "registry", None) is not None:
             doc["registry"] = self.registry
+        # Present only under a registry: each instance's current generation,
+        # what its fenced generations still hold, and any request held as a
+        # reused id, with its age and the operator hint (router/generations.py).
+        if getattr(self, "generations", None) is not None:
+            doc["generations"] = self.generations
         # Omitted, never defaulted, when this tracker cannot answer. A
         # consumer distinguishes "a router older than this field" from a
         # wrong value only if the absence is real.

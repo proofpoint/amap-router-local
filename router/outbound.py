@@ -138,7 +138,7 @@ from datetime import timedelta
 from . import attachments as attachments_mod, binding, firstsight
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
-from .config import (RouterConfig, address_for, instance_for, instance_state_dir, state_key,
+from .config import (RouterConfig, address_for, gen_state_dir, instance_for, state_key,
                      target_hold, target_known_id, target_logical_id)
 from .util import (
     DEFAULT_READ_CAP,
@@ -198,11 +198,11 @@ def _outbox_dir(cfg: RouterConfig, name: str) -> Path:
 
 
 def _private_result_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return instance_state_dir(cfg, name) / "results" / f"{req_id}.json"
+    return gen_state_dir(cfg, name) / "results" / f"{req_id}.json"
 
 
 def _held_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return instance_state_dir(cfg, name) / "held" / f"req-{req_id}.json"
+    return gen_state_dir(cfg, name) / "held" / f"req-{req_id}.json"
 
 
 class UnreadableRequest(OSError):
@@ -1482,7 +1482,7 @@ def _quarantine_one(
     recipient. See `router/firstsight.py`'s module docstring for what the
     quarantine check does and does not guarantee."""
     first_seen_ts = marker_doc.get("first_seen_ts")
-    q_dir = instance_state_dir(cfg, name) / "quarantine"
+    q_dir = gen_state_dir(cfg, name) / "quarantine"
     try:
         atomic_write(q_dir / filename, raw)
         snap_entry = next(
@@ -1594,7 +1594,7 @@ class PendingDamaged(Exception):
 
 
 def _pending_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return instance_state_dir(cfg, name) / PENDING_DIR / f"{req_id}.json"
+    return gen_state_dir(cfg, name) / PENDING_DIR / f"{req_id}.json"
 
 
 def _str_or_none(v: Any) -> bool:
@@ -2015,7 +2015,7 @@ def _sweep_answered_pending(cfg: RouterConfig, name: str) -> None:
     record leaves a record for a request already answered (and archived, so
     the resume path never sees it again). The private Result is the
     authority: its record goes."""
-    d = instance_state_dir(cfg, name) / PENDING_DIR
+    d = gen_state_dir(cfg, name) / PENDING_DIR
     try:
         names = [p.name for p in d.iterdir() if p.name.endswith(".json")]
     except (FileNotFoundError, NotADirectoryError):
@@ -2029,7 +2029,7 @@ def _sweep_answered_pending(cfg: RouterConfig, name: str) -> None:
 def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
     """Every pending request of `name`, for status.json: what is held, on
     whom, and why. A damaged record is listed as such."""
-    d = instance_state_dir(cfg, name) / PENDING_DIR
+    d = gen_state_dir(cfg, name) / PENDING_DIR
     try:
         names = sorted(p.name for p in d.iterdir() if p.name.endswith(".json"))
     except (FileNotFoundError, NotADirectoryError):

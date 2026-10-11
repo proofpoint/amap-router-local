@@ -243,6 +243,7 @@ import logging
 
 from . import firstsight
 from . import audit as audit_mod
+from . import generations as generations_mod
 from . import inflight as inflight_mod
 from . import lock as lock_mod
 from . import registry as registry_mod
@@ -279,6 +280,19 @@ _OUTCOMES = "outcomes"
 # the ids it already handed to the external leg must not be reused
 # (`router/inflight.py`). In-flight RECORDS are not preserved.
 _STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR)
+
+
+def _kept(cfg: RouterConfig, entry_name: str) -> bool:
+    """Whether a reset leaves `state_dir/<key>/<entry_name>` alone. Under a
+    registry, also every generation (`gen-*`), the generations file and a
+    migration journal: a reset FENCES the current generation and begins a
+    new one (`_reset_one`), it never deletes one."""
+    if entry_name in _STATE_KEEP:
+        return True
+    if cfg.registry_dir is None:
+        return False
+    return (entry_name.startswith(generations_mod.GEN_PREFIX)
+            or entry_name in (generations_mod.GEN_FILE, generations_mod.MIGRATION_FILE))
 
 
 class ResetError(Exception):
@@ -477,6 +491,12 @@ def _plan_one(cfg: RouterConfig, name: str) -> ResetPlan:
     first_seen_marker = firstsight.marker_path(cfg.state_dir, name,
                                                state_key=state_key(cfg, name))
     was_seen = first_seen_marker.is_file()
+    if cfg.registry_dir is not None:
+        # The marker lives in the current generation, which a reset fences
+        # and keeps; it is reported, never listed for removal.
+        key = generations_mod.peek(cfg, cfg.registry_report).get(name)
+        was_seen = key is not None and firstsight.marker_path(
+            cfg.state_dir, name, state_key=key).is_file()
 
     state_paths: List[Path] = []
     # Present in ANY shape (regular file, directory, or dangling symlink)
@@ -498,7 +518,7 @@ def _plan_one(cfg: RouterConfig, name: str) -> ResetPlan:
         # when the marker was actually appended above. `audit/` is never
         # listed: a reset preserves it (module docstring).
         state_paths.extend(
-            p for p in rest if p not in state_paths and p.name not in _STATE_KEEP
+            p for p in rest if p not in state_paths and not _kept(cfg, p.name)
         )
 
     inbox_root, outbox_root = inst.inbox_root, inst.outbox_root
@@ -826,7 +846,7 @@ def _clear_state(cfg: RouterConfig, name: str) -> int:
     except OSError:
         rest = []
     for p in rest:
-        if p.name in _STATE_KEEP:
+        if _kept(cfg, p.name):
             continue
         _remove_path(p)
         removed += 1
@@ -851,9 +871,35 @@ def reset_instance(cfg: RouterConfig, name: str) -> Dict[str, Any]:
     return _reset_one(_keyed(cfg, [name], persist=True), name)
 
 
+def _generation_inputs(cfg: RouterConfig, name: str) -> Optional[Dict[str, Any]]:
+    """Under a registry, everything the new generation needs, established
+    BEFORE anything is removed so that a reset that cannot begin one removes
+    nothing: the registry entry, the root identity, and a successor counter
+    that can be carried. A legacy (pre-generation) layout is refused: adopt
+    or fence it first."""
+    if cfg.registry_dir is None:
+        return None
+    entry = cfg.registry_report.resolved[name]
+    lid = entry.logical_id
+    try:
+        doc = generations_mod.read_doc(cfg.state_dir, lid)
+        if doc is None and generations_mod.legacy_entries(cfg.state_dir, lid):
+            raise ResetError(
+                f"reset: {name!r} has state in the pre-generation layout; adopt it or "
+                "fence it first (`router generation adopt|fence-legacy`)")
+        root = generations_mod.root_identity(cfg.instances[name].root)
+        if doc is not None:
+            generations_mod.next_counter(
+                generations_mod.gen_dir(cfg.state_dir, lid, doc["current"]))
+    except generations_mod.GenerationHeld as e:
+        raise ResetError(f"reset: {name!r}: {e}") from None
+    return {"entry": entry, "root": root}
+
+
 def _reset_one(cfg: RouterConfig, name: str) -> Dict[str, Any]:
     """`reset_instance` on a view `_keyed` has already validated."""
     plan = _plan_one(cfg, name)  # validates name; fast, early containment probe
+    gen_inputs = _generation_inputs(cfg, name)
     state_removed = _clear_state(cfg, name)
     mailbox = _empty_mailboxes(cfg, name)
     # Re-sweep, LIVE (not `plan.state_paths`, computed before any of this
@@ -871,6 +917,14 @@ def _reset_one(cfg: RouterConfig, name: str) -> Dict[str, Any]:
         "mailbox_removed": mailbox["removed"],
         "audit_preserved": False,
     }
+    if gen_inputs is not None:
+        # Fence the current generation and begin the next, after both sweeps:
+        # what the old generation holds is kept, and the new one starts
+        # fresh, with its own first sight and the carried transport counter.
+        entry = gen_inputs["entry"]
+        summary["generation"] = generations_mod.begin(
+            cfg.state_dir, name, entry.logical_id, generations_mod.binding_of(entry),
+            gen_inputs["root"], generations_mod.REASON_RESET)
     # The evidence this command spares records the command itself. Written
     # LAST, after both sweeps, so the line describes what actually happened;
     # never fatal — a reset that succeeded is not undone by a log failure.

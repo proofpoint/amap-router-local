@@ -136,6 +136,7 @@ class KeyedDrainTests(helpers.RouterTestCase):
 
     def migrate(self):
         (self.state_dir / "alpha").rename(self.state_dir / ALPHA_LID)
+        helpers.adopt_test_markers(self.cfg)
 
     def test_private_results_land_under_the_logical_id(self):
         self.migrate()
@@ -143,7 +144,8 @@ class KeyedDrainTests(helpers.RouterTestCase):
         with self.assertLogs("amap_router_local"):
             summary = service.run_once(self.cfg, None)
         self.assertEqual(list(summary), ["alpha"])
-        self.assertTrue((self.state_dir / ALPHA_LID / "results" / "00000001.json").is_file())
+        self.assertTrue((helpers.gen_state(self.state_dir, ALPHA_LID) / "results"
+                         / "00000001.json").is_file())
         self.assertFalse((self.state_dir / "alpha").exists(),
                          "an unkeyed join recreated the name's directory")
 
@@ -196,6 +198,7 @@ class KeyedDeliveryTests(helpers.RouterTestCase):
         self.cfg = replace(plain, registry_dir=self.reg)
         for name, lid in (("alpha", ALPHA_LID), ("beta", BETA_LID)):
             (self.state_dir / name).rename(self.state_dir / lid)
+        helpers.adopt_test_markers(self.cfg)
         service._REGISTRY_LOGGED.clear()
 
     def test_the_reply_ledger_is_keyed_by_the_recipients_logical_id(self):
@@ -220,6 +223,7 @@ class KeyedConsoleTests(helpers.RouterTestCase):
         (self.reg / registry.SNAPSHOT).write_text(json.dumps(_snapshot()))
         self.cfg = replace(self.make_config({"alpha": []}), registry_dir=self.reg)
         (self.state_dir / "alpha").rename(self.state_dir / ALPHA_LID)
+        helpers.adopt_test_markers(self.cfg)
 
     def test_the_marker_is_read_under_the_logical_id(self):
         from router import console
@@ -246,17 +250,41 @@ class KeyedResetTests(helpers.RouterTestCase):
         (self.reg / registry.SNAPSHOT).write_text(json.dumps(_snapshot()))
         self.cfg = replace(self.make_config({"alpha": []}), registry_dir=self.reg)
 
-    def test_reset_clears_the_logical_id_directory(self):
+    def test_reset_fences_the_generation_and_begins_the_next(self):
+        """Under a registry a reset never deletes a generation: it fences the current one, keeping what it holds, wipes the
+        per-identity state and the mailbox as before, and begins a fresh
+        generation whose transport counter carries on."""
+        (self.state_dir / "alpha").rename(self.state_dir / ALPHA_LID)
+        helpers.adopt_test_markers(self.cfg)
+        old = helpers.gen_state(self.state_dir, ALPHA_LID)
+        (old / "results").mkdir()
+        (old / "results" / "00000001.json").write_text("{}")
+        (old / "transport" / "next_req_id").write_text("7")
+        ledger = self.state_dir / ALPHA_LID / "delivered"
+        ledger.mkdir()
+        (ledger / "notice-x.json").write_text("{}")
+        summary = reset.reset_instances(self.cfg, ["alpha"])[0]
+        new = helpers.gen_state(self.state_dir, ALPHA_LID)
+        self.assertNotEqual(new, old)
+        self.assertEqual(new.name, "gen-" + summary["generation"])
+        self.assertTrue((old / "results" / "00000001.json").is_file(), "a generation was deleted")
+        self.assertFalse((new / "first-seen.json").exists())
+        self.assertEqual((new / "transport" / "next_req_id").read_text(), "7")
+        self.assertFalse(ledger.exists())
+        self.assertGreater(summary["state_removed"], 0)
+        self.assertTrue(summary["was_seen"])
+        self.assertTrue((self.state_dir / ALPHA_LID / "audit").is_dir())
+
+    def test_reset_refuses_the_pre_generation_layout(self):
         (self.state_dir / "alpha").rename(self.state_dir / ALPHA_LID)
         stale = self.state_dir / ALPHA_LID / "results"
         stale.mkdir()
         (stale / "00000001.json").write_text("{}")
-        summary = reset.reset_instances(self.cfg, ["alpha"])[0]
-        self.assertGreater(summary["state_removed"], 0)
-        self.assertFalse(stale.exists())
-        self.assertFalse((self.state_dir / "alpha").exists())
-        # The reset's own audit line lands under the logical_id too.
-        self.assertTrue((self.state_dir / ALPHA_LID / "audit").is_dir())
+        with self.assertRaises(reset.ResetError) as cm:
+            reset.reset_instances(self.cfg, ["alpha"])
+        self.assertIn("pre-generation layout", str(cm.exception))
+        self.assertTrue((stale / "00000001.json").is_file())
+        self.assertFalse((self.state_dir / ALPHA_LID / "generations.json").exists())
 
     def test_a_held_instance_is_refused_and_nothing_is_removed(self):
         marker = self.state_dir / "alpha" / "first-seen.json"
