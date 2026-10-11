@@ -28,8 +28,16 @@ visible refusal into requests written nowhere.
 
 THE LOADER (each step is a refusal with a fixed reason, `PluginRefused.reason`):
 
-  1. the path is absolute and canonical: no symlinked component anywhere
-     (`path_not_absolute`, `path_not_canonical`);
+  1. the path is absolute and canonical (`path_not_absolute`,
+     `path_not_canonical`): the string AS CONFIGURED equals its own
+     `os.path.realpath`. Nothing normalises it first. That one equality
+     refuses a symlinked component anywhere, and every lexical spelling
+     (`..`, `.`, `//`, a trailing `/`): `realpath` always returns a
+     normalised path, so equality with it implies `path ==
+     os.path.normpath(path)` as well. Normalising first would check a
+     DIFFERENT path from the one the kernel opens: with `b` a symlink,
+     `/a/b/../c/p.py` names `c/p.py` beside `b`'s TARGET, while its
+     lexical normal form `/a/c/p.py` names another file;
   2. it is not inside any directory an agent can reach (`agent_reachable`);
   3. every directory from its parent up to `/` is owned by a trusted uid
      and is not writable by anyone else, unless it is sticky
@@ -442,10 +450,12 @@ def _check_path(path: str, forbidden_roots: Iterable[Path],
                 trusted_uids: Tuple[int, ...]) -> Path:
     if not os.path.isabs(path):
         raise PluginRefused("path_not_absolute", f"{path!r} is not absolute")
-    p = Path(os.path.normpath(path))
-    if os.path.realpath(p) != str(p):
+    # The RAW string, never a normalised copy (module docstring, step 1).
+    if os.path.realpath(path) != path:
         raise PluginRefused("path_not_canonical",
-                            f"{path!r} has a symlinked or non-canonical component")
+                            f"{path!r} is not its own realpath: a symlinked component, "
+                            "or a spelling such as '..', '.', '//' or a trailing '/'")
+    p = Path(path)
     for root in forbidden_roots:
         r = Path(os.path.realpath(root))
         if _is_within(p, r):
