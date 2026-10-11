@@ -913,3 +913,28 @@ class SchemaRoundThreeTests(_Legacy):
         j["legacy"].update(local=1, basis="counter",
                            manifest_sha256=generations.manifest_digest(j["manifest"]))
         self.refused_by_reader(j, "manifest")
+
+
+class CompleteResumeTests(_Legacy):
+
+    def test_a_resume_at_complete_re_verifies_the_conversions(self):
+        """Stopped just after `complete`, the converted record rewritten
+        back to version 1, then resumed: refused, naming the record."""
+        self.make_pending()
+        self.to_legacy()
+        self.to_v1()
+        real = generations._advance
+
+        def advance(cfg, journal, phase):
+            real(cfg, journal, phase)
+            if phase == "complete":
+                raise Crash(phase)
+        with mock.patch.object(generations, "_advance", advance):
+            self.expect(Crash, self.migrate)
+        self.assertEqual(self.journal()["converted"], {REQ: outbound.CONVERTED})
+        g = generations.gen_dir(self.state_dir, LIDS["alpha"], self.journal()["gen"])
+        self.to_v1(d=g / outbound.PENDING_DIR)
+        e = self.refuse()
+        self.assertIn(REQ, str(e))
+        self.assertEqual(self.journal()["phase"], "complete")
+        self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)

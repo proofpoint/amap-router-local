@@ -413,6 +413,11 @@ M = [
   '            and all(isinstance(x, str) and _MANIFEST_LINE.fullmatch(x) for x in manifest)\n',
   '            and all(isinstance(x, str) for x in manifest)\n',
   [R + 'SchemaRoundThreeTests.test_manifest_lines_are_canonical']),
+ # -- review round 4 -----------------------------------------------------------
+ ('Q24 a resume at complete does not re-verify conversions', GN,
+  '    if journal["verb"] == VERB_ADOPT:\n        view = keyed(registry_mod.keyed_config(cfg, report), {name: gen_key(lid, journal["gen"])})\n        _verify_conversions(view, name, journal, complete=True)\n    want = journal.get("fresh_gen") or journal["gen"]\n',
+  '    want = journal.get("fresh_gen") or journal["gen"]\n',
+  [R + 'CompleteResumeTests.test_a_resume_at_complete_re_verifies_the_conversions']),
 ]
 
 

@@ -1401,6 +1401,13 @@ with a newline and the line written whole after it; a malformed line that
 mentions this journal, a different line for it, or a second copy holds the
 instance; a malformed line about anything else is skipped with a WARNING.
 
+Each version-1 conversion's outcome is checked against the record it
+describes before `complete`, and again whenever a run resumes at
+`complete`. So an operator who repairs or replaces a pending record between
+a crash and the resume gets a refusal naming that record (the instance stays
+held) rather than a migration that attests something the record no longer
+shows.
+
 **Rolling back past this version is not supported.** The last step before a
 migration completes leaves a DIRECTORY named `first-seen.json` where the
 legacy marker was. An older router run against the migrated layout fails at
