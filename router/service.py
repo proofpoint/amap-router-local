@@ -74,12 +74,13 @@ def start_transport(cfg: RouterConfig) -> Optional[Any]:
         return transport_mod.NullTransport().make_sender({}, None)
     plugin = transport_mod.load_plugin(
         pin.path, pin.sha256, forbidden_roots=_agent_reachable_roots(cfg))
-    logger.info("transport plugin loaded: path=%s sha256=%s PLUGIN_API=%s",
-                plugin.path, plugin.sha256, plugin.api)
+    # No "loaded" line: success is logged only once a plugin is ACTIVATED,
+    # and none can be yet. The refusal names what was verified instead.
     raise transport_mod.PluginRefused(
         "fsops_unavailable",
-        "the plugin passed every check, but the filesystem port its factories "
-        "need is not built yet; it cannot be activated")
+        f"{plugin.path} (sha256 {plugin.sha256}, PLUGIN_API {plugin.api}) passed "
+        "every check, but the filesystem port its factories need is not built "
+        "yet; it cannot be activated")
 
 
 def run_once(cfg: RouterConfig, transport: Any = _LOAD) -> Dict[str, Dict[str, int]]:

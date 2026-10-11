@@ -212,6 +212,16 @@ class LoaderTests(_PluginDir):
                 self.write(GOOD, mode=mode)
                 self.load()
 
+    def test_the_pinned_open_refuses_a_symlink(self):
+        """The second line behind `path_not_canonical`: a symlink swapped in
+        after the path checks is refused by the O_NOFOLLOW open itself."""
+        target = self.dir / "real.py"
+        os.rename(self.path, target)
+        self.path.symlink_to(target)
+        with self.assertRaises(transport.PluginRefused) as cm:
+            transport._read_pinned(self.path, ME)
+        self.assertEqual(cm.exception.reason, "symlink")
+
     def test_a_non_regular_file_is_refused(self):
         self.path.unlink()
         self.path.mkdir(mode=0o755)
@@ -289,6 +299,18 @@ class NoPluginImportTests(unittest.TestCase):
         self.assertNotIn("__import__", names)
         self.assertNotIn("import_module", attrs)
         self.assertNotIn("importlib", names)
+
+
+class RefusalVocabularyTests(unittest.TestCase):
+
+    def test_the_shared_reasons(self):
+        """One vocabulary for both loaders, agreed with the sibling runtime."""
+        self.assertEqual(set(transport.REFUSAL_REASONS), {
+            "path_not_absolute", "path_not_canonical", "agent_reachable",
+            "parent_owner", "parent_writable", "missing", "symlink", "not_regular",
+            "owner", "mode", "too_large", "hash_mismatch", "exec_failed",
+            "api_mismatch", "missing_factory", "fsops_unavailable", "role_mismatch",
+        })
 
 
 class NullTransportTests(unittest.TestCase):
@@ -370,13 +392,13 @@ class StartupTests(_PluginDir):
 
     def test_a_valid_plugin_is_refused_until_the_filesystem_port_exists(self):
         cfg = self._cfg(config_mod.TransportPluginPin(str(self.path), self.sha))
-        with self._trusting_me(), \
-                self.assertLogs("amap_router_local", logging.INFO) as logs:
+        with self._trusting_me(), mock.patch.object(service, "logger") as log:
             with self.assertRaises(transport.PluginRefused) as cm:
                 service.start_transport(cfg)
         self.assertEqual(cm.exception.reason, "fsops_unavailable")
-        self.assertTrue(any("transport plugin loaded" in m and self.sha in m
-                            for m in logs.output))
+        log.info.assert_not_called()  # no success line for a refused plugin
+        self.assertIn(self.sha, cm.exception.detail)
+        self.assertIn(str(self.path), cm.exception.detail)
 
     def test_run_forever_refuses_to_start_and_never_polls(self):
         self.path.unlink()
@@ -412,7 +434,10 @@ class ClaimedIsPendingTests(_InflightCase):
         self.drain()
         self.port.claim("00000001")
         s = self.drain()
+        # The fake RECORDS a rewrite attempt before refusing it: the drain
+        # isolates the refusal, so a refusal alone would never be seen.
         self.assertEqual(self.port.writes, ["00000001"], "handed over again while claimed")
+        self.assertEqual(s["inflight_errored"], 0)
         self.assertFalse(self.has_result(), "settled while the downstream runtime held it")
         self.assertEqual(s["outbound_inflight_waiting"], 1)
         self.port.send("00000001", recipients=[EXT])
@@ -441,7 +466,9 @@ class ClaimingTransport(FakeTransport):
         return n in self.pending or n in self.claimed
 
     def write_request(self, n, data):
-        assert n not in self.claimed, f"transport request {n} rewritten while claimed"
+        if n in self.claimed:
+            self.writes.append(n)  # recorded BEFORE the refusal, as in FakeTransport
+            raise AssertionError(f"transport request {n} rewritten while claimed")
         super().write_request(n, data)
 
     def send(self, n, **kw):

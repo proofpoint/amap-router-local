@@ -91,8 +91,11 @@ REFUSAL_REASONS = (
     "parent_owner", "parent_writable",
     "missing", "symlink", "not_regular", "owner", "mode", "too_large",
     "hash_mismatch", "exec_failed", "api_mismatch", "missing_factory",
-    "fsops_unavailable",
+    "fsops_unavailable", "role_mismatch",
 )
+# `role_mismatch` is the sibling runtime's: its link role and its plugin pin
+# disagree, in either direction. This router has no link role and never
+# raises it; the reason is listed so both loaders share one vocabulary.
 
 
 class PluginRefused(Exception):
