@@ -58,12 +58,13 @@ import json
 import logging
 import os
 import re
+import stat
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import config as config_mod
 from .config import RouterConfig
-from .util import atomic_write, utc_ts
+from .util import atomic_write, open_child_pinned, utc_ts
 
 logger = logging.getLogger("amap_router_local.firstsight")
 
@@ -132,7 +133,7 @@ def quarantined_filenames(marker_doc: Dict[str, Any]) -> Set[str]:
     }
 
 
-def _snapshot_outbox(outbox_root: Path) -> List[Dict[str, Any]]:
+def _snapshot_outbox(outbox_root: Path, root: Optional[Path] = None) -> List[Dict[str, Any]]:
     """Inventory every directory entry directly under `outbox_root` whose
     NAME matches `_REQ_NAME_RE` — DELIBERATELY regardless of type
     (regular file, symlink, directory) or whether it can currently be
@@ -160,31 +161,74 @@ def _snapshot_outbox(outbox_root: Path) -> List[Dict[str, Any]]:
     is correctly not recorded; this only ever reports names that existed
     in the listing, however briefly."""
     entries: List[Dict[str, Any]] = []
-    if not outbox_root.is_dir():
+    out_fd = _pin_outbox(outbox_root, root)
+    if out_fd is None:
         return entries
     try:
-        names = sorted(p.name for p in outbox_root.iterdir())
-    except OSError:
-        return entries
-    for name in names:
-        if not _REQ_NAME_RE.fullmatch(name):
-            continue
-        p = outbox_root / name
-        sha256: Optional[str] = None
-        size: Optional[int] = None
         try:
-            if p.is_file() and not p.is_symlink():
-                data = p.read_bytes()
-                sha256 = hashlib.sha256(data).hexdigest()
-                size = len(data)
+            names = sorted(os.listdir(out_fd))
         except OSError:
-            pass  # type/permission/race — the entry is STILL a quarantine
-            # member by name; only the forensic digest is unavailable.
-        entries.append({"filename": name, "sha256": sha256, "size": size})
+            return entries
+        for name in names:
+            if not _REQ_NAME_RE.fullmatch(name):
+                continue
+            sha256: Optional[str] = None
+            size: Optional[int] = None
+            try:
+                # The forensic digest is read the way a request is: never
+                # through a symlink, a regular file at link count 1 only.
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=out_fd)
+                try:
+                    st = os.fstat(fd)
+                    if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+                        data = b""
+                        while True:
+                            chunk = os.read(fd, 1 << 20)
+                            if not chunk:
+                                break
+                            data += chunk
+                        sha256 = hashlib.sha256(data).hexdigest()
+                        size = len(data)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass  # type/permission/race — the entry is STILL a quarantine
+                # member by name; only the forensic digest is unavailable.
+            entries.append({"filename": name, "sha256": sha256, "size": size})
+    finally:
+        os.close(out_fd)
     return entries
 
 
-def record_first_sight(cfg: RouterConfig, name: str) -> Tuple[Dict[str, Any], bool]:
+def _pin_outbox(outbox_root: Path, root: Optional[Path]) -> Optional[int]:
+    """The outbox directory, reached from `root` by `O_NOFOLLOW` steps, or
+    None when it does not exist. One that exists but is not a real directory
+    (a symlink to elsewhere, a file) raises `FirstSightError`: no snapshot is
+    taken and no marker written, so first sight is retried rather than taken
+    through, or without, a tree the reads would refuse."""
+    root = root if root is not None else outbox_root.parent
+    try:
+        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None
+    try:
+        for part in outbox_root.relative_to(root).parts:
+            kind, nfd = open_child_pinned(fd, part)
+            if kind == "missing":
+                return None
+            if kind != "dir":
+                raise FirstSightError(
+                    f"first sight: {str(outbox_root)!r} is not a real directory "
+                    "(or cannot be opened); not taken through it")
+            os.close(fd)
+            fd = nfd
+        return os.dup(fd)
+    finally:
+        os.close(fd)
+
+
+def record_first_sight(cfg: RouterConfig, name: str, *,
+                       exclude: Iterable[str] = ()) -> Tuple[Dict[str, Any], bool]:
     """Ensure instance `name` has a first-sight marker, taking the snapshot if
     it does not. Returns `(doc, was_new)`.
 
@@ -227,7 +271,11 @@ def record_first_sight(cfg: RouterConfig, name: str) -> Tuple[Dict[str, Any], bo
             name, LEGACY_APPROVAL_FILENAME, len(doc["outbox_snapshot"]),
         )
     else:
-        snapshot = _snapshot_outbox(inst.outbox_root)
+        # `exclude`: filenames a fenced generation's work still owns at this
+        # root (`outbound._drain_fenced`): handed over already, never staged.
+        excluded = set(exclude)
+        snapshot = [e for e in _snapshot_outbox(inst.outbox_root, inst.root)
+                    if e.get("filename") not in excluded]
         doc = {
             "schema": SCHEMA,
             "instance": name,
