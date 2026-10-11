@@ -603,3 +603,73 @@ class DigestlessAnchorTests(_Pending):
         doc = (tracker.to_doc().get("generations") or {}).get("alpha") or {}
         self.assertIn("generation", doc, "precondition: no generations section")
         self.assertNotIn("fenced_damaged_anchors", doc)
+
+    # -- transient faults and a vanished generations file fail closed -------
+
+    def fenced_fault(self):
+        """EIO on the live read, but only inside the fenced claim and
+        completion scans: the current generation reads normally."""
+        real = outbound._read_request_pinned
+
+        def fault(cfg, name, filename, *a, **kw):
+            f = sys._getframe(1)
+            while f is not None:
+                if f.f_code.co_name in ("_fenced_claims", "_settled_unarchived"):
+                    raise OSError(5, "injected")
+                f = f.f_back
+            return real(cfg, name, filename, *a, **kw)
+        return mock.patch.object(outbound, "_read_request_pinned", fault)
+
+    def test_a_transient_fault_checking_a_fenced_anchor_keeps_its_claim(self):
+        """A fenced verdict whose archive failed: a fault while checking its
+        claim keeps the file from the current generation, and the next poll
+        completes the fenced verdict."""
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="once")
+        with mock.patch.object(outbound, "_publish_result_and_archive",
+                               side_effect=OSError(5, "injected")):
+            self.poll()
+        generations.operator_new(self.cfg, "alpha", "connector reset")
+        new = gen_state(self.state_dir, LIDS["alpha"])
+        with self.fenced_fault():
+            self.poll()
+        self.assertFalse((new / "results" / "00000001.json").exists(),
+                         "the current generation answered a request the fenced one had")
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists())
+        self.poll()
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(), "never completed")
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
+                         "accepted")
+        self.assertEqual(self.bodies(), ["once"])
+
+    def test_a_transient_fault_under_a_digestless_anchor_publishes_nothing(self):
+        """A readable request reused under a fenced digest-less anchor: a
+        fault reading it is not "still the original", so the old verdict is
+        never published over it."""
+        old, live = self.settle_oversized(publish=False)
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="new")
+        with self.fenced_fault():
+            self.poll()
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists(),
+                         "a verdict was published on a transient fault")
+        self.assertTrue(live.exists(), "archived on a transient fault")
+        self.assertEqual(list_notices(self.cfg, "bravo"), [])
+
+    def test_a_vanished_generations_file_on_the_second_read_holds_the_drain(self):
+        """As an unreadable one: missing during the drain is never "no
+        fenced generations"."""
+        old, live = self.settle_oversized(publish=False)
+        real = generations.read_doc
+
+        def second_read_gone(*a, **kw):
+            if sys._getframe(1).f_code.co_name == "_fenced_views":
+                return None
+            return real(*a, **kw)
+
+        with mock.patch.object(generations, "read_doc", second_read_gone):
+            self.poll()
+        new = gen_state(self.state_dir, LIDS["alpha"])
+        self.assertFalse((new / "results" / "00000001.json").exists(),
+                         "drained past a vanished generations file")
+        self.assertFalse((new / "first-seen.json").exists(),
+                         "first sight taken past a vanished generations file")
+        self.assertTrue(live.exists())

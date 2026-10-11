@@ -136,6 +136,18 @@ M = [
   '    try:\n        doc = generations_mod.read_doc(cfg.state_dir, lid)\n'
   '    except generations_mod.GenerationHeld:\n        return []\n    if doc is None:\n',
   [P + 'ReviewRoundTests.test_an_unreadable_generations_file_on_the_second_read_holds_the_drain']),
+ ('W12 a transient fault on a fenced anchor releases its claim', OB,
+  '        except (OSError, ReadTooLargeError):\n            out.add(live.name)\n    return out\n',
+  '        except (OSError, ReadTooLargeError):\n            pass\n    return out\n',
+  [P + 'DigestlessAnchorTests.test_a_transient_fault_checking_a_fenced_anchor_keeps_its_claim']),
+ ('W13 a transient fault under a digest-less anchor is the original', OB,
+  '        if _unreadable_now(e):\n            return True\n        raise\n    return False\n',
+  '        if _unreadable_now(e):\n            return True\n        return True\n    return False\n',
+  [P + 'DigestlessAnchorTests.test_a_transient_fault_under_a_digestless_anchor_publishes_nothing']),
+ ('W14 a vanished generations file reads as no fenced generations', OB,
+  '    if doc is None:\n        raise generations_mod.GenerationHeld(\n',
+  '    if doc is None:\n        return []\n        raise generations_mod.GenerationHeld(\n',
+  [P + 'DigestlessAnchorTests.test_a_vanished_generations_file_on_the_second_read_holds_the_drain']),
  # -- the recipient ------------------------------------------------------------------
  ('R1 delivering records no recipient generation', OB,
   '        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts(),\n                 recipient_gen=_recipient_gen(cfg, t["recipient"]))\n',
