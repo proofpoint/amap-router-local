@@ -74,6 +74,7 @@ TARGET_UNKNOWN = "target_unknown"
 NO_HISTORY = "no_name_history"
 NOT_IN_HISTORY = "not_in_name_history"
 COLLISION = "skeleton_collision"
+NAME_REUSED = "name_held_by_another_identity"
 
 #: The store rows `store_row` returns (README, "Aliases").
 ROW_INIT = "init"
@@ -378,9 +379,10 @@ class AliasView:
     tombstone_errors: Mapping[str, str] = field(default_factory=dict)
 
 
-#: The last drain pre-pass's failed tombstone writes, for status (which runs
-#: on its own read-only view): process state, replaced every pre-pass.
-LAST_TOMBSTONE_ERRORS: Dict[str, str] = {}
+#: The drain pre-pass's failed tombstone writes, for status (which runs on its
+#: own read-only view): process state. Each keeps the time the drain FIRST saw
+#: it fail (`since`), so status can give its age; a success clears it.
+LAST_TOMBSTONE_ERRORS: Dict[str, Dict[str, str]] = {}
 
 
 def _decide(cfg: Any, report: Any, store_state: str, store: Store, now) -> Dict[str, Decision]:
@@ -388,6 +390,7 @@ def _decide(cfg: Any, report: Any, store_state: str, store: Store, now) -> Dict[
     registry_ok = getattr(report, "state", None) == "ok"
     known = dict(getattr(report, "known", None) or {})
     entries = dict(getattr(report, "entries", None) or {})
+    every = tuple(getattr(report, "all_entries", None) or ())
     for a in cfg.aliases:
         old_local = a.old.split("@")[0]
         target = a.new.split("@")[0]
@@ -409,11 +412,28 @@ def _decide(cfg: Any, report: Any, store_state: str, store: Store, now) -> Dict[
             except (ValueError, TypeError):
                 out[a.old] = Decision(UNVERIFIABLE, HELD_HISTORY)
                 continue
-            others = {skeleton(n) for n in known if n != target}
+            # Every OTHER identity the registry holds, whether or not this router
+            # serves it, and retired ones too: none may own the old local part,
+            # or the alias would deliver one identity's old mail to another.
+            rest = [e for e in every if e.logical_id != entries[target].logical_id]
+            others = {skeleton(e.name) for e in rest if e.state == "active"}
+            reuse = None
+            for e in rest:
+                try:
+                    hist = parse_names(e)
+                except (ValueError, TypeError):
+                    reuse = UNVERIFIABLE
+                    break
+                if old_local in (hist if hist is not None else [e.name]):
+                    reuse = NAME_REUSED
             if names is None:
                 out[a.old] = Decision(INACTIVE, NO_HISTORY)
             elif old_local not in names:
                 out[a.old] = Decision(INACTIVE, NOT_IN_HISTORY)
+            elif reuse == UNVERIFIABLE:
+                out[a.old] = Decision(UNVERIFIABLE, HELD_HISTORY)
+            elif reuse == NAME_REUSED:
+                out[a.old] = Decision(INACTIVE, NAME_REUSED)
             elif skeleton(old_local) in others:
                 out[a.old] = Decision(INACTIVE, COLLISION)
             else:
@@ -448,8 +468,13 @@ def prepare(cfg: Any, report: Any, *, write: bool) -> AliasView:
                     # The store may be one write ahead of its floor now; the
                     # next pre-pass settles that (`ROW_RAISE_FLOOR`) first.
                     break
-        LAST_TOMBSTONE_ERRORS.clear()
-        LAST_TOMBSTONE_ERRORS.update(errors)
+        if state == "ok":
+            for old in list(LAST_TOMBSTONE_ERRORS):
+                if old not in errors:
+                    del LAST_TOMBSTONE_ERRORS[old]
+        for old, err in errors.items():
+            since = LAST_TOMBSTONE_ERRORS.get(old, {}).get("since") or utc_ts()
+            LAST_TOMBSTONE_ERRORS[old] = {"error": err, "since": since}
     else:
         row, store, f, w = store_row(cfg.state_dir)
         state = {ROW_OK: "ok", ROW_RAISE_FLOOR: "ok", ROW_UNVERIFIED: "unverified"}.get(
@@ -648,10 +673,12 @@ def status_doc(cfg: Any, report: Any) -> Optional[Dict[str, Any]]:
                   "tombstones": sorted(store.tombstones) if store.kind == "ok" else None},
         "entries": entries,
     }
-    errors = (cfg.alias_view.tombstone_errors if cfg.alias_view is not None
-              else LAST_TOMBSTONE_ERRORS)
-    if errors:
-        doc["store"]["tombstone_errors"] = dict(errors)
+    if LAST_TOMBSTONE_ERRORS:
+        now = _now()
+        doc["store"]["tombstone_errors"] = {
+            old: {"error": e["error"], "since": e["since"],
+                  "age_s": max(0, int((now - parse_utc_ts(e["since"])).total_seconds()))}
+            for old, e in sorted(LAST_TOMBSTONE_ERRORS.items())}
     held = {}
     for name in sorted(getattr(cfg, "gen_keys", {}) or {}):
         h = held_list(cfg, name)
@@ -713,7 +740,11 @@ def reinit(cfg: Any, reason: str, *, dry_run: bool = False) -> Dict[str, Any]:
     try:
         row, s, f, w = store_row(cfg.state_dir)
         expires = {a.old: a.expires for a in cfg.aliases}
-        tombs = sorted(set(expires) | _audit_tombstoned(cfg.state_dir))
+        # Everything that could deny, never anything that could permit: the
+        # configured aliases, what the audit log records as tombstoned, and the
+        # tombstones of a store that can still be READ, trusted or not.
+        tombs = sorted(set(expires) | _audit_tombstoned(cfg.state_dir)
+                       | (set(s.tombstones) if s.kind == "ok" else set()))
         seq = max(f if isinstance(f, int) else 0, s.seq if s.kind == "ok" else 0) + 1
         plan = {"previous": {"row": row, "store": s.kind, "seq": s.seq if s.kind == "ok" else None,
                              "floor": f, "witness": w},

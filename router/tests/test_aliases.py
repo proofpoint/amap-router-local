@@ -1,5 +1,7 @@
-"""The alias table (`router/aliases.py`; contract §2.3, design v2 + v2.1 +
-A1-A3).
+"""The alias table (`router/aliases.py`; contract §2.3): load-time rules, each
+poll's decisions, normalisation, the external leg, expiry and tombstones, the
+tombstone store with its floor and witness, `reinit`, pinned pending work, and
+the hold markers.
 
 Each test pins one rule; `router/tests/mutate_aliases.py` breaks each rule
 in the source and names the test that must go red.
@@ -33,6 +35,8 @@ class _Aliases(_Pending):
 
     def setUp(self):
         super().setUp()
+        aliases.LAST_TOMBSTONE_ERRORS.clear()
+        self.addCleanup(aliases.LAST_TOMBSTONE_ERRORS.clear)
         self.table(AliasEntry(OLD, addr("bravo"), FUTURE))
 
     def table(self, *entries):
@@ -68,13 +72,24 @@ class _Aliases(_Pending):
                 e["names"] = hist
         return h
 
-    def put_entry(self, **edits):
-        """The registry with each named entry edited by its function."""
+    def put_entry(self, extra=(), **edits):
+        """The registry with each named entry edited by its function, plus
+        `extra` entries this router does not serve: `(name, history, state)`."""
         self.seq += 1
         doc = snapshot(self.seq)
         for e in doc["entries"]:
             if e["name"] in edits:
                 edits[e["name"]](e)
+        proto = doc["entries"][0]
+        for i, (name, hist, state) in enumerate(extra):
+            e = json.loads(json.dumps(proto))
+            e.update(logical_id=f"{i + 3:x}" * 32 if i + 3 < 16 else "e" * 32, name=name,
+                     stable_key=f"/srv/work/{name}", state=state)
+            e["bindings"][0]["stable_key"] = f"/srv/work/{name}"
+            self.names(name, hist)(e)
+            if state != "active":
+                e["retired"] = {"seq": self.seq, "ts": "2026-10-11T04:00:00Z"}
+            doc["entries"].append(e)
         (self.reg / registry.SNAPSHOT).write_text(json.dumps(doc))
 
     def audit_lines(self):
@@ -253,7 +268,7 @@ def keyed_view(tc):
 
 
 # ---------------------------------------------------------------------------
-# The external leg (R7)
+# The external leg: an aliased request never takes it
 # ---------------------------------------------------------------------------
 
 class ExternalTests(_Aliases):
@@ -276,7 +291,7 @@ class ExternalTests(_Aliases):
 
 
 # ---------------------------------------------------------------------------
-# Expiry and tombstones (V2-7)
+# Expiry and tombstones
 # ---------------------------------------------------------------------------
 
 class TombstoneTests(_Aliases):
@@ -319,7 +334,7 @@ class TombstoneTests(_Aliases):
 
 
 # ---------------------------------------------------------------------------
-# The store, the floor and the witness (R4, A3)
+# The store, the floor and the witness
 # ---------------------------------------------------------------------------
 
 class StoreTests(_Aliases):
@@ -422,7 +437,7 @@ class StoreTests(_Aliases):
 
 
 # ---------------------------------------------------------------------------
-# reinit (V2-2, R5, A1)
+# reinit: the way out of an unverified store
 # ---------------------------------------------------------------------------
 
 class ReinitTests(_Aliases):
@@ -504,7 +519,7 @@ class ReinitTests(_Aliases):
 
 
 # ---------------------------------------------------------------------------
-# Pending work pins its aliases (V2-1, R1, A2)
+# Pending work pins its aliases and its targets
 # ---------------------------------------------------------------------------
 
 class PinTests(_Aliases):
@@ -592,7 +607,8 @@ class PinTests(_Aliases):
 
 
 class HoldMarkerTests(_Aliases):
-    """N4: a router-owned age, bound to the request, cleared on consume."""
+    """A held request's age is router-owned: bound to the request, cleared
+    when it is consumed."""
 
     def held(self):
         self.put_entry(bravo=self.names("bravo", [{"name": "bravo"}]))
@@ -619,3 +635,111 @@ class HoldMarkerTests(_Aliases):
         self.put_entry()
         self.poll()
         self.assertEqual(self.bodies(), ["via the alias"])
+
+
+
+class AnotherIdentityTests(_Aliases):
+    """No other identity the registry holds, served here or not, retired or
+    not, may own an alias's old local part (exactly, or by skeleton)."""
+
+    OLDA = "alice@old.example.invalid"
+
+    def setUp(self):
+        super().setUp()
+        self.table(AliasEntry(self.OLDA, addr("bravo"), FUTURE))
+
+    def decision(self):
+        return keyed_view(self).alias_view.decisions[self.OLDA]
+
+    def test_a_reused_name_never_retargets(self):
+        """bravo was alice; another identity now registers as alice: the
+        alias would hand bravo's old-era mail to it, so it is inactive."""
+        self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
+                       extra=[("alice", ["alice"], "active")])
+        self.assertEqual(self.decision().reason, aliases.NAME_REUSED)
+        self.send(to=[self.OLDA])
+        self.assertEqual(self.answered()["reason_code"], outbound.REASON_RECIPIENT_UNKNOWN)
+
+    def test_a_retired_holder_counts(self):
+        self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
+                       extra=[("carol", ["alice", "carol"], "retired")])
+        self.assertEqual(self.decision().reason, aliases.NAME_REUSED)
+
+    def test_an_unreadable_history_elsewhere_holds(self):
+        self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
+                       extra=[("carol", [{"name": "carol"}], "active")])
+        self.assertEqual(self.decision().status, aliases.UNVERIFIABLE)
+        self.send(to=[self.OLDA])
+        self.assertIsNone(self.result(), "an undecidable alias was consumed")
+
+    def test_an_unserved_identity_with_the_same_skeleton_collides(self):
+        self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
+                       extra=[("ALICE", ["ALICE"], "active")])
+        self.assertEqual(self.decision().reason, aliases.COLLISION)
+
+    def test_without_another_holder_it_is_active(self):
+        self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
+                       extra=[("carol", ["carol"], "active")])
+        self.assertEqual(self.decision().status, aliases.ACTIVE)
+
+
+class ReviewRoundTwoTests(_Aliases):
+
+    def test_reinit_keeps_a_readable_stores_tombstones(self):
+        """registry/ lost (floor, witness and audit log with it) while the
+        store survived at a later seq: its tombstones only add denials."""
+        self.poll()
+        s = aliases.read_store(self.state_dir)
+        aliases._write_store(self.state_dir, s.seq + 1, {"gone@old.example.invalid": {
+            "expires": PAST, "tombstoned_ts": "2026-10-11T04:00:00Z"}})
+        shutil.rmtree(self.state_dir / "registry")
+        plan = aliases.reinit(self.cfg, "registry dir lost", dry_run=True)
+        self.assertIn("gone@old.example.invalid", plan["tombstoned"])
+
+    def test_a_domain_flip_keeps_pinned_work_on_its_target(self):
+        root = self.cfg.instances["bravo"].root
+        shutil.move(str(root), str(root) + ".away")
+        self.send()
+        self.assertEqual(self.record()["v"], outbound.PENDING_VERSION_ALIASED)
+        # The §2.4 flip: the fleet's domain changes; the table now names the
+        # new canonical address (or nothing at all).
+        self.cfg = replace(self.cfg, fleet_domain="flip.example.invalid",
+                           aliases=(AliasEntry(OLD, "bravo@flip.example.invalid", PAST),))
+        shutil.move(str(root) + ".away", str(root))
+        self.poll()
+        self.assertEqual(self.bodies(), ["via the alias"])
+
+    def test_a_tombstone_error_shows_its_age(self):
+        self.table(AliasEntry(OLD, addr("bravo"), PAST))
+        with mock.patch.object(aliases, "write_tombstone",
+                               side_effect=OSError(errno.EIO, "injected")):
+            self.poll()
+            first = dict(aliases.LAST_TOMBSTONE_ERRORS[OLD])
+            self.poll()
+        self.assertEqual(aliases.LAST_TOMBSTONE_ERRORS[OLD]["since"], first["since"],
+                         "the first-seen time moved")
+        k = keyed_for_poll(self.cfg)
+        err = aliases.status_doc(k, k.registry_report)["store"]["tombstone_errors"][OLD]
+        self.assertIsInstance(err.get("age_s"), int)
+        self.assertEqual(err["since"], first["since"])
+
+    def test_a_version_1_record_with_later_members_is_damaged(self):
+        root = self.cfg.instances["bravo"].root
+        shutil.move(str(root), str(root) + ".away")
+        self.table()
+        self.send(to=[addr("bravo")])
+        path = self.pending_dir() / "00000001.json"
+        base = json.loads(path.read_text())
+        for k in ("snapshot", "source_gen", "from_address", "aliases"):
+            base.pop(k, None)
+        for t in base["targets"]:
+            t.pop("address", None)
+        base["v"] = 1
+        for label, extra in {"aliases": {"aliases": {}}, "snapshot": {"snapshot": {
+                "nonce": "a" * 32, "attachments": []}}}.items():
+            with self.subTest(label):
+                path.write_text(json.dumps(dict(base, **extra)))
+                with self.assertRaises(outbound.PendingDamaged):
+                    outbound._read_pending(path, "00000001")
+        path.write_text(json.dumps(base))
+        outbound._read_pending(path, "00000001")        # the plain version 1 is fine

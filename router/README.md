@@ -1427,14 +1427,20 @@ timestamp. The loader refuses a table without a registry, a `new` outside
 the fleet's domain, a duplicate `old`, a chain (a `new` that is some `old`),
 a reserved local part, and a same-domain `old` that is a case or confusable
 variant of its own target. An instance named `aliases` is now a load error:
-`state_dir/aliases/` is the store.
+`state_dir/aliases/` is the store. `old`'s domain is not restricted: an entry
+the operator writes can make an address that looks external deliver locally.
+The table is operator-owned configuration, so that is the operator's choice,
+stated here rather than prevented.
 
 **Every poll decides each entry, before anything drains.** ACTIVE: not
 expired, not tombstoned, its target a known identity (resolved, or held by
 the registry, in which case the delivery holds exactly as a direct address
 would), `old`'s local part in that identity's registry name history (whose
 last element must be its current name), and `old` no other identity's
-current name by skeleton. INACTIVE, deterministically, otherwise: a request
+current name by skeleton, and no other identity in the registry (served here
+or not, retired or not) holding `old`'s local part in its name history (a
+name reused by another identity never retargets an alias; an unreadable
+history anywhere holds). INACTIVE, deterministically, otherwise: a request
 naming an inactive alias is answered `rejected` / `recipient_unknown` right
 there, before any policy sees it. Matching is exact: the local part as
 written, the domain lowercased, so a case variant is not the alias.
@@ -1457,16 +1463,19 @@ Pending work pins the aliases it used (`aliases` in the record, with each
 target's `address`; a record with any is version 3, which an older router
 holds as damaged rather than misread): a later expiry or table edit never
 retargets or refuses it, and a target rebound since holds as
-`identity_changed`. So drain pending work before a §2.4 domain flip if the
-old addresses must stop working at once.
+`identity_changed`. Pinned work keeps its pin-time target across a §2.4
+domain flip too (each pinned address maps to that target's address in the new
+domain). So drain pending work before a flip if the old addresses must stop
+working at once.
 
 **Expiry and tombstones.** At or after `expires` an alias is inactive
 whatever else happened. The poll's pre-pass then writes its tombstone to
 `state_dir/aliases/tombstones.json`, so that re-listing it can never revive
 it: a tombstoned address stays unusable even with a new `expires`. A failed
 tombstone write is logged at ERROR, shown as
-`aliases.store.tombstone_errors`, retried every poll, and never stops
-anything else.
+`aliases.store.tombstone_errors` with the time the drain first saw it fail and
+its age (kept by the running router, so a restart starts the age again),
+retried every poll, and never stops anything else.
 
 **The store is checked against a floor and a witness** kept outside it, in
 `state_dir/registry/`: `aliases.floor` (the highest seq ever written) and
@@ -1482,7 +1491,8 @@ the registry floor's.
 **`router aliases reinit --reason TEXT [--dry-run]`** is the way out of an
 unverified store, with the router stopped. It writes a fresh store that
 tombstones EVERY configured alias, plus every address the audit log records
-as tombstoned, at a seq above anything seen, and audits it. **reinit
+as tombstoned and every tombstone of a store that can still be read (trusted
+or not), at a seq above anything seen, and audits it. **reinit
 permanently retires every configured alias; tombstoned addresses can never
 be re-enabled.** Nothing is taken as proof that an alias was still active,
 because a store can commit a tombstone and lose it before its audit line.

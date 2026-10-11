@@ -406,6 +406,9 @@ class Report:
     #: The same names as `known`, each to its whole active registry entry
     #: (the alias table reads a target's name history from it).
     entries: Mapping[str, Entry] = None  # type: ignore[assignment]
+    #: EVERY entry the registry holds, any state, configured or not: the
+    #: alias table's collision and name-reuse checks look past this router.
+    all_entries: Tuple[Entry, ...] = ()
 
     def to_doc(self) -> Dict[str, Any]:
         doc: Dict[str, Any] = {"state": self.state}
@@ -468,7 +471,7 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
         else:
             held[n] = HELD_NOT_REGISTERED
     return Report(state="ok", seq=reg.seq, resolved=resolved, held=held, known=known,
-                  entries=entries)
+                  entries=entries, all_entries=tuple(reg.entries))
 
 
 def stranded_state(state_dir: Path) -> List[str]:

@@ -2275,9 +2275,8 @@ def _pending_policy(
     pin = rec.get("binding")
     if pin is None:
         policy = cold_policy if cold_policy is not None else default_cold_policy
-        # The aliases PINNED when the record was made, never the live table.
         decided = policy(cfg, name, aliases_mod.apply_pinned(doc["draft"],
-                                                             rec.get("aliases") or {}))
+                                                             _pinned_map(cfg, rec)))
         if isinstance(decided, ColdRefusal):
             return decided
         if rec["kind"] == "peer":
@@ -2298,6 +2297,22 @@ def _pending_policy(
         if not (pin["window_ok"] or binding.check_peer_edge(cfg, name, bound)):
             return ColdRefusal("rejected", REASON_PEER_REPLY_WINDOW_EXPIRED)
     return None
+
+
+def _pinned_map(cfg: RouterConfig, rec: Dict[str, Any]) -> Dict[str, str]:
+    """How a pending record's draft addresses its PINNED targets this poll:
+    each target's pin-time address, and each alias pinned to it, map to that
+    same target's address as the fleet names it NOW. So a later domain flip,
+    expiry or table edit never refuses or retargets the work; the target's
+    identity is still checked against its pinned lid (`identity_changed`).
+    A record made before aliases (no `aliases`, no addresses) maps nothing."""
+    if "aliases" not in rec:
+        return {}
+    now = {t["address"]: address_for(t["recipient"], cfg.fleet_domain) for t in rec["targets"]}
+    out = dict(now)
+    for old, new in (rec.get("aliases") or {}).items():
+        out[old] = now.get(new, new)
+    return out
 
 
 def _block(cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], why: str) -> str:
