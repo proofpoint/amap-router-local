@@ -973,9 +973,9 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 `router/inflight.py` holds a request that stays unanswered across polls: one
 handed to a second runtime and settled from that runtime's result. Nothing
 reaches it yet. No built-in policy returns `outbound.ExternalRoute`, and
-`drain_instance`'s `transport` port is omitted by every caller; the rest of
-the external leg (classification, the transport itself, re-placement) is
-designed but not built. The transport is an optional plugin.
+no plugin can be activated yet (below); the rest of the external leg
+(classification, the transport itself, re-placement) is designed but not
+built. The transport is an optional plugin.
 
 * A record per request at `state_dir/<name>/inflight/<req_id>.json`, holding
   the staged copy; the agent's file stays in its outbox, skipped, until settled.
@@ -987,6 +987,45 @@ designed but not built. The transport is an optional plugin.
   only for an instance with a transport or with records.
 * The downstream verdict passes through verbatim, `detail` prefixed
   `transport:`.
+
+### The transport plugin (`router/transport.py`)
+
+The transport is an optional plugin, named in the config by path and
+content hash and never by import name:
+
+```json
+"transport_plugin": {"path": "/opt/amap/transport-plugin.py",
+                     "sha256": "<64 lowercase hex digits>"}
+```
+
+Both members or neither. Absent, the router runs `transport.NullTransport`,
+whose factories return `None`: the drain gets no transport, exactly as
+before, and an external route settles `queued_for_human`/`transport_anomaly`
+("the external leg is not configured").
+
+Present, the router loads it ONCE at startup (`service.start_transport`)
+and refuses to start on any failure. A config reload that changes it is
+refused; changing the plugin needs a restart. The loader's refusals, each a
+fixed `PluginRefused.reason`:
+
+| reason | refused when |
+|---|---|
+| `path_not_absolute`, `path_not_canonical` | the path is relative, or any component is a symlink |
+| `agent_reachable` | the file is inside an instance's root, inbox, outbox or peer tree |
+| `parent_owner`, `parent_writable` | a directory between the file and `/` is not root-owned, or is writable by others without the sticky bit |
+| `missing`, `symlink`, `not_regular` | the file is absent, is a symlink, or is not a regular file |
+| `owner`, `mode` | the file is not root-owned, or its mode is not exactly 0444 or 0644 |
+| `too_large` | the file exceeds `transport.MAX_PLUGIN_BYTES` |
+| `hash_mismatch` | its bytes, read once from the pinned descriptor, do not hash to `sha256` |
+| `exec_failed` | those bytes, the only ones ever executed, fail to run |
+| `api_mismatch` | its `PLUGIN_API` is not `(our major, at least our minor)` |
+| `missing_factory` | it lacks a callable `make_sender` or `make_intake_reader` |
+| `fsops_unavailable` | it passed every check, but the filesystem port its factories need is not built yet |
+
+The last one is deliberate and temporary: until that port exists, any
+configured plugin stops startup, so no transport is used before its
+durability work is done. `TransportPort.has_pending` is true for a request
+the downstream runtime has claimed as well as one it has not.
 
 ## Retention / deletion rights (v2.2.0)
 

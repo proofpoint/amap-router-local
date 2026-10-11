@@ -83,6 +83,12 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
     (`<intake_dir>/<instance>/`, created by `provision`). Same containment
     rules as `state_dir`. Nothing in this repo reads it yet: it exists so the
     adapter can express the mount before an email router is real.
+  - `transport_plugin` — `{"path": <absolute path>, "sha256": <64 hex>}`,
+    the optional transport plugin, pinned by path and content hash, never
+    by import name (`router/transport.py`). Both members or the key absent:
+    absent means no plugin (`transport.NullTransport`), and the external
+    leg settles as not configured. This module checks only the shape; the
+    file itself is checked, and refused, when the router starts.
 
 A caller may declare ADDITIONAL permitted instance keys (`extra_instance_keys`)
 together with a `validate_extra` callable; validated values surface on
@@ -167,6 +173,7 @@ _TOP_KEYS = {
     "task_graph", "mail_graph",
     "instances_dir", "selected_json",
     "peer_senders", "peers",
+    "transport_plugin",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders"}
 
@@ -445,6 +452,38 @@ class RouterConfig:
     #: Which `outbound/ext/<id>/outcomes/` directories are scanned, in order.
     #: One budget and one dedup key span all of them (`outcomes._consume_dir`).
     connector_outcome_ids: Tuple[str, ...] = DEFAULT_CONNECTOR_OUTCOME_IDS
+    #: The pinned transport plugin, or None for none (`transport_plugin`
+    #: in the module docstring).
+    transport_plugin: Optional["TransportPluginPin"] = None
+
+
+@dataclass(frozen=True)
+class TransportPluginPin:
+    """`transport_plugin` as configured: where the plugin is and what its
+    bytes must hash to. Nothing here has looked at the file."""
+    path: str
+    sha256: str
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
+
+def _transport_plugin(top: Dict[str, Any]) -> Optional[TransportPluginPin]:
+    if "transport_plugin" not in top:
+        return None
+    raw = top["transport_plugin"]
+    if not isinstance(raw, dict):
+        raise ConfigError("config.transport_plugin: expected an object {path, sha256}")
+    keys = set(raw)
+    if keys != {"path", "sha256"}:
+        raise ConfigError(
+            "config.transport_plugin: needs exactly 'path' and 'sha256', both or "
+            f"neither; got {sorted(keys)}")
+    path = _require_absolute(raw["path"], "config.transport_plugin.path")
+    sha = raw["sha256"]
+    if not (isinstance(sha, str) and _SHA256_HEX_RE.match(sha)):
+        raise ConfigError("config.transport_plugin.sha256: expected 64 lowercase hex digits")
+    return TransportPluginPin(path=str(path), sha256=sha)
 
 
 def address_for(name: str, fleet_domain: Optional[str] = None) -> str:
@@ -1227,6 +1266,7 @@ def load_obj(
                 )
 
     outcome_ids = _connector_outcome_ids(top)
+    transport_plugin = _transport_plugin(top)
 
     cfg = RouterConfig(
         state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
@@ -1239,6 +1279,7 @@ def load_obj(
         discovery=(replace(discovery, inert_edges=inert)
                    if discovery is not None else None),
         selected_json=selected_json,
+        transport_plugin=transport_plugin,
     )
 
     # The two lanes are DISJOINT per ordered pair. A pair that is both a

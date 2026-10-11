@@ -119,8 +119,9 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import transport as transport_mod
 from .config import RouterConfig
 from .util import atomic_write, fsync_dir, parse_utc_ts, utc_ts
 
@@ -152,15 +153,9 @@ WRITTEN = "written"
 CLEANED = "cleaned"
 
 
-class TransportPort(Protocol):
-    """The transport, as `advance` needs it. A real implementation comes
-    from an optional transport plugin; tests supply a fake."""
-
-    def has_result(self, n: str) -> bool: ...
-    def has_pending(self, n: str) -> bool: ...
-    def has_archived(self, n: str) -> bool: ...
-    def read_result(self, n: str) -> bytes: ...
-    def write_request(self, n: str, data: bytes) -> None: ...
+#: The transport port lives in `router/transport.py`, with the plugin seam;
+#: the name stays here so every existing caller and type hint is unchanged.
+TransportPort = transport_mod.TransportPort
 
 
 class CounterCorrupt(Exception):

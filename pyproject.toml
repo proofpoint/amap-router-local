@@ -1,6 +1,6 @@
 # amap-router-local is packaged so that OTHER runtimes can import its policy
 # core -- `binding`, `config`, `peers`, `validate`, `attachments`, `deliver`,
-# `outbound`, `exposure`, `lock` --
+# `outbound`, `exposure`, `lock`, `transport` --
 # instead of reimplementing it. `binding.py` calls itself "the security core:
 # recipient resolution"; two copies of a mutual-allowlist check drift, and they
 # drift silently, with both test suites staying green while the semantics

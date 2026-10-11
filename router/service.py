@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from . import outbound, outcomes, roster
+from . import outbound, outcomes, roster, transport as transport_mod
 from .config import RouterConfig
 from .config import ConfigError, load
 from .status import StatusTracker, render_discovery
@@ -40,7 +41,48 @@ from .status import StatusTracker, render_discovery
 logger = logging.getLogger("amap_router_local")
 
 
-def run_once(cfg: RouterConfig) -> Dict[str, Dict[str, int]]:
+#: `run_once`'s default: load the configured plugin for this one call.
+_LOAD = object()
+
+
+def _agent_reachable_roots(cfg: RouterConfig) -> List[Path]:
+    """Every directory an agent can reach: no plugin may live inside one."""
+    roots: List[Path] = []
+    for inst in cfg.instances.values():
+        for p in (inst.root, inst.inbox_root, inst.outbox_root, inst.peer_root):
+            if p is not None:
+                roots.append(p)
+    return roots
+
+
+def start_transport(cfg: RouterConfig) -> Optional[Any]:
+    """The transport the drain uses, loaded ONCE per process (`run_forever`)
+    and never hot-swapped. With no `transport_plugin` configured this is
+    `NullTransport`'s sender, `None`, and the drain behaves exactly as it
+    did before plugins existed. With one configured, `transport.load_plugin`
+    checks the file and raises `PluginRefused` on any failure, which stops
+    startup: a configured hand-off with no usable plugin never starts in a
+    degraded mode.
+
+    NOT YET ACTIVATABLE. The filesystem port a plugin's factories receive
+    is not built yet, so a plugin that passes every check is still refused
+    (`fsops_unavailable`) rather than handed `None` for it. Configuring one
+    therefore stops startup until that port exists, which is the intended
+    gate: no transport is used before its durability work is done."""
+    pin = cfg.transport_plugin
+    if pin is None:
+        return transport_mod.NullTransport().make_sender({}, None)
+    plugin = transport_mod.load_plugin(
+        pin.path, pin.sha256, forbidden_roots=_agent_reachable_roots(cfg))
+    logger.info("transport plugin loaded: path=%s sha256=%s PLUGIN_API=%s",
+                plugin.path, plugin.sha256, plugin.api)
+    raise transport_mod.PluginRefused(
+        "fsops_unavailable",
+        "the plugin passed every check, but the filesystem port its factories "
+        "need is not built yet; it cannot be activated")
+
+
+def run_once(cfg: RouterConfig, transport: Any = _LOAD) -> Dict[str, Dict[str, int]]:
     """Drain every configured instance's outbound/ once. Returns
     `{instance_name: drain_summary}` for logging/tests.
 
@@ -67,10 +109,12 @@ def run_once(cfg: RouterConfig) -> Dict[str, Dict[str, int]]:
     log line stops being the only option but does not stop being what they
     parse today.
     """
+    if transport is _LOAD:
+        transport = start_transport(cfg)
     summary: Dict[str, Dict[str, int]] = {}
     for name in sorted(cfg.instances):
         try:
-            result = outbound.drain_instance(cfg, name)
+            result = outbound.drain_instance(cfg, name, transport=transport)
         except Exception:
             logger.exception(
                 "error draining instance %r — isolated, continuing with "
@@ -128,7 +172,8 @@ def run_once(cfg: RouterConfig) -> Dict[str, Dict[str, int]]:
     return summary
 
 
-def poll_once(cfg: RouterConfig, tracker: StatusTracker) -> Dict[str, Dict[str, int]]:
+def poll_once(cfg: RouterConfig, tracker: StatusTracker,
+              transport: Any = _LOAD) -> Dict[str, Dict[str, int]]:
     """One iteration of `run_forever`'s loop: drain everything, fold the
     result into `tracker`, and persist it to `cfg.state_dir/status.json`.
     `run_once` already isolates per-instance failures; this adds one more
@@ -143,7 +188,9 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker) -> Dict[str, Dict[str, 
     # counters. An errored poll must still report the set it was working on.
     tracker.record_admitted(cfg.instances)
     try:
-        summary = run_once(cfg)
+        # The no-plugin call keeps its exact shape (`run_once(cfg)`), so a
+        # router without a plugin runs precisely the code it ran before.
+        summary = run_once(cfg) if transport is _LOAD else run_once(cfg, transport)
     except Exception:
         logger.exception(
             "error running a full poll — isolated, continuing the loop"
@@ -210,6 +257,12 @@ def reload_config(config_path, current: RouterConfig) -> RouterConfig:
             "private state; moving it needs a restart, not a reload.",
             current.state_dir, fresh.state_dir)
         return current
+    if fresh.transport_plugin != current.transport_plugin:
+        logger.error(
+            "config reload changed transport_plugin — REFUSED and ignored. The "
+            "plugin is loaded once at startup and never hot-swapped; changing "
+            "it needs a restart, not a reload.")
+        return current
     return fresh
 
 
@@ -245,6 +298,9 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
     """
     logger.info("router starting: interval=%ss, instances=%s",
                 interval, sorted(cfg.instances))
+    # Once, before the loop, and allowed to raise: a refused plugin stops
+    # startup here (`start_transport`).
+    transport = start_transport(cfg)
     tracker = StatusTracker(interval_s=interval)
     seen_report = None
     seen_names = sorted(cfg.instances)
@@ -282,7 +338,12 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
                     for line in current or []:
                         logger.warning("%s", line)
                     seen_report = current
-            poll_once(cfg, tracker)
+            # Without a plugin (`transport` is None) the loop body is called
+            # exactly as before; `run_once` then resolves the same None.
+            if transport is None:
+                poll_once(cfg, tracker)
+            else:
+                poll_once(cfg, tracker, transport)
             time.sleep(interval)
     except KeyboardInterrupt:
         logger.info("router stopping (interrupted)")

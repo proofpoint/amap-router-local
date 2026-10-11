@@ -176,7 +176,7 @@ change.
 
 #: What another repo may import. Held to a no-side-effect bare import.
 PUBLIC_MODULES = ("attachments", "binding", "config", "deliver", "exposure",
-                  "lock", "outbound", "peers", "validate")
+                  "lock", "outbound", "peers", "transport", "validate")
 
 #: Implementation. May change shape without notice.
 INTERNAL_MODULES = ("__main__", "audit", "console", "inflight", "outcomes", "provision",
