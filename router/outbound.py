@@ -6,7 +6,7 @@ policy -> deliver -> result -> archive), transplanted onto the router's own
 config/binding/deliver primitives:
 
   1. List `<ns>/outbound/` entries; accept ONLY filenames matching
-     `^req-[A-Za-z0-9_-]{1,64}\\.json$` (verbatim `REQ_NAME_RE`,
+     `req-[A-Za-z0-9_-]{1,64}\\.json`, whole name (`REQ_NAME_RE`, fullmatch; from
      `gate/outbound.py:85`) — anything else is logged (`logger.warning`)
      and never opened. A symlinked entry is likewise never opened (`list_
      outbound` excludes it and reports the count) — it could resolve
@@ -149,7 +149,9 @@ from .util import (
 
 logger = logging.getLogger("amap_router_local.outbound")
 
-REQ_NAME_RE = re.compile(r"^req-[A-Za-z0-9_-]{1,64}\.json$")
+#: Applied with `fullmatch` and anchored with `\Z`: `$` also matches before a
+#: trailing newline, so `req-1.json\n` passed the gate it was copied from.
+REQ_NAME_RE = re.compile(r"req-[A-Za-z0-9_-]{1,64}\.json\Z")
 
 # Reason-code vocabulary this router emits (README.md documents these for
 # operators; AMAP §4 treats the vocabulary as extensible, not enum-locked).
@@ -1492,7 +1494,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     inflight_begun = inflight_waiting = 0
     skipped_bad_name = skipped_symlinks
     for filename in filenames:
-        if not REQ_NAME_RE.match(filename):
+        if not REQ_NAME_RE.fullmatch(filename):
             skipped_bad_name += 1
             logger.warning(
                 "outbound listing for instance %r has a filename that fails "

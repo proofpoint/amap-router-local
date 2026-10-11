@@ -296,8 +296,8 @@ SELECTED_SCHEMA = 1
 # two spellings of one domain would make a correct fleet look misconfigured.
 # Refused rather than folded, like instance names.
 _FLEET_DOMAIN_RE = re.compile(
-    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+    r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\Z"
 )
 
 # The router's own local part. The `.` is outside the instance-name charset
@@ -517,7 +517,7 @@ def _transport_plugin(top: Dict[str, Any]) -> Optional[TransportPluginPin]:
             f"neither; got {sorted(keys)}")
     path = _require_absolute(raw["path"], "config.transport_plugin.path")
     sha = raw["sha256"]
-    if not (isinstance(sha, str) and _SHA256_HEX_RE.match(sha)):
+    if not (isinstance(sha, str) and _SHA256_HEX_RE.fullmatch(sha)):
         raise ConfigError("config.transport_plugin.sha256: expected 64 lowercase hex digits")
     return TransportPluginPin(path=str(path), sha256=sha)
 
@@ -576,7 +576,7 @@ def router_address(fleet_domain: Optional[str]) -> Optional[str]:
     return f"{ROUTER_LOCAL_PART}@{fleet_domain}"
 
 
-_ADDR_RE = re.compile(r"^agent\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})@local$")
+_ADDR_RE = re.compile(r"agent\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})@local\Z")
 
 
 def instance_for(address: str, fleet_domain: Optional[str] = None,
@@ -608,12 +608,12 @@ def instance_for(address: str, fleet_domain: Optional[str] = None,
         return None
     candidate = address.strip().lower()
     if fleet_domain:
-        m = re.match(
-            r"^([A-Za-z0-9][A-Za-z0-9._-]{0,63})@" + re.escape(fleet_domain) + r"$",
+        m = re.fullmatch(
+            r"([A-Za-z0-9][A-Za-z0-9._-]{0,63})@" + re.escape(fleet_domain) + r"\Z",
             candidate,
         )
     else:
-        m = _ADDR_RE.match(candidate)
+        m = _ADDR_RE.fullmatch(candidate)
     if m is None:
         return None
     name = m.group(1)
@@ -1013,7 +1013,7 @@ def load_obj(
     fleet_domain: Optional[str] = None
     if "fleet_domain" in top:
         fd = top["fleet_domain"]
-        if not isinstance(fd, str) or not _FLEET_DOMAIN_RE.match(fd):
+        if not isinstance(fd, str) or not _FLEET_DOMAIN_RE.fullmatch(fd):
             raise ConfigError(
                 f"config.fleet_domain: expected a bare, lowercase domain label "
                 f"sequence such as 'example.invalid', got {fd!r}"
@@ -1424,7 +1424,7 @@ def _connector_outcome_ids(top: Dict[str, Any]) -> Tuple[str, ...]:
             f"ids, got {raw!r}")
     seen: Dict[str, str] = {}
     for cid in raw:
-        if not isinstance(cid, str) or not _CONNECTOR_ID_RE.match(cid):
+        if not isinstance(cid, str) or not _CONNECTOR_ID_RE.fullmatch(cid):
             raise ConfigError(
                 f"config.connector_outcome_ids: {cid!r} is not a connector id — "
                 f"it becomes a path segment under outbound/ext/, so it must match "

@@ -85,7 +85,7 @@ ORIGIN_EXTERNAL = "external"
 #: abandoned and the stamp omitted (module docstring).
 MAX_NOTICE_LISTING = 50_000
 
-_NOTICE_FILE_RE = re.compile(r"^notice-([A-Za-z0-9_][A-Za-z0-9_.-]*)\.json$")
+_NOTICE_FILE_RE = re.compile(r"notice-([A-Za-z0-9_][A-Za-z0-9_.-]*)\.json\Z")  # fullmatch
 
 
 def _window(cfg: RouterConfig, sender: str, now: datetime) -> datetime:
@@ -118,7 +118,7 @@ def _scan_ledger(
     except OSError:
         return ids, None
     for entry in entries:
-        m = _NOTICE_FILE_RE.match(entry.name)
+        m = _NOTICE_FILE_RE.fullmatch(entry.name)
         if not m:
             continue
         ids.add(m.group(1))
@@ -161,7 +161,7 @@ def _scan_unledgered_notices(
                             sender, MAX_NOTICE_LISTING,
                         )
                         return False, None
-                    m = _NOTICE_FILE_RE.match(entry.name)
+                    m = _NOTICE_FILE_RE.fullmatch(entry.name)
                     if not m or m.group(1) in ledgered:
                         continue
                     try:

@@ -196,7 +196,7 @@ def _int(v: Any) -> bool:
 
 
 def _str(pattern):
-    return lambda v: isinstance(v, str) and bool(pattern.match(v))
+    return lambda v: isinstance(v, str) and bool(pattern.fullmatch(v))
 
 
 def parse(data: bytes) -> Registry:

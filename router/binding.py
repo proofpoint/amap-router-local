@@ -73,7 +73,7 @@ from .config import ALLOW_ANY, RouterConfig
 # Verbatim from `gate/outbound.py:_NOTICE_ID_RE` — the notice-id an agent
 # supplies in `in_reply_to` is agent-controlled and becomes part of a
 # filesystem path; sanitize before it ever touches one.
-_NOTICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_NOTICE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")  # fullmatch; `$` admitted a trailing newline
 
 
 def ledger_dir(state_dir: Path, recipient_instance: str, *,
@@ -145,7 +145,7 @@ def read_ledger_record(
     original `message_id` forward as `message.in_reply_to` enrichment
     (`deliver.py`'s `reply_to_record`). Same fail-closed rules as
     `resolve_binding`: `None` on anything not cleanly resolved."""
-    if not isinstance(in_reply_to, str) or not _NOTICE_ID_RE.match(in_reply_to):
+    if not isinstance(in_reply_to, str) or not _NOTICE_ID_RE.fullmatch(in_reply_to):
         return None
     path = ledger_path(state_dir, sender_instance, in_reply_to, state_key=state_key)
     if not path.is_file():

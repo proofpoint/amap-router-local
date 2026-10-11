@@ -206,7 +206,7 @@ def dest_tag(rel: Sequence[str]) -> str:
     if not rel:
         return "0-"
     for c in rel:
-        if not _TAG_COMPONENT.match(c):
+        if not _TAG_COMPONENT.fullmatch(c):
             raise BindingError(f"directory name {c!r} is outside the tag charset [A-Za-z0-9._-]")
     return ".".join(f"{len(c.encode('ascii'))}-{c}" for c in rel)
 

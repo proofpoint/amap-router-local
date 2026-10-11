@@ -77,7 +77,7 @@ LEGACY_APPROVAL_FILENAME = "approval.json"
 # to avoid a module-load cycle (outbound.py imports this module). The
 # snapshot only ever needs to recognize the same filename shape the drain
 # loop itself would ever open.
-_REQ_NAME_RE = re.compile(r"^req-[A-Za-z0-9_-]{1,64}\.json$")
+_REQ_NAME_RE = re.compile(r"req-[A-Za-z0-9_-]{1,64}\.json\Z")
 
 
 class FirstSightError(Exception):
@@ -163,7 +163,7 @@ def _snapshot_outbox(outbox_root: Path) -> List[Dict[str, Any]]:
     except OSError:
         return entries
     for name in names:
-        if not _REQ_NAME_RE.match(name):
+        if not _REQ_NAME_RE.fullmatch(name):
             continue
         p = outbox_root / name
         sha256: Optional[str] = None

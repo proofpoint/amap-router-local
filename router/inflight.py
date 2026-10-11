@@ -216,7 +216,7 @@ def allocate_transport_req_id(cfg: RouterConfig, name: str) -> str:
     except FileNotFoundError:
         n = 1
     else:
-        if not _COUNTER_RE.match(text):
+        if not _COUNTER_RE.fullmatch(text):
             raise CounterCorrupt(f"{path}: not a positive decimal; refusing to reuse ids")
         n = int(text)
     _effect("counter", atomic_write, path, str(n + 1).encode("ascii"),
@@ -333,7 +333,7 @@ def verdict_from_result(raw: bytes, n: str, record: Dict[str, Any]) -> Dict[str,
         return _anomaly("transport result has no recognized outcome")
 
     reason = doc.get("reason_code")
-    if reason is not None and not (isinstance(reason, str) and _REASON_RE.match(reason)):
+    if reason is not None and not (isinstance(reason, str) and _REASON_RE.fullmatch(reason)):
         return _anomaly("transport result has a malformed reason_code")
 
     detail = doc.get("detail")

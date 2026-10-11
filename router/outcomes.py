@@ -181,7 +181,7 @@ def outcomes_rel(connector_id: str) -> Path:
     went on pinning it."""
     return Path("ext") / connector_id / "outcomes"
 
-OUTCOME_NAME_RE = re.compile(r"^peer-([a-f0-9]{32})\.json$")
+OUTCOME_NAME_RE = re.compile(r"peer-([a-f0-9]{32})\.json\Z")  # fullmatch; never `$`
 
 OUTCOME_DELIVERED = "delivered"
 OUTCOME_HELD = "held"
@@ -466,7 +466,7 @@ def empty_summary() -> Dict[str, Any]:
 
 #: The record files `_consume_one` writes: `<tree>-<notice_id>.<outcome>.json`.
 _RECORD_NAME_RE = re.compile(
-    r"^(?P<tree>[a-z]+)-(?P<notice_id>[a-f0-9]{32})\.(?P<outcome>[a-z_]+)\.json$"
+    r"(?P<tree>[a-z]+)-(?P<notice_id>[a-f0-9]{32})\.(?P<outcome>[a-z_]+)\.json\Z"
 )
 
 
@@ -493,7 +493,7 @@ def placed_but_denied(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
         return []
     latest: Dict[str, tuple] = {}
     for entry in entries:
-        m = _RECORD_NAME_RE.match(entry.name)
+        m = _RECORD_NAME_RE.fullmatch(entry.name)
         if not m or m.group("tree") != deliver_mod.TREE_PEER:
             continue
         try:
@@ -593,7 +593,7 @@ def _consume_names(
     Returns the running `examined` count, which `_consume_dir` carries from
     one directory to the next."""
     for filename in sorted(e.name for e in os.scandir(dir_fd)):
-        m = OUTCOME_NAME_RE.match(filename)
+        m = OUTCOME_NAME_RE.fullmatch(filename)
         if not m:
             # Never opened: the daemon's `.tmp` staging names land
             # here legitimately, so this is not even a warning.
