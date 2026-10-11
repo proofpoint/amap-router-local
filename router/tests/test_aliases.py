@@ -335,7 +335,9 @@ class StoreTests(_Aliases):
             def wrap(*a, _real=real, _fn=fn, **kw):
                 order.append(_fn)
                 return _real(*a, **kw)
-            self.enterContext(mock.patch.object(aliases, fn, wrap))
+            patcher = mock.patch.object(aliases, fn, wrap)   # enterContext is 3.11+
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.poll()
         self.assertEqual(order, ["_write_store", "_write_floor", "_audit", "_write_witness"])
         self.assertEqual(self.state(), aliases.ROW_OK)
