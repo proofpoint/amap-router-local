@@ -1083,6 +1083,37 @@ H2), not derived from `req_id`, so this narrow window is not currently
 made idempotent. Out of scope for L1; flagged for anyone hardening this
 further.
 
+## The host registry (`registry_dir`)
+
+With `registry_dir` set to the host registry's directory (a read-only mount
+holding `registry.json`), every poll reads the registry and drains only the
+instances whose name is an ACTIVE, uncontested registry entry. Every other
+configured instance is HELD, not drained, and reported in `status.json`
+under `registry.held` with a reason:
+
+| reason | meaning |
+|---|---|
+| `not_registered` | no active registry entry has this name |
+| `skeleton_collision` | two active entries' names fold to the same skeleton; both are held, never guessed between |
+| `registry_unavailable` | the snapshot is absent, unreadable, not a regular file, too large, not strict JSON, an unknown schema token, or a field of the wrong shape (`registry.code` says which) |
+| `registry_rolled_back` | the snapshot's `seq` is lower than one already accepted |
+
+Without `registry_dir`, nothing changes. The router never writes the
+registry. It checks the schema token, `seq` and the fields it uses, and
+relies on the registry writer for the rest (it validates every snapshot
+before making it visible).
+
+**A rolled-back registry is an operator event.** The highest `seq` this
+router has accepted is kept in `state_dir/registry/seq`. A snapshot with a
+lower `seq` means the registry was restored, and adopting it could re-bind
+names to older identities, so every instance stays held and `status.json`
+shows `registry.state: "rolled_back"`. To accept a deliberate restore, the
+operator removes `state_dir/registry/seq`; the next poll accepts the
+snapshot's `seq` as the new floor.
+
+Private state is still keyed by instance name in this version; moving it to
+`state_dir/<logical_id>/` is a separate, guarded step.
+
 ## Approved but NOT BUILT: discovery and the published directory
 
 Approved by this repo's operator on 2026-09-18, against the tree as it stood

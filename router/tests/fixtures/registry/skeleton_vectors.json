@@ -1,0 +1,148 @@
+{
+  "description": "Test vectors for amap-host's name skeleton (docs/registry-model.md, Names). Any implementation of skeleton() must reproduce every vector. Copy this file verbatim; do not edit a copy.",
+  "fold": {
+    "steps": [
+      "NFC",
+      "casefold",
+      "confusables",
+      "remove separators"
+    ],
+    "confusables": {
+      "0": "o",
+      "1": "l",
+      "i": "l",
+      "5": "s"
+    },
+    "separators_removed": [
+      "-",
+      "_",
+      "."
+    ]
+  },
+  "reserved_local_parts": [
+    "amap.router",
+    "postmaster",
+    "abuse"
+  ],
+  "skeletons": [
+    [
+      "alpha",
+      "alpha"
+    ],
+    [
+      "Foo__Bar..baz",
+      "foobarbaz"
+    ],
+    [
+      "foo-",
+      "foo"
+    ],
+    [
+      "a.m.a.p.router",
+      "amaprouter"
+    ],
+    [
+      "b0b-1",
+      "bobl"
+    ],
+    [
+      "BOB_l",
+      "bobl"
+    ],
+    [
+      "mail",
+      "mall"
+    ],
+    [
+      "s5",
+      "ss"
+    ],
+    [
+      "Alpha-1",
+      "alphal"
+    ],
+    [
+      "x--y__z..w",
+      "xyzw"
+    ],
+    [
+      "amap.router.",
+      "amaprouter"
+    ]
+  ],
+  "reserved": [
+    "amap.router",
+    "AMAP.Router",
+    "amap-router",
+    "amap_router",
+    "amap--router",
+    "amaprouter",
+    "a.m.a.p.router",
+    "amap-r0uter",
+    "postmaster",
+    "p0stmaster",
+    "post-master",
+    "postmaster-",
+    "abuse",
+    "ABUSE",
+    "abu5e",
+    "ab-use",
+    "Abuse_",
+    "abuse.",
+    "amap.router.",
+    "abuse-",
+    "postmaster_"
+  ],
+  "not_reserved": [
+    "amap-routers",
+    "router",
+    "abused",
+    "postmasters",
+    "post-mistress",
+    "alpha"
+  ],
+  "collide": [
+    [
+      "foo",
+      "foo-"
+    ],
+    [
+      "foo-bar",
+      "foobar"
+    ],
+    [
+      "alpha",
+      "ALPHA"
+    ],
+    [
+      "alpha",
+      "a1pha"
+    ],
+    [
+      "alpha",
+      "al.pha"
+    ],
+    [
+      "b0b",
+      "bob"
+    ],
+    [
+      "s5",
+      "ss"
+    ]
+  ],
+  "distinct": [
+    [
+      "alpha",
+      "alpha2"
+    ],
+    [
+      "foo",
+      "fooo"
+    ],
+    [
+      "router",
+      "routers"
+    ]
+  ]
+}

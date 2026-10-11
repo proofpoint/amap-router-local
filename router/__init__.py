@@ -180,7 +180,7 @@ PUBLIC_MODULES = ("attachments", "binding", "config", "deliver", "exposure",
 
 #: Implementation. May change shape without notice.
 INTERNAL_MODULES = ("__main__", "audit", "console", "fsops", "inflight", "outcomes", "provision",
-                    "reset", "roster", "service", "status")
+                    "registry", "reset", "roster", "service", "status")
 
 #: Named by no ruling yet. Absent from the plan's table, not assigned by it.
 UNCLASSIFIED_MODULES = ("firstsight", "util")
