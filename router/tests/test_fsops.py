@@ -199,7 +199,91 @@ class BarrierOrderTests(_HopCase):
 
         with mock.patch("router.fsops.os.fsync", fsync):
             self.ops.stage_tree(lid, ".adm-order")
-        self.assertEqual(synced, ["sub", "sub", "lid"])
+        # stage/ (its mode), up/ (stage's entry), the root (up's entry), then
+        # the <logical_id>/ parent (the root's entry).
+        self.assertEqual(synced, ["sub", "sub", "sub", "lid"])
+
+
+class ExistsBranchTests(_HopCase):
+    """Establish and make durable BEFORE any cleanup; repair the stage-dir
+    barrier on every exists_same."""
+
+    def _spy(self):
+        events = []
+        real = os.fsync
+        stage_ino = os.fstat(self.up_stage).st_ino
+        dest_ino = os.fstat(self.outbound).st_ino
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            events.append("file" if not stat.S_ISDIR(st.st_mode) else
+                          {stage_ino: "stage_dir", dest_ino: "dest_dir"}.get(st.st_ino, "dir"))
+            return real(fd)
+
+        return events, mock.patch("router.fsops.os.fsync", fsync)
+
+    def test_exists_same_fsyncs_the_file_the_destination_and_the_stage_dir(self):
+        self.commit()
+        events, patch = self._spy()
+        with patch:
+            self.assertEqual(self.commit(), "exists_same")
+        self.assertEqual(events, ["file", "dest_dir", "stage_dir"])
+
+    def test_a_failed_final_stage_dir_fsync_is_repaired_by_a_fresh_retry(self):
+        """Codex F1: the last barrier (the stage-dir fsync after the unlink)
+        fails. A fresh instance's retry must attempt it again, and must not
+        answer exists_same while it still fails."""
+        stage_ino = os.fstat(self.up_stage).st_ino
+        real = os.fsync
+        state = {"armed": False}
+
+        def fsync(fd):
+            if state["armed"] and os.fstat(fd).st_ino == stage_ino:
+                raise OSError(errno.EIO, "injected")
+            return real(fd)
+
+        def step(lbl, **kw):
+            if lbl == "unlinked":
+                state["armed"] = True
+
+        with mock.patch.object(self.ops, "_step", step), \
+                mock.patch("router.fsops.os.fsync", fsync):
+            with self.assertRaises(OSError):
+                self.commit()
+            ops, stage, out = self.fresh()
+            with self.assertRaises(OSError):
+                self.commit(ops, stage=stage, dest=out)
+        ops, stage, out = self.fresh()
+        events, patch = self._spy()
+        with patch:
+            self.assertEqual(self.commit(ops, stage=stage, dest=out), "exists_same")
+        self.assertIn("stage_dir", events)
+
+    def test_a_mismatched_final_keeps_our_stage_as_evidence(self):
+        """Codex F2: an nlink-1 final with different bytes, and our own stage
+        present. exists_different, with the stage kept."""
+        self.final().write_bytes(b"someone else's")
+        os.chmod(self.final(), 0o640)
+        self.stage_path().write_bytes(DATA)
+        with self.assertLogs("amap_router_local.fsops", logging.ERROR):
+            self.assertEqual(self.commit(), "exists_different")
+        self.assertTrue(self.stage_path().exists(), "evidence removed before the compare")
+        self.assertEqual(self.final().read_bytes(), b"someone else's")
+
+    def test_a_matching_final_drops_our_stale_stage_only_after_the_barriers(self):
+        self.final().write_bytes(DATA)
+        os.chmod(self.final(), 0o640)
+        self.stage_path().write_bytes(b"old attempt")
+        seen = []
+
+        def step(lbl, **kw):
+            if lbl == "same_synced":
+                seen.append(self.stage_path().exists())
+
+        with mock.patch.object(self.ops, "_step", step):
+            self.assertEqual(self.commit(), "exists_same")
+        self.assertEqual(seen, [True])
+        self.assertFalse(self.stage_path().exists())
 
 
 class CrashPointTests(_HopCase):
@@ -385,6 +469,55 @@ class BindingAndTagTests(_HopCase):
         direct = ops.open_root_nofollow(str(self.hop / LID / GEN / "outbound"))
         self.assertEqual(ops.binding(direct).tag, tag)
         self.assertEqual(ops.binding(direct).tree, ops.binding(out).tree)
+
+    def test_tag_components_outside_the_charset_are_refused(self):
+        with self.assertRaises(fsops.BindingError):
+            fsops.dest_tag(("outbound", "a b"))
+        with self.assertRaises(fsops.BindingError):
+            self.ops.mkdir_and_pin(self.tree, "we irdé", 0o750)
+        self.assertEqual(fsops.dest_tag(("a-b_c.d",)), "7-a-b_c.d")
+
+    def test_a_prior_binding_no_descriptor_holds_is_replaced_not_ambiguous(self):
+        """RE's B2: once nothing holds the prior directory, its inode may be
+        freed and reused, so the old binding proves nothing."""
+        d = self.ops.mkdir_and_pin(self.outbound, "req-00000001.attachments", 0o770)
+        os.close(d)
+        os.rename(self.final().parent / "req-00000001.attachments",
+                  self.final().parent / "req-00000002.attachments")
+        fd = self.ops.descend_pinned(self.outbound, "req-00000002.attachments")
+        self.assertEqual(self.ops.binding(fd).rel, ("outbound", "req-00000002.attachments"))
+
+    def test_an_injected_inode_reuse_after_removal_is_not_ambiguous(self):
+        """The ext4/xfs case, simulated: a per-item directory removed BY
+        SOMEONE ELSE (so remove_pinned's pruning never ran) has its
+        (dev, ino) reappear for the next item's directory."""
+        a = self.ops.mkdir_and_pin(self.outbound, "req-00000001.attachments", 0o770)
+        old = os.fstat(a)
+        os.close(a)
+        os.rmdir(self.final().parent / "req-00000001.attachments")
+        real = os.fstat
+        target = str(self.final().parent / "req-00000002.attachments")
+
+        def fstat(fd):
+            st = real(fd)
+            if stat.S_ISDIR(st.st_mode) and os.readlink(f"/proc/self/fd/{fd}") == target:
+                fields = list(st)
+                fields[stat.ST_INO], fields[stat.ST_DEV] = old.st_ino, old.st_dev
+                return os.stat_result(fields)
+            return st
+
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("needs /proc/self/fd")
+        with mock.patch("router.fsops.os.fstat", fstat):
+            b = self.ops.mkdir_and_pin(self.outbound, "req-00000002.attachments", 0o770)
+            self.assertEqual(self.ops.binding(b).rel[-1], "req-00000002.attachments")
+
+    def test_remove_pinned_forgets_the_bindings_under_it(self):
+        d = self.ops.mkdir_and_pin(self.outbound, "req-00000003.attachments", 0o770)
+        key = (os.fstat(d).st_dev, os.fstat(d).st_ino)
+        os.close(d)
+        self.ops.remove_pinned(self.outbound, "req-00000003.attachments")
+        self.assertNotIn(key, self.ops._by_dir)
 
     def test_one_directory_under_two_paths_is_ambiguous(self):
         os.rename(self.hop / LID / GEN / "outbound", self.hop / LID / GEN / "moved")

@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import re
 import fcntl
 import logging
 import os
@@ -192,13 +193,22 @@ class Binding:
         return self.kind in (GENERATION, INTAKE)
 
 
+#: What a destination-tag component may contain (the Protocol's tag grammar).
+_TAG_COMPONENT = re.compile(r"[A-Za-z0-9._-]+\Z")
+
+
 def dest_tag(rel: Sequence[str]) -> str:
     """The destination tag for a relative path: each component as
-    `<length>-<component>`, joined by `.`; the tree root itself is `0-`.
-    Unambiguous whatever the components contain."""
+    `<length in bytes>-<component>`, joined by `.`; the tree root itself is
+    `0-`. Components must match `[A-Za-z0-9._-]+` (BindingError otherwise),
+    so the tag does too, and the length prefixes keep it unambiguous though
+    components may contain `.`."""
     if not rel:
         return "0-"
-    return ".".join(f"{len(c)}-{c}" for c in rel)
+    for c in rel:
+        if not _TAG_COMPONENT.match(c):
+            raise BindingError(f"directory name {c!r} is outside the tag charset [A-Za-z0-9._-]")
+    return ".".join(f"{len(c.encode('ascii'))}-{c}" for c in rel)
 
 
 def _check_name(name: str) -> str:
@@ -262,12 +272,51 @@ class FsOps:
         with self._lock:
             prior = self._by_dir.get((b.dev, b.ino))
             if prior is not None and (prior.kind, prior.tree, prior.rel) != (kind, tree, rel):
-                raise BindingError(
-                    f"ambiguous binding: one directory as {'/'.join(prior.rel) or '.'} "
-                    f"and as {'/'.join(rel) or '.'}")
+                if self._live(prior, exclude_fd=fd):
+                    raise BindingError(
+                        f"ambiguous binding: one directory as {'/'.join(prior.rel) or '.'} "
+                        f"and as {'/'.join(rel) or '.'}")
+                # No descriptor still holds the prior directory, so its inode
+                # may have been freed and reused (ordinary per-item churn on
+                # ext4 and xfs): the prior binding proves nothing. Drop it.
+                self._forget(prior)
             self._by_dir[(b.dev, b.ino)] = b
             self._by_fd[fd] = b
         return b
+
+    def _live(self, b: Binding, exclude_fd: int) -> bool:
+        """Whether some descriptor still holds `b`'s directory. While one
+        does, its inode cannot be freed, so a second binding to the same
+        (dev, ino) really is the same directory under another path.
+        `exclude_fd` is the descriptor being registered: if its number was
+        recorded for `b` before, that record is stale (the number was closed
+        and reused), so it cannot show `b` is still held."""
+        for fd, other in list(self._by_fd.items()):
+            if other is not b or fd == exclude_fd:
+                continue
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == (b.dev, b.ino) and st.st_nlink > 0:
+                return True
+        return False
+
+    def _forget(self, b: Binding) -> None:
+        self._by_dir.pop((b.dev, b.ino), None)
+        for fd in [fd for fd, other in self._by_fd.items() if other is b]:
+            del self._by_fd[fd]
+        self._validated_stages.discard((b.dev, b.ino))
+
+    def _forget_under(self, parent: Binding, name: str) -> None:
+        """Drop every binding at or under `name` in `parent` (it is being
+        removed)."""
+        prefix = parent.rel + (name,)
+        with self._lock:
+            for b in [b for b in self._by_dir.values()
+                      if b.kind == parent.kind and b.tree == parent.tree
+                      and b.rel[:len(prefix)] == prefix]:
+                self._forget(b)
 
     def binding(self, fd: int) -> Binding:
         """The live binding for `fd`, or BindingError. The live descriptor
@@ -376,7 +425,10 @@ class FsOps:
 
     def mkdir_and_pin(self, parent_fd: int, name: str, mode: int) -> int:
         """Create `name` if missing, pin it, and fsync the parent either way
-        (an earlier creator's fsync may have failed)."""
+        (an earlier creator's fsync may have failed). `mode` is subject to
+        the process umask, as `mkdir(2)` is; an existing directory's mode is
+        left as it is. Where a mode must be exact (stage directories), the
+        caller that owns it sets and checks it (`open_stage_dir`)."""
         parent = self.binding(parent_fd)
         _check_name(name)
         try:
@@ -412,6 +464,11 @@ class FsOps:
                 os.chmod("up", 0o750, dir_fd=root)
                 os.mkdir("stage", 0o700, dir_fd=up)
                 os.chmod("stage", 0o700, dir_fd=up)
+                sfd = os.open("stage", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=up)
+                try:
+                    os.fsync(sfd)  # its mode, after the chmod
+                finally:
+                    os.close(sfd)
                 os.fsync(up)
             finally:
                 os.close(up)
@@ -539,10 +596,9 @@ class FsOps:
             try:
                 os.link(sname, name, src_dir_fd=sfd, dst_dir_fd=dfd, follow_symlinks=False)
             except FileExistsError:
+                # Raced: a final appeared. Judge it before touching our stage.
                 os.close(fd)
                 fd = -1
-                os.unlink(sname, dir_fd=sfd)
-                os.fsync(sfd)
                 return self._on_exists(sfd, dfd, name, sname, data, mode)
             linked = os.stat(name, dir_fd=dfd, follow_symlinks=False)
             if (linked.st_dev, linked.st_ino) != (frozen.st_dev, frozen.st_ino):
@@ -571,52 +627,62 @@ class FsOps:
         except FileNotFoundError:
             return False
 
-    def _different(self, dfd: int, name: str, why: str) -> str:
+    def _different(self, dfd: int, name: str, why: str, fd: Optional[int] = None) -> str:
+        """The anomaly. Before it is returned, the existing file (when it is
+        a regular file we opened) and the destination are fsynced, as for
+        every exists_* result; any own stage is KEPT as evidence."""
+        if fd is not None:
+            os.fsync(fd)
+        os.fsync(dfd)
         logger.error("commit_durable: %r exists and is not this commit (%s); "
                      "the existing file is never replaced", name, why)
         return "exists_different"
 
     def _on_exists(self, sfd: int, dfd: int, name: str, sname: str,
                    data: bytes, mode: int) -> str:
+        """`name` exists. Establish what it is, and make it durable, BEFORE
+        any cleanup: an own stage is removed only once the final is known to
+        be this commit and its barriers are taken, and is kept as evidence
+        otherwise. Every exists_same also fsyncs the stage directory, so a
+        stage-dir barrier that failed on an earlier attempt is repaired."""
         try:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
         except OSError as e:
             if e.errno == errno.ELOOP:
-                os.fsync(dfd)
                 return self._different(dfd, name, "a symlink")
             raise
         try:
             st = os.fstat(fd)
-            # Before returning either exists_*, the existing entry and the
-            # destination are made durable (B §e.2), refusals included.
             if not stat.S_ISREG(st.st_mode):
-                os.fsync(dfd)
                 return self._different(dfd, name, "not a regular file")
             if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != mode:
-                os.fsync(fd)
-                os.fsync(dfd)
-                return self._different(dfd, name, "owner or mode")
+                return self._different(dfd, name, "owner or mode", fd)
             if st.st_nlink == 1:
-                stale = self._exists(sfd, sname)
-                if stale:
-                    os.unlink(sname, dir_fd=sfd)
-                    os.fsync(sfd)
-                same = self._read_all(fd, len(data)) == data
+                if self._read_all(fd, len(data)) != data:
+                    return self._different(dfd, name, "different bytes", fd)
                 os.fsync(fd)
                 os.fsync(dfd)
-                return "exists_same" if same else self._different(dfd, name, "different bytes")
+                self._step("same_synced")
+                if self._exists(sfd, sname):
+                    # Our own stage, linked nowhere (the final is at link
+                    # count 1): stale, and safe to drop now the match is
+                    # established and durable.
+                    os.unlink(sname, dir_fd=sfd)
+                os.fsync(sfd)
+                return "exists_same"
             if st.st_nlink == 2:
                 try:
                     sst = os.stat(sname, dir_fd=sfd, follow_symlinks=False)
                 except FileNotFoundError:
-                    return self._different(dfd, name, "a second link that is not our stage")
+                    return self._different(dfd, name, "a second link that is not our stage", fd)
                 if (sst.st_dev, sst.st_ino) != (st.st_dev, st.st_ino):
-                    return self._different(dfd, name, "our stage is a different inode")
+                    return self._different(dfd, name, "our stage is a different inode", fd)
                 # Our interrupted commit (F1). Everything is established with
                 # the stage still present, so readers keep seeing NOT_YET (H1).
                 self._step("recover_before_compare")
                 if self._read_all(fd, len(data)) != data:
-                    return self._different(dfd, name, "interrupted commit with different bytes")
+                    return self._different(dfd, name, "interrupted commit with different bytes",
+                                           fd)
                 self._step("recover_after_compare")
                 os.fsync(fd)
                 os.fsync(dfd)
@@ -626,7 +692,7 @@ class FsOps:
                 if os.fstat(fd).st_nlink != 1:
                     raise FsOpsError(f"{name!r} is not at link count 1 after recovery")
                 return "exists_same"
-            return self._different(dfd, name, f"link count {st.st_nlink}")
+            return self._different(dfd, name, f"link count {st.st_nlink}", fd)
         finally:
             os.close(fd)
 
@@ -710,6 +776,7 @@ class FsOps:
             os.fsync(dir_fd)
             return
         if stat.S_ISDIR(st.st_mode):
+            self._forget_under(self.binding(dir_fd), name)
             aside = f".{name}.old.tmp.{os.getpid()}.{secrets.token_hex(8)}"
             os.rename(name, aside, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             os.fsync(dir_fd)
