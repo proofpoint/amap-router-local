@@ -74,6 +74,12 @@ EVENT_OUTCOME_CONSUMED = "outcome_consumed"
 EVENT_OUTCOME_DISCARDED = "outcome_discarded"
 EVENT_DSN_SENT = "dsn_sent"
 EVENT_RESET = "reset"
+#: A local delivery held because the registry does not resolve its target
+#: (or no longer resolves it to the same identity). Written per TRANSITION
+#: of a target's hold reason, never per poll.
+EVENT_DELIVERY_HELD = "delivery_held"
+#: A router-authored DSN queued because its target is held; same rule.
+EVENT_DSN_HELD = "dsn_held"
 
 
 class AuditError(Exception):

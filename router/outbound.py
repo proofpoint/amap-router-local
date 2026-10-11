@@ -122,6 +122,7 @@ other instance's.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -136,12 +137,15 @@ from datetime import timedelta
 from . import attachments as attachments_mod, binding, firstsight
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
-from .config import RouterConfig, address_for, instance_for, instance_state_dir, state_key
+from .config import (RouterConfig, address_for, instance_for, instance_state_dir, state_key,
+                     target_hold, target_known_id, target_logical_id)
 from .util import (
     DEFAULT_READ_CAP,
     NamespaceEscapeError,
     ReadTooLargeError,
     atomic_write,
+    fsync_dir,
+    mint_notice_id,
     parse_utc_ts,
     read_capped,
     utc_ts,
@@ -635,6 +639,14 @@ def _drain_reply(
     # Resolved LATE, per call, never as a def-time default: the default
     # has to be whatever `deliver_mod.deliver` names at the moment of the
     # call, not the function object that existed at import time.
+    if _any_held(cfg, [bound_instance]) and req_digest is not None:
+        # The binding resolved now: pinned with the request digest, so a
+        # hold never turns this reply into an unresolved one.
+        return _begin_pending(
+            cfg, name, req_id, doc, kind="mail", recipients=[bound_instance],
+            pin={"in_reply_to": str(in_reply_to), "bound_instance": bound_instance,
+                 "record": record, "evaluated_ts": utc_ts(), "window_ok": True},
+            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend)
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
     try:
         delivered = backend(
@@ -874,6 +886,7 @@ def _drain_peer_route(
     *, req_digest: Optional[str],
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     reply_to_record: Optional[Dict[str, Any]] = None,
+    pin: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Place one peer notice (fresh task or reply) and answer the request
     exactly once — `accepted`/`peer_routed` with the minted peer id, or
@@ -882,6 +895,10 @@ def _drain_peer_route(
     comment in `_drain_reply` for why an unguarded delivery would retry
     forever). Late-resolved so a test can patch `deliver_mod.deliver_peer`."""
     recipient = route.recipient
+    if _any_held(cfg, [recipient]) and req_digest is not None:
+        return _begin_pending(
+            cfg, name, req_id, doc, kind="peer", recipients=[recipient], pin=pin,
+            req_digest=req_digest, attachments=attachments, deliver_backend=None)
     try:
         delivered = deliver_mod.deliver_peer(
             cfg, cfg.state_dir, name, recipient, doc,
@@ -936,11 +953,13 @@ def _drain_peer_reply(
         )
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
 
+    evaluated_ts = utc_ts()
+    issued = parse_utc_ts(record.get("ts"))
+    now = parse_utc_ts(evaluated_ts)
+    window = timedelta(seconds=cfg.peer_reply_window_seconds)
+    window_ok = not (issued is None or now is None or now - issued > window)
     if not binding.check_peer_edge(cfg, name, bound_instance):
-        issued = parse_utc_ts(record.get("ts"))
-        now = parse_utc_ts(utc_ts())
-        window = timedelta(seconds=cfg.peer_reply_window_seconds)
-        if issued is None or now is None or now - issued > window:
+        if not window_ok:
             _audit_peer_refusal(
                 cfg, name, req_id, REASON_PEER_REPLY_WINDOW_EXPIRED,
                 recipients=[bound_instance], in_reply_to=in_reply_to,
@@ -953,9 +972,15 @@ def _drain_peer_reply(
             )
             return _finish(cfg, name, req_id, result, req_digest=req_digest)
 
+    # Eligible now (an edge, or within the window). If the target is held,
+    # this is the first eligible evaluation and it is what gets pinned:
+    # `window_ok` records whether the WINDOW held now, so a later loss of
+    # the edge cannot be rescued by a window that had already passed.
     return _drain_peer_route(
         cfg, name, req_id, doc, PeerRoute(bound_instance),
         req_digest=req_digest, attachments=attachments, reply_to_record=record,
+        pin={"in_reply_to": str(in_reply_to), "bound_instance": bound_instance,
+             "record": record, "evaluated_ts": evaluated_ts, "window_ok": window_ok},
     )
 
 
@@ -1017,6 +1042,14 @@ def _drain_cold(
     # hostile recipient owns its own namespace and can arrange exactly that,
     # turning a peer into an amplifier. The request must be answered exactly
     # once no matter how any single delivery goes.
+    # Under a registry, a held local target makes the whole request PENDING
+    # (HELD LOCAL DELIVERY, below): nothing is answered until it resolves,
+    # and the targets that can go now go through the pending record.
+    if _any_held(cfg, recipients) and req_digest is not None:
+        return _begin_pending(
+            cfg, name, req_id, doc, kind="mail", recipients=recipients, pin=None,
+            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend)
+
     # Late resolution, as in `_drain_reply` above — see that comment.
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
     delivered: List[Dict[str, Any]] = []
@@ -1424,6 +1457,529 @@ def _quarantine_one(
     return _finish(cfg, name, req_id, result, req_digest=req_digest)
 
 
+# ---------------------------------------------------------------------------
+# HELD LOCAL DELIVERY (registry mode only)
+#
+# Under a registry, a LOCAL target the poll's report does not resolve is
+# HELD, not failed (`config.target_hold`). AMAP gives a Runtime exactly one,
+# terminal Result per consumed request and a closed outcome vocabulary, so
+# "held" cannot be a Result: the request stays in `outbound/`, unconsumed,
+# and the sender sees only "not yet". The operator sees the hold, with its
+# reason, in status.json and in one audit line per transition.
+#
+# The state lives in a router-private PENDING RECORD per request,
+# `state_dir/<sender>/pending/<req_id>.json`, written durably (file and
+# directory fsync) at every transition:
+#
+#   * each target is `held` | `ready` | `delivering` | `delivered` | `failed`;
+#   * before ANY placement for a target, the record moves it to
+#     `delivering` with its full identity: a PRE-MINTED notice_id and ts,
+#     the recipient's logical_id and the delivery kind. A crash anywhere
+#     after that is recovered by REPLAYING the placement with the SAME
+#     identity through the whole notice-last sequence, and the target is
+#     `delivered` only once that placement returned. The ledger cannot be
+#     the completion test: it is written BEFORE the notice. So the guarantee
+#     is one stable notice id and ledger path per (request, recipient),
+#     offered at least once, never two ids, never a lost notice once a
+#     barrier has succeeded. A consumer that must not act twice dedups by id;
+#   * a target whose name resolves to a DIFFERENT logical_id than the one
+#     it was bound to holds as `identity_changed`; a retry is never
+#     rerouted to whoever acquired the name;
+#   * a reply's binding is PINNED at its first eligible evaluation (it
+#     resolved, and passed the reply window then), together with the
+#     request digest, so waiting in a hold cannot age it out. Fresh policy
+#     still applies every poll, and a refusal is terminal and reports the
+#     recipients already delivered to;
+#   * when no target is still pending, the request gets its ONE Result
+#     (from the delivered and failed sets, as an unheld drain would have
+#     answered) and the record is removed.
+#
+# A damaged record fails closed: the request holds and the operator sees it.
+# Nothing here runs without a registry.
+# ---------------------------------------------------------------------------
+
+#: `drain_instance`'s tally for a request left pending this poll.
+HELD = "held"
+PENDING_DIR = "pending"
+PENDING_VERSION = 1
+_TARGET_STATES = frozenset({"held", "ready", "delivering", "delivered", "failed"})
+_PENDING_KINDS = frozenset({"mail", "peer"})
+_HEX32 = re.compile(r"[0-9a-f]{32}\Z")
+_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+#: Request-level blocks: the request itself can no longer be trusted to be
+#: the one the record was made for, or the route policy now chooses differs.
+BLOCK_REQUEST_MISSING = "request_missing"
+BLOCK_REQUEST_UNREADABLE = "request_unreadable"
+BLOCK_REQUEST_CHANGED = "request_changed"
+BLOCK_ATTACHMENTS_CHANGED = "attachments_changed"
+BLOCK_ROUTE_CHANGED = "route_changed"
+HOLD_IDENTITY_CHANGED = "identity_changed"
+#: An injected delivery backend that cannot take the pre-minted identity:
+#: held, never placed with a fresh one.
+HOLD_BACKEND_NO_PRESET = "backend_no_preset"
+
+
+class PendingDamaged(Exception):
+    """A pending record that cannot be trusted. The request holds."""
+
+
+def _pending_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
+    return instance_state_dir(cfg, name) / PENDING_DIR / f"{req_id}.json"
+
+
+def _str_or_none(v: Any) -> bool:
+    return v is None or (isinstance(v, str) and bool(v))
+
+
+def _check_target(t: Any) -> None:
+    if not isinstance(t, dict) or not isinstance(t.get("recipient"), str) or not t["recipient"]:
+        raise PendingDamaged("target")
+    if t.get("state") not in _TARGET_STATES:
+        raise PendingDamaged("target state")
+    for k in ("lid", "reason", "message_id", "error"):
+        if not _str_or_none(t.get(k)):
+            raise PendingDamaged(f"target {k}")
+    if t.get("kind") not in _PENDING_KINDS:
+        raise PendingDamaged("target kind")
+    # The identity rule for EVERY state a target can reach: held/ready have
+    # none; delivering/delivered must have one; failed has one iff it failed
+    # after becoming delivering (always, here; either is consistent).
+    nid, ts = t.get("notice_id"), t.get("ts")
+    has = nid is not None or ts is not None
+    valid = isinstance(nid, str) and bool(_HEX32.fullmatch(nid)) and parse_utc_ts(ts) is not None
+    if t["state"] in ("delivering", "delivered"):
+        if not valid:
+            raise PendingDamaged("delivering identity")
+    elif t["state"] == "failed":
+        if has and not valid:
+            raise PendingDamaged("failed identity")
+    elif has:
+        raise PendingDamaged("identity before delivering")
+
+
+def _check_pending(doc: Any, req_id: str) -> Dict[str, Any]:
+    """The record, or PendingDamaged. Strict: anything unexpected is damage."""
+    if not isinstance(doc, dict) or doc.get("v") != PENDING_VERSION:
+        raise PendingDamaged("version")
+    if doc.get("req_id") != req_id:
+        raise PendingDamaged("req_id")
+    if not (isinstance(doc.get("request_sha256"), str) and _HEX64.fullmatch(doc["request_sha256"])):
+        raise PendingDamaged("request_sha256")
+    if doc.get("kind") not in _PENDING_KINDS:
+        raise PendingDamaged("kind")
+    if not _str_or_none(doc.get("block")) or not _str_or_none(doc.get("sender_lid")):
+        raise PendingDamaged("block/sender_lid")
+    if parse_utc_ts(doc.get("created_ts")) is None:
+        raise PendingDamaged("created_ts")
+    targets = doc.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise PendingDamaged("targets")
+    for t in targets:
+        _check_target(t)
+    if len({t["recipient"] for t in targets}) != len(targets):
+        raise PendingDamaged("duplicate target")
+    pin = doc.get("binding")
+    if pin is not None:
+        if (not isinstance(pin, dict) or len(targets) != 1
+                or pin.get("bound_instance") != targets[0]["recipient"]
+                or not isinstance(pin.get("in_reply_to"), str)
+                or not isinstance(pin.get("record"), dict)
+                or parse_utc_ts(pin.get("evaluated_ts")) is None
+                or not isinstance(pin.get("window_ok"), bool)):
+            raise PendingDamaged("binding")
+    return doc
+
+
+def _read_pending(path: Path, req_id: str) -> Dict[str, Any]:
+    try:
+        raw = read_capped(path, DEFAULT_READ_CAP)
+        doc = json.loads(raw.decode("utf-8"))
+    except (OSError, ReadTooLargeError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise PendingDamaged(f"unreadable: {type(e).__name__}") from None
+    return _check_pending(doc, req_id)
+
+
+def _write_pending(cfg: RouterConfig, path: Path, rec: Dict[str, Any]) -> None:
+    """Durably: the file, its directory, and every new parent (`atomic_write`
+    with `durable_root`). A failure RAISES, and nothing that depends on the
+    write happens."""
+    atomic_write(path, json.dumps(rec, sort_keys=True).encode("utf-8"),
+                 durable_root=cfg.state_dir)
+
+
+def _remove_pending(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    fsync_dir(path.parent)
+
+
+def _audit_held(cfg: RouterConfig, name: str, req_id: str, target: Dict[str, Any]) -> None:
+    """One line per transition of a target's hold reason (best-effort: the
+    record, not the log, is the state)."""
+    try:
+        audit_mod.append(
+            cfg.state_dir, name, audit_mod.EVENT_DELIVERY_HELD,
+            state_key=state_key(cfg, name), req_id=req_id,
+            recipient=target["recipient"], reason=target["reason"], kind=target["kind"],
+        )
+    except (audit_mod.AuditError, OSError) as e:
+        logger.warning("instance %r req %r: could not audit a hold (%s: %s)",
+                       name, req_id, type(e).__name__, e)
+
+
+def _hold_reason(cfg: RouterConfig, target: Dict[str, Any]) -> Optional[str]:
+    """This poll's reason to hold `target`, or None. A non-instance target
+    (a custom policy's) is not gated here; its backend owns it."""
+    r = target["recipient"]
+    if r not in cfg.instances:
+        return None
+    reason = target_hold(cfg, r)
+    if reason is None and target.get("lid") is not None and \
+            target_logical_id(cfg, r) != target["lid"]:
+        return HOLD_IDENTITY_CHANGED
+    return reason
+
+
+def _any_held(cfg: RouterConfig, recipients: List[str]) -> bool:
+    return cfg.registry_dir is not None and any(
+        r in cfg.instances and target_hold(cfg, r) is not None for r in recipients)
+
+
+def _begin_pending(
+    cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], *,
+    kind: str, recipients: List[str], pin: Optional[Dict[str, Any]],
+    req_digest: str, attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    deliver_backend: Optional[deliver_mod.DeliveryBackend],
+) -> str:
+    """At least one target is held: make the request pending (durably, before
+    anything is placed) and advance whatever can go now. A reply's target is
+    pinned to the logical_id its ledger record names (the identity the task
+    came from), else the one the registry knows now."""
+    pinned = {}
+    if pin is not None and isinstance(pin.get("record"), dict) and pin["record"].get("from_lid"):
+        pinned[pin["bound_instance"]] = pin["record"]["from_lid"]
+    targets = []
+    for r in recipients:
+        reason = target_hold(cfg, r) if r in cfg.instances else None
+        targets.append({
+            "recipient": r, "kind": kind,
+            # The identity the registry KNOWS now, held or not: a later rebind
+            # of the name holds as identity_changed instead of rerouting.
+            "lid": pinned.get(r) or (target_known_id(cfg, r) if r in cfg.instances else None),
+            "state": "held" if reason else "ready", "reason": reason,
+            "notice_id": None, "ts": None, "message_id": None, "error": None,
+        })
+    rec = {
+        "v": PENDING_VERSION, "req_id": req_id, "request_sha256": req_digest,
+        "kind": kind, "sender_lid": target_logical_id(cfg, name),
+        "created_ts": utc_ts(), "block": None, "binding": pin, "targets": targets,
+    }
+    path = _pending_path(cfg, name, req_id)
+    _write_pending(cfg, path, rec)
+    for t in targets:
+        if t["state"] == "held":
+            _audit_held(cfg, name, req_id, t)
+    return _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend)
+
+
+def _place_target(
+    cfg: RouterConfig, name: str, target: Dict[str, Any], doc: Dict[str, Any],
+    attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    reply_record: Optional[Dict[str, Any]],
+    deliver_backend: Optional[deliver_mod.DeliveryBackend],
+) -> Dict[str, str]:
+    preset = (target["notice_id"], target["ts"])
+    if target["kind"] == "peer":
+        return deliver_mod.deliver_peer(
+            cfg, cfg.state_dir, name, target["recipient"], doc,
+            reply_to_record=reply_record, attachments=attachments, preset=preset)
+    backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
+    # Every backend path places with the PRE-MINTED identity; one that cannot
+    # take it is refused BEFORE placement (a replay would otherwise mint a
+    # second id and a second ledger record).
+    if not _accepts_preset(backend):
+        raise deliver_mod.RecipientHeld(target["recipient"], HOLD_BACKEND_NO_PRESET)
+    return backend(cfg, cfg.state_dir, name, target["recipient"], doc,
+                   reply_to_record=reply_record, attachments=attachments, preset=preset)
+
+
+def _accepts_preset(backend: Callable[..., Any]) -> bool:
+    """True when `backend` takes a `preset` keyword (named, or **kwargs)."""
+    try:
+        params = inspect.signature(backend).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "preset" and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)
+               or p.kind is p.VAR_KEYWORD for p in params)
+
+
+def _place_one(
+    cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], t: Dict[str, Any],
+    doc: Dict[str, Any], attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    deliver_backend: Optional[deliver_mod.DeliveryBackend],
+) -> bool:
+    """One target that this poll's report resolves: durable `delivering`
+    identity FIRST (on a replay too), then the placement with that identity,
+    then `delivered`. A failure after placement began keeps it `delivering`,
+    to be replayed with the SAME identity next poll; nothing here is
+    terminal. Returns True when the record changed without being written."""
+    path = _pending_path(cfg, name, req_id)
+    pin = rec.get("binding")
+    if t["state"] in ("held", "ready"):
+        if t["recipient"] in cfg.instances and t["lid"] is None:
+            t["lid"] = target_logical_id(cfg, t["recipient"])   # never known until now
+        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts())
+    t["reason"] = None
+    # Durable BEFORE the recipient is touched, on a REPLAY too: a record can
+    # be visible after its directory barrier failed, and a placement must
+    # never rest on that. A rewrite with `durable_root` repairs the whole
+    # chain; if it fails again, this raises and nothing is placed.
+    _write_pending(cfg, path, rec)
+    try:
+        delivered = _place_target(cfg, name, t, doc, attachments,
+                                  pin["record"] if pin else None, deliver_backend)
+    except deliver_mod.RecipientHeld as e:
+        t["reason"] = e.reason              # identity kept: a later poll replays it
+        return True
+    except Exception as e:  # noqa: BLE001 — one target must not sink the request
+        logger.warning(
+            "instance %r req %r: delivery to %r failed: %s: %s — kept, replayed next poll "
+            "with the same identity", name, req_id, t["recipient"], type(e).__name__, e)
+        t["reason"] = f"failing: {type(e).__name__}"
+        return True
+    t.update(state="delivered", message_id=delivered.get("message_id"), reason=None)
+    _write_pending(cfg, path, rec)
+    return False
+
+
+def _advance_pending(
+    cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], doc: Dict[str, Any],
+    attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    deliver_backend: Optional[deliver_mod.DeliveryBackend],
+    *, settle_only: bool = False,
+) -> str:
+    """Advance every target that this poll's report resolves (P4'), then
+    answer the request iff nothing is still pending. `settle_only` replays
+    only targets already `delivering` (a refusal must first know every
+    placement it would report) and never answers."""
+    path = _pending_path(cfg, name, req_id)
+    dirty = False
+    for t in rec["targets"]:
+        if t["state"] in ("delivered", "failed"):
+            continue
+        if settle_only and t["state"] != "delivering":
+            continue
+        reason = _hold_reason(cfg, t)
+        if reason is not None:
+            if t["state"] == "ready":
+                t["state"] = "held"
+            if t["reason"] != reason:
+                t["reason"] = reason
+                dirty = True
+                _audit_held(cfg, name, req_id, t)
+            continue
+        dirty = _place_one(cfg, name, req_id, rec, t, doc, attachments, deliver_backend) or False
+    if dirty:
+        _write_pending(cfg, path, rec)
+    if settle_only or any(t["state"] not in ("delivered", "failed") for t in rec["targets"]):
+        return HELD
+    outcome = _finish(cfg, name, req_id, _pending_result(cfg, req_id, rec, attachments),
+                      req_digest=rec["request_sha256"])
+    _remove_pending(path)
+    return outcome
+
+
+def _delivered_addrs(cfg: RouterConfig, rec: Dict[str, Any]) -> List[str]:
+    return [address_for(t["recipient"], cfg.fleet_domain)
+            for t in rec["targets"] if t["state"] == "delivered"]
+
+
+def _pending_result(
+    cfg: RouterConfig, req_id: str, rec: Dict[str, Any],
+    attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+) -> Dict[str, Any]:
+    """The ONE Result, as the unheld drain would have answered the same
+    delivered and failed sets."""
+    delivered = [t for t in rec["targets"] if t["state"] == "delivered"]
+    failed = sorted(t["recipient"] for t in rec["targets"] if t["state"] == "failed")
+    addrs = _delivered_addrs(cfg, rec)
+    diag = _attachments_accepted_diag(attachments or [])
+    if rec["kind"] == "peer":
+        ok_reason = REASON_PEER_ROUTED
+    elif rec.get("binding") is not None:
+        ok_reason = REASON_RECIPIENT_BOUND
+    else:
+        ok_reason = REASON_ALLOWLISTED
+    message_id = delivered[0]["message_id"] if len(delivered) == 1 and not failed else None
+    if not failed:
+        return _result_doc(req_id, "accepted", reason_code=ok_reason, recipients=addrs,
+                           message_id=message_id, attachments=diag)
+    if delivered:
+        return _result_doc(
+            req_id, "accepted", reason_code=REASON_PARTIAL_DELIVERY, recipients=addrs,
+            message_id=None,
+            detail=f"delivered to {len(delivered)}; failed for: {', '.join(failed)}",
+            attachments=diag)
+    return _result_doc(
+        req_id, "queued_for_human", reason_code=REASON_DELIVERY_FAILED, recipients=[],
+        detail=f"no recipient could be delivered to: {', '.join(failed)}")
+
+
+def _pending_refusal(
+    cfg: RouterConfig, req_id: str, rec: Dict[str, Any],
+    outcome: str, reason_code: str, detail: Optional[str],
+) -> Dict[str, Any]:
+    """A fresh policy refusal is terminal, and reports what was already
+    delivered rather than erasing it."""
+    addrs = _delivered_addrs(cfg, rec)
+    if addrs:
+        detail = (f"{detail + '; ' if detail else ''}already delivered to "
+                  f"{len(addrs)} recipient(s) before the refusal")
+        return _result_doc(req_id, outcome, reason_code=reason_code, detail=detail,
+                           recipients=addrs)
+    return _result_doc(req_id, outcome, reason_code=reason_code, detail=detail)
+
+
+def _pending_policy(
+    cfg: RouterConfig, name: str, rec: Dict[str, Any], doc: Dict[str, Any],
+    cold_policy: Optional[ColdPolicy],
+) -> Union[None, str, ColdRefusal]:
+    """This poll's policy for a pending request: None (proceed), a
+    ColdRefusal (terminal), or BLOCK_ROUTE_CHANGED (the route policy now
+    chooses is not the one the record was made for: hold, never reroute)."""
+    recipients = [t["recipient"] for t in rec["targets"]]
+    pin = rec.get("binding")
+    if pin is None:
+        policy = cold_policy if cold_policy is not None else default_cold_policy
+        decided = policy(cfg, name, doc["draft"])
+        if isinstance(decided, ColdRefusal):
+            return decided
+        if rec["kind"] == "peer":
+            same = isinstance(decided, PeerRoute) and [decided.recipient] == recipients
+        else:
+            same = isinstance(decided, list) and sorted(decided) == sorted(recipients)
+        return None if same else BLOCK_ROUTE_CHANGED
+    bound = pin["bound_instance"]
+    if bound == name:
+        return ColdRefusal("rejected", REASON_SELF_SEND)
+    if bound not in cfg.instances:
+        return ColdRefusal("rejected", REASON_UNRESOLVED_REPLY)
+    if rec["kind"] == "peer":
+        if cfg.instances[bound].peer_root is None:
+            return ColdRefusal("rejected", REASON_UNRESOLVED_REPLY)
+        # The window was proven at the first eligible evaluation and is not
+        # re-measured; a declared edge is checked FRESH.
+        if not (pin["window_ok"] or binding.check_peer_edge(cfg, name, bound)):
+            return ColdRefusal("rejected", REASON_PEER_REPLY_WINDOW_EXPIRED)
+    return None
+
+
+def _block(cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], why: str) -> str:
+    if rec.get("block") != why:
+        rec["block"] = why
+        _write_pending(cfg, _pending_path(cfg, name, req_id), rec)
+        logger.warning("instance %r req %r: pending request blocked: %s", name, req_id, why)
+    return HELD
+
+
+def _drain_pending(
+    cfg: RouterConfig, name: str, filename: str, req_id: str,
+    *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
+    cold_policy: Optional[ColdPolicy] = None,
+) -> str:
+    """One poll for a request that has a pending record."""
+    try:
+        rec = _read_pending(_pending_path(cfg, name, req_id), req_id)
+    except PendingDamaged as e:
+        logger.warning("instance %r req %r: pending record damaged (%s) — held, "
+                       "nothing delivered", name, req_id, e)
+        return HELD
+    try:
+        raw = _read_request_pinned(cfg, name, filename)
+    except FileNotFoundError:
+        return _block(cfg, name, req_id, rec, BLOCK_REQUEST_MISSING)
+    except (ReadTooLargeError, OSError):
+        return _block(cfg, name, req_id, rec, BLOCK_REQUEST_UNREADABLE)
+    if hashlib.sha256(raw).hexdigest() != rec["request_sha256"]:
+        return _block(cfg, name, req_id, rec, BLOCK_REQUEST_CHANGED)
+    doc = json.loads(raw.decode("utf-8"))        # the bytes the record was made from
+    try:
+        attachments = attachments_mod.ingest_attachments(
+            cfg, name, req_id, doc["draft"].get("attachments") or [])
+    except attachments_mod.AttachmentIngestError:
+        return _block(cfg, name, req_id, rec, BLOCK_ATTACHMENTS_CHANGED)
+    decided = _pending_policy(cfg, name, rec, doc, cold_policy)
+    if decided == BLOCK_ROUTE_CHANGED:
+        return _block(cfg, name, req_id, rec, BLOCK_ROUTE_CHANGED)
+    if isinstance(decided, ColdRefusal):
+        # Every placement already begun is settled first (replayed with its
+        # identity), so the terminal Result can report EVERY target whose
+        # notice was placed. One that cannot settle now (held, failing)
+        # defers the refusal: a later poll reports it.
+        if any(t["state"] == "delivering" for t in rec["targets"]):
+            _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend,
+                             settle_only=True)
+            if any(t["state"] == "delivering" for t in rec["targets"]):
+                return HELD
+        if decided.hold:
+            _write_held_copy(cfg, name, req_id)
+        if decided.reason_code in _PEER_REFUSALS:
+            _audit_peer_refusal(cfg, name, req_id, decided.reason_code,
+                                recipients=[t["recipient"] for t in rec["targets"]])
+        outcome = _finish(cfg, name, req_id,
+                          _pending_refusal(cfg, req_id, rec, decided.outcome,
+                                           decided.reason_code, decided.detail),
+                          req_digest=rec["request_sha256"])
+        _remove_pending(_pending_path(cfg, name, req_id))
+        return outcome
+    if rec.get("block") is not None:
+        rec["block"] = None
+        _write_pending(cfg, _pending_path(cfg, name, req_id), rec)
+    return _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend)
+
+
+def _sweep_answered_pending(cfg: RouterConfig, name: str) -> None:
+    """A crash between a pending request's Result and the removal of its
+    record leaves a record for a request already answered (and archived, so
+    the resume path never sees it again). The private Result is the
+    authority: its record goes."""
+    d = instance_state_dir(cfg, name) / PENDING_DIR
+    try:
+        names = [p.name for p in d.iterdir() if p.name.endswith(".json")]
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    for fn in names:
+        req_id = fn[:-len(".json")]
+        if _private_result_path(cfg, name, req_id).is_file():
+            _remove_pending(d / fn)
+
+
+def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
+    """Every pending request of `name`, for status.json: what is held, on
+    whom, and why. A damaged record is listed as such."""
+    d = instance_state_dir(cfg, name) / PENDING_DIR
+    try:
+        names = sorted(p.name for p in d.iterdir() if p.name.endswith(".json"))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    out: List[Dict[str, Any]] = []
+    for fn in names:
+        req_id = fn[:-len(".json")]
+        try:
+            rec = _read_pending(d / fn, req_id)
+        except PendingDamaged as e:
+            out.append({"req_id": req_id, "damaged": str(e)})
+            continue
+        out.append({
+            "req_id": req_id, "since": rec["created_ts"], "block": rec.get("block"),
+            "targets": [{"recipient": t["recipient"], "state": t["state"], "reason": t["reason"]}
+                        for t in rec["targets"] if t["state"] not in ("delivered", "failed")],
+        })
+    return out
+
+
 def drain_instance(
     cfg: RouterConfig, name: str,
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
@@ -1488,9 +2044,11 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     if transport is not None or inflight_mod.list_records(cfg, name):
         inflight_summary = _advance_inflight(cfg, name, transport, outcomes)
 
+    if cfg.registry_dir is not None:
+        _sweep_answered_pending(cfg, name)
     filenames, skipped_symlinks = list_outbound(cfg, name)
 
-    drained = resumed = errored = reused = quarantined = 0
+    drained = resumed = errored = reused = quarantined = held = 0
     inflight_begun = inflight_waiting = 0
     skipped_bad_name = skipped_symlinks
     for filename in filenames:
@@ -1580,6 +2138,11 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                         cfg, name, req_id,
                         json.dumps(stored_result, sort_keys=True).encode("utf-8"),
                     )
+                    if cfg.registry_dir is not None:
+                        # A crash between a pending request's Result and
+                        # the removal of its record leaves the record:
+                        # the Result is the authority, so it goes.
+                        _remove_pending(_pending_path(cfg, name, req_id))
                     resumed += 1
                 else:
                     # req_id reuse with DIFFERENT content: never replay the
@@ -1604,6 +2167,17 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                     )
                     reused += 1
                     outcomes["rejected"] += 1
+            elif (cfg.registry_dir is not None
+                  and _pending_path(cfg, name, req_id).exists()):
+                outcome = _drain_pending(
+                    cfg, name, filename, req_id, deliver_backend=deliver_backend,
+                    cold_policy=cold_policy,
+                )
+                if outcome == HELD:
+                    held += 1
+                    continue
+                if outcome in outcomes:
+                    outcomes[outcome] += 1
             elif inflight_mod.record_path(cfg, name, req_id).exists():
                 # In flight: the record carries it now (docstring, IN
                 # FLIGHT). Not drained this poll.
@@ -1637,6 +2211,9 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                 )
                 if outcome == INFLIGHT:
                     inflight_begun += 1
+                elif outcome == HELD:
+                    held += 1
+                    continue
                 elif outcome in outcomes:
                     outcomes[outcome] += 1
         except Exception:
@@ -1662,6 +2239,10 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
         "rejected": outcomes["rejected"],
         "queued_for_human": outcomes["queued_for_human"],
         "quarantined": quarantined,
+        # Under a registry only, so an unregistered router reports exactly
+        # the summary it always did.
+        **({"outbound_held": held, "held_local": held_report(cfg, name)}
+           if cfg.registry_dir is not None else {}),
         **({"outbound_inflight_begun": inflight_begun,
             "outbound_inflight_waiting": inflight_waiting,
             **inflight_summary,

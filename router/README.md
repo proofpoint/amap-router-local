@@ -1143,11 +1143,10 @@ merges one; this router does not choose. An unreadable entry counts as present.
 
 **Nothing is written under a name while a registry is configured.** An
 instance the registry holds has no state key at all (`config.state_key`
-raises rather than fall back to the name). A delivery TO a held recipient
-therefore fails through the ordinary failure path (`queued_for_human` /
-`delivery_failed`, or `partial_delivery` beside healthy recipients) and
-creates nothing under `state_dir/<name>/`, which would otherwise come back as
-`state_conflict` once the recipient is registered again.
+raises rather than fall back to the name), and a delivery TO a held
+recipient HOLDS ("Held local delivery", below): nothing is placed and
+nothing is created under `state_dir/<name>/`, which would otherwise come
+back as `state_conflict` once the recipient is registered again.
 
 **`reset` follows the same keys, read fresh.** Under a registry, `reset <name>`
 reads the registry again under the drain lock, whatever keys a caller
@@ -1170,12 +1169,106 @@ discovery skips such a directory (the host keys its own per-identity
 directories that way; the registry never issues that shape as a name). The
 name rule itself is unchanged without a registry.
 
+### Held local delivery
+
+Under a registry, a delivery to a LOCAL target that this poll's report does
+not resolve HOLDS. One immutable report per poll is attached to the keyed
+config (`config.target_hold`), and the mail, peer, reply and router-notice
+paths all ask it before reading or writing anything on the recipient's side.
+A held target is never reclassified as unknown or external. A registry with
+no report attached fails closed (`registry_report_missing`).
+
+**What the sender sees: "not yet".** AMAP gives a Runtime exactly one,
+terminal Result per request it consumes, and a closed outcome vocabulary
+(draft §6.1), so "held" cannot be a Result. A request with a held target is
+NOT consumed and gets NO Result while held; it stays in `outbound/`.
+`queued_for_human` is not used for it (that is terminal). A sender-visible
+"held" would need a change to AMAP itself.
+
+**What the operator sees.** `status.json` lists, per instance:
+
+- `held_local`: each pending request, its held targets and why (any reason
+  in the registry table above, or `identity_changed`), and a request-level
+  `block` when the request itself changed, went missing, became unreadable,
+  its attachments changed, or fresh policy now routes it differently;
+- `dsn_held`: each DSN waiting on a held sender, and why.
+
+Each change of a hold reason is one `delivery_held` / `dsn_held` audit line,
+never one per poll. The console shows both counts.
+
+**The pending record.** `state_dir/<sender>/pending/<req_id>.json` holds
+the request's sha256, its kind and targets, and for a reply its PINNED
+binding. It is written durably (file and directory fsync) at every
+transition:
+
+- before ANY placement for a target, the record moves it to `delivering`
+  with a pre-minted notice id and ts, the target's logical_id and the
+  delivery kind. A crash anywhere after that replays the placement with the
+  SAME identity through the full notice-last sequence; the target is
+  `delivered` only once the placement returned. The guarantee is one stable
+  notice id and ledger path per (request, recipient), offered at least once
+  (a crash after the notice can offer the same id again; dedup by id), never
+  two ids;
+- a target is pinned to a logical_id whenever one is known: for a reply,
+  the identity its task was delivered from (ledger records under a registry
+  carry `from_lid` / `to_lid`); otherwise the identity the registry knows
+  now, held or not (`state_not_migrated`, `state_conflict` and
+  `skeleton_collision` names still have one). Only a target never known is
+  bound at its first resolution. A name that later resolves to another
+  logical_id holds as `identity_changed`; it is never rerouted;
+- an error after a placement began is NOT terminal: the target stays
+  `delivering` (reason `failing: <error>`) and is replayed with the same
+  identity next poll;
+- a reply pins its binding at its first ELIGIBLE evaluation (it resolved,
+  and passed the reply window then), so a hold cannot age it out. A reply
+  already outside its window is refused at once, never pinned;
+- fresh policy runs every poll: a refusal is terminal, but only once every
+  placement already begun is settled (replayed with its identity), so its
+  Result names EVERY recipient whose notice was placed; a changed route
+  holds;
+- an injected delivery backend gets the pre-minted identity (a `preset`
+  keyword); one that cannot take it is held as `backend_no_preset` BEFORE
+  any placement;
+- targets that resolve go at once; completed ones are never re-delivered;
+  when none is pending, the request gets its ONE Result, as an unheld drain
+  would have answered, and the record goes;
+- a damaged record fails closed: the request holds, listed as damaged.
+
+**DSNs to a held sender.** A DSN is enqueued as a durable intent under the
+RECEIVER (`state_dir/<receiver>/dsn-pending/<tree>-<nid>.<outcome>.json`,
+with a pre-minted DSN id and the sender's pinned logical_id) BEFORE the
+outcome is recorded or its file unlinked; until the record is durably
+written the outcome file stays for the next poll. An existing intent is
+validated exactly and made durable again before its source is consumed.
+Intents are drained after fresh outcomes, under their own budget and a
+persisted fair cursor (damaged intents count toward it, and are reported),
+armed only on a DURABLE outcome record, rewritten durably before every
+placement, and removed only after the DSN is placed. Nothing is dropped, timed out or turned into
+`queued_for_human`.
+
+An unavailable or rolled-back registry holds every instance, senders
+included, so neither pending requests nor DSN intents advance until it
+recovers.
+
+**Removing `registry_dir` with work in flight is unsupported.** Pending
+records and DSN intents live under logical_ids, which cannot be mapped back
+to instances without the registry. If `registry_dir` is absent and any
+`state_dir/<logical_id>/` holds pending records or intents, every instance
+is held (`status.json` `registry.state: "stranded"`, reason
+`registry_state_without_registry`, and an error in the log) rather than
+re-delivering completed targets with new ids. Restore `registry_dir`, let
+the work drain, and only then remove it. A state directory that cannot be read is
+treated as stranded too (it cannot be shown empty). Only the documented
+path is detected: moving logical_id directories back to names by hand and
+then removing `registry_dir` is not, and re-delivers. Without `registry_dir` none of this runs: drains, results, DSNs
+and `status.json` are as before.
+
 **Known limits, recorded rather than fixed here:**
 
-- A delivery to a held recipient is a `delivery_failed` today (above). The
-  behaviour it should have (held, retried, visible to the sender) is
-  approved and lands separately; until then the
-  sender sees the failure path.
+- Held delivery: a target whose identity was NEVER known (no ledger
+  `from_lid`, no registry entry at the time) binds its logical_id at its
+  first resolution.
+
 - A name the registry has overridden is `not_registered` until aliases exist:
   the snapshot's `names` history is not read yet.
 - The casefold incumbency check during discovery still looks for

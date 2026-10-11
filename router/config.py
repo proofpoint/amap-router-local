@@ -491,6 +491,11 @@ class RouterConfig:
     #: name absent from it keeps its own name (`state_key`). Set by the
     #: service from the poll's registry report, never by a config file.
     state_keys: Mapping[str, str] = field(default_factory=dict)
+    #: Per poll, under a registry: THE one immutable registry report every
+    #: delivery gate of that poll reads (`target_hold`). Set together with
+    #: `state_keys` by `registry.keyed_config`, never by a config file; None
+    #: means no report was attached, which under a registry fails closed.
+    registry_report: Any = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -545,6 +550,52 @@ def state_key(cfg: "RouterConfig", name: str) -> str:
             f"{name!r} has no resolved state key under the registry (held); "
             "no state is read or written for it")
     return name
+
+
+#: `target_hold`'s reason when a registry is configured but no report was
+#: attached to this config: nothing may be delivered on a guess.
+HELD_REPORT_MISSING = "registry_report_missing"
+
+
+def target_hold(cfg: "RouterConfig", name: str) -> Optional[str]:
+    """Why a LOCAL delivery to instance `name` must hold this poll, or None.
+
+    Without a registry: always None (nothing changes). Under one: None only
+    when THIS POLL's report (`cfg.registry_report`) resolved `name`;
+    otherwise the report's hold reason for it. A registry with no report
+    attached fails closed (`HELD_REPORT_MISSING`). Every local placement
+    path, and every recovery of one, asks this before it reads or writes
+    anything on the recipient's side."""
+    if cfg.registry_dir is None:
+        return None
+    report = cfg.registry_report
+    if report is None:
+        return HELD_REPORT_MISSING
+    if name in (report.resolved or {}):
+        return None
+    return (report.held or {}).get(name, "not_registered")
+
+
+def target_logical_id(cfg: "RouterConfig", name: str) -> Optional[str]:
+    """`name`'s logical_id in this poll's report, or None (no registry, no
+    report, or not resolved)."""
+    report = cfg.registry_report
+    if cfg.registry_dir is None or report is None:
+        return None
+    entry = (report.resolved or {}).get(name)
+    return entry.logical_id if entry is not None else None
+
+
+def target_known_id(cfg: "RouterConfig", name: str) -> Optional[str]:
+    """`name`'s logical_id as this poll's report KNOWS it, held or not, or
+    None when the registry has no single active entry for it. A pending
+    delivery pins this, so a later rebind of the name to another identity
+    holds instead of rerouting; only a truly unknown identity is bound at
+    its first resolution."""
+    report = cfg.registry_report
+    if cfg.registry_dir is None or report is None:
+        return None
+    return (getattr(report, "known", None) or {}).get(name) or target_logical_id(cfg, name)
 
 
 def instance_state_dir(cfg: "RouterConfig", name: str) -> Path:

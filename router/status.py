@@ -218,6 +218,13 @@ class StatusTracker:
             placed_denied = s.get("peer_placed_denied")
             if isinstance(placed_denied, list):
                 inst["placed_but_denied"] = [d for d in placed_denied if isinstance(d, dict)]
+            # Registry mode only, state likewise: the requests held on a
+            # local target (`outbound.held_report`) and the DSNs waiting on
+            # a held sender (`outcomes.drain_dsn_queue`), each with why.
+            for key in ("held_local", "dsn_held"):
+                held = s.get(key)
+                if isinstance(held, list):
+                    inst[key] = [h for h in held if isinstance(h, dict)]
 
     def to_doc(self) -> Dict[str, Any]:
         doc: Dict[str, Any] = {
