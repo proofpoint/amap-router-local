@@ -540,47 +540,87 @@ class RecipientIntegrityTests(_InflightCase):
         inflight.transport_request_bytes(self.cfg, "alice", rec)
 
 
-class CounterRollbackTests(_InflightCase):
-    """THE DURABILITY WITNESS, as a model. The counter's successor was
-    written without any fsync, so a power loss could roll it back AFTER a
-    request had used the id and finished. The next, DIFFERENT request then
-    got the same transport id, found the old request's result, and settled
-    from it: accepted, with nothing sent. The fsyncs in `atomic_write` are
-    the first barrier (`DurabilityBarrierTests`); this test rolls the file
-    back by hand, so it proves the second one, the HANDED marker, which
-    holds whatever made the counter go backwards (a restored state volume,
-    too)."""
+class TransportIdInUseTests(_InflightCase):
+    """A record not recorded as handed over finds a trace under its `n`, and
+    cannot tell whose request it carries. Both guesses are unsafe, and each
+    has a witness here: settling from the trace (a rolled-back counter,
+    where the trace is ANOTHER request's) and handing over again (a restored
+    state, where it is THIS request's own). It fails closed."""
 
     def test_a_rolled_back_counter_never_settles_a_request_from_another_ones_result(self):
+        """The power-loss witness, as a model: the counter's successor was
+        lost after a request had used the id and finished, so a DIFFERENT
+        request got the same id and, before the fix, settled from the first
+        one's result with nothing sent. The fsyncs in `atomic_write` are one
+        barrier (`DurabilityBarrierTests`); this rolls the file back by hand,
+        so it holds whatever made the counter go backwards."""
         write_request(self.cfg, "alice", "00000001", to=[EXT])
         self.drain()
         self.port.send_all(recipients=[EXT])
         self.drain()
         self.assertEqual(self.result("00000001")["outcome"], "accepted")
-        before = inflight.counter_path(self.cfg, "alice").read_text()
-        self.assertEqual(before, "2")
+        self.assertEqual(inflight.counter_path(self.cfg, "alice").read_text(), "2")
 
         inflight.counter_path(self.cfg, "alice").write_text("1")  # the rollback
 
         write_request(self.cfg, "alice", "00000002", to=[EXT], subject="different")
         with self.assertLogs("amap_router_local.inflight", logging.ERROR) as logs:
             self.drain()
-        self.assertTrue(any("went backwards" in m for m in logs.output))
-        self.assertFalse(self.has_result("00000002"),
+        self.assertTrue(any("already exists on the transport" in m for m in logs.output))
+        r = self.result("00000002")
+        self.assertEqual((r["outcome"], r["reason_code"]),
+                         ("queued_for_human", "transport_anomaly"),
                          "settled from another request's downstream result")
+        self.assertIn("cannot tell whose request it carries", r["detail"])
         self.assertEqual(self.port.writes, ["00000001"])
+        self.drain()
+        self.assertEqual(self.port.writes, ["00000001"])
+
+    def test_a_restored_state_never_hands_the_same_request_over_twice(self):
+        """THE WITNESS for the remedy the first fix used. The state is
+        restored to after the record and before its marker, so the trace
+        under `n` is this request's OWN hand-off. Re-handing under a new id
+        (the previous fix) put it on the transport twice."""
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        self.assertEqual(self.port.writes, ["00000001"])
+        inflight.handed_path(self.cfg, "alice", "00000001").unlink()  # the restore
+        with self.assertLogs("amap_router_local.inflight", logging.ERROR):
+            self.drain()
+        self.drain()
+        self.assertEqual(self.port.writes, ["00000001"], "handed over twice")
+        r = self.result()
+        self.assertEqual((r["outcome"], r["reason_code"]),
+                         ("queued_for_human", "transport_anomaly"))
         self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
 
-        self.drain()  # processed afresh, under the next id
-        self.assertFalse(self.has_result("00000002"))
-        self.assertEqual(self.port.writes, ["00000001", "00000002"])
-        self.assertEqual(json.loads(self.port.pending["00000002"])["draft"]["subject"],
-                         "different")
-
+    def test_the_marker_names_its_id_and_an_orphan_does_not_vouch(self):
+        """An orphan marker (a crash between the two unlinks in `_cleanup`)
+        for a reused agent req_id names an OLD id, so the new record is
+        still checked, and a mismatched draft is still refused."""
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        self.assertEqual(inflight.handed_path(self.cfg, "alice", "00000001").read_bytes(),
+                         b"00000001")
         self.port.send_all(recipients=[EXT])
         self.drain()
-        self.assertEqual(self.result("00000002")["outcome"], "accepted")
-        self.assertEqual(self.port.writes, ["00000001", "00000002"])
+        handed = inflight.handed_path(self.cfg, "alice", "00000001")
+        self.assertFalse(handed.exists())
+        handed.write_bytes(b"00000001")  # the orphan
+
+        rec = inflight.begin(self.cfg, "alice", "00000001", digest=None,
+                             request_doc={"contract_version": "2", "req_id": "00000001",
+                                          "draft": {"to": [ALLOWED, DENIED],
+                                                    "subject": "s", "body_text": "b"}},
+                             recipients=[ALLOWED])
+        self.assertEqual(rec["transport_req_id"], "00000002")
+        settled = []
+        state = inflight.advance(self.cfg, "alice", "00000001", rec, self.port,
+                                 settle=lambda v, d: settled.append(v),
+                                 already_settled=False)
+        self.assertEqual(state, inflight.SETTLED)
+        self.assertEqual(settled[0]["reason_code"], "transport_anomaly")
+        self.assertEqual(self.port.writes, ["00000001"])
 
 
 def _fd_target(fd):

@@ -92,8 +92,11 @@ def fsync_dir(path: Union[str, Path]) -> None:
 
 
 def _mkdir_durable(path: Path) -> None:
-    """`mkdir -p`, then fsync the parent of every directory it CREATED, so a
-    new directory entry is fsynced along with what is written in it."""
+    """`mkdir -p`, then fsync the parent of every directory it created AND of
+    `path` itself, so the directory entry is fsynced along with what is
+    written in it. `path`'s parent is fsynced even when `path` already
+    existed: an earlier creator whose fsync failed leaves a directory that
+    exists but may not be durable, and existing is not proof."""
     missing = []
     p = path
     while not p.exists():
@@ -102,8 +105,11 @@ def _mkdir_durable(path: Path) -> None:
             break
         p = p.parent
     path.mkdir(parents=True, exist_ok=True)
-    for d in reversed(missing):
-        fsync_dir(d.parent)
+    parents = [d.parent for d in reversed(missing)]
+    if path.parent not in parents:
+        parents.append(path.parent)
+    for d in parents:
+        fsync_dir(d)
 
 
 def atomic_write(path: Union[str, Path], data: bytes, *,

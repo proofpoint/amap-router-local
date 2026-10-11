@@ -41,8 +41,9 @@ BEFORE it archives the request):
   | none of them, and still no result    | write it now, under the SAME `n`        |
 
 Before that table, a record that was never handed over (no HANDED marker)
-is checked twice: a transport trace under `n` is a collision (`COLLIDED`),
-and a draft whose `to` ∪ `cc` is not the evaluated set settles at once.
+is checked twice: a transport trace under `n` settles it as an anomaly
+(THE HANDED MARKER, below), and so does a draft whose `to` ∪ `cc` is not
+the evaluated set.
 
 The two "still no result" re-checks are not redundant. Between this step's
 first probe and its later ones the downstream runtime may write the result
@@ -72,14 +73,21 @@ and narrowing the draft to the authorised part would be a partial send.
 `transport_request_bytes` refuses a mismatched record as well, so no caller
 can build a request that skips the check.
 
-THE HANDED MARKER, `inflight/<req_id>.handed`, is written (empty) after the
-record and BEFORE the transport request. It is how a record tells its own
-transport request from someone else's: if the transport already shows
-anything under `n` and this record was never handed over, the counter went
-backwards (for example a restored state volume), and settling from that
-would answer this request with another request's result. The record is
-dropped instead (`COLLIDED`, logged as an ERROR) and the request is processed
-afresh under a later id.
+THE HANDED MARKER, `inflight/<req_id>.handed`, holds the transport id `n`
+and is written after the record and BEFORE the transport request. A record
+counts as handed over only when its marker exists AND names its own `n`, so
+an orphan marker (a crash between the two unlinks in `_cleanup`, then a
+reused agent req_id) never vouches for a new record.
+
+A record NOT handed over that finds anything under `n` on the transport
+cannot tell whose request that is. It may be another request's (the counter
+went backwards: a restored or rolled-back state volume), and settling from
+it would answer this request with that request's result. It may equally be
+this request's own hand-off, if the state was restored to between the
+record and its marker, and then handing it over again under a new id would
+send it twice. Neither guess is safe, so it fails closed: settled
+`queued_for_human`/`transport_anomaly`, logged as an ERROR, never handed
+over again and never settled from the trace.
 
 DURABILITY. Every write here goes through `util.atomic_write`, which fsyncs
 the file and its directory, and the record is removed only after the
@@ -134,7 +142,6 @@ SETTLED = "settled"
 PENDING = "pending"
 WRITTEN = "written"
 CLEANED = "cleaned"
-COLLIDED = "collided"
 
 
 class TransportPort(Protocol):
@@ -379,23 +386,24 @@ def advance(
 
     n = record["transport_req_id"]
 
-    if not handed.exists():
-        # Nothing was ever handed over under `n` for THIS request, so any
-        # trace of `n` on the transport belongs to another one: the counter
-        # went backwards (a restored or rolled-back state volume). Settling
-        # from that trace would answer this request with someone else's
-        # result, with nothing sent. Drop the record instead; the request
-        # is still unsettled and is processed afresh under a new id (the
-        # counter is already past `n`).
+    if not _was_handed(handed, n):
+        # Nothing is recorded as handed over under `n` for THIS request, yet
+        # the transport shows `n`. Whose request it carries cannot be told
+        # (module docstring, THE HANDED MARKER): settling from it could be
+        # another request's result, and handing over again could send this
+        # one twice. Fail closed.
         if port.has_result(n) or port.has_pending(n) or port.has_archived(n):
             logger.error(
                 "instance %r req %r: transport req_id %r already exists on the "
-                "transport but was never handed over for this request — the "
-                "transport counter went backwards; discarding the id",
-                name, req_id, n,
+                "transport but is not recorded as handed over for this request "
+                "(the counter went backwards, or state was restored); settling "
+                "as an anomaly, not handing over again", name, req_id, n,
             )
+            _effect("settle", settle, _anomaly(
+                "transport id already in use; cannot tell whose request it carries"),
+                record.get("digest"))
             _effect("unlink", _cleanup, path, handed)
-            return COLLIDED
+            return SETTLED
         mismatch = recipient_mismatch(record)
         if mismatch is not None:
             _effect("settle", settle, _anomaly(mismatch + "; nothing was sent"),
@@ -424,9 +432,17 @@ def advance(
     if port.has_result(n):
         return from_result()
     data = transport_request_bytes(cfg, name, record)
-    _effect("handed", atomic_write, handed, b"")
+    _effect("handed", atomic_write, handed, n.encode("ascii"))
     _effect("transport", port.write_request, n, data)
     return WRITTEN
+
+
+def _was_handed(handed: Path, n: str) -> bool:
+    """Whether the HANDED marker exists and names `n` (module docstring)."""
+    try:
+        return handed.read_bytes() == n.encode("ascii")
+    except FileNotFoundError:
+        return False
 
 
 def _cleanup(record: Path, handed: Path) -> None:

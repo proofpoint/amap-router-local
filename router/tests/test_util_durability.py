@@ -62,9 +62,12 @@ class AtomicWriteBarrierTests(unittest.TestCase):
         """On the commit before this test there was no fsync at all."""
         events = self._run()
         kinds = [(e[0], e[1] if e[0] == "fsync" else None) for e in events]
-        self.assertEqual(kinds, [("fsync", "file"), ("replace", None), ("fsync", "dir")])
-        self.assertTrue(os.path.basename(events[0][2]).startswith("f.json."))
-        self.assertEqual(events[2][2], str(self.dest.parent))
+        # The leading dir fsync is the existing parent's (`_mkdir_durable`).
+        self.assertEqual(kinds, [("fsync", "dir"), ("fsync", "file"),
+                                 ("replace", None), ("fsync", "dir")])
+        self.assertEqual(events[0][2], str(self.root))
+        self.assertTrue(os.path.basename(events[1][2]).startswith("f.json."))
+        self.assertEqual(events[3][2], str(self.dest.parent))
         self.assertEqual(self.dest.read_bytes(), b"new")
 
     def test_a_failed_file_fsync_leaves_the_destination_untouched(self):
@@ -85,7 +88,7 @@ class AtomicWriteBarrierTests(unittest.TestCase):
         """Success is never reported for a write that is not yet durable."""
         self.dest.write_bytes(b"old")
         with self.assertRaises(OSError):
-            self._run(fail=lambda t: t[0] == "dir")
+            self._run(fail=lambda t: t == ("dir", str(self.dest.parent)))
         self.assertEqual(self.dest.read_bytes(), b"new")
         self.assertEqual(self._leftovers(), [])
 
@@ -97,6 +100,14 @@ class AtomicWriteBarrierTests(unittest.TestCase):
         self.assertIn(str(self.root / "a"), dirs)      # for a/b/
         self.assertIn(str(self.root / "a" / "b"), dirs)  # for the rename
         self.assertEqual(self.dest.read_bytes(), b"new")
+
+    def test_the_parent_is_fsynced_even_when_the_directory_exists(self):
+        """An earlier creator whose fsync failed leaves a directory that
+        exists but may not be durable."""
+        events = self._run()
+        dirs = [e[2] for e in events if e[0] == "fsync" and e[1] == "dir"]
+        self.assertIn(str(self.root), dirs)  # d/ existed before the write
+        self.assertIn(str(self.dest.parent), dirs)
 
     def test_fsync_dir_propagates_errors(self):
         with mock.patch("router.util.os.fsync", side_effect=OSError(5, "x")):
