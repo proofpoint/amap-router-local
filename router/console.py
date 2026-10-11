@@ -75,8 +75,10 @@ from . import firstsight as firstsight_mod
 from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
+from . import registry as registry_mod
 from . import status as status_mod
-from .config import MODE_NAMESPACE, RouterConfig, address_for, derive_matrix
+from .config import (MODE_NAMESPACE, RouterConfig, address_for, derive_matrix,
+                     instance_state_dir, state_key)
 from .util import utc_ts
 
 #: One message body, for display. Larger bodies render truncated with a note
@@ -242,7 +244,7 @@ def _ledger_records(cfg: RouterConfig, recipient: str) -> List[Dict[str, Any]]:
     """Every ledger record filed under `recipient`, newest first. Router-
     private and therefore the authority for who sent what to whom."""
     out: List[Dict[str, Any]] = []
-    d = binding.ledger_dir(cfg.state_dir, recipient)
+    d = binding.ledger_dir(cfg.state_dir, recipient, state_key=state_key(cfg, recipient))
     try:
         entries = sorted(p.name for p in os.scandir(d))
     except OSError:
@@ -265,7 +267,7 @@ def _outcome_for(cfg: RouterConfig, recipient: str, notice_id: str) -> Optional[
     """The latest recorded outcome for one notice, or `None` if none was
     recorded. Router-private; the outcome FILE the daemon wrote is long
     unlinked by the time this runs."""
-    d = cfg.state_dir / recipient / "outcomes"
+    d = instance_state_dir(cfg, recipient) / "outcomes"
     latest: Tuple[str, str] = ("", "")
     try:
         entries = list(os.scandir(d))
@@ -404,6 +406,17 @@ def gather(
     body_cap: int = BODY_DISPLAY_CAP,
 ) -> Dict[str, Any]:
     """Everything the page shows, read fresh. Stores nothing."""
+    # Under a registry, private state is keyed by logical_id: read the keys
+    # the way a poll would, without persisting the seq floor. A HELD instance
+    # has no key (`config.state_key` raises), so NO private state is read for
+    # it: it is shown as held, with the registry's reason, and its ledger is
+    # not listed. That is the situation the page most needs to show.
+    held: Dict[str, str] = {}
+    if cfg.registry_dir is not None:
+        report = registry_mod.report_for(
+            cfg.registry_dir, cfg.state_dir, cfg.instances, persist=False)
+        cfg = registry_mod.keyed_config(cfg, report)
+        held = dict(report.held or {})
     names = sorted(cfg.instances)
     status_doc = status_mod.read(cfg.state_dir) or {}
     host = load_host_facts(host_facts_path)
@@ -411,13 +424,27 @@ def gather(
     per_instance: Dict[str, Dict[str, Any]] = {}
     for name in names:
         inst = cfg.instances[name]
+        if name in held:
+            per_instance[name] = {
+                "seen": None,             # unknown: its private state is not read
+                "held": held[name],
+                "mode": inst.mode,
+                "peer_lane": inst.peer_root is not None,
+                "address": address_for(name, cfg.fleet_domain),
+                "status": (status_doc.get("instances") or {}).get(name) or {},
+                "events": [],
+            }
+            continue
         per_instance[name] = {
-            "seen": firstsight_mod.read_marker(cfg.state_dir, name) is not None,
+            "held": None,
+            "seen": firstsight_mod.read_marker(cfg.state_dir, name,
+                                               state_key=state_key(cfg, name)) is not None,
             "mode": inst.mode,
             "peer_lane": inst.peer_root is not None,
             "address": address_for(name, cfg.fleet_domain),
             "status": (status_doc.get("instances") or {}).get(name) or {},
-            "events": audit_mod.read_events(cfg.state_dir, name),
+            "events": audit_mod.read_events(cfg.state_dir, name,
+                                            state_key=state_key(cfg, name)),
         }
 
     # Traffic and messages both come off the ledger, which is router-private
@@ -426,6 +453,8 @@ def gather(
     messages: List[Dict[str, Any]] = []
     pairs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for recipient in names:
+        if recipient in held:
+            continue                      # no key: its ledger is not read
         for rec in _ledger_records(cfg, recipient):
             notice_id = str(rec.get("notice_id") or "")
             if not notice_id:
@@ -555,7 +584,7 @@ def _excluded(
         "not_enrolled": not_enrolled if isinstance(not_enrolled, list) else None,
         "not_enrolled_known": host.get("available") and isinstance(not_enrolled, list),
         "no_edge": no_edge,
-        "never_polled": [n for n in names if not per_instance[n]["seen"]],
+        "never_polled": [n for n in names if per_instance[n]["seen"] is False],
     }
 
 
@@ -726,7 +755,9 @@ def _health_section(data: Dict[str, Any]) -> str:
         # report, which is not the same as counters that are zero.
         observed = bool(totals)
         flags = []
-        if not inst["seen"]:
+        if inst.get("held"):
+            flags.append(_pill("warn", f"HELD: {inst['held']}"))
+        elif not inst["seen"]:
             flags.append(_pill("warn", "NEVER POLLED"))
         if inst["mode"] == MODE_NAMESPACE:
             flags.append(_pill("unk", "namespace mode"))

@@ -83,7 +83,7 @@ from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
 from . import exposure as exposure_mod
-from .config import RouterConfig, address_for, router_address
+from .config import RouterConfig, address_for, router_address, state_key
 from .util import atomic_write, mint_notice_id, utc_ts
 
 #: The two inbound trees this router writes, as the ledger's `tree` names them.
@@ -282,6 +282,7 @@ def _place(
     message_doc: Dict[str, Any], notice_doc: Dict[str, Any], ledger_bytes: bytes,
     attachments: List[attachments_mod.VerifiedAttachment],
     audit_line: Optional[bytes] = None, audit_instance: Optional[str] = None,
+    recipient_key: Optional[str] = None,
 ) -> None:
     """THE commit routine, for every tree this router writes: blobs ->
     message spool -> ledger -> [audit] -> notice LAST (module docstring).
@@ -314,7 +315,10 @@ def _place(
 
     message_path = tree_root / "messages" / f"notice-{notice_id}.json"
     notice_path = tree_root / "notices" / f"notice-{notice_id}.json"
-    ledger_path = binding.ledger_path(state_dir, recipient, notice_id)
+    # `recipient_key` names the recipient's directory under `state_dir` (its
+    # logical_id under a registry, else its name); passed through, never
+    # derived here.
+    ledger_path = binding.ledger_path(state_dir, recipient, notice_id, state_key=recipient_key)
 
     # 2. Message spool -> 3. ledger -> [audit] -> 4. notice LAST.
     attachments_mod.write_agent_visible(
@@ -322,7 +326,7 @@ def _place(
     )
     atomic_write(ledger_path, ledger_bytes)
     if audit_line is not None and audit_instance is not None:
-        audit_mod.append_bytes(state_dir, audit_instance, audit_line)
+        audit_mod.append_bytes(state_dir, audit_instance, audit_line, state_key=recipient_key)
     attachments_mod.write_agent_visible(
         root, notice_path, json.dumps(notice_doc, sort_keys=True).encode("utf-8")
     )
@@ -360,6 +364,11 @@ def deliver(
             "the local backend delivers only to fleet instances; an external "
             "reply needs a runtime with an SMTP arm"
         )
+    # FIRST, before anything is written: the recipient's state key. Under a
+    # registry a held recipient has none and this raises, failing this one
+    # delivery through the caller's ordinary failure path; nothing is ever
+    # written under a NAME there (`config.state_key`).
+    recipient_key = state_key(cfg, recipient)
     attachments = attachments or []
     notice_id = mint_notice_id()
     message_id = notice_id  # PICKED: no external provider exists; coincide the two.
@@ -399,7 +408,7 @@ def deliver(
     )
     _place(
         root=recipient_cfg.root, tree_root=recipient_cfg.inbox_root, state_dir=state_dir,
-        recipient=recipient, notice_id=notice_id,
+        recipient=recipient, notice_id=notice_id, recipient_key=recipient_key,
         message_doc=message_doc, notice_doc=notice_doc, ledger_bytes=ledger_bytes,
         attachments=attachments,
     )
@@ -435,6 +444,7 @@ def deliver_peer(
     and a reply can name it. `sender_exposure` is assessed over the SENDER
     (`exposure.assess`) at `ts` and stamped under `message`; when the
     assessment cannot be made the member is omitted, never guessed."""
+    recipient_key = state_key(cfg, recipient)  # first, as in `deliver`
     attachments = attachments or []
     recipient_cfg = cfg.instances[recipient]
     if recipient_cfg.peer_root is None:
@@ -499,7 +509,7 @@ def deliver_peer(
     )
     _place(
         root=recipient_cfg.root, tree_root=recipient_cfg.peer_root, state_dir=state_dir,
-        recipient=recipient, notice_id=notice_id,
+        recipient=recipient, notice_id=notice_id, recipient_key=recipient_key,
         message_doc=message_doc, notice_doc=notice_doc, ledger_bytes=ledger_bytes,
         attachments=attachments,
         audit_line=audit_line, audit_instance=recipient,
@@ -534,6 +544,7 @@ def deliver_router_notice(
     from_address = router_address(cfg.fleet_domain)
     if from_address is None:
         raise PeerLaneUnavailable("no fleet_domain: the router has no address to author from")
+    recipient_key = state_key(cfg, recipient)  # first, as in `deliver`
     recipient_cfg = cfg.instances[recipient]
     notice_id = mint_notice_id()
     message_id = notice_id
@@ -573,7 +584,7 @@ def deliver_router_notice(
     audit_line = audit_mod.build_line(audit_mod.EVENT_DSN_SENT, recipient, fields)
     _place(
         root=recipient_cfg.root, tree_root=recipient_cfg.inbox_root, state_dir=state_dir,
-        recipient=recipient, notice_id=notice_id,
+        recipient=recipient, notice_id=notice_id, recipient_key=recipient_key,
         message_doc=message_doc, notice_doc=notice_doc, ledger_bytes=ledger_bytes,
         attachments=[],
         audit_line=audit_line, audit_instance=recipient,

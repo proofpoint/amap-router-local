@@ -122,6 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import transport as transport_mod
+from . import config as config_mod
 from .config import RouterConfig
 from .util import atomic_write, fsync_dir, parse_utc_ts, utc_ts
 
@@ -170,7 +171,7 @@ def _effect(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> An
 
 
 def _inflight_dir(cfg: RouterConfig, name: str) -> Path:
-    return cfg.state_dir / name / INFLIGHT_DIR
+    return config_mod.instance_state_dir(cfg, name) / INFLIGHT_DIR
 
 
 def record_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
@@ -182,7 +183,7 @@ def handed_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
 
 
 def counter_path(cfg: RouterConfig, name: str) -> Path:
-    return cfg.state_dir / name / TRANSPORT_STATE_DIR / COUNTER_FILE
+    return config_mod.instance_state_dir(cfg, name) / TRANSPORT_STATE_DIR / COUNTER_FILE
 
 
 def read_record(cfg: RouterConfig, name: str, req_id: str) -> Optional[Dict[str, Any]]:

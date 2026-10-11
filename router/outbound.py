@@ -136,7 +136,7 @@ from datetime import timedelta
 from . import attachments as attachments_mod, binding, firstsight
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
-from .config import RouterConfig, address_for, instance_for
+from .config import RouterConfig, address_for, instance_for, instance_state_dir, state_key
 from .util import (
     DEFAULT_READ_CAP,
     NamespaceEscapeError,
@@ -191,11 +191,11 @@ def _outbox_dir(cfg: RouterConfig, name: str) -> Path:
 
 
 def _private_result_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return cfg.state_dir / name / "results" / f"{req_id}.json"
+    return instance_state_dir(cfg, name) / "results" / f"{req_id}.json"
 
 
 def _held_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return cfg.state_dir / name / "held" / f"req-{req_id}.json"
+    return instance_state_dir(cfg, name) / "held" / f"req-{req_id}.json"
 
 
 def _read_request_pinned(cfg: RouterConfig, name: str, filename: str,
@@ -530,7 +530,8 @@ def _drain_reply(
     goes to `_drain_external_reply` instead; one that fails it (a router
     DSN, or anything short of all three) is unresolved as before. Returns
     the governing `outcome` string."""
-    record = binding.read_ledger_record(cfg.state_dir, name, str(in_reply_to))
+    record = binding.read_ledger_record(cfg.state_dir, name, str(in_reply_to),
+                                        state_key=state_key(cfg, name))
     bound_instance = None
     if record is not None:
         from_instance = record.get("from_instance")
@@ -855,6 +856,7 @@ def _audit_peer_refusal(
     try:
         audit_mod.append(
             cfg.state_dir, sender, audit_mod.EVENT_PEER_REFUSED,
+            state_key=state_key(cfg, sender),
             req_id=req_id, reason_code=reason_code,
             recipients=list(recipients or []), in_reply_to=in_reply_to,
         )
@@ -1375,7 +1377,7 @@ def _quarantine_one(
     recipient. See `router/firstsight.py`'s module docstring for what the
     quarantine check does and does not guarantee."""
     first_seen_ts = marker_doc.get("first_seen_ts")
-    q_dir = cfg.state_dir / name / "quarantine"
+    q_dir = instance_state_dir(cfg, name) / "quarantine"
     try:
         atomic_write(q_dir / filename, raw)
         snap_entry = next(

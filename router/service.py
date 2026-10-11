@@ -138,6 +138,9 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
         transport = start_transport(cfg)
     if report is None:
         report = registry_report(cfg)
+    # Under a registry every resolved instance's private state is keyed by
+    # its logical_id from here on (`registry.keyed_config`).
+    cfg = registry_mod.keyed_config(cfg, report)
     summary: Dict[str, Dict[str, int]] = {}
     for name in sorted(cfg.instances):
         if report.state != "off" and name not in report.resolved:
