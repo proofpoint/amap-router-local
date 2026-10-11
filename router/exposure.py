@@ -7,8 +7,12 @@ envelope before policy runs (`router/validate.py`, pinned by
 `tests/test_peer_fixtures.py`). What it asserts is narrow and delivery-based:
 "was external mail written into the SENDER's mail tree during this window",
 a proxy for "may this peer message paraphrase something a stranger wrote".
-Advisory only — it MUST NOT drive routing or treatment, and nothing in this
-repo reads it back.
+The VALUE is advisory only: it MUST NOT drive routing or treatment, and
+nothing in this repo reads it back. Its AVAILABILITY gates, and that is a
+different thing: a cross-host peer task is never sent without a stamp, so
+when `assess` returns None (or raises) the classifier refuses it
+`exposure_unavailable` (`router/classify.py`, item 5d). Availability gates;
+the value never routes.
 
     {"asserted_by": "amap.router@<fleet_domain>",
      "external_mail_delivered": false,

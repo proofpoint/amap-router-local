@@ -1,0 +1,189 @@
+{
+ "description": "Known answers for the policy digest (router/classify.py). digest = \"sha256:\" + hex(sha256(json.dumps(object, sort_keys=True, separators=(\",\", \":\"), ensure_ascii=False, allow_nan=False).encode(\"utf-8\"))). Each case gives the raw `input` (canonicalised by the one canonicaliser before sorting) or, with object_only, only the object to digest. Shared with the external leg's runtime so the two suites cannot drift.",
+ "cases": [
+  {
+   "why": "nothing configured",
+   "input": {
+    "send_to": [],
+    "remote_fleet": [],
+    "task_deny": [],
+    "trusted_fleet_hosts": [],
+    "egress": false
+   },
+   "object": {
+    "v": 1,
+    "send_to": [],
+    "remote_fleet": [],
+    "task_deny": [],
+    "trusted_fleet_hosts": [],
+    "egress": false
+   },
+   "digest": "sha256:9e64697e576c916d4fbfea58edb224f0e0e26998b0bd7af94f67445159f2724f"
+  },
+  {
+   "why": "every input, already canonical",
+   "input": {
+    "send_to": [
+     "@partner.example",
+     "Bob@example.com"
+    ],
+    "remote_fleet": [
+     "hub2.fleet.example"
+    ],
+    "task_deny": [
+     "@t1.fleet.example",
+     "x@t2.fleet.example"
+    ],
+    "trusted_fleet_hosts": [
+     "t1.fleet.example",
+     "t2.fleet.example"
+    ],
+    "egress": true
+   },
+   "object": {
+    "v": 1,
+    "send_to": [
+     "@partner.example",
+     "Bob@example.com"
+    ],
+    "remote_fleet": [
+     "hub2.fleet.example"
+    ],
+    "task_deny": [
+     "@t1.fleet.example",
+     "x@t2.fleet.example"
+    ],
+    "trusted_fleet_hosts": [
+     "t1.fleet.example",
+     "t2.fleet.example"
+    ],
+    "egress": true
+   },
+   "digest": "sha256:f7d314d82ad216594d86085c0603576553a01ceb20a8d4fe4dd402abd925b4f3"
+  },
+  {
+   "why": "case variants: domains fold, local parts do not; the same digest as the canonical input",
+   "input": {
+    "send_to": [
+     "Bob@EXAMPLE.com",
+     "@Partner.Example"
+    ],
+    "remote_fleet": [
+     "HUB2.fleet.example"
+    ],
+    "task_deny": [
+     "x@T2.fleet.example",
+     "@t1.FLEET.example"
+    ],
+    "trusted_fleet_hosts": [
+     "T2.fleet.example",
+     "t1.fleet.EXAMPLE"
+    ],
+    "egress": true
+   },
+   "object": {
+    "v": 1,
+    "send_to": [
+     "@partner.example",
+     "Bob@example.com"
+    ],
+    "remote_fleet": [
+     "hub2.fleet.example"
+    ],
+    "task_deny": [
+     "@t1.fleet.example",
+     "x@t2.fleet.example"
+    ],
+    "trusted_fleet_hosts": [
+     "t1.fleet.example",
+     "t2.fleet.example"
+    ],
+    "egress": true
+   },
+   "digest": "sha256:f7d314d82ad216594d86085c0603576553a01ceb20a8d4fe4dd402abd925b4f3"
+  },
+  {
+   "why": "duplicates (after canonicalisation) and reordering: the same digest as the canonical input",
+   "input": {
+    "send_to": [
+     "Bob@example.com",
+     "@partner.example",
+     "Bob@Example.com"
+    ],
+    "remote_fleet": [
+     "hub2.fleet.example",
+     "hub2.fleet.example"
+    ],
+    "task_deny": [
+     "x@t2.fleet.example",
+     "@t1.fleet.example",
+     "@T1.fleet.example"
+    ],
+    "trusted_fleet_hosts": [
+     "t2.fleet.example",
+     "t1.fleet.example",
+     "t2.fleet.example"
+    ],
+    "egress": true
+   },
+   "object": {
+    "v": 1,
+    "send_to": [
+     "@partner.example",
+     "Bob@example.com"
+    ],
+    "remote_fleet": [
+     "hub2.fleet.example"
+    ],
+    "task_deny": [
+     "@t1.fleet.example",
+     "x@t2.fleet.example"
+    ],
+    "trusted_fleet_hosts": [
+     "t1.fleet.example",
+     "t2.fleet.example"
+    ],
+    "egress": true
+   },
+   "digest": "sha256:f7d314d82ad216594d86085c0603576553a01ceb20a8d4fe4dd402abd925b4f3"
+  },
+  {
+   "why": "a local part differing only in case is a DIFFERENT entry",
+   "input": {
+    "send_to": [
+     "bob@example.com"
+    ],
+    "remote_fleet": [],
+    "task_deny": [],
+    "trusted_fleet_hosts": [],
+    "egress": true
+   },
+   "object": {
+    "v": 1,
+    "send_to": [
+     "bob@example.com"
+    ],
+    "remote_fleet": [],
+    "task_deny": [],
+    "trusted_fleet_hosts": [],
+    "egress": true
+   },
+   "digest": "sha256:e25f4efbb883f54162f91038ec5d70187c3dbedb4073dd8a714f6297ad634466"
+  },
+  {
+   "why": "non-ASCII in a string value is UTF-8, never \\u-escaped (ensure_ascii=False)",
+   "object_only": true,
+   "object": {
+    "v": 1,
+    "send_to": [
+     "café"
+    ],
+    "remote_fleet": [],
+    "task_deny": [],
+    "trusted_fleet_hosts": [],
+    "egress": false
+   },
+   "digest": "sha256:ce2b598ed7aabeea149e5cbebf900efc30351284e9a039130a03d1356b51acd3"
+  }
+ ]
+}

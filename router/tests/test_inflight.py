@@ -131,7 +131,10 @@ class LifecycleTests(_InflightCase):
         self.drain()
         self.assertEqual(self.port.writes, ["00000001"])
 
-    def test_the_policy_is_consulted_once_not_every_poll(self):
+    def test_the_request_is_handed_once_and_rechecked_every_poll(self):
+        """Consumed and handed over ONCE; the policy is consulted again by the
+        re-check at publication and on every poll while it is pending,
+        because what decides a permit can change after it was staged."""
         calls = []
 
         def spy(cfg, sender, draft):
@@ -140,8 +143,10 @@ class LifecycleTests(_InflightCase):
 
         write_request(self.cfg, "alice", "00000001", to=[EXT])
         self.drain(cold_policy=spy)
+        self.assertEqual(calls, ["alice", "alice"], "classified, then re-checked to publish")
         self.drain(cold_policy=spy)
-        self.assertEqual(calls, ["alice"])
+        self.assertEqual(calls, ["alice"] * 3, "re-checked while pending")
+        self.assertEqual(self.port.writes, ["00000001"])
 
     def test_the_verdict_passes_through_verbatim_with_the_detail_prefixed(self):
         write_request(self.cfg, "alice", "00000001", to=[EXT])
@@ -218,12 +223,15 @@ class LifecycleTests(_InflightCase):
         anchor = read_json(outbound._private_result_path(self.cfg, "alice", "00000001"))
         self.assertEqual(anchor["result"]["outcome"], "accepted")
 
-    def test_without_a_transport_the_request_settles_as_an_anomaly(self):
+    def test_without_a_transport_a_cross_host_recipient_is_unknown(self):
+        """No transport plugin: every cross-host address is `recipient_unknown`
+        before any policy is asked, and nothing is put in flight."""
+        called = []
         write_request(self.cfg, "alice", "00000001", to=[EXT])
-        self.drain(transport=None)
+        self.drain(transport=None, cold_policy=lambda c, s, d: called.append(s))
         r = self.result()
-        self.assertEqual((r["outcome"], r["reason_code"]),
-                         ("queued_for_human", "transport_anomaly"))
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "recipient_unknown"))
+        self.assertEqual(called, [])
         self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
 
     def test_records_without_a_transport_are_left_alone(self):
@@ -526,15 +534,32 @@ class RecipientIntegrityTests(_InflightCase):
         self.assertEqual(self.port.writes, [])
         self.assertEqual(self.result()["reason_code"], "transport_anomaly")
 
-    def test_the_exact_set_goes_out_case_insensitively(self):
+    def test_the_exact_set_goes_out_with_the_domain_folded(self):
         """The positive twin: without it, a check refusing everything would
-        pass both tests above."""
+        pass both tests above. The domain is compared case-insensitively."""
         write_request(self.cfg, "alice", "00000001", to=["Allowed@Example.ORG"], cc=[DENIED])
-        self.drain(cold_policy=self._only(ALLOWED, DENIED.upper()))
+        self.drain(cold_policy=self._only("Allowed@example.org", DENIED))
         self.assertEqual(self.port.writes, ["00000001"])
         sent = json.loads(self.port.pending["00000001"])
         self.assertEqual(sent["draft"]["to"], ["Allowed@Example.ORG"])
         self.assertEqual(sent["draft"]["cc"], [DENIED])
+
+    def test_a_local_part_differing_in_case_is_a_different_recipient(self):
+        """A remote local part is matched exactly, never case-folded: a
+        policy naming DENIED@ for a draft naming denied@ routed someone the
+        agent did not name, and nothing goes out."""
+        write_request(self.cfg, "alice", "00000001", to=[ALLOWED], cc=[DENIED])
+        self.drain(cold_policy=self._only(ALLOWED, "DENIED@example.org"))
+        self.assertEqual(self.port.writes, [])
+        self.assertEqual(self.result()["reason_code"], "transport_anomaly")
+
+    def test_the_mismatch_check_compares_local_parts_exactly(self):
+        """The in-flight check alone, past the policy's own class check."""
+        rec = {"recipients": ["denied@example.org"],
+               "request": {"draft": {"to": ["DENIED@example.org"]}}}
+        self.assertIsNotNone(inflight.recipient_mismatch(rec))
+        rec["request"]["draft"]["to"] = ["denied@EXAMPLE.org"]
+        self.assertIsNone(inflight.recipient_mismatch(rec))
 
     def test_the_request_bytes_cannot_be_built_for_a_mismatched_record(self):
         """Defence in depth: the builder itself refuses, so no caller can

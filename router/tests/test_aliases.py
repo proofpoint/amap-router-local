@@ -274,17 +274,21 @@ def keyed_view(tc):
 class ExternalTests(_Aliases):
 
     def test_an_aliased_draft_never_reaches_the_external_leg(self):
+        """An alias names a LOCAL identity, so the normalised draft is in the
+        local class, which no custom policy decides: a policy that would hand
+        the agent's original recipients to the external leg is never asked."""
         port = FakeTransport()
+        called = []
 
         def policy(cfg, sender, draft):
+            called.append(draft)
             return outbound.ExternalRoute(tuple([OLD]))      # the ORIGINAL recipients
         write_request(self.cfg, "alpha", "00000001", to=[OLD])
         outbound.drain_instance(keyed_view(self), "alpha", transport=port, cold_policy=policy)
         r = self.answered()
         self.assertEqual((r["outcome"], r["reason_code"]),
-                         ("queued_for_human", outbound.REASON_TRANSPORT_ANOMALY))
-        self.assertEqual(r["detail"], "alias-normalised recipients cannot take the external "
-                                      "leg; nothing was sent")
+                         ("accepted", outbound.REASON_ALLOWLISTED))
+        self.assertEqual(called, [], "a custom policy decided an alias-normalised draft")
         self.assertEqual(port.writes, [])
         self.assertFalse((gen_state(self.state_dir, LIDS["alpha"]) / "inflight").exists()
                          and any((gen_state(self.state_dir, LIDS["alpha"]) / "inflight").iterdir()))

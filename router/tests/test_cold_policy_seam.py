@@ -1,20 +1,26 @@
 """The cold-send POLICY seam: injected, or this router's own decision.
 
 The delivery seam alone was not enough, and this test file exists because of
-exactly why. `_resolve_cold_recipients` returns `None` for any address that is
-not a known instance, so a cold send to an EXTERNAL address is refused with
-`recipient_unknown` LONG BEFORE any delivery backend is consulted. A combined
-local+external runtime therefore could not reach the backend it had been given:
-the seam was one step too late in the pipeline.
+exactly why: a cold send to an EXTERNAL address used to be refused with
+`recipient_unknown` LONG BEFORE any delivery backend was consulted, so a
+combined local+external runtime could not reach the backend it had been
+given. `cold_policy` sits at the decision itself.
 
-`cold_policy` sits at the decision itself. What it may NOT do is skip the one
-governing outcome — a policy chooses the verdict, never whether there is one.
+Since the classification order (`router/classify.py`) the seam is NARROW: the
+order's non-negotiables run outside it, always, and a policy decides only a
+request whose recipients are all in ONE cross-host class of item 6 or item 7
+(a fleet host outside the trusted list, or the internet). What it may NOT do
+is skip the one governing outcome, decide a same-host request, or route a
+recipient into a class it is not in.
 """
 from unittest import mock
 
 from router import outbound
 from router.tests import helpers
 from router.tests.helpers import read_json, result_path, write_request
+from router.tests.test_inflight import FakeTransport
+
+EXT = "you@example.com"
 
 
 class ColdPolicySeamTest(helpers.RouterTestCase):
@@ -52,44 +58,37 @@ class ColdPolicySeamTest(helpers.RouterTestCase):
 
     # -- what the seam exists for ----------------------------------------
 
-    def test_a_policy_may_authorize_a_recipient_this_router_would_refuse(self):
-        """THE POINT. `you@example.com` is not an instance, so the default
-        policy refuses it outright with `recipient_unknown`. A combined
-        runtime's policy authorizes it and its own backend carries it — which
-        the delivery seam alone could never reach."""
+    def test_a_policy_may_authorize_a_recipient_the_default_would_refuse(self):
+        """THE POINT. With no egress configured, the default answers an
+        internet address `no_route`. A combined runtime's policy routes it to
+        the external leg instead."""
         cfg = self._pair()
-        carried = []
+        port = FakeTransport()
 
         def external_ok(c, sender, draft):
-            return ["you@example.com"]
+            return outbound.ExternalRoute((EXT,))
 
-        def backend(c, state_dir, sender, recipient, request, **kw):
-            carried.append(recipient)
-            return {"notice_id": "n-ext-1", "message_id": "<provider@id>",
-                    "recipient": recipient}
-
-        write_request(cfg, "alice", "0000001", to=["you@example.com"])
-        outbound.drain_instance(cfg, "alice",
-                                deliver_backend=backend, cold_policy=external_ok)
-
-        self.assertEqual(carried, ["you@example.com"])
-        r = self._result(cfg, "0000001")
-        self.assertEqual(r["outcome"], "accepted")
-        self.assertEqual(r["message_id"], "<provider@id>")
+        write_request(cfg, "alice", "0000001", to=[EXT])
+        outbound.drain_instance(cfg, "alice", transport=port, cold_policy=external_ok)
+        self.assertEqual(port.writes, ["00000001"])
+        write_request(cfg, "alice", "0000002", to=[EXT])
+        outbound.drain_instance(cfg, "alice", transport=port)
+        r = self._result(cfg, "0000002")
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "no_route"))
 
     def test_a_policy_refusal_carries_its_own_outcome_and_reason(self):
         cfg = self._pair()
 
         def refuse(c, sender, draft):
             return outbound.ColdRefusal(
-                "queued_for_human", "mixed_recipient_classes",
-                detail="local and external in one request")
+                "queued_for_human", "recipient_not_allowlisted",
+                detail="held by one request's policy")
 
-        write_request(cfg, "alice", "0000001", to=["agent.bob@local"])
-        outbound.drain_instance(cfg, "alice", cold_policy=refuse)
+        write_request(cfg, "alice", "0000001", to=[EXT])
+        outbound.drain_instance(cfg, "alice", transport=FakeTransport(), cold_policy=refuse)
         r = self._result(cfg, "0000001")
         self.assertEqual(r["outcome"], "queued_for_human")
-        self.assertEqual(r["reason_code"], "mixed_recipient_classes")
+        self.assertEqual(r["reason_code"], "recipient_not_allowlisted")
         self.assertIn("one request", r["detail"])
 
     def test_hold_is_the_policys_choice_not_the_outcomes(self):
@@ -101,8 +100,9 @@ class ColdPolicySeamTest(helpers.RouterTestCase):
         def refuse_no_hold(c, sender, draft):
             return outbound.ColdRefusal("rejected", outbound.REASON_MALFORMED)
 
-        write_request(cfg, "alice", "0000001", to=["agent.bob@local"])
-        outbound.drain_instance(cfg, "alice", cold_policy=refuse_no_hold)
+        write_request(cfg, "alice", "0000001", to=[EXT])
+        outbound.drain_instance(cfg, "alice", transport=FakeTransport(),
+                                cold_policy=refuse_no_hold)
         self.assertFalse(held.exists())
 
         def refuse_hold(c, sender, draft):
@@ -110,34 +110,54 @@ class ColdPolicySeamTest(helpers.RouterTestCase):
                 "queued_for_human", outbound.REASON_RECIPIENT_NOT_ALLOWLISTED,
                 hold=True)
 
-        write_request(cfg, "alice", "0000002", to=["agent.bob@local"])
-        outbound.drain_instance(cfg, "alice", cold_policy=refuse_hold)
+        write_request(cfg, "alice", "0000002", to=[EXT])
+        outbound.drain_instance(cfg, "alice", transport=FakeTransport(),
+                                cold_policy=refuse_hold)
         self.assertTrue((cfg.state_dir / "alice" / "held" / "req-0000002.json").exists())
 
     # -- what a policy must NOT be able to do -----------------------------
 
-    def test_a_policy_authorizing_nobody_still_gets_one_governing_outcome(self):
-        """Silence is not a delivery. An empty list is answered, archived, and
-        never left in `outbound/` for every later poll to retry."""
+    def test_a_policy_never_decides_a_same_host_request(self):
+        """The same-host decision is this router's: a policy that would
+        refuse is never asked, and the notice is delivered."""
         cfg = self._pair()
-
-        def authorize_nobody(c, sender, draft):
-            return []
-
-        write_request(cfg, "alice", "0000001", to=["agent.bob@local"])
-        outbound.drain_instance(cfg, "alice", cold_policy=authorize_nobody)
-        r = self._result(cfg, "0000001")
-        self.assertEqual(r["outcome"], "rejected")
-        self.assertEqual(r["reason_code"], outbound.REASON_MALFORMED)
-        self.assertFalse((cfg.instances["alice"].outbox_root / "req-0000001.json").exists(),
-                         "the request must be archived, not left to be retried forever")
-
-    def test_no_notice_is_delivered_on_a_policy_refusal(self):
-        cfg = self._pair()
+        called = []
 
         def refuse(c, sender, draft):
-            return outbound.ColdRefusal("rejected", outbound.REASON_SELF_SEND)
+            called.append(sender)
+            return outbound.ColdRefusal("rejected", "custom")
 
         write_request(cfg, "alice", "0000001", to=["agent.bob@local"])
-        outbound.drain_instance(cfg, "alice", cold_policy=refuse)
+        outbound.drain_instance(cfg, "alice", transport=FakeTransport(), cold_policy=refuse)
+        self.assertEqual(called, [])
+        self.assertEqual(self._result(cfg, "0000001")["outcome"], "accepted")
+        self.assertEqual(len(helpers.list_notices(cfg, "bob")), 1)
+
+    def test_a_policy_cannot_route_outside_the_class(self):
+        """Local delivery, a peer route, or an external route naming someone
+        the request did not: each answered `transport_anomaly`, nothing sent,
+        nothing delivered."""
+        cfg = self._pair()
+        answers = {
+            "0000001": ["bob"],
+            "0000002": outbound.PeerRoute("bob"),
+            "0000003": outbound.ExternalRoute(("other@example.com",)),
+            "0000004": [],
+        }
+        port = FakeTransport()
+        for req_id, answer in answers.items():
+            write_request(cfg, "alice", req_id, to=[EXT])
+            outbound.drain_instance(cfg, "alice", transport=port,
+                                    cold_policy=lambda c, s, d, a=answer: a)
+            r = self._result(cfg, req_id)
+            self.assertEqual((r["outcome"], r["reason_code"]),
+                             ("queued_for_human", "transport_anomaly"), req_id)
+            # The class check is the only producer of this detail; the
+            # in-flight recipient check would answer the external case with
+            # the same code and a different detail.
+            self.assertEqual(r["detail"], "the cold policy routed outside this request's "
+                                          "recipient class; nothing was sent", req_id)
+            self.assertFalse((cfg.instances["alice"].outbox_root / f"req-{req_id}.json").exists(),
+                             "the request must be archived, not left to be retried forever")
+        self.assertEqual(port.writes, [])
         self.assertEqual(helpers.list_notices(cfg, "bob"), [])

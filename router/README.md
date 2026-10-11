@@ -386,6 +386,10 @@ python3 -m router --config C reset {NAME [NAME...]|--all} [--yes|--dry-run]
                                                                       # wipe NAME's (or every instance's) mailbox contents + router-private
                                                                       # state together; returns the instance(s) to NEVER SEEN — see "Resetting an
                                                                       # instance" above
+python3 -m router --config C quarantine list [NAME] [--control-dir DIR]
+python3 -m router --config C quarantine show NAME SOURCE GEN ID [--control-dir DIR]
+                                                                      # read-only inspection of the ingress quarantine — see
+                                                                      # "The ingress quarantine" below
 ```
 
 `matrix` is kept as an exact alias for `peers` (same output) so nothing
@@ -980,13 +984,20 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `accepted` | `allowlisted` | Cold send, all recipients mutually allowlisted, every delivery succeeded |
 | `accepted` | `partial_delivery` | Some deliveries succeeded, some raised. `recipients` lists **only those actually delivered to** (AMAP §4 makes it authoritative); failures are named in `detail`. Not retried — a retry would re-deliver to the ones that already have it |
 | `queued_for_human` | `delivery_failed` | Every delivery raised. An infrastructure failure, not a policy refusal, so it is held for an operator rather than silently dropped |
-| `queued_for_human` | `recipient_not_allowlisted` | Every address is a known instance, but at least one isn't mutual; request held at `state_dir/<name>/held/` — no release mechanism in L1 |
+| `queued_for_human` | `recipient_not_allowlisted` | Every address is a known instance, but at least one isn't mutual; or a fleet host outside the trusted list that the sender's `remote_fleet` does not name; or an internet address its `send_to` does not permit. Request held at `state_dir/<name>/held/` — no release mechanism in L1. Also the answer when the policy changed between staging and publication ("policy changed before publication: …", nothing held, nothing sent) |
 | `rejected` | `unsupported_contract_version` | `contract_version` absent or not `"2"` |
-| `rejected` | `malformed_request` | Fails AMAP §3 shape (bad JSON, missing/mistyped fields, empty `to`, bad attachment descriptor, ...) |
+| `rejected` | `malformed_request` | Fails AMAP §3 shape (bad JSON, missing/mistyped fields, empty `to`, bad attachment descriptor, ...), or a cold-send address outside the one address grammar (`router/classify.py`: a trailing dot, an IP literal, a doubled dot, a U-label, a fleet local part outside the name grammar, ...) |
 | `rejected` | `req_id_mismatch` | Body `req_id` != the filename's id |
 | `rejected` | `agent_id_mismatch` | Body `agent_id` present and != the namespace instance |
 | `rejected` | `attachment_mismatch` | An attachment descriptor and its sidecar bytes disagree, or the sidecar dir's shape is wrong: sha/size mismatch, missing/extra ordinal, non-ordinal entry name, symlinked/hardlinked/non-regular sidecar, dir present with no attachments declared (or vice versa) — see "Attachment transport" below |
-| `rejected` | `recipient_unknown` | Cold send: an address doesn't parse, or names an instance this router doesn't know |
+| `rejected` | `recipient_unknown` | Cold send: an address at this router's own domain names no instance (classification step 3); or, with no transport plugin, any cross-host address (step 4); or a trusted-host peer task that passed every check, because this router cannot yet sign a cross-host peer statement (item 5e) |
+| `rejected` | `mixed_recipient_classes` | Cold send: `to` ∪ `cc` spans more than one class (local, trusted fleet host, other fleet host, internet). One request, one class |
+| `rejected` | `no_route` | Cold send to the internet, and this host has no `egress`. Decided before `send_to` |
+| `rejected` | `fleet_mail_disabled` | Cold send to a trusted fleet host that cannot be a peer task: more than one recipient, or any `cc` |
+| `rejected` | `peer_denied` | Trusted fleet host: the sender's `task_deny` removes the edge (an exact address or `@domain`) |
+| `rejected` | `peer_quarantined` | Trusted fleet host: the sender's registry `first_registered_ts` is under 24 h old, in the future, or absent ("sender age unknown") |
+| `rejected` | `exposure_unavailable` | Trusted fleet host: the `sender_exposure` assessment returned nothing or failed; a cross-host peer task never goes without it |
+| `rejected` | `peer_statement_too_large` | Trusted fleet host: the signed statement would exceed 8192 bytes. Reachable only once a signer exists (item 5e decides first today) |
 | `rejected` | `unresolved_reply` | Reply: `in_reply_to` doesn't resolve to a ledger record for this sender |
 | `rejected` | `self_send` | Recipient resolves to the sender's own instance |
 | `rejected` | `req_id_reused` | The filename's `req_id` was already anchored to a DIFFERENT request (agent deleted its own `outbound/{results,processed}` and resubmitted under a reused id) — refused rather than replaying the stale verdict |
@@ -996,15 +1007,135 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `accepted` | `peer_routed` | Peer lane: placed in the recipient's `peer/` tree along a declared edge (or, for a reply, the reverse edge). `message_id` is the peer message id. Fresh task and reply alike — the code names the TREE |
 | `rejected` | `peer_single_recipient` | Peer lane: a submit touching a declared edge named more than one recipient or carried `cc`. Refused whole; a mixed-lane submit is never half-sent |
 | `rejected` | `peer_reply_window_expired` | Peer lane: the reply key resolves to a peer notice, no edge exists in the reply's direction, and the notice is older than `peer_reply_window_seconds` |
-| `queued_for_human` | `transport_anomaly` | External leg (not yet reachable from any built-in policy; see "In-flight requests"): the transport request was archived without a result, its result failed validation, no transport is configured, or the request carried attachments (staging to the transport is not built yet). Never resubmitted |
+| `queued_for_human` | `transport_anomaly` | External leg (see "In-flight requests"): the transport request was archived without a result, its result failed validation, the request carried attachments (staging to the transport is not built yet), a custom cold policy routed outside the request's class, or a trusted-host peer task passed every check with no cross-host peer lane built to carry it. Never resubmitted |
+
+**Codes this router never originates.** They reach an agent only as a
+transport verdict, passed through verbatim with `detail` prefixed
+`transport: `: `hop_version_mismatch`, `hop_invalid_request`,
+`recipient_refused`, `loop_refused`, `special_use_domain`,
+`delivery_unknown`, `rate_limited`, `halted`, and `transport_timeout`. The
+last one in particular: this router never settles a request on age (no
+timeout, by operator decision), so a `transport_timeout` is always the
+downstream runtime's. `agent_id_mismatch` is in both lists: this router
+originates it for its own envelope check, and also passes a downstream one
+through. `halted` and `agent_id_mismatch` arrive from the external leg's
+runtime and are not in the contract's reason-code table, a gap recorded
+for the contract's owner.
+
+## Cross-host classification (`router/classify.py`)
+
+Every cold send is classified before any policy sees it, in this order,
+and the first step that answers decides:
+
+1. alias normalisation (hold, then refuse; "Aliases" below);
+2. any address outside the one address grammar: `malformed_request`;
+3. any address at this router's own domain naming no instance:
+   `recipient_unknown`;
+4. no transport plugin and any cross-host address: `recipient_unknown`,
+   nothing below runs;
+5. more than one class across `to` ∪ `cc`: `mixed_recipient_classes`;
+6. the one class's rule: **local** (the same-host decision, unchanged);
+   **trusted fleet host** (in order: the shape, `task_deny`, the 24 h
+   quarantine, the exposure stamp, the peer lane's availability, the
+   statement size; see the reason codes above); **fleet host not in the
+   trusted list** (permitted when the sender's `remote_fleet` names it,
+   else held); **internet** (`no_route` without egress, first; then permitted
+   when `send_to` names the address or `@domain`, else held).
+
+A reply (`in_reply_to`) never reaches it: it is decided by its binding, and
+an unbound key stays `unresolved_reply`.
+
+The address grammar is one parser, shared by the drain and the loader: an
+ASCII dot-atom local part of at most 64 characters, one `@`, LDH labels of
+at most 63 characters, a domain of at most 253 and an address of at most
+254. A domain is compared lowercased; a remote local part is compared
+EXACTLY, never case-folded; a local part at a fleet domain must also match
+the registry's name grammar. The envelope's own pattern
+(`router/validate.py`) still runs first and refuses some shapes before
+classification; both answers are `malformed_request`.
+`tests/vectors/address_grammar.json` holds the cases, shared with the
+external leg's runtime.
+
+**Config.** All optional:
+
+```json
+"trusted_fleet_hosts": ["t1.fleet.example"],
+"fleet_hosts": ["t1.fleet.example", "hub2.fleet.example"],
+"egress": false,
+"ingress_quarantine_days": 14,
+"instances": {"alice": {"handoff_dir": "...",
+  "task_deny": ["@t1.fleet.example"],
+  "send_to": ["bob@example.com", "@partner.example"],
+  "remote_fleet": ["hub2.fleet.example"]}}
+```
+
+`fleet_hosts` is every fleet host and must include every trusted one. The
+loader refuses, and startup stops on: this router's own domain in either
+list; a trusted host missing from `fleet_hosts`; `send_to` or
+`remote_fleet` naming a trusted host; `remote_fleet` naming a host outside
+`fleet_hosts`; a `task_deny` entry outside the trusted hosts; a duplicate in
+any list after canonicalisation; anything outside the grammar. Absent keys
+reproduce the behaviour before them ONLY without a transport plugin. With
+one, an absent `egress` makes every internet address `no_route`. The
+per-instance keys exist only in an authored `instances` object for now: a
+discovered fleet has no per-instance section to put them in.
+
+**The policy digest.** At staging, the in-flight record stores the
+sender's policy digest and the request's route. The digest is
+`"sha256:" + hex(sha256(json.dumps(obj, sort_keys=True, separators=(",",
+":"), ensure_ascii=False, allow_nan=False).encode("utf-8")))` over
+`{"v": 1, "send_to", "remote_fleet", "task_deny", "trusted_fleet_hosts",
+"egress"}`, each list canonicalised (domains lowercased, de-duplicated,
+sorted) by the same canonicaliser the loader uses.
+`tests/vectors/policy_digest.json` holds known answers, shared with the
+external leg's runtime.
+
+**The re-check.** Every publication attempt re-classifies the staged
+request under the current config: the first, and the re-write of a
+handed-but-unwritten one. A digest change is LOGGED and never the trigger,
+because what decides a permit (the registry age, the exposure, the plugin's
+presence, `fleet_domain`, `fleet_hosts`) is wider than the digest. Still
+permitted means the same class, route and recipient set; then the record's
+digest is updated durably BEFORE the request is written, so the digest
+published with it is the current one. Anything else settles
+`queued_for_human`/`recipient_not_allowlisted`, "policy changed before
+publication: …", saying "route changed from X to Y" where that is the
+cause. A different route is refused, never rebuilt.
+
+**Revocation after hand-over.** While a handed request is pending, every
+poll re-checks it. If it is no longer permitted, nothing this router
+accepts can withdraw it: no transport API has a withdraw operation. The
+record is marked `revocation_unenforceable` (a member of its closed schema,
+so it survives a restart), an ERROR is logged every poll it stays pending,
+and `status` lists it with its age. A result, if one arrives, still settles
+it, because the send may have happened. A `withdraw_request` on the port is
+reported (`withdraw_capable`) and never called: it is a proposal for a
+later plugin API, not an approved part of this one.
+
+**A failing reload.** A reload that fails, or that `reload_config` refuses
+(a changed `state_dir` or `transport_plugin`), keeps the last good config
+with `reload_failed` set. That is process state, never read from a file;
+a restart loads the config afresh and the next good reload clears it.
+While it is set the local lane runs unchanged and the external leg fails
+closed: nothing new is published, a handed-but-unwritten request is not
+re-written, and a revocation is logged but not enacted. An ERROR is
+logged every poll, and `status` shows `config_reload_failed`.
+
+**The cold-policy seam.** A custom `cold_policy` decides only a request
+whose recipients are all in ONE class of item 6 or item 7, after steps 1-5.
+It never decides a same-host request, the peer lane or a trusted host. Its
+answer is checked against the class: only a refusal, or an external route
+naming recipients of this request's class, is accepted, and anything else
+is `queued_for_human`/`transport_anomaly`. No deployment configures one;
+it is a test and embedding hook.
 
 ## In-flight requests (external leg, partly built)
 
 `router/inflight.py` holds a request that stays unanswered across polls: one
-handed to a second runtime and settled from that runtime's result. Nothing
-reaches it yet. No built-in policy returns `outbound.ExternalRoute`, and
-no plugin can be activated yet (below); the rest of the external leg
-(classification, the transport itself, re-placement) is designed but not
+handed to a second runtime and settled from that runtime's result. The
+classifier above routes an item 6 or item 7 request here when a transport
+is present, but no plugin can be activated yet (below), so no deployment
+reaches it; the transport itself and re-placement are designed but not
 built. The transport is an optional plugin.
 
 * A record per request at `state_dir/<name>/inflight/<req_id>.json`, holding
@@ -1077,6 +1208,40 @@ plugin, and `start_transport` still refuses every plugin. It needs
 capability probe (`fsops.probe`) refuses a filesystem without it or without
 a working directory fsync. Whether a given mount honours those is a
 deployment measurement, not something this code can show.
+
+## The ingress quarantine (`router/quarantine.py`)
+
+Cross-host inbound that is not placed is held in the generation it arrived
+for, at `state_dir/<logical_id>/gen-<g>/ingress-quarantine/<id>.json`. This
+router FREEZES the item format and inspects it read-only; the writer and
+the expiry sweep are a later step's, which must write exactly this format.
+
+An item has exactly `schema` (`amap-router-local.ingress-quarantine/1`),
+`id` (32 hex, the filename stem), `generation` (32 hex, the directory's),
+`arrival_ts`, `causes` (non-empty, no duplicates, from a closed
+vocabulary: `cold_fleet_mail` today; the peer-origin profile's §5 causes are
+added once the revision defining them is published) and
+`evidence` (at most 32 members; keys 1-64 printable ASCII; values strings of
+at most 1024 characters or integers, never booleans, of magnitude below
+2^53; at most 16 KiB). Evidence is hostile input and is printed
+JSON-escaped, never raw. An item file is at most 64 KiB, read without
+following a link, regular, with one link; anything that fails a rule,
+including an `arrival_ts` more than 300 s in the future, is listed as
+DAMAGED with the reason and never hidden, and its content is never printed.
+
+```
+router quarantine list [NAME]              one line per item: NAME SOURCE GEN ID, age, expiry, causes
+router quarantine show NAME SOURCE GEN ID  one item as escaped JSON
+```
+
+SOURCE is `ingress` or `control`. `.control/` entries (candidates another
+runtime writes) are listed with `--control-dir`, keyed `- control - ID`
+with ID the candidate's 32-hex directory name, METADATA ONLY (the
+`candidate.json` size, sha256 and mtime) until the inbound step freezes their
+format; their path is not configured yet. Nothing is moved or written, and
+the registry is read without recording its seq. Retention is
+`ingress_quarantine_days` (default 14, 1-365). `status` reports a count per
+agent under a registry.
 
 ## Retention / deletion rights (v2.2.0)
 

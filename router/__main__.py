@@ -34,6 +34,13 @@
                                  rebuild an unverified alias tombstone store (the router must be
                                  stopped). It PERMANENTLY retires every configured alias:
                                  tombstoned addresses can never be re-enabled.
+  quarantine list [NAME] [--control-dir DIR]
+  quarantine show NAME SOURCE GEN ID [--control-dir DIR]
+                                 read-only inspection of the ingress quarantine
+                                 (router/quarantine.py): one line per item keyed NAME SOURCE GEN
+                                 ID, or one item as escaped JSON. SOURCE is ingress or control;
+                                 a control entry is NAME - GEN -. Exit 1 for an unknown instance
+                                 or item.
   generation adopt NAME --reason TEXT [--dry-run] [--no-transport-history=N]
   generation fence-legacy NAME --reason TEXT [--dry-run] [--no-transport-history=N]
                                  under a registry: migrate NAME's pre-generation state, held as
@@ -179,7 +186,68 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ri.add_argument("--dry-run", action="store_true",
                       help="list what would be tombstoned; take no lock and write nothing")
 
+    p_q = sub.add_parser("quarantine", help="read-only inspection of the ingress quarantine")
+    q_sub = p_q.add_subparsers(dest="quarantine_command", required=True)
+    p_ql = q_sub.add_parser("list", help="one line per item: NAME SOURCE GEN ID and its state")
+    p_ql.add_argument("name", nargs="?", help="one instance (default: every instance)")
+    p_qs = q_sub.add_parser("show", help="one item, as escaped JSON")
+    p_qs.add_argument("name", help="the instance, or - for a control entry")
+    p_qs.add_argument("source", choices=("ingress", "control"))
+    p_qs.add_argument("generation", help="the 32-hex generation, or - for a control entry")
+    p_qs.add_argument("id", help="the item id")
+    for p in (p_ql, p_qs):
+        p.add_argument("--control-dir", type=Path, default=None,
+                       help="the .control/ intake to list too (read-only; its path is not "
+                            "configured yet)")
+
     return parser
+
+
+def _quarantine(cfg, args) -> int:
+    """`quarantine list|show` (router/quarantine.py). Read-only: it takes no
+    lock, and reads the registry without recording its seq."""
+    from . import quarantine as quarantine_mod, registry as registry_mod
+    known = {}
+    if cfg.registry_dir is not None:
+        report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
+                                         persist=False)
+        known = dict(report.known or {})
+
+    def ingress(name):
+        if name not in cfg.instances:
+            raise KeyError(name)
+        lid = known.get(name)
+        if lid is None:
+            return []
+        return quarantine_mod.list_ingress(cfg.state_dir, lid, name,
+                                           days=cfg.ingress_quarantine_days)
+
+    try:
+        if args.quarantine_command == "list":
+            names = [args.name] if args.name else sorted(cfg.instances)
+            items = [i for n in names for i in ingress(n)]
+            if args.control_dir is not None:
+                items += quarantine_mod.list_control(args.control_dir)
+            for item in items:
+                print(quarantine_mod.render_line(item))
+            return 0
+        if args.source == "control":
+            if args.name != "-" or args.generation != "-" or args.control_dir is None:
+                print("router: quarantine show: a control entry is NAME - and GEN -, and "
+                      "needs --control-dir", file=sys.stderr)
+                return 1
+            items = quarantine_mod.list_control(args.control_dir)
+        else:
+            items = [i for i in ingress(args.name) if i.generation == args.generation]
+    except KeyError as e:
+        print(f"router: quarantine: unknown instance {e.args[0]!r}", file=sys.stderr)
+        return 1
+    for item in items:
+        if item.id == args.id:
+            print(quarantine_mod.render_show(item))
+            return 0
+    print("router: quarantine show: no such item", file=sys.stderr)
+    return 1
 
 
 def _render_reset_plan(plan) -> str:
@@ -520,6 +588,9 @@ def main(argv=None) -> int:
         print(f"router: aliases reinit: {aliases_mod.REINIT_WARNING}", file=sys.stderr)
         print(json.dumps(plan, sort_keys=True))
         return 0
+
+    if args.command == "quarantine":
+        return _quarantine(cfg, args)
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover — argparse prevents this
     return 2

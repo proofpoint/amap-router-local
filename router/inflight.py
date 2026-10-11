@@ -67,7 +67,7 @@ RECIPIENTS: EXACTLY THE EVALUATED SET, OR NOBODY. The transport request
 carries the staged draft, and the downstream runtime sends to everything in
 its `to` and `cc`. So before anything is handed over, `recipient_mismatch`
 requires the draft's `to` ∪ `cc` to be exactly the evaluated recipients
-(case-insensitively); any difference settles `queued_for_human`/
+(domains case-insensitively, local parts exactly); any difference settles `queued_for_human`/
 `transport_anomaly` with nothing sent, because cold sends are all-or-nothing
 and narrowing the draft to the authorised part would be a partial send.
 `transport_request_bytes` refuses a mismatched record as well, so no caller
@@ -118,6 +118,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -152,6 +153,29 @@ SETTLED = "settled"
 PENDING = "pending"
 WRITTEN = "written"
 CLEANED = "cleaned"
+#: Not published this poll because the config reload is failing (`advance`).
+BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class Recheck:
+    """The caller's re-classification of a record's staged request under the
+    CURRENT config (`outbound._recheck`). `permitted` means the same class,
+    route and recipient set. When permitted, `policy_digest` is the sender's
+    digest now; when not, `verdict` is the settlement and `why` says what
+    changed."""
+    permitted: bool
+    policy_digest: Optional[str] = None
+    verdict: Optional[Dict[str, Any]] = None
+    why: str = ""
+
+
+def withdraw_capable(port: Any) -> bool:
+    """Whether the transport offers `withdraw_request`. No transport this
+    router accepts does: it is a proposal for a later plugin API, not part
+    of `TransportPort`, and this router never calls it. Reported so that a
+    revoked request's log line and `status` say which case they are in."""
+    return callable(getattr(port, "withdraw_request", None))
 
 
 #: The transport port lives in `router/transport.py`, with the plugin seam;
@@ -186,12 +210,69 @@ def counter_path(cfg: RouterConfig, name: str) -> Path:
     return config_mod.gen_state_dir(cfg, name) / TRANSPORT_STATE_DIR / COUNTER_FILE
 
 
+class RecordDamaged(ValueError):
+    """A record outside the closed schema (`check_record`). Raised, never
+    repaired: the per-record isolation in the drain keeps it, and the request
+    is neither settled nor handed over on a guess."""
+
+
+#: The CLOSED record schema: every member, with whether it is required.
+#: `policy_digest` and `route` are written at `begin` by every caller that
+#: classified the request; a record without them (written before they
+#: existed, or by a test driving this module alone) is re-classified at
+#: publication like any other. `revocation_unenforceable` is the ts at which
+#: a handed record was found no longer permitted with no way to withdraw it
+#: (`mark_unenforceable`).
+_RECORD_KEYS = {
+    "digest": False, "transport_req_id": True, "recipients": True, "request": True,
+    "written_ts": True, "policy_digest": False, "route": False,
+    "revocation_unenforceable": False,
+}
+_ROUTES = ("fleet_host", "internet")
+_POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def check_record(doc: Any) -> Dict[str, Any]:
+    """`doc` if it is a record in the closed schema, else `RecordDamaged`."""
+    if not isinstance(doc, dict):
+        raise RecordDamaged("not an object")
+    extra = sorted(set(doc) - set(_RECORD_KEYS))
+    if extra:
+        raise RecordDamaged(f"unknown member(s) {extra}")
+    missing = sorted(k for k, req in _RECORD_KEYS.items() if req and k not in doc)
+    if missing:
+        raise RecordDamaged(f"missing member(s) {missing}")
+    if not (isinstance(doc["transport_req_id"], str)
+            and re.fullmatch(r"[0-9]{8,18}", doc["transport_req_id"])):
+        raise RecordDamaged("transport_req_id is not 8-18 digits")
+    if not (isinstance(doc["recipients"], list)
+            and all(isinstance(r, str) for r in doc["recipients"])):
+        raise RecordDamaged("recipients is not a list of strings")
+    if not isinstance(doc["request"], dict):
+        raise RecordDamaged("request is not an object")
+    for key in ("written_ts", "revocation_unenforceable"):
+        if key in doc and not isinstance(doc[key], str):
+            raise RecordDamaged(f"{key} is not a string")
+    if doc.get("digest") is not None and not isinstance(doc["digest"], str):
+        raise RecordDamaged("digest is not a string")
+    if "policy_digest" in doc and not (isinstance(doc["policy_digest"], str)
+                                       and _POLICY_DIGEST_RE.fullmatch(doc["policy_digest"])):
+        raise RecordDamaged("policy_digest is not sha256:<64 hex>")
+    if "route" in doc and doc["route"] not in _ROUTES:
+        raise RecordDamaged("route is not a known route")
+    return doc
+
+
 def read_record(cfg: RouterConfig, name: str, req_id: str) -> Optional[Dict[str, Any]]:
     try:
         raw = record_path(cfg, name, req_id).read_bytes()
     except FileNotFoundError:
         return None
-    return json.loads(raw.decode("utf-8"))
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise RecordDamaged("not JSON") from e
+    return check_record(doc)
 
 
 def list_records(cfg: RouterConfig, name: str) -> List[str]:
@@ -227,25 +308,39 @@ def allocate_transport_req_id(cfg: RouterConfig, name: str) -> str:
 def begin(
     cfg: RouterConfig, name: str, req_id: str,
     *, digest: Optional[str], request_doc: Dict[str, Any], recipients: List[str],
+    policy_digest: Optional[str] = None, route: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Put `req_id` in flight: allocate its transport id, then write the
     record. Returns the record. A crash between the two burns the id; the
     agent's request is still unsettled and unrecorded, so the next poll
-    processes it afresh and allocates a new one."""
+    processes it afresh and allocates a new one. `policy_digest` and `route`
+    are the sender's policy digest and the request's class when it was
+    classified (`router/classify.py`), recorded BEFORE anything is handed
+    over."""
     n = allocate_transport_req_id(cfg, name)
-    record = {
+    record: Dict[str, Any] = {
         "digest": digest,
         "transport_req_id": n,
         "recipients": list(recipients),
         "request": request_doc,
         "written_ts": utc_ts(),
     }
+    if policy_digest is not None:
+        record["policy_digest"] = policy_digest
+    if route is not None:
+        record["route"] = route
+    check_record(record)
+    _write_record(cfg, name, req_id, record, "record")
+    return record
+
+
+def _write_record(cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
+                  label: str) -> None:
     _effect(
-        "record", atomic_write, record_path(cfg, name, req_id),
+        label, atomic_write, record_path(cfg, name, req_id),
         json.dumps(record, sort_keys=True).encode("utf-8"),
         durable_root=cfg.state_dir,
     )
-    return record
 
 
 def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]) -> bytes:
@@ -275,7 +370,8 @@ class RecipientSetMismatch(Exception):
 
 def recipient_mismatch(record: Dict[str, Any]) -> Optional[str]:
     """None when the staged draft's `to` ∪ `cc` is EXACTLY the evaluated set
-    (case-insensitively), else why not.
+    (the domain compared case-insensitively, the local part exactly: the one
+    address grammar, `router/classify.py`), else why not.
 
     The transport request carries the draft, and the downstream runtime
     sends to every address in it. So a policy that authorised only part of
@@ -297,9 +393,20 @@ def recipient_mismatch(record: Dict[str, Any]) -> Optional[str]:
     evaluated = record.get("recipients")
     if not isinstance(evaluated, list) or not all(isinstance(a, str) for a in evaluated):
         return "the record's evaluated recipients are malformed"
-    if {a.casefold() for a in addrs} != {a.casefold() for a in evaluated}:
+    drafted, authorised = _canonical_set(addrs), _canonical_set(evaluated)
+    if drafted is None or authorised is None or drafted != authorised:
         return "the draft's to/cc differ from the authorised recipients"
     return None
+
+
+def _canonical_set(addrs: List[str]) -> Optional[set]:
+    """The canonical forms (`classify.parse_address`: the domain folded, the
+    local part exact), or None if any address is outside the grammar."""
+    from . import classify as classify_mod   # local: keeps this module's imports minimal
+    try:
+        return {classify_mod.parse_address(a).canonical() for a in addrs}
+    except classify_mod.Malformed:
+        return None
 
 
 def _anomaly(detail: str) -> Dict[str, Any]:
@@ -380,6 +487,8 @@ def advance(
     *, settle: Callable[[Dict[str, Any], Optional[str]], Any],
     already_settled: bool,
     anchor: Optional[Path] = None,
+    recheck: Optional[Callable[[Dict[str, Any]], Recheck]] = None,
+    publish_blocked: bool = False,
 ) -> str:
     """One step for one record (module docstring's table). `settle(verdict,
     digest)` writes the agent's one result; `already_settled` says the
@@ -387,7 +496,24 @@ def advance(
     settling). `anchor` is that private result's path: before the record is
     removed on its strength, it is validated and made durable again
     (`_redurabilise`), because its existence alone does not prove it
-    survives a power loss. Returns the state reached."""
+    survives a power loss. Returns the state reached.
+
+    `recheck` re-classifies the staged request (THE RE-CHECK, below). Every
+    caller in production passes it; it is optional only so this state
+    machine can be driven alone. `publish_blocked` is the failing-reload
+    gate: nothing is written to the transport while it is set.
+
+    THE RE-CHECK runs at EVERY publication attempt, the first and a
+    handed-but-unwritten record's re-write alike, and on every poll while
+    the request is pending. Not permitted at publication: settled from the
+    re-check's verdict, nothing handed over. Permitted with a changed
+    digest: the record's digest is updated durably FIRST, so the digest
+    published with the request is the current one. Not permitted while
+    pending: the request was handed over and cannot be withdrawn through any
+    transport this router accepts, so the record is marked
+    `revocation_unenforceable` and an ERROR is logged every poll; a result,
+    if one arrives, still settles it as usual, because the send may have
+    happened."""
     path = record_path(cfg, name, req_id)
     handed = handed_path(cfg, name, req_id)
     if already_settled:
@@ -432,6 +558,9 @@ def advance(
     if port.has_result(n):
         return from_result()
     if port.has_pending(n):
+        if recheck is not None:
+            _check_revocation(cfg, name, req_id, record, port, recheck,
+                              enact=not publish_blocked)
         return PENDING
     if port.has_archived(n):
         if port.has_result(n):
@@ -443,11 +572,76 @@ def advance(
         return SETTLED
     if port.has_result(n):
         return from_result()
+    if publish_blocked:
+        logger.error(
+            "instance %r req %r: NOT published: the config reload is failing, and "
+            "the external leg fails closed until a reload succeeds", name, req_id)
+        return BLOCKED
+    if recheck is not None:
+        rc = recheck(record)
+        if not rc.permitted:
+            logger.warning("instance %r req %r: not published: %s", name, req_id, rc.why)
+            _effect("settle", settle, rc.verdict, record.get("digest"))
+            _effect("unlink", _cleanup, path, handed)
+            return SETTLED
+        if rc.policy_digest is not None and rc.policy_digest != record.get("policy_digest"):
+            logger.warning(
+                "instance %r req %r: the sender's policy digest changed since the "
+                "request was staged (%s -> %s); still permitted, publishing under "
+                "the new digest", name, req_id, record.get("policy_digest"),
+                rc.policy_digest)
+            record["policy_digest"] = rc.policy_digest
+            _write_record(cfg, name, req_id, record, "repin")
     data = transport_request_bytes(cfg, name, record)
     _effect("handed", atomic_write, handed, n.encode("ascii"),
             durable_root=cfg.state_dir)
     _effect("transport", port.write_request, n, data)
     return WRITTEN
+
+
+def _check_revocation(
+    cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any], port: Any,
+    recheck: Callable[[Dict[str, Any]], Recheck], *, enact: bool,
+) -> None:
+    """The pending row's re-check (`advance`, THE RE-CHECK). Fail-visible:
+    a marked record is logged as an ERROR on every poll it stays pending."""
+    capable = withdraw_capable(port)
+    how = ("the transport offers withdraw_request, which is not an approved part "
+           "of the plugin API and is never called" if capable
+           else "the transport has no way to withdraw it")
+    since = record.get("revocation_unenforceable")
+    if since is not None:
+        logger.error(
+            "instance %r req %r: REVOKED since %s but still pending: %s; it may "
+            "still be sent", name, req_id, since, how)
+        return
+    rc = recheck(record)
+    if rc.permitted:
+        return
+    if not enact:
+        logger.error(
+            "instance %r req %r: no longer permitted (%s), but the config reload is "
+            "failing, so nothing is enacted", name, req_id, rc.why)
+        return
+    record["revocation_unenforceable"] = utc_ts()
+    _write_record(cfg, name, req_id, record, "revoked")
+    logger.error(
+        "instance %r req %r: REVOKED: %s; it was already handed over and %s, so it "
+        "may still be sent", name, req_id, rc.why, how)
+
+
+def revoked(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
+    """Every record of `name` marked `revocation_unenforceable`, with its
+    req_id and the router-written ts it was marked at, for `status`."""
+    out = []
+    for req_id in list_records(cfg, name):
+        try:
+            rec = read_record(cfg, name, req_id)
+        except (OSError, ValueError):
+            continue
+        if rec is not None and rec.get("revocation_unenforceable") is not None:
+            out.append({"req_id": req_id, "since": rec["revocation_unenforceable"]})
+    return out
 
 
 class AnchorInvalid(Exception):
