@@ -230,6 +230,138 @@ class SeqTests(_Dir):
         self.unavailable("seq_unreadable")
 
 
+class FloorDurabilityTests(_Dir):
+    """A floor that is visible but not durable is not a floor: every load
+    re-establishes it before any resolved view escapes."""
+
+    def _deny_registry_dir_fsync(self):
+        real = os.fsync
+        target = os.stat(self.state).st_ino
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            # the floor's own directory, state_dir/registry
+            if os.path.isdir(registry.seq_path(self.state).parent) and \
+                    st.st_ino == os.stat(registry.seq_path(self.state).parent).st_ino:
+                raise OSError(5, "injected")
+            return real(fd)
+
+        return mock.patch("router.util.os.fsync", fsync)
+
+    def _ok(self):
+        return registry.report_for(self.reg, self.state, ["alpha"])
+
+    def test_the_initial_floor(self):
+        self.put()
+        with self._deny_registry_dir_fsync():
+            r1 = self._ok()
+            r2 = self._ok()  # the floor is now VISIBLE at 3, still not durable
+        self.assertEqual((r1.state, r1.code), ("unavailable", "seq_persist_failed"))
+        self.assertEqual((r2.state, r2.code), ("unavailable", "seq_persist_failed"),
+                         "an equal seq was taken as durable")
+        self.assertEqual(r2.resolved, {})
+        self.assertEqual(self._ok().state, "ok")
+
+    def test_an_increased_floor(self):
+        self.put()
+        self.assertEqual(self._ok().state, "ok")
+        d = self.doc()
+        d["seq"] = 7
+        self.put(d)
+        with self._deny_registry_dir_fsync():
+            r1 = self._ok()
+            r2 = self._ok()
+        self.assertEqual(r1.state, "unavailable")
+        self.assertEqual(r2.state, "unavailable")
+        r3 = self._ok()
+        self.assertEqual((r3.state, r3.seq), ("ok", 7))
+        self.assertEqual(registry.seq_path(self.state).read_text(), "7")
+
+
+class FloorReadTests(_Dir):
+    """The floor file is read pinned and bounded."""
+
+    def setUp(self):
+        super().setUp()
+        self.put()
+        registry.seq_path(self.state).parent.mkdir(parents=True)
+
+    def _held(self, code="seq_unreadable"):
+        r = registry.report_for(self.reg, self.state, ["alpha"])
+        self.assertEqual((r.state, r.code, r.resolved), ("unavailable", code, {}))
+
+    def test_a_fifo_does_not_block(self):
+        os.mkfifo(registry.seq_path(self.state))
+        import signal
+
+        def _timeout(*_):
+            raise AssertionError("the floor read blocked on a FIFO")
+
+        old = signal.signal(signal.SIGALRM, _timeout)
+        signal.alarm(5)
+        try:
+            self._held()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_a_symlink_an_oversized_file_and_a_read_error(self):
+        target = self.state / "elsewhere"
+        target.write_text("3")
+        registry.seq_path(self.state).symlink_to(target)
+        self._held()
+        registry.seq_path(self.state).unlink()
+        # Valid once stripped, so only the size cap can refuse it.
+        registry.seq_path(self.state).write_text("3" + " " * 100)
+        self._held()
+        registry.seq_path(self.state).write_text("3")
+        real_read = os.read
+        seq_file = str(registry.seq_path(self.state))
+
+        def read(fd, n):
+            if os.path.isdir("/proc/self/fd") and os.readlink(f"/proc/self/fd/{fd}") == seq_file:
+                raise OSError(5, "injected")
+            return real_read(fd, n)
+
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("needs /proc/self/fd to target the floor read")
+        with mock.patch("router.registry.os.read", read):
+            self._held()
+
+
+class ShapeAndErrorTests(_Dir):
+
+    def test_unhashable_shapes_are_invalid_not_a_crash(self):
+        for field, value in (("adapter", {}), ("state", [])):
+            with self.subTest(field=field):
+                d = self.doc()
+                d["entries"][0][field] = value
+                self.put(d)
+                r = registry.report_for(self.reg, self.state, ["alpha"])
+                self.assertEqual((r.state, r.code), ("unavailable", "invalid"))
+
+    def test_an_unexpected_error_holds_everything(self):
+        """A bug inside the reader must hold, never resolve or escape."""
+        self.put()
+        with mock.patch.object(registry, "parse", side_effect=TypeError("bug")):
+            r = registry.report_for(self.reg, self.state, ["alpha"])
+        self.assertEqual((r.state, r.code, r.resolved), ("unavailable", "internal", {}))
+        self.assertEqual(r.held, {"alpha": registry.HELD_UNAVAILABLE})
+
+    def test_a_seq_the_floor_could_not_store_is_invalid(self):
+        d = self.doc()
+        d["seq"] = 10 ** 19
+        self.put(d)
+        r = registry.report_for(self.reg, self.state, ["alpha"])
+        self.assertEqual((r.state, r.code), ("unavailable", "invalid"))
+
+    def test_an_fstat_error_is_unavailable(self):
+        self.put()
+        with mock.patch("router.registry.os.fstat", side_effect=OSError(5, "injected")):
+            r = registry.report_for(self.reg, self.state, ["alpha"])
+        self.assertEqual((r.state, r.code), ("unavailable", "unreadable"))
+
+
 class ReportTests(_Dir):
 
     def test_off_changes_nothing(self):
@@ -261,6 +393,14 @@ class ReportTests(_Dir):
         self.assertEqual(r.resolved, {})
         self.assertEqual(r.held, {"alpha": registry.HELD_COLLISION,
                                   "a1pha": registry.HELD_COLLISION})
+
+    def test_a_reserved_name_in_a_snapshot_is_held(self):
+        d = self.doc()
+        d["entries"][0]["name"] = "post-master"
+        self.put(d)
+        r = registry.report_for(self.reg, self.state, ["post-master"])
+        self.assertEqual(r.resolved, {})
+        self.assertIn("post-master", r.held)
 
     def test_an_unusable_or_rolled_back_registry_holds_everything(self):
         r = registry.report_for(self.reg, self.state, ["alpha"])
@@ -311,6 +451,31 @@ class ServiceTests(helpers.RouterTestCase):
         self.assertEqual(doc["registry"]["state"], "ok")
         self.assertEqual(doc["registry"]["seq"], 3)
         self.assertEqual(doc["registry"]["held"], {"beta": registry.HELD_NOT_REGISTERED})
+
+    def test_a_bad_snapshot_after_a_good_one_replaces_the_status(self):
+        """Status never keeps an old "ok" when the registry turns bad."""
+        tracker = StatusTracker(interval_s=5.0)
+        with self.assertLogs("amap_router_local", logging.WARNING):
+            service.poll_once(self.cfg, tracker, None)
+        self.assertEqual(tracker.to_doc()["registry"]["state"], "ok")
+        doc = json.loads((FIXTURES / "snapshot.json").read_text())
+        doc["entries"][0]["state"] = []
+        (self.reg / registry.SNAPSHOT).write_text(json.dumps(doc))
+        drained = []
+        real = service.outbound.drain_instance
+
+        def spy(cfg, name, **kw):
+            drained.append(name)
+            return real(cfg, name, **kw)
+
+        with mock.patch.object(service.outbound, "drain_instance", spy), \
+                self.assertLogs("amap_router_local", logging.ERROR):
+            service.poll_once(self.cfg, tracker, None)
+        reg = tracker.to_doc()["registry"]
+        self.assertEqual(reg["state"], "unavailable")
+        self.assertEqual(reg["held"], {"alpha": registry.HELD_UNAVAILABLE,
+                                       "beta": registry.HELD_UNAVAILABLE})
+        self.assertEqual(drained, [])
 
     def test_no_registry_means_no_registry_key_and_everything_drains(self):
         from dataclasses import replace

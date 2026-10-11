@@ -110,15 +110,21 @@ class Registry:
     def resolve(self) -> Tuple[Dict[str, Entry], List[str]]:
         """`({name: entry}, held)`: the active entries by name, and the
         names held because their skeleton collides with another active
-        entry's (both are held, never guessed between)."""
+        entry's (both are held, never guessed between) or with a reserved
+        local part."""
         by_skel: Dict[str, List[Entry]] = {}
         for e in self.entries:
             if e.state == "active":
                 by_skel.setdefault(skeleton(e.name), []).append(e)
         resolved: Dict[str, Entry] = {}
         held: List[str] = []
-        for group in by_skel.values():
-            if len(group) == 1:
+        reserved = {skeleton(r) for r in RESERVED_LOCAL_PARTS}
+        for skel, group in by_skel.items():
+            if skel in reserved:
+                # The writer never issues one; if a snapshot carries one
+                # anyway, it is held, never treated as an agent.
+                held.extend(e.name for e in group)
+            elif len(group) == 1:
                 resolved[group[0].name] = group[0]
             else:
                 held.extend(e.name for e in group)
@@ -148,7 +154,10 @@ def _read_snapshot(directory: Path) -> bytes:
         code = "symlink" if e.errno == errno.ELOOP else "unreadable"
         raise RegistryUnavailable(code, f"{path}: {e.strerror}") from None
     try:
-        st = os.fstat(fd)
+        try:
+            st = os.fstat(fd)
+        except OSError as e:
+            raise RegistryUnavailable("unreadable", f"{path}: {e.strerror}") from None
         if not stat.S_ISREG(st.st_mode):
             raise RegistryUnavailable("not_regular", f"{path} is not a regular file")
         if st.st_size > MAX_SNAPSHOT_BYTES:
@@ -180,7 +189,8 @@ def _field(obj: Mapping[str, Any], key: str, check, what: str) -> Any:
 
 
 def _int(v: Any) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+    # At most 19 digits: what the seq floor file stores and reads back.
+    return isinstance(v, int) and not isinstance(v, bool) and 1 <= v < 10 ** 19
 
 
 def _str(pattern):
@@ -214,13 +224,13 @@ def parse(data: bytes) -> Registry:
         entries.append(Entry(
             logical_id=_field(e, "logical_id", _str(_LOGICAL_ID), what),
             name=name,
-            adapter=_field(e, "adapter", lambda v: v in _ADAPTERS, what),
+            adapter=_field(e, "adapter", lambda v: isinstance(v, str) and v in _ADAPTERS, what),
             stable_key=_field(e, "stable_key", lambda v: isinstance(v, str) and v != "", what),
             binding_seq=_field(e, "binding_seq", _int, what),
             name_seq=_field(e, "name_seq", _int, what),
             enrollment_epoch=_field(e, "enrollment_epoch", _int, what),
             first_registered_ts=_field(e, "first_registered_ts", _str(_TS), what),
-            state=_field(e, "state", lambda v: v in _STATES, what),
+            state=_field(e, "state", lambda v: isinstance(v, str) and v in _STATES, what),
         ))
     ids = [e.logical_id for e in entries]
     if len(set(ids)) != len(ids):
@@ -232,14 +242,37 @@ def seq_path(state_dir: Path) -> Path:
     return Path(state_dir) / SEQ_DIR / SEQ_FILE
 
 
+#: The floor file is a decimal; anything longer is refused unread.
+_SEQ_CAP = 64
+
+
 def _accepted_seq(state_dir: Path) -> Optional[int]:
+    """The highest seq accepted so far, or None when none has been. Read
+    pinned: never following a symlink, never blocking on a FIFO, a regular
+    file only, bounded."""
     p = seq_path(state_dir)
     try:
-        text = p.read_text(encoding="ascii").strip()
+        fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeDecodeError) as e:
-        raise RegistryUnavailable("seq_unreadable", f"{p}: {e}") from None
+    except OSError as e:
+        raise RegistryUnavailable("seq_unreadable", f"{p}: {e.strerror}") from None
+    try:
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise RegistryUnavailable("seq_unreadable", f"{p} is not a regular file")
+            if st.st_size > _SEQ_CAP:
+                raise RegistryUnavailable("seq_unreadable", f"{p} is {st.st_size} bytes")
+            raw = os.read(fd, _SEQ_CAP + 1)
+        except OSError as e:
+            raise RegistryUnavailable("seq_unreadable", f"{p}: {e.strerror}") from None
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("ascii").strip()
+    except UnicodeDecodeError:
+        raise RegistryUnavailable("seq_unreadable", f"{p} is not ASCII") from None
     if not re.fullmatch(r"[1-9][0-9]{0,18}", text):
         raise RegistryUnavailable("seq_unreadable", f"{p} is not a positive integer")
     return int(text)
@@ -256,9 +289,15 @@ def load(directory: Path, state_dir: Path) -> Registry:
             "rolled_back",
             f"snapshot seq {reg.seq} is below the accepted {prior}; treated as an operator "
             f"restore and held until {seq_path(state_dir)} is removed to acknowledge it")
-    if prior is None or reg.seq > prior:
+    # The floor is (re)written durably on EVERY load, equal seq included,
+    # before any view built on it is used: a floor that is visible but whose
+    # barrier failed is not a floor. Never lowered (the check above).
+    try:
         atomic_write(seq_path(state_dir), str(reg.seq).encode("ascii"),
                      durable_root=state_dir)
+    except OSError as e:
+        raise RegistryUnavailable(
+            "seq_persist_failed", f"the seq floor could not be made durable: {e}") from None
     return reg
 
 
@@ -317,6 +356,10 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
                       held={n: HELD_ROLLED_BACK for n in names})
     except RegistryUnavailable as e:
         return Report(state="unavailable", code=e.code, detail=e.detail, resolved={},
+                      held={n: HELD_UNAVAILABLE for n in names})
+    except Exception as e:  # noqa: BLE001 -- a bug here must hold, never resolve
+        return Report(state="unavailable", code="internal",
+                      detail=f"{type(e).__name__}: {e}", resolved={},
                       held={n: HELD_UNAVAILABLE for n in names})
     active, colliding = reg.resolve()
     resolved: Dict[str, Entry] = {}

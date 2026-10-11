@@ -1111,6 +1111,11 @@ shows `registry.state: "rolled_back"`. To accept a deliberate restore, the
 operator removes `state_dir/registry/seq`; the next poll accepts the
 snapshot's `seq` as the new floor.
 
+**Losing `state_dir` loses the floor.** With `state_dir/registry/seq` gone,
+the next snapshot is accepted whatever its `seq`, a rolled-back one
+included. Restoring or recreating `state_dir` is therefore an operator
+event to check against the registry, not a routine restart.
+
 Private state is still keyed by instance name in this version; moving it to
 `state_dir/<logical_id>/` is a separate, guarded step.
 
