@@ -56,15 +56,17 @@ class ExposureTests(RouterTestCase):
         """Source 2: a notice this router did not write can only be another
         deliverer's — the open transport."""
         cfg = self._cfg()
-        now = utc_ts()
         foreign = notices_dir(cfg, "a") / ("notice-" + "e" * 32 + ".json")
         foreign.write_text("{}")
-        stamp = exposure.assess(cfg, "a", now=now)
+        # The mtime is SET, a minute inside the window, never left to the
+        # clock: `now` has whole-second precision, so a write that crossed a
+        # second boundary after `now` was taken landed after `window_end`
+        # and fell outside the window.
+        written = parse_utc_ts(NOW) - timedelta(minutes=1)
+        os.utime(foreign, (written.timestamp(), written.timestamp()))
+        stamp = exposure.assess(cfg, "a", now=NOW)
         self.assertIs(stamp["external_mail_delivered"], True)
-        self.assertIn("last_external_delivery_ts", stamp)
-        # mtime now is within a 24 h window ending now.
-        self.assertGreaterEqual(parse_utc_ts(stamp["last_external_delivery_ts"]),
-                                parse_utc_ts(stamp["window_start"]))
+        self.assertEqual(stamp["last_external_delivery_ts"], format_utc_ts(written))
 
     def test_unledgered_notice_older_than_the_window_does_not_count(self):
         cfg = self._cfg()
