@@ -174,3 +174,18 @@ class DigestlessAnchorReuseTests(RouterTestCase):
         r = read_json(result_path(self.cfg, "alice", "00000001"))
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "malformed_request"))
         self.assertEqual((s["outbound_req_id_reused"], s["outbound_resumed"]), (0, 1))
+
+    def test_a_transient_fault_under_a_digestless_anchor_decides_nothing(self):
+        self._settle_oversized()
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], body_text="new")
+
+        def eio(cfg, name, filename, *a, **kw):
+            raise OSError(errno.EIO, "EIO reading the live entry")
+        with mock.patch.object(outbound, "_read_request_pinned", eio):
+            s = outbound.drain_instance(self.cfg, "alice")
+        self.assertEqual((s["outbound_req_id_reused"], s["outbound_resumed"],
+                          s["outbound_errored"]), (0, 0, 1))
+        self.assertFalse(result_path(self.cfg, "alice", "00000001").exists())
+        self.assertTrue(self.live.is_file())
+        s = outbound.drain_instance(self.cfg, "alice")
+        self.assertEqual(s["outbound_req_id_reused"], 1)

@@ -289,6 +289,23 @@ slate, not a clean one:
   request; the drain path then refuses it as `req_id_reused` (see
   `router/tests/test_req_id_reuse.py`) instead of accepting a perfectly
   legitimate first post-reset send.
+
+  Every branch that holds work under an id compares digests before
+  answering a file under it. A settled anchor refuses a different request
+  as `req_id_reused`. A request still IN FLIGHT settles privately when the
+  file under its id is now a different one: the anchor keeps its verdict,
+  nothing is published or archived, the new file is held (counted as
+  `outbound_req_id_reused_pending`) until then and refused as
+  `req_id_reused` after. An anchor with no digest (an original too large to
+  read) resumes only while the file under its id is still unreadable for
+  what it is; a readable one is `req_id_reused`. A transient read fault
+  decides none of these (`router/tests/test_reuse.py`).
+
+  **Residual, accepted:** a request byte-identical to the original under a
+  reused id IS the original as far as the router can tell, and resumes
+  with the stored verdict without being delivered again. `ts` is optional,
+  so a template-like request can repeat exactly. Telling the two apart
+  needs a connector incarnation id, which AMAP does not carry.
 - **Stale first-sight snapshot.** `state_dir/<name>/first-seen.json` carries
   the `outbox_snapshot` that gates the staged-request quarantine (above).
   Keep it across a mailbox wipe and a genuinely NEW post-reset file that

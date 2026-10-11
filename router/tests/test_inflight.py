@@ -197,7 +197,12 @@ class LifecycleTests(_InflightCase):
 
     def test_the_staged_copy_is_sent_not_the_agents_later_bytes(self):
         """Ingest by copy: rewriting the outbox file after the hand-off
-        changes nothing that reaches the transport."""
+        changes nothing that reaches the transport. The rewritten file is a
+        different request under a used id, and nothing here can tell a
+        rewrite from a reset connector's reuse, so it is answered as one:
+        the staged copy's verdict stays private (the anchor) and the file
+        now in the outbox is refused as `req_id_reused`, never reported as
+        sent (test_reuse.py)."""
         write_request(self.cfg, "alice", "00000001", to=[EXT], subject="original")
         self.drain()
         write_request(self.cfg, "alice", "00000001", to=["other@example.net"],
@@ -208,6 +213,10 @@ class LifecycleTests(_InflightCase):
         self.assertEqual(sent["draft"]["subject"], "original")
         self.assertEqual(sent["draft"]["to"], [EXT])
         self.assertEqual(self.port.writes, ["00000001"])
+        r = self.result()
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
+        anchor = read_json(outbound._private_result_path(self.cfg, "alice", "00000001"))
+        self.assertEqual(anchor["result"]["outcome"], "accepted")
 
     def test_without_a_transport_the_request_settles_as_an_anomaly(self):
         write_request(self.cfg, "alice", "00000001", to=[EXT])
