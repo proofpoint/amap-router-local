@@ -565,7 +565,12 @@ def _transport_plugin(top: Dict[str, Any]) -> Optional[TransportPluginPin]:
         raise ConfigError(
             "config.transport_plugin: needs exactly 'path' and 'sha256', both or "
             f"neither; got {sorted(keys)}")
-    path = _require_absolute(raw["path"], "config.transport_plugin.path")
+    # Checked absolute, but kept EXACTLY as written: the normalised path
+    # `_require_absolute` returns is a different path when a component is a
+    # symlink, and the loader is the one place a non-canonical plugin path
+    # is refused (`transport`, step 1). So the pin is never rewritten here.
+    _require_absolute(raw["path"], "config.transport_plugin.path")
+    path = raw["path"]
     sha = raw["sha256"]
     if not (isinstance(sha, str) and _SHA256_HEX_RE.fullmatch(sha)):
         raise ConfigError("config.transport_plugin.sha256: expected 64 lowercase hex digits")

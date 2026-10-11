@@ -357,6 +357,113 @@ class ConfigTests(helpers.RouterTestCase):
                 self.assertIn("transport_plugin", str(cm.exception))
 
 
+class CanonicalPathTests(_PluginDir):
+    """The plugin path must be its own realpath, compared as WRITTEN: no
+    lexical normalisation runs first, in the loader or in the config."""
+
+    def symlink_decoy(self):
+        """`<root>/a/b` is a symlink to `<root>/x/y`. The kernel resolves
+        `<root>/a/b/../c/p.py` to `<root>/x/c/p.py`; its lexical normal form
+        is `<root>/a/c/p.py`, a DIFFERENT file: the decoy, whose sha256 is
+        the pinned one. Returns (the configured path, the decoy's sha)."""
+        root = self.dir
+        for d in ("a/c", "x/y", "x/c"):
+            (root / d).mkdir(parents=True, mode=0o755)
+            os.chmod(root / d, 0o755)
+        os.chmod(root / "a", 0o755)
+        os.chmod(root / "x", 0o755)
+        (root / "a" / "b").symlink_to(root / "x" / "y")
+        decoy = root / "a" / "c" / "p.py"
+        decoy.write_bytes(GOOD)
+        os.chmod(decoy, 0o644)
+        other = root / "x" / "c" / "p.py"
+        other.write_bytes(GOOD.replace(b'"sender"', b'"other"'))
+        os.chmod(other, 0o644)
+        return f"{root}/a/b/../c/p.py", hashlib.sha256(GOOD).hexdigest()
+
+    def test_dotdot_after_a_symlink_is_refused_and_neither_file_is_opened(self):
+        """THE WITNESS. Before this check compared the raw string, the path
+        was normalised to the decoy's, which passed and was loaded."""
+        path, sha = self.symlink_decoy()
+        # A WRAPPING spy, not a raising one: under the old check the decoy is
+        # opened and LOADED, so the refusal assertion FAILS (not errors).
+        with mock.patch.object(transport, "_read_pinned", wraps=transport._read_pinned) as spy:
+            self.refused("path_not_canonical", path=path, sha=sha)
+        spy.assert_not_called()
+
+    def test_every_lexical_spelling_is_refused(self):
+        name = self.dir.name
+        spellings = [
+            f"{self.dir}/../{name}/plugin.py",
+            f"{self.dir}/./plugin.py",
+            f"{self.dir}//plugin.py",
+            f"{self.dir}/plugin.py/",
+            "/" + str(self.path),          # a leading "//": normpath keeps it, realpath does not
+        ]
+        for path in spellings:
+            with self.subTest(path=path):
+                self.refused("path_not_canonical", path=path)
+        self.assertEqual(self.load().sha256, self.sha, "the plain spelling still loads")
+
+    def test_accepted_means_equal_to_both_forms(self):
+        """The acceptance's `path == normpath(path) == realpath(path)`: the
+        realpath equality the loader checks implies the normpath one, on
+        every case here, and every refused case breaks at least one."""
+        decoy, _sha = self.symlink_decoy()
+        name = self.dir.name
+        link = self.dir.parent / "via"
+        link.symlink_to(self.dir)
+        cases = [str(self.path), decoy, f"{self.dir}/../{name}/plugin.py",
+                 f"{self.dir}/./plugin.py", f"{self.dir}//plugin.py",
+                 f"{self.dir}/plugin.py/", "/" + str(self.path), str(link / "plugin.py")]
+        accepted = 0
+        for path in cases:
+            with self.subTest(path=path):
+                try:
+                    transport._check_path(path, (), ME)
+                except transport.PluginRefused as e:
+                    self.assertEqual(e.reason, "path_not_canonical")
+                    self.assertFalse(path == os.path.normpath(path) == os.path.realpath(path))
+                else:
+                    accepted += 1
+                    self.assertTrue(path == os.path.normpath(path) == os.path.realpath(path))
+        self.assertEqual(accepted, 1)
+
+    def test_the_config_keeps_the_path_as_written_and_startup_refuses_it(self):
+        path, sha = self.symlink_decoy()
+        cfg = config_mod.load_obj({
+            "state_dir": str(self.dir.parent / "state"),
+            "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
+            "transport_plugin": {"path": path, "sha256": sha}})
+        self.assertEqual(cfg.transport_plugin.path, path, "the config rewrote the pin")
+        real = transport.load_plugin
+        with mock.patch.object(transport, "load_plugin",
+                               lambda p, h, **kw: real(p, h, **dict(kw, trusted_uids=ME))), \
+                mock.patch.object(transport, "_read_pinned",
+                                  wraps=transport._read_pinned) as spy:
+            with self.assertRaises(transport.PluginRefused) as cm:
+                service.start_transport(cfg)
+        self.assertEqual(cm.exception.reason, "path_not_canonical")
+        spy.assert_not_called()
+
+    def test_a_spelling_only_change_on_reload_is_refused(self):
+        """A consequence, stated in the README: the pin is compared as
+        written, so respelling the same file is a changed plugin, and the
+        reload is refused (fail closed) like any other plugin change."""
+        doc = {"state_dir": str(self.dir.parent / "state"),
+               "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
+               "transport_plugin": {"path": str(self.path), "sha256": self.sha}}
+        cfg = config_mod.load_obj(doc)
+        respelled = config_mod.load_obj(dict(doc, transport_plugin={
+            "path": f"{self.dir}/./plugin.py", "sha256": self.sha}))
+        with mock.patch.object(service, "load", return_value=respelled):
+            with self.assertLogs("amap_router_local", logging.ERROR) as logs:
+                kept = service.reload_config("/unused", cfg)
+        self.assertTrue(kept.reload_failed)
+        self.assertEqual(kept.transport_plugin.path, str(self.path))
+        self.assertTrue(any("changed transport_plugin" in m for m in logs.output))
+
+
 class StartupTests(_PluginDir):
     """`service.start_transport`: loaded once, refusal stops startup."""
 

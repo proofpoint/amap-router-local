@@ -1174,12 +1174,20 @@ before, and an external route settles `queued_for_human`/`transport_anomaly`
 
 Present, the router loads it ONCE at startup (`service.start_transport`)
 and refuses to start on any failure. A config reload that changes it is
-refused; changing the plugin needs a restart. The loader's refusals, each a
+refused; changing the plugin needs a restart.
+
+The path is used EXACTLY as written: the config does not normalise it, and
+the loader compares the raw string with its `realpath`. A normalised copy is
+not the same path when a component is a symlink: with `b` a symlink,
+`/a/b/../c/p.py` names `c/p.py` beside `b`'s target, while `/a/c/p.py`
+names another file. One consequence: respelling the SAME file on a reload
+(`/opt/amap/./plugin.py` for `/opt/amap/plugin.py`) is a changed
+`transport_plugin`, and the reload is refused like any other change. The loader's refusals, each a
 fixed `PluginRefused.reason`:
 
 | reason | refused when |
 |---|---|
-| `path_not_absolute`, `path_not_canonical` | the path is relative, or any component is a symlink |
+| `path_not_absolute`, `path_not_canonical` | the path is relative, or is not its own `realpath` exactly as written: any symlinked component, or a spelling such as `..`, `.`, `//` or a trailing `/` |
 | `agent_reachable` | the file is inside an instance's root, inbox, outbox or peer tree |
 | `parent_owner`, `parent_writable` | a directory between the file and `/` is not root-owned, or is writable by others without the sticky bit |
 | `missing`, `symlink`, `not_regular` | the file is absent, is a symlink, or is not a regular file |
