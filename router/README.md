@@ -1040,6 +1040,14 @@ a parameter or a bare descriptor number; and `open_regular_pinned` returns
 `bytes` or the port's own `NOT_YET`, with anything else a protocol
 violation that callers raise on, never skip.
 
+**This router's implementation of `HopFsOps`** is `router/fsops.py`
+(internal). It is built and tested but NOT activated: nothing hands it to a
+plugin, and `start_transport` still refuses every plugin. It needs
+`renameat2` with `RENAME_NOREPLACE` (Linux, glibc 2.28+), and a startup
+capability probe (`fsops.probe`) refuses a filesystem without it or without
+a working directory fsync. Whether a given mount honours those is a
+deployment measurement, not something this code can show.
+
 ## Retention / deletion rights (v2.2.0)
 
 AMAP v2.2.0 §2 names, for the first time, who may delete each artifact class

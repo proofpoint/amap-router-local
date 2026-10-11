@@ -870,3 +870,68 @@ class RetryRepairsBarrierTests(_FsyncSpyCase):
         dirs = [e[2] for e in events[:cut] if e[0] == "fsync" and e[1] == "dir"]
         for d in (state_dir, os.path.join(state_dir, "alice")):
             self.assertIn(d, dirs)
+
+
+class RootChainPerWriteTests(_FsyncSpyCase):
+    """`durable_root` on EACH in-flight write, witnessed per write: in the
+    window between the previous write's file fsync and this write's own,
+    state_dir and state_dir/alice are fsynced. Cut per write, so no other
+    write's chain can satisfy it (the second-producer trap the counter's
+    witness fell into)."""
+
+    def test_the_record_marker_and_private_result_each_rebuild_the_chain(self):
+        state_dir = str(self.cfg.state_dir.resolve())
+        chain = {state_dir, os.path.join(state_dir, "alice")}
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        events = []
+        a, b = self._spy(events)
+        with a, b:
+            self.drain()
+            self.port.send_all(recipients=[EXT])
+            self.drain()
+        self.assertEqual(self.result()["outcome"], "accepted")
+        prefixes = {"record": "inflight/00000001.json.",
+                    "marker": "inflight/00000001.handed.",
+                    "result": "results/00000001.json."}
+        windows = {}
+        since = []
+        for e in events:
+            if e[0] != "fsync":
+                continue
+            if e[1] == "dir":
+                since.append(e[2])
+                continue
+            for label, prefix in prefixes.items():
+                d, f = prefix.rsplit("/", 1)
+                if (label not in windows and os.path.basename(e[2]).startswith(f)
+                        and os.path.basename(os.path.dirname(e[2])) == d
+                        and os.path.dirname(os.path.dirname(e[2])).startswith(state_dir)):
+                    windows[label] = set(since)
+            since = []
+        self.assertEqual(set(windows), set(prefixes), windows)
+        for label, seen in windows.items():
+            with self.subTest(write=label):
+                self.assertLessEqual(chain, seen)
+
+
+class AnchorShapeTests(_InflightCase):
+
+    def test_a_valid_json_anchor_of_the_wrong_shape_keeps_the_record(self):
+        """The envelope check, not only the JSON check: valid JSON that is
+        not a {digest, result} envelope is refused, and nothing is resent."""
+        for bad in ('{"result": "x"}', '{"digest": null}', '[1, 2]',
+                    '{"digest": null, "result": []}'):
+            with self.subTest(anchor=bad):
+                self.tearDown()
+                self.setUp()
+                write_request(self.cfg, "alice", "00000001", to=[EXT])
+                self.drain()
+                self.port.send_all(recipients=[EXT])
+                private = outbound._private_result_path(self.cfg, "alice", "00000001")
+                private.parent.mkdir(parents=True, exist_ok=True)
+                private.write_text(bad)
+                with self.assertLogs("amap_router_local.outbound", logging.ERROR):
+                    self.drain()
+                self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
+                self.assertEqual(private.read_text(), bad)
+                self.assertEqual(self.port.writes, ["00000001"])
