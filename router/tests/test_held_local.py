@@ -840,3 +840,137 @@ class DsnArmingAndIdentityTests(_Fleet):
         self.assertEqual((held["req_id"], held["targets"]),
                          ("00000002", [{"recipient": "alpha", "state": "held",
                                         "reason": "not_registered"}]))
+
+
+
+class _BarrierFails:
+    """`util.fsync_dir` fails for `directory` while `when()` is true: the
+    REAL write and rename happen first (`atomic_write`'s order), so the new
+    contents are visible but not durable."""
+
+    def __init__(self, directory, when=lambda: True):
+        from router import util
+        self.util, self.real, self.directory, self.when = util, util.fsync_dir, Path(directory), when
+        self.failed = 0
+
+    def __call__(self, path):
+        if Path(path) == self.directory and self.when():
+            self.failed += 1
+            raise OSError(5, "EIO (injected after the rename)")
+        return self.real(path)
+
+    def __enter__(self):
+        self.patch = mock.patch.object(self.util, "fsync_dir", self)
+        self.patch.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.patch.stop()
+
+
+class BarrierAfterReplaceTests(_Fleet):
+    """A record or intent replaced on disk whose directory barrier then fails
+    is visible but NOT durable: nothing may be placed on it until a rewrite
+    makes it durable, and a repair that keeps failing stops."""
+
+    def test_a_failed_target_keeps_its_identity_and_the_record_stays_valid(self):
+        self.hold("not_registered", "bravo")
+        real = outbound._place_target
+
+        def eio_for_charlie(cfg, name, target, *a, **kw):
+            if target["recipient"] == "charlie":
+                raise OSError(5, "EIO")
+            return real(cfg, name, target, *a, **kw)
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo"), addr("charlie")])
+        with mock.patch.object(outbound, "_place_target", eio_for_charlie):
+            self.poll()
+        rec = json.loads(self.pending("alpha", "00000001").read_text())
+        charlie = next(t for t in rec["targets"] if t["recipient"] == "charlie")
+        self.assertEqual(charlie["state"], "failed")
+        self.assertIsNotNone(charlie["notice_id"])
+        self.recover("not_registered", "bravo")
+        self.poll()
+        res = self.result("alpha", "00000001")
+        self.assertEqual((res["outcome"], res["reason_code"], res["recipients"]),
+                         ("accepted", "partial_delivery", [addr("bravo")]))
+        self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
+
+    def test_a_visible_delivering_record_is_made_durable_before_any_placement(self):
+        self.hold("not_registered", "bravo")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        self.poll()
+        self.recover("not_registered", "bravo")
+        path = self.pending("alpha", "00000001")
+        delivering = lambda: '"delivering"' in path.read_text()
+        with _BarrierFails(path.parent, delivering) as b:
+            self.poll()                       # replaced to delivering, barrier failed
+            self.assertGreaterEqual(b.failed, 1)
+            self.assertIn('"delivering"', path.read_text())
+            self.assertEqual(list_notices(self.cfg, "bravo"), [])
+            self.poll()                       # the repair keeps failing: still nothing placed
+            self.assertEqual(list_notices(self.cfg, "bravo"), [])
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
+        nid = json.loads((self.state_dir / LIDS["alpha"] / "results" / "00000001.json")
+                         .read_text())["result"]["message_id"]
+        self.assertEqual(list_notices(self.cfg, "bravo"), [f"notice-{nid}.json"])
+
+    def test_a_visible_intent_is_made_durable_before_the_source_is_consumed(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        nid = self.result("alpha", "00000001")["message_id"]
+        self.hold("not_registered", "alpha")
+        write_outcome(self.cfg, "delta", nid, "denied")
+        from router.tests.peer_helpers import outcomes_dir
+        source = outcomes_dir(self.cfg, "delta") / f"peer-{nid}.json"
+        intents = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        rec = outcomes.record_path(self.state_dir, "delta", "peer", nid, "denied",
+                                   state_key=LIDS["delta"])
+        with _BarrierFails(intents):
+            self.poll()                       # intent replaced, barrier failed
+            self.assertTrue(source.is_file())
+            self.assertEqual(len(list(intents.glob("*.json"))), 1)
+            self.poll()                       # repair keeps failing: source NOT consumed
+            self.assertTrue(source.is_file(), "consumed without a durable intent")
+            self.assertFalse(rec.exists())
+        self.poll()
+        self.assertFalse(source.exists())
+        self.assertTrue(rec.exists())
+        self.recover("not_registered", "alpha")
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "alpha")), 1)
+
+    def test_a_visible_dsn_binding_is_made_durable_before_the_dsn(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        nid = self.result("alpha", "00000001")["message_id"]
+        self.hold("not_registered", "alpha")
+        write_outcome(self.cfg, "delta", nid, "denied")
+        self.poll()
+        self.recover("not_registered", "alpha")
+        intents = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        with _BarrierFails(intents):
+            self.poll()
+            self.poll()
+            self.assertEqual(list_notices(self.cfg, "alpha"), [], "a DSN on a non-durable intent")
+        self.poll()
+        self.assertEqual(len(list_notices(self.cfg, "alpha")), 1)
+
+
+    def test_an_existing_intent_that_does_not_match_keeps_the_source(self):
+        write_request(self.cfg, "alpha", "00000001", to=[addr("delta")])
+        self.poll()
+        nid = self.result("alpha", "00000001")["message_id"]
+        intents = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        intents.mkdir(parents=True)
+        (intents / f"peer-{nid}.denied.json").write_text(json.dumps({
+            "v": 1, "tree": "peer", "notice_id": nid, "outcome": "denied",
+            "outcome_ts": "2026-09-03T12:00:00Z", "receiver": "delta", "sender": "bravo",
+            "sender_lid": None, "dsn_notice_id": "f" * 32, "dsn_ts": "2026-09-03T12:00:00Z",
+            "reason": None, "created_ts": "2026-09-03T12:00:00Z"}))
+        write_outcome(self.cfg, "delta", nid, "denied")
+        from router.tests.peer_helpers import outcomes_dir
+        self.poll()
+        self.assertTrue((outcomes_dir(self.cfg, "delta") / f"peer-{nid}.json").is_file())
+        self.assertFalse(outcomes.record_path(self.state_dir, "delta", "peer", nid, "denied",
+                                              state_key=LIDS["delta"]).exists())

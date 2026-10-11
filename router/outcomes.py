@@ -688,9 +688,17 @@ def _intent_name(tree: str, notice_id: str, outcome: str) -> str:
 
 def _enqueue_dsn(cfg: RouterConfig, name: str, notice_id: str, outcome: str,
                  doc: Dict[str, Any], sender: str) -> None:
-    """Durable, idempotent: an intent already there is kept, id and all."""
+    """Durable, idempotent: an intent already there is kept, id and all, but
+    only after it is validated EXACTLY against this outcome and made durable
+    again (its directory barrier may have failed after the rename). An
+    existing intent that does not match raises: the source is then kept."""
     path = _dsn_dir(cfg, name) / _intent_name(deliver_mod.TREE_PEER, notice_id, outcome)
     if path.exists():
+        existing = _read_intent(path)
+        if existing is None or (existing["receiver"], existing["sender"],
+                                existing["outcome_ts"]) != (name, sender, doc["ts"]):
+            raise ValueError("an existing DSN intent does not match this outcome")
+        _write_intent(cfg, path, existing)
         return
     intent = {
         "v": 1, "tree": deliver_mod.TREE_PEER, "notice_id": notice_id,
@@ -790,16 +798,26 @@ def drain_dsn_queue(cfg: RouterConfig, name: str, summary: Dict[str, Any]) -> Li
         if not rec.exists():
             continue                         # not armed until the outcome is recorded
         reason = _dsn_hold(cfg, intent)
-        if reason is not None:
-            if intent.get("reason") != reason:
-                intent["reason"] = reason
-                _write_intent(cfg, path, intent)
-                _audit_dsn_held(cfg, name, intent)
-            waiting.append(_held_entry(intent, reason))
+        try:
+            if reason is not None:
+                if intent.get("reason") != reason:
+                    intent["reason"] = reason
+                    _write_intent(cfg, path, intent)
+                    _audit_dsn_held(cfg, name, intent)
+                waiting.append(_held_entry(intent, reason))
+                continue
+            if intent.get("sender_lid") is None:
+                intent["sender_lid"] = config_mod.target_logical_id(cfg, intent["sender"])
+            # Durable BEFORE the placement, on a replay too (the bound lid may
+            # be visible after a failed directory barrier).
+            _write_intent(cfg, path, intent)
+        except OSError as e:
+            # A failed barrier: this intent is not placed this poll. Isolated,
+            # so the cursor still moves on.
+            logger.warning("instance %r: DSN intent %s not durable (%s: %s) — not placed",
+                           name, fn, type(e).__name__, e)
+            waiting.append(_held_entry(intent, "barrier_failed"))
             continue
-        if intent.get("sender_lid") is None:
-            intent["sender_lid"] = config_mod.target_logical_id(cfg, intent["sender"])
-            _write_intent(cfg, path, intent)  # durable BEFORE the placement
         try:
             _dsn(cfg, intent["sender"], name, intent["notice_id"],
                  {"outcome": intent["outcome"], "ts": intent["outcome_ts"]},

@@ -1537,11 +1537,19 @@ def _check_target(t: Any) -> None:
             raise PendingDamaged(f"target {k}")
     if t.get("kind") not in _PENDING_KINDS:
         raise PendingDamaged("target kind")
+    # The identity rule for EVERY state a target can reach: held/ready have
+    # none; delivering/delivered must have one; failed has one iff it failed
+    # after becoming delivering (always, here; either is consistent).
     nid, ts = t.get("notice_id"), t.get("ts")
+    has = nid is not None or ts is not None
+    valid = isinstance(nid, str) and bool(_HEX32.fullmatch(nid)) and parse_utc_ts(ts) is not None
     if t["state"] in ("delivering", "delivered"):
-        if not (isinstance(nid, str) and _HEX32.fullmatch(nid)) or parse_utc_ts(ts) is None:
+        if not valid:
             raise PendingDamaged("delivering identity")
-    elif nid is not None or ts is not None:
+    elif t["state"] == "failed":
+        if has and not valid:
+            raise PendingDamaged("failed identity")
+    elif has:
         raise PendingDamaged("identity before delivering")
 
 
@@ -1715,10 +1723,14 @@ def _advance_pending(
             t.update(state="delivering", reason=None, notice_id=mint_notice_id(), ts=utc_ts(),
                      lid=target_logical_id(cfg, t["recipient"]) if t["recipient"] in cfg.instances
                      else None)
-            _write_pending(cfg, path, rec)   # durable BEFORE the recipient is touched
-            dirty = False
-        elif t["reason"] is not None:
+        else:
             t["reason"] = None
+        # Durable BEFORE the recipient is touched, on a REPLAY too: a record
+        # can be visible after its directory barrier failed, and a placement
+        # must never rest on that. A rewrite with `durable_root` repairs the
+        # whole chain; if it fails again, this raises and nothing is placed.
+        _write_pending(cfg, path, rec)
+        dirty = False
         try:
             delivered = _place_target(cfg, name, t, doc, attachments, reply_record, deliver_backend)
         except deliver_mod.RecipientHeld as e:
