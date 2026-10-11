@@ -30,6 +30,14 @@
                                  (for a connector counter reset the router cannot see). Needs the router
                                  stopped (the drain lock is fail-fast); --dry-run prints the plan and
                                  writes nothing.
+  generation adopt NAME --reason TEXT [--dry-run] [--no-transport-history=N]
+  generation fence-legacy NAME --reason TEXT [--dry-run] [--no-transport-history=N]
+                                 under a registry: migrate NAME's pre-generation state, held as
+                                 legacy_state_unadopted. adopt attests the root and binding are
+                                 unchanged and makes it the current generation; fence-legacy fences
+                                 it and begins a fresh one. Journaled and resumable (re-run the same
+                                 verb); the router must be stopped. Rolling back past this version
+                                 is not supported.
 
 `--config PATH` is required for every subcommand. Logging goes to stderr
 only. Stdlib only throughout.
@@ -48,7 +56,7 @@ import sys
 from pathlib import Path
 
 from .config import ConfigError, load
-from .generations import OperatorRefused, operator_new
+from .generations import OperatorRefused, operator_migrate, operator_new
 from .lock import LockHeldError, acquire as acquire_lock
 from .peers import render_peers, render_peers_json
 from .provision import ProvisionError, format_env, format_report, provision, report
@@ -143,6 +151,20 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="why (written to the instance's audit log)")
     p_gen_new.add_argument("--dry-run", action="store_true",
                            help="print the plan; take no lock and write nothing")
+    for verb, text in (("adopt", "attest that pre-generation state belongs to this root and "
+                                 "binding, and make it the first current generation"),
+                       ("fence-legacy", "make pre-generation state a fenced generation and "
+                                        "begin a fresh current one")):
+        p_v = gen_sub.add_parser(verb, help=text)
+        p_v.add_argument("name", help="instance name, as in config.instances")
+        p_v.add_argument("--reason", required=True,
+                         help="why (written to the instance's audit log)")
+        p_v.add_argument("--dry-run", action="store_true",
+                         help="print the plan; take no lock and write nothing")
+        p_v.add_argument("--no-transport-history", type=int, metavar="N", default=None,
+                         help="attest that this instance never had a transport route, when "
+                              "its transport counter is absent and exactly N local anchors "
+                              "remain (refused if N differs)")
 
     return parser
 
@@ -463,9 +485,14 @@ def main(argv=None) -> int:
 
     if args.command == "generation":
         try:
-            plan = operator_new(cfg, args.name, args.reason, dry_run=args.dry_run)
+            if args.gen_command == "new":
+                plan = operator_new(cfg, args.name, args.reason, dry_run=args.dry_run)
+            else:
+                plan = operator_migrate(cfg, args.name, args.gen_command, args.reason,
+                                        dry_run=args.dry_run,
+                                        no_transport_history=args.no_transport_history)
         except OperatorRefused as e:
-            print(f"router: generation new: refused: {e}", file=sys.stderr)
+            print(f"router: generation {args.gen_command}: refused: {e}", file=sys.stderr)
             return 1
         print(json.dumps(plan, sort_keys=True))
         return 0

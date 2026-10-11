@@ -102,6 +102,10 @@ class Entry:
     enrollment_epoch: int
     first_registered_ts: str
     state: str
+    #: The binding history exactly as the registry gave it (canonical JSON),
+    #: parsed only by `router generation adopt` (`generations.parse_bindings`):
+    #: an ordinary poll never depends on it.
+    bindings_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -234,6 +238,7 @@ def parse(data: bytes) -> Registry:
             enrollment_epoch=_field(e, "enrollment_epoch", _int, what),
             first_registered_ts=_field(e, "first_registered_ts", _str(_TS), what),
             state=_field(e, "state", lambda v: isinstance(v, str) and v in _STATES, what),
+            bindings_json=json.dumps(e.get("bindings"), sort_keys=True),
         ))
     ids = [e.logical_id for e in entries]
     if len(set(ids)) != len(ids):

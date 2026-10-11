@@ -88,6 +88,14 @@ class _Gens(RouterTestCase):
             self.fail(f"expected {exc.__name__}, got {type(e).__name__}: {e}")
         self.fail(f"{exc.__name__} was not raised")
 
+    def unfinished_migration(self, name="alpha"):
+        """A well-formed journal of a migration that has not finished: only
+        the migration check can refuse on it (a malformed one is refused by
+        every reader of the journal, the transport counter's included)."""
+        (self.state_dir / LIDS[name] / generations.MIGRATION_FILE).write_text(json.dumps({
+            "schema": generations.JOURNAL_SCHEMA, "verb": "adopt", "phase": "planned",
+            "gen": "c" * 32, "source": {}, "paths": [], "legacy": {}, "manifest": []}))
+
     def cur(self, name="alpha"):
         return self.doc(name)["current"]
 
@@ -215,7 +223,7 @@ class HoldTests(_Gens):
         self.assertIsNotNone(self.doc())
 
     def test_an_unfinished_migration_holds(self):
-        (self.state_dir / LIDS["alpha"] / generations.MIGRATION_FILE).write_text("{}")
+        self.unfinished_migration()
         self.assertEqual(self.held(), generations.HELD_LAYOUT_CONFLICT)
 
     def test_a_lost_marker_in_a_generation_with_state_holds_never_resnapshots(self):
@@ -586,9 +594,10 @@ class OperatorNewTests(_Gens):
         self.assertIn("pre-generation", str(cm.exception))
 
     def test_an_unfinished_migration_is_refused(self):
-        (self.state_dir / LIDS["alpha"] / generations.MIGRATION_FILE).write_text("{}")
-        with self.assertRaises(generations.OperatorRefused):
+        self.unfinished_migration()
+        with self.assertRaises(generations.OperatorRefused) as cm:
             self.new()
+        self.assertIn("unfinished", str(cm.exception))
 
     def test_an_unreadable_root_does_not_stop_the_fence(self):
         old = self.cur()
@@ -706,10 +715,11 @@ class ResetGenerationTests(_Gens):
     anything is wiped."""
 
     def test_an_unfinished_migration_refuses_reset(self):
-        (self.state_dir / LIDS["alpha"] / generations.MIGRATION_FILE).write_text("{}")
+        self.unfinished_migration()
         before = self.doc()
-        with self.assertRaises(reset.ResetError):
+        with self.assertRaises(reset.ResetError) as cm:
             reset.reset_instances(self.cfg, ["alpha"])
+        self.assertIn("unfinished", str(cm.exception))
         self.assertEqual(self.doc(), before)
 
     def test_one_instance_that_cannot_begin_refuses_the_whole_batch(self):

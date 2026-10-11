@@ -61,11 +61,13 @@ that work still owns.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
+import stat as stat_mod
 import time
 import dataclasses
 import types
@@ -159,9 +161,12 @@ def _present(path: Path) -> bool:
 
 
 def legacy_entries(state_dir: Path, logical_id: str) -> List[str]:
-    """The pre-generation entries directly under `state_dir/<logical_id>/`."""
+    """The pre-generation entries directly under `state_dir/<logical_id>/`.
+    A migration's rollback blocker is not one, but only when the journal
+    records it and it is still a real directory (`is_recorded_blocker`)."""
     d = lid_dir(state_dir, logical_id)
-    return [n for n in GEN_SCOPED if _present(d / n)]
+    return [n for n in GEN_SCOPED if _present(d / n)
+            and not (n == BLOCKER and is_recorded_blocker(state_dir, logical_id))]
 
 
 def _empty_leftover(d: Path) -> bool:
@@ -334,9 +339,34 @@ def next_counter(pred_dir: Optional[Path]) -> int:
     predecessor's counter FILE value, which is its next UNUSED id (never
     "last used"), or 1 when it never handed one out. A missing counter
     while ids were handed out, or a corrupt one, raises
-    `GenerationHeld(transport_counter_unverified)`."""
+    `GenerationHeld(transport_counter_unverified)`.
+
+    A predecessor made by a migration is known ONLY from the retained, done
+    journal that names it, never from what its generations entry carries:
+    it must carry the journal's legacy record exactly (`successor_counter`).
+    An entry that carries a legacy record no done journal names holds."""
     if pred_dir is None:
         return 1
+    lid_path = pred_dir.parent
+    gen = pred_dir.name[len(GEN_PREFIX):]
+    try:
+        journal = read_journal(lid_path.parent, lid_path.name)
+        doc = read_doc(lid_path.parent, lid_path.name)
+    except GenerationHeld as e:
+        raise GenerationHeld(HELD_COUNTER_UNVERIFIED, e.detail) from None
+    entry = next((g for g in (doc or {}).get("gens", []) if g["gen"] == gen), {})
+    if journal is not None and journal["gen"] == gen:
+        if journal["phase"] != "done" or entry.get("legacy") != journal.get("legacy"):
+            raise GenerationHeld(HELD_COUNTER_UNVERIFIED,
+                                 "a migrated predecessor without its journal's legacy record")
+        return successor_counter(pred_dir, journal["legacy"], journal.get("manifest"))
+    if "legacy" in entry:
+        raise GenerationHeld(HELD_COUNTER_UNVERIFIED,
+                             "a legacy record on a generation no migration journal names")
+    return _ordinary_counter(pred_dir)
+
+
+def _ordinary_counter(pred_dir: Path) -> int:
     try:
         text = _counter_path(pred_dir).read_text(encoding="ascii").strip()
     except FileNotFoundError:
@@ -351,6 +381,30 @@ def next_counter(pred_dir: Optional[Path]) -> int:
     if not _COUNTER_RE.fullmatch(text):
         raise GenerationHeld(HELD_COUNTER_UNVERIFIED, "the predecessor's counter is corrupt")
     return max(int(text), 1)
+
+
+def successor_counter(pred_dir: Path, legacy: Any, manifest: Any) -> int:
+    """`next_counter` for a predecessor a migration made, given the legacy
+    record its journal holds. The record must be consistent
+    (`check_legacy`). Basis "counter": the counter must exist and not be
+    below the migrated value (lower means a rollback that could reuse ids).
+    Basis "empty" or "attested": the legacy anchors are known to have handed
+    out no id, so only what was written since counts, by the ordinary rule
+    (in-flight entries, recorded transport ids, unreadable anchors)."""
+    try:
+        check_legacy(legacy, manifest)
+    except ValueError as e:
+        raise GenerationHeld(HELD_COUNTER_UNVERIFIED, f"the legacy record: {e}") from None
+    if legacy["basis"] == BASIS_COUNTER:
+        if not _counter_path(pred_dir).exists():
+            raise GenerationHeld(HELD_COUNTER_UNVERIFIED,
+                                 "the migrated transport counter has been lost")
+        start = _ordinary_counter(pred_dir)
+        if start < int(legacy["counter"]):
+            raise GenerationHeld(HELD_COUNTER_UNVERIFIED,
+                                 "the transport counter is below the one migrated")
+        return start
+    return _ordinary_counter(pred_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -456,8 +510,7 @@ def resolve(state_dir: Path, name: str, entry: Any, root: Path) -> str:
     lid = entry.logical_id
     observed = root_identity(root)
     binding = binding_of(entry)
-    if _present(lid_dir(state_dir, lid) / MIGRATION_FILE):
-        raise GenerationHeld(HELD_LAYOUT_CONFLICT, f"an unfinished {MIGRATION_FILE}")
+    migration_state(state_dir, lid)
     doc = read_doc(state_dir, lid)
     if doc is None:
         legacy = legacy_entries(state_dir, lid)
@@ -581,7 +634,12 @@ def expected_root(cfg: Any, name: str) -> Optional[Tuple[int, int]]:
     entry = next((g for g in (doc or {}).get("gens", []) if g["gen"] == gen), None)
     if entry is None:
         raise LookupError(f"{name!r}'s generation {gen} is not recorded")
-    return int(entry["root"]["st_dev"]), int(entry["root"]["st_ino"])
+    dev, ino = entry["root"].get("st_dev"), entry["root"].get("st_ino")
+    if not (isinstance(dev, int) and isinstance(ino, int)):
+        # Recorded as unknown (a root that could not be opened, or a legacy
+        # generation whose marker kept only a path): it vouches for nothing.
+        raise LookupError(f"{name!r}'s generation {gen} records no root identity")
+    return dev, ino
 
 
 def keyed(cfg: Any, gen_keys: Mapping[str, str]) -> Any:
@@ -699,6 +757,31 @@ def _root_or_unknown(root: Path) -> Dict[str, Any]:
         return {"path": str(root), "st_dev": None, "st_ino": None}
 
 
+def _verb_lock(cfg: Any, dry_run: bool) -> Any:
+    """The drain lock for an operator verb, fail-fast (the router must be
+    stopped), or None for a dry run, which takes none."""
+    from . import lock as lock_mod
+    if dry_run:
+        return None
+    try:
+        return lock_mod.acquire(cfg.state_dir)
+    except lock_mod.LockHeldError as e:
+        raise OperatorRefused(f"the router is running (stop it first): {e}") from None
+
+
+def _fresh_entry(cfg: Any, name: str, dry_run: bool) -> Tuple[Any, Any]:
+    """`(report, entry)` from a FRESH registry read (persisting the seq floor
+    only when not a dry run); a name the registry holds is refused."""
+    from . import registry as registry_mod
+    report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
+                                     persist=not dry_run)
+    if name not in (report.resolved or {}):
+        raise OperatorRefused(
+            f"{name!r} is held by the registry: "
+            f"{(report.held or {}).get(name, report.state)}")
+    return report, report.resolved[name]
+
+
 def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> Dict[str, Any]:
     """`router generation new <name> --reason <text>`: fence `name`'s current
     generation and begin the next, for what the router cannot see (a
@@ -712,32 +795,19 @@ def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> 
     next poll begins the first); an unfinished migration; a successor
     counter that cannot be carried; an empty reason. Allowed with the root
     unreadable: it fences."""
-    from . import lock as lock_mod
-    from . import registry as registry_mod
     if cfg.registry_dir is None:
         raise OperatorRefused("generations exist only under a registry (registry_dir)")
     if name not in cfg.instances:
         raise OperatorRefused(f"{name!r} names no configured instance")
     if not (isinstance(reason, str) and reason.strip()):
         raise OperatorRefused("a --reason is required; it is written to the audit log")
-    lk = None
-    if not dry_run:
-        try:
-            lk = lock_mod.acquire(cfg.state_dir)
-        except lock_mod.LockHeldError as e:
-            raise OperatorRefused(f"the router is running (stop it first): {e}") from None
+    lk = _verb_lock(cfg, dry_run)
     try:
-        report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
-                                         persist=not dry_run)
-        if name not in (report.resolved or {}):
-            raise OperatorRefused(
-                f"{name!r} is held by the registry: "
-                f"{(report.held or {}).get(name, report.state)}")
-        entry = report.resolved[name]
+        report, entry = _fresh_entry(cfg, name, dry_run)
         lid = entry.logical_id
-        if _present(lid_dir(cfg.state_dir, lid) / MIGRATION_FILE):
-            raise OperatorRefused(f"an unfinished {MIGRATION_FILE}; finish that verb first")
         try:
+            migration_state(cfg.state_dir, lid, audit=True)
+            warn_attested(cfg.state_dir, name, lid, "generation new")
             doc = read_doc(cfg.state_dir, lid)
         except GenerationHeld as e:
             raise OperatorRefused(str(e)) from None
@@ -766,6 +836,961 @@ def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> 
     finally:
         if lk is not None:
             lk.release()
+
+
+# ---------------------------------------------------------------------------
+# The migration verbs: `router generation adopt | fence-legacy`
+#
+# State written before generations existed sits directly under
+# `state_dir/<logical_id>/`, and the instance holds (`legacy_state_unadopted`)
+# until the operator says what it is:
+#
+#   * `adopt` attests that the root and binding are unchanged since that
+#     state was written. It becomes the first CURRENT generation, every
+#     entry moved exactly (the transport counter included), and each
+#     version-1 pending record gains a snapshot taken from the live request
+#     it still names, only where those bytes match its digest.
+#   * `fence-legacy` makes it a FENCED generation (its work settles
+#     privately; a version-1 record with no snapshot holds), and a fresh
+#     current generation begins with its own first sight.
+#
+# Both are journaled in `migration.json`, written durably before the first
+# rename and retained when done. Each phase is durable before the next
+# begins; a re-run of the same verb resumes from the journal, deciding each
+# path from what is at its source and its destination, and only while the
+# binding (and, for adopt, the root) it recorded still verifies. The last
+# step before `complete` leaves a DIRECTORY named `first-seen.json` where the
+# legacy marker was: an older router run against the migrated layout then
+# fails at its first statement, before any delivery, instead of taking a
+# fresh first sight and restarting the transport counter. Rolling back past
+# this version is not supported.
+# ---------------------------------------------------------------------------
+
+VERB_ADOPT = "adopt"
+VERB_FENCE_LEGACY = "fence-legacy"
+VERBS = (VERB_ADOPT, VERB_FENCE_LEGACY)
+JOURNAL_SCHEMA = "amap-router-local.migration/1"
+#: Each phase names the step that has COMPLETED, in this order.
+PHASES = ("planned", "renamed", "converted", "blocked", "complete", "done")
+#: Where the rollback blocker goes: the legacy first-sight marker's path.
+BLOCKER = "first-seen.json"
+#: Legacy files small enough to carry a digest in the plan.
+_DIGESTED = ("first-seen.json", "approval.json")
+
+REASON_ADOPTED = "adopted"
+REASON_LEGACY = "legacy"
+REASON_FENCE_LEGACY = "fence_legacy"
+
+
+class MigrationConflict(Exception):
+    """What is on disk does not match the journal; nothing more is moved."""
+
+
+def journal_path(state_dir: Path, logical_id: str) -> Path:
+    return lid_dir(state_dir, logical_id) / MIGRATION_FILE
+
+
+def read_journal(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
+    """The migration journal, or None when there is none. Anything that is
+    not a well-formed journal raises `GenerationHeld(state_layout_conflict)`."""
+    try:
+        raw = journal_path(state_dir, logical_id).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise GenerationHeld(HELD_LAYOUT_CONFLICT, f"{MIGRATION_FILE} unreadable: {e}") from None
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise GenerationHeld(HELD_LAYOUT_CONFLICT, f"{MIGRATION_FILE} is not JSON") from None
+    ok = (isinstance(doc, dict) and doc.get("schema") == JOURNAL_SCHEMA
+          and doc.get("verb") in VERBS and doc.get("phase") in PHASES
+          and isinstance(doc.get("gen"), str) and _GEN_ID.fullmatch(doc["gen"])
+          and isinstance(doc.get("source"), dict) and isinstance(doc.get("paths"), list)
+          and all(isinstance(p, dict) and p.get("name") in GEN_SCOPED
+                  and p.get("type") in ("dir", "file") for p in doc["paths"]))
+    if ok:
+        ok = isinstance(doc.get("legacy"), dict) and isinstance(doc.get("manifest"), list)
+    if ok and doc["phase"] in ("complete", "done"):
+        ok = (isinstance(doc.get("audit_line"), str) and doc["audit_line"].endswith("\n")
+              and isinstance(doc.get("journal_sha256"), str)
+              and bool(_HEX64.fullmatch(doc["journal_sha256"])))
+    if ok and doc["verb"] == VERB_FENCE_LEGACY:
+        ok = isinstance(doc.get("fresh_gen"), str) and bool(_GEN_ID.fullmatch(doc["fresh_gen"]))
+    if not ok:
+        raise GenerationHeld(HELD_LAYOUT_CONFLICT, f"{MIGRATION_FILE} is malformed")
+    return doc
+
+
+def migration_state(state_dir: Path, logical_id: str, *, audit: bool = False) -> str:
+    """THE reader of a migration's outcome, for every consumer (the
+    pre-pass, reset, the operator verbs): "none" (no journal) or "done".
+    "done" is never the phase alone. Checked on every call: the journal is
+    well-formed and `done`; the generations file has exactly the chain the
+    verb made, with the binding and root the journal recorded; every planned
+    path is in the legacy generation with its type, and the digested files
+    unchanged; the legacy record equals the journal's and is consistent with
+    its manifest, every manifest anchor is still there unchanged, and the
+    counter (basis "counter") is not below the one recorded; the recorded
+    blocker is a real directory. With `audit` (at the verb's resume, before
+    reset and before `generation new`; never on an ordinary poll), also
+    that exactly one attestation line in the audit log is the planned one.
+    Anything else raises `GenerationHeld(state_layout_conflict)`."""
+    journal = read_journal(state_dir, logical_id)
+    if journal is None:
+        return "none"
+    if journal["phase"] != "done":
+        raise _held(f"unfinished ({journal['phase']})")
+    _check_made(state_dir, logical_id, journal)
+    if audit and audit_state(state_dir, logical_id, journal) != "present":
+        raise _held("the attestation line is not in the audit log")
+    return "done"
+
+
+def _held(why: str) -> GenerationHeld:
+    return GenerationHeld(HELD_LAYOUT_CONFLICT, f"{MIGRATION_FILE}: {why}")
+
+
+def done_journal(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
+    """The journal when `migration_state` says "done", else None (raises
+    what it raises)."""
+    if migration_state(state_dir, logical_id) == "none":
+        return None
+    return read_journal(state_dir, logical_id)
+
+
+def _check_made(state_dir: Path, logical_id: str, journal: Mapping[str, Any]) -> None:
+    doc = read_doc(state_dir, logical_id)
+    if doc is None:
+        raise _held(f"done, but there is no {GEN_FILE}")
+    gens, src = doc["gens"], journal["source"]
+    if not gens or gens[0]["gen"] != journal["gen"]:
+        raise _held(f"{GEN_FILE} does not begin with the generation it made")
+    made = gens[0]
+    if journal["verb"] == VERB_ADOPT:
+        if not (made.get("reason") == REASON_ADOPTED and made["binding"] == src["binding"]
+                and made["root"] == src["root"]):
+            raise _held("the adopted generation is not the one the journal recorded")
+    else:
+        fresh = gens[1] if len(gens) > 1 else {}
+        if not (made.get("reason") == REASON_LEGACY and made.get("fenced_ts") is not None
+                and made["binding"] == _UNKNOWN_BINDING
+                and made["root"] == {"path": journal.get("declared_root"),
+                                     "st_dev": None, "st_ino": None}
+                and fresh.get("gen") == journal["fresh_gen"]
+                and fresh.get("reason") == REASON_FENCE_LEGACY
+                and fresh.get("binding") == src["binding"] and fresh.get("root") == src["root"]):
+            raise _held("the fenced legacy generation and its successor are not the ones "
+                        "the journal recorded")
+    d = gen_dir(state_dir, logical_id, journal["gen"])
+    for p in journal["paths"]:
+        try:
+            ok = _matches(d / p["name"], p)
+        except OSError:
+            ok = False
+        if not ok:
+            raise _held(f"{p['name']} in the migrated generation is not what was planned")
+    legacy = journal["legacy"]
+    if made.get("legacy") != legacy:
+        raise _held("the legacy record differs between the journal and the generation")
+    try:
+        check_legacy(legacy, journal.get("manifest"))
+    except ValueError as e:
+        raise _held(f"the legacy record: {e}") from None
+    for line in journal["manifest"]:
+        req_id, _, sha = line.partition(" ")
+        try:
+            ok = _sha256(d / "results" / f"{req_id}.json") == sha
+        except OSError:
+            ok = False
+        if not ok:
+            raise _held(f"legacy anchor {req_id} is gone or changed")
+    if legacy["basis"] == BASIS_COUNTER:
+        try:
+            now = _counter_path(d).read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            now = ""
+        if not (_COUNTER_RE.fullmatch(now) and int(now) >= int(legacy["counter"])):
+            raise _held("the transport counter is missing or below the one migrated")
+    if not is_recorded_blocker(state_dir, logical_id):
+        raise _held("done, but its rollback blocker is missing")
+
+
+def attested(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
+    """`{gen, local_anchors, attested_ts}` when a done migration rests on an
+    ATTESTED transport history (no counter, local anchors only), else None.
+    Report-only; a fault reading it is None."""
+    try:
+        journal = done_journal(state_dir, logical_id)
+    except GenerationHeld:
+        return None
+    if not journal or journal["legacy"]["basis"] != BASIS_ATTESTED:
+        return None
+    return {"gen": journal["gen"], "local_anchors": journal["legacy"]["local"],
+            "attested_ts": journal["planned_ts"]}
+
+
+def warn_attested(state_dir: Path, name: str, logical_id: str, verb: str) -> None:
+    """The WARNING every later `generation new` and `reset` logs while the
+    chain rests on an attested transport history."""
+    a = attested(state_dir, logical_id)
+    if a:
+        logger.warning("instance %r (%s): %s on a chain whose migrated generation %s rests on "
+                       "an ATTESTED transport history (%d local anchor(s), attested %s); a "
+                       "false attestation can reuse a transport id", name, logical_id, verb,
+                       a["gen"], a["local_anchors"], a["attested_ts"])
+
+
+# -- The attestation: one planned line, committed exactly once ------------------
+
+def audit_state(state_dir: Path, logical_id: str, journal: Mapping[str, Any]) -> str:
+    """Where the journal's planned attestation line stands in the audit log:
+    "present" (exactly one full copy), "absent", or "torn" (the log ends in a
+    prefix of it). Read strictly (`audit.read_raw`); raises
+    `GenerationHeld(state_layout_conflict)` for an unreadable log, a
+    malformed line that carries this journal's digest, a well-formed line
+    for this journal that differs from the planned one, or two copies. A
+    malformed line that does not mention this journal (an older crash) is
+    skipped with a WARNING."""
+    planned = journal["audit_line"].encode("utf-8")
+    body, digest = planned[:-1], journal["journal_sha256"]
+    try:
+        raw = audit_mod.read_raw(state_dir, logical_id)
+    except (OSError, audit_mod.AuditError) as e:
+        raise _held(f"the audit log cannot be read: {e}") from None
+    if raw is None:
+        return "absent"
+    lines = raw.split(b"\n")
+    tail = lines.pop()               # b"" when the log ends with a newline
+    found = 0
+    for line in lines:
+        if line == body:
+            found += 1
+            continue
+        if line and body.startswith(line):
+            continue                 # a torn copy already repaired (`commit_audit`)
+        try:
+            doc = strict_json(line)
+        except (UnicodeDecodeError, ValueError):
+            if digest.encode("ascii") in line:
+                raise _held("a malformed audit line carries this journal's digest") from None
+            logger.warning("audit log for %s: an unparseable line is skipped", logical_id)
+            continue
+        if isinstance(doc, dict) and doc.get("journal_sha256") == digest:
+            raise _held("an audit line for this journal differs from the planned one")
+    if found > 1:
+        raise _held("the attestation line is in the audit log more than once")
+    if tail:
+        if found == 0 and tail == body:
+            return "unterminated_copy"   # whole, only its newline missing
+        if found == 0 and body.startswith(tail):
+            return "torn"
+        if digest.encode("ascii") in tail:
+            raise _held("a torn audit line carries this journal's digest")
+        logger.warning("audit log for %s: an unterminated last line is skipped", logical_id)
+    return "present" if found == 1 else ("absent" if not tail else "unterminated")
+
+
+def commit_audit(state_dir: Path, name: str, logical_id: str,
+                 journal: Mapping[str, Any]) -> None:
+    """Make the planned attestation line present exactly once, durably."""
+    planned = journal["audit_line"].encode("utf-8")
+    state = audit_state(state_dir, logical_id, journal)
+    if state == "present":
+        return
+    if state == "unterminated_copy":
+        data = b"\n"                    # the copy is whole: terminate it
+    elif state in ("torn", "unterminated"):
+        # Terminate the torn (or unrelated) last line, then the whole line.
+        data = b"\n" + planned
+    else:
+        data = planned
+    audit_mod.append_bytes(state_dir, name, data, state_key=logical_id, durable=True)
+    if audit_state(state_dir, logical_id, journal) != "present":
+        raise _held("the attestation line did not land")
+
+
+def is_recorded_blocker(state_dir: Path, logical_id: str) -> bool:
+    """Whether `state_dir/<logical_id>/first-seen.json` is the migration's
+    rollback blocker: the journal records it AND it is a real directory. An
+    unrecorded one, or a file, is legacy state like any other."""
+    try:
+        doc = read_journal(state_dir, logical_id)
+        st = os.lstat(lid_dir(state_dir, logical_id) / BLOCKER)
+    except (GenerationHeld, OSError):
+        return False
+    return bool(doc and doc.get("blocker") is True and stat_mod.S_ISDIR(st.st_mode))
+
+
+def _write_journal(state_dir: Path, logical_id: str, doc: Dict[str, Any]) -> bytes:
+    raw = json.dumps(doc, sort_keys=True, indent=1).encode("utf-8")
+    atomic_write(journal_path(state_dir, logical_id), raw, durable_root=state_dir)
+    return raw
+
+
+def _kind(path: Path) -> Optional[str]:
+    """"dir", "file", None (absent), or "other" (a symlink or anything else)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat_mod.S_ISDIR(st.st_mode):
+        return "dir"
+    if stat_mod.S_ISREG(st.st_mode):
+        return "file"
+    return "other"
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# -- Classifying legacy transport evidence (once, at plan time) --------------
+
+#: `outbound._begin_external`'s two refusals before any transport id was
+#: allocated (exact `detail` at every pre-generation version).
+_BEGIN_EXTERNAL_DETAILS = frozenset({
+    "the external leg is not configured for this instance",
+    "attachments on the external leg are not supported yet",
+})
+#: `outbound._result_doc`'s members, as every pre-generation anchor has them.
+_RESULT_REQUIRED = frozenset({"contract_version", "req_id", "outcome", "detail",
+                              "reason_code", "ts", "message_id", "job_id"})
+_RESULT_OPTIONAL = frozenset({"recipients", "attachments"})
+_OUTCOMES = frozenset({"accepted", "queued_for_human", "rejected"})
+_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+LOCAL, TRANSPORT, MALFORMED = "local", "transport", "malformed"
+TRANSPORT_DETAIL_PREFIX = "transport: "
+REASON_TRANSPORT_ANOMALY = "transport_anomaly"
+#: How a migrated generation's transport counter is known (`legacy.basis`).
+BASIS_COUNTER, BASIS_EMPTY, BASIS_ATTESTED = "counter", "empty", "attested"
+_LEGACY_KEYS = frozenset({"basis", "counter", "local", "transport", "malformed", "inflight",
+                          "positive_evidence_count", "manifest_sha256"})
+
+
+def strict_json(raw: bytes) -> Any:
+    """`json.loads`, refusing duplicate object keys (ValueError)."""
+    def pairs(items):
+        out = {}
+        for k, v in items:
+            if k in out:
+                raise ValueError(f"duplicate key {k!r}")
+            out[k] = v
+        return out
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+
+
+def classify_anchor(raw: bytes, req_id: str) -> str:
+    """LOCAL, TRANSPORT or MALFORMED, for a pre-generation anchor's bytes.
+
+    TRANSPORT is positive evidence that a transport id was allocated: a
+    recorded `transport_req_id`, a verdict passed through from the transport
+    (its detail begins "transport: "), or a `transport_anomaly` other than
+    the two refusals `_begin_external` made before allocating. LOCAL is the
+    exact shape every pre-generation anchor had (`{"digest", "result"}`, the
+    result as `_result_doc` wrote it) and none of that. Anything else is
+    MALFORMED: an arbitrary result object is not an anchor."""
+    from .util import parse_utc_ts
+    try:
+        env = strict_json(raw)
+    except (UnicodeDecodeError, ValueError):
+        return MALFORMED
+    if not isinstance(env, dict):
+        return MALFORMED
+    if "transport_req_id" in env:
+        return TRANSPORT
+    if set(env) != {"digest", "result"}:
+        return MALFORMED
+    digest, res = env["digest"], env["result"]
+    if not (digest is None or (isinstance(digest, str) and _HEX64.fullmatch(digest))):
+        return MALFORMED
+    if not isinstance(res, dict) or not (_RESULT_REQUIRED <= set(res)
+                                         <= _RESULT_REQUIRED | _RESULT_OPTIONAL):
+        return MALFORMED
+    detail, reason = res["detail"], res["reason_code"]
+    ok = (res["contract_version"] == "2" and res["req_id"] == req_id
+          and res["outcome"] in _OUTCOMES
+          and (detail is None or isinstance(detail, str))
+          and isinstance(reason, str) and reason != ""
+          and parse_utc_ts(res["ts"]) is not None
+          and (res["message_id"] is None or isinstance(res["message_id"], str))
+          and res["job_id"] is None)
+    if ok and "recipients" in res:
+        ok = isinstance(res["recipients"], list) and all(
+            isinstance(r, str) for r in res["recipients"])
+    if ok and "attachments" in res:
+        a = res["attachments"]
+        ok = isinstance(a, list) and bool(a) and all(
+            isinstance(x, dict) and set(x) == {"index", "outcome", "detail"}
+            and isinstance(x["index"], int) and not isinstance(x["index"], bool)
+            and x["index"] >= 0 and isinstance(x["outcome"], str)
+            and (x["detail"] is None or isinstance(x["detail"], str)) for x in a)
+    if not ok:
+        return MALFORMED
+    if isinstance(detail, str) and detail.startswith(TRANSPORT_DETAIL_PREFIX):
+        return TRANSPORT
+    if reason == REASON_TRANSPORT_ANOMALY and detail not in _BEGIN_EXTERNAL_DETAILS:
+        return TRANSPORT
+    return LOCAL
+
+
+def manifest_digest(manifest: List[str]) -> str:
+    return hashlib.sha256("".join(line + "\n" for line in manifest).encode("utf-8")).hexdigest()
+
+
+def classify_legacy(d: Path) -> Tuple[Dict[str, Any], List[str]]:
+    """`(facts, manifest)` for the legacy layout at `d`: the counter's text
+    (None when there is no counter file), and how many anchors are LOCAL,
+    TRANSPORT and MALFORMED, how many in-flight entries exist (each one is
+    positive evidence), and the manifest of LOCAL anchors (`"<req_id>
+    <sha256>"`, sorted). `facts["basis"]` is left for `legacy_basis`. A
+    counter that exists but is not a positive decimal raises
+    `OperatorRefused`."""
+    counts = {LOCAL: 0, TRANSPORT: 0, MALFORMED: 0}
+    manifest: List[str] = []
+    try:
+        entries = sorted(os.scandir(d / "results"), key=lambda e: e.name)
+    except FileNotFoundError:
+        entries = []
+    for e in entries:
+        if not (e.name.endswith(".json") and e.is_file(follow_symlinks=False)):
+            counts[MALFORMED] += 1
+            continue
+        req_id = e.name[:-len(".json")]
+        try:
+            raw = Path(e.path).read_bytes()
+        except OSError:
+            counts[MALFORMED] += 1
+            continue
+        kind = classify_anchor(raw, req_id)
+        counts[kind] += 1
+        if kind == LOCAL:
+            manifest.append(f"{req_id} {hashlib.sha256(raw).hexdigest()}")
+    try:
+        inflight = sum(1 for _ in os.scandir(d / "inflight"))
+    except FileNotFoundError:
+        inflight = 0
+    try:
+        counter: Optional[str] = _counter_path(d).read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        counter = None
+    except (OSError, UnicodeDecodeError) as e:
+        raise OperatorRefused(f"the legacy transport counter is unreadable: {e}") from None
+    if counter is not None and not _COUNTER_RE.fullmatch(counter):
+        raise OperatorRefused("the legacy transport counter is corrupt")
+    manifest.sort()
+    facts = {"basis": None, "counter": counter, "local": counts[LOCAL],
+             "transport": counts[TRANSPORT], "malformed": counts[MALFORMED],
+             "inflight": inflight,
+             "positive_evidence_count": counts[TRANSPORT] + inflight,
+             "manifest_sha256": manifest_digest(manifest)}
+    return facts, manifest
+
+
+def legacy_basis(facts: Mapping[str, Any], attested: Optional[int]) -> str:
+    """How the counter is known, or `OperatorRefused`. A counter preserves
+    exactly. Without one: any positive evidence, or any malformed anchor,
+    refuses whatever is attested; nothing at all is "empty"; LOCAL anchors
+    alone need `--no-transport-history=N` with N their exact count."""
+    if facts["counter"] is not None:
+        return BASIS_COUNTER
+    if facts["positive_evidence_count"]:
+        raise OperatorRefused(
+            f"the transport counter is lost and {facts['positive_evidence_count']} "
+            "transport id(s) are proven allocated (in-flight entries or transport "
+            "verdicts); ids would be reused. Nothing can attest this away")
+    if facts["malformed"]:
+        raise OperatorRefused(
+            f"the transport counter is absent and {facts['malformed']} anchor(s) cannot "
+            "be classified; nothing shows they handed out no transport id")
+    if not facts["local"]:
+        return BASIS_EMPTY
+    if attested is None:
+        raise OperatorRefused(
+            f"the transport counter is absent and {facts['local']} local anchor(s) "
+            "remain; if this instance never had a transport route, attest it with "
+            f"--no-transport-history={facts['local']}")
+    if attested != facts["local"]:
+        raise OperatorRefused(
+            f"--no-transport-history={attested} does not match the {facts['local']} "
+            "local anchor(s) found")
+    return BASIS_ATTESTED
+
+
+def check_legacy(rec: Any, manifest: Any) -> None:
+    """A migrated generation's legacy record, strictly, with the manifest
+    the journal kept. Raises ValueError on anything inconsistent."""
+    if not (isinstance(rec, dict) and set(rec) == _LEGACY_KEYS):
+        raise ValueError("not a legacy record")
+    n = {k: rec[k] for k in ("local", "transport", "malformed", "inflight",
+                             "positive_evidence_count")}
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in n.values()):
+        raise ValueError("a count is not a non-negative integer")
+    if n["positive_evidence_count"] != n["transport"] + n["inflight"]:
+        raise ValueError("positive_evidence_count is not transport + inflight")
+    if not (isinstance(manifest, list) and all(isinstance(x, str) for x in manifest)
+            and manifest == sorted(manifest) and len(manifest) == n["local"]
+            and manifest_digest(manifest) == rec["manifest_sha256"]):
+        raise ValueError("the manifest does not match its record")
+    counter, basis = rec["counter"], rec["basis"]
+    if basis == BASIS_COUNTER:
+        if not (isinstance(counter, str) and _COUNTER_RE.fullmatch(counter)):
+            raise ValueError("basis counter without a counter")
+    elif basis == BASIS_EMPTY:
+        if counter is not None or any(n.values()):
+            raise ValueError("basis empty with legacy state")
+    elif basis == BASIS_ATTESTED:
+        if (counter is not None or n["local"] < 1 or n["transport"] or n["malformed"]
+                or n["inflight"]):
+            raise ValueError("basis attested with more than local anchors")
+    else:
+        raise ValueError(f"unknown basis {basis!r}")
+
+
+def _plan_paths(state_dir: Path, logical_id: str) -> List[Dict[str, Any]]:
+    d = lid_dir(state_dir, logical_id)
+    paths = []
+    for n in legacy_entries(state_dir, logical_id):
+        kind = _kind(d / n)
+        if kind not in ("dir", "file"):
+            raise MigrationConflict(f"{n} is not a plain file or directory")
+        entry: Dict[str, Any] = {"name": n, "type": kind}
+        if kind == "file" and n in _DIGESTED:
+            entry["digest"] = _sha256(d / n)
+        paths.append(entry)
+    return paths
+
+
+def _fsync(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _matches(path: Path, planned: Mapping[str, Any]) -> bool:
+    if _kind(path) != planned["type"]:
+        return False
+    return "digest" not in planned or _sha256(path) == planned["digest"]
+
+
+def _move_paths(state_dir: Path, logical_id: str, journal: Mapping[str, Any]) -> None:
+    """Each planned path into the legacy generation's directory, decided per
+    path from what is at each end (never from the phase alone):
+
+        source   destination   action
+        present  absent        rename (never over anything)
+        absent   as planned    already moved
+        present  present       conflict
+        absent   absent        conflict (it was planned present)
+
+    The recorded blocker at its source path counts as absent ("moved")."""
+    src_dir = lid_dir(state_dir, logical_id)
+    dst_dir = gen_dir(state_dir, logical_id, journal["gen"])
+    if _kind(dst_dir) is None:
+        os.mkdir(dst_dir)
+        _fsync(src_dir)
+    elif _kind(dst_dir) != "dir":
+        raise MigrationConflict(f"{dst_dir.name} is not a directory")
+    blocker = is_recorded_blocker(state_dir, logical_id)
+    for p in journal["paths"]:
+        src, dst = src_dir / p["name"], dst_dir / p["name"]
+        src_here = _kind(src) is not None and not (p["name"] == BLOCKER and blocker)
+        dst_here = _kind(dst) is not None
+        if src_here and not dst_here:
+            if not _matches(src, p):
+                raise MigrationConflict(f"{p['name']} changed since the plan")
+            os.rename(src, dst)
+            _fsync(src_dir)
+            _fsync(dst_dir)
+        elif not src_here and dst_here:
+            if not _matches(dst, p):
+                raise MigrationConflict(f"{p['name']} at the destination is not what was planned")
+        elif src_here and dst_here:
+            raise MigrationConflict(f"{p['name']} is at both the legacy path and the generation")
+        else:
+            raise MigrationConflict(f"{p['name']} is at neither the legacy path nor the generation")
+    left = legacy_entries(state_dir, logical_id)
+    if left:
+        raise MigrationConflict(f"legacy entries {left} appeared that were not planned")
+
+
+def _place_blocker(state_dir: Path, logical_id: str, journal: Dict[str, Any]) -> None:
+    """The rollback blocker: recorded in the journal FIRST, then made, so a
+    blocker is never there unrecorded (an unrecorded one reads as legacy)."""
+    if journal.get("blocker") is not True:
+        journal["blocker"] = True
+        _write_journal(state_dir, logical_id, journal)
+    path = lid_dir(state_dir, logical_id) / BLOCKER
+    kind = _kind(path)
+    if kind is None:
+        os.mkdir(path)
+        _fsync(lid_dir(state_dir, logical_id))
+    elif kind != "dir":
+        raise MigrationConflict(f"{BLOCKER} is at the legacy path and is not the blocker")
+
+
+_UNKNOWN_BINDING = {"adapter": None, "stable_key": None, "binding_seq": None}
+
+
+def _migrated_doc(journal: Mapping[str, Any], now: str) -> Dict[str, Any]:
+    """The generations file the journal's verb ends in."""
+    src = journal["source"]
+    legacy = dict(journal["legacy"])
+    if journal["verb"] == VERB_ADOPT:
+        gens = [{"gen": journal["gen"], "minted_ts": now, "reason": REASON_ADOPTED,
+                 "binding": dict(src["binding"]), "root": dict(src["root"]),
+                 "fenced_ts": None, "note": journal["reason"], "legacy": legacy}]
+        return {"schema": SCHEMA, "gens": gens, "current": journal["gen"]}
+    # The legacy generation's binding was never recorded, and its marker
+    # kept only a path: neither vouches for anything, so its work settles
+    # privately (`expected_root`).
+    gens = [{"gen": journal["gen"], "minted_ts": now, "reason": REASON_LEGACY,
+             "binding": dict(_UNKNOWN_BINDING),
+             "root": {"path": journal.get("declared_root"), "st_dev": None, "st_ino": None},
+             "fenced_ts": now, "legacy": legacy},
+            {"gen": journal["fresh_gen"], "minted_ts": now, "reason": REASON_FENCE_LEGACY,
+             "binding": dict(src["binding"]), "root": dict(src["root"]),
+             "fenced_ts": None, "note": journal["reason"]}]
+    return {"schema": SCHEMA, "gens": gens, "current": journal["fresh_gen"]}
+
+
+#: adopt's clock-skew margin: a rebind this close to first sight counts as after it.
+SKEW_S = 1
+
+
+def legacy_marker(state_dir: Path, logical_id: str) -> Optional[Dict[str, Any]]:
+    """What the legacy layout says about when and where it began:
+    `{"first_seen_ts", "declared_root", "source"}`, or None when it has no
+    marker it can be read from. `first-seen.json` first; one a pre-generation
+    router adopted from `approval.json` is trusted only when its
+    `first_seen_ts` IS that `approved_ts` (otherwise it may have been the
+    clock at adoption). Then `approval.json`, only with a valid
+    `approved_ts`. Nothing here is ever synthesised."""
+    from .util import parse_utc_ts
+    d = lid_dir(state_dir, logical_id)
+
+    def load(n: str) -> Optional[Dict[str, Any]]:
+        try:
+            doc = strict_json((d / n).read_bytes())
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        return doc if isinstance(doc, dict) else None
+    doc = load("first-seen.json")
+    if doc is not None:
+        ts, root = doc.get("first_seen_ts"), doc.get("declared_root")
+        if doc.get("adopted_from") == "approval.json" and doc.get("approved_ts") != ts:
+            return None
+        if isinstance(ts, str) and parse_utc_ts(ts) and isinstance(root, str):
+            return {"first_seen_ts": ts, "declared_root": root, "source": "first-seen.json"}
+        return None
+    if _present(d / "first-seen.json"):
+        return None
+    doc = load("approval.json")
+    if doc is not None:
+        ts, root = doc.get("approved_ts"), doc.get("declared_root")
+        if isinstance(ts, str) and parse_utc_ts(ts) and isinstance(root, str):
+            return {"first_seen_ts": ts, "declared_root": root, "source": "approval.json"}
+    return None
+
+
+_BINDING_KEYS = frozenset({"adapter", "seq", "stable_key", "ts"})
+
+
+def parse_bindings(text: str, flat: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """A registry entry's binding history, strictly: a non-empty list of
+    `{adapter, seq, stable_key, ts}` and nothing else, seqs strictly
+    increasing, timestamps never decreasing, and the LAST element the flat
+    current binding. Raises ValueError."""
+    from .util import parse_utc_ts
+    hist = json.loads(text)
+    if not (isinstance(hist, list) and hist):
+        raise ValueError("no binding history")
+    prev_seq, prev_ts = 0, None
+    for b in hist:
+        if not (isinstance(b, dict) and set(b) == _BINDING_KEYS):
+            raise ValueError("a binding is not {adapter, seq, stable_key, ts}")
+        if not (isinstance(b["adapter"], str) and b["adapter"]
+                and isinstance(b["stable_key"], str) and b["stable_key"]
+                and isinstance(b["seq"], int) and not isinstance(b["seq"], bool)
+                and b["seq"] >= 1):
+            raise ValueError("a binding has a bad adapter, stable_key or seq")
+        ts = parse_utc_ts(b["ts"])
+        if ts is None:
+            raise ValueError("a binding has a bad ts")
+        if b["seq"] <= prev_seq:
+            raise ValueError("binding seqs do not strictly increase")
+        if prev_ts is not None and ts < prev_ts:
+            raise ValueError("binding timestamps decrease")
+        prev_seq, prev_ts = b["seq"], ts
+    last = hist[-1]
+    if (last["adapter"], last["stable_key"], last["seq"]) != (
+            flat["adapter"], flat["stable_key"], flat["binding_seq"]):
+        raise ValueError("the last binding is not the current one")
+    return hist
+
+
+def adopt_evidence(cfg: Any, name: str, entry: Any, marker: Optional[Mapping[str, Any]]) -> None:
+    """adopt's refusals on contrary evidence (each points to fence-legacy):
+    no marker to date or place the legacy state; a marker whose root is not
+    this instance's root (compared as normalised paths, never resolved); a
+    binding history that is malformed or does not end in the current
+    binding; or any REBIND (a binding after the initial one) at or after
+    first sight, less `SKEW_S`. The initial binding is not compared: a
+    registry imported after the router first saw an instance records its
+    initial binding later than that, and the root check and the operator's
+    attestation stand for it."""
+    from .util import parse_utc_ts
+    hint = "; use `fence-legacy`"
+    if marker is None:
+        raise OperatorRefused("no legacy first-sight marker (or approval with a valid "
+                              "approved_ts) to date and place this state" + hint)
+    if os.path.normpath(marker["declared_root"]) != os.path.normpath(str(cfg.instances[name].root)):
+        raise OperatorRefused(f"the legacy state was written for root "
+                              f"{marker['declared_root']!r}, not this instance's" + hint)
+    try:
+        hist = parse_bindings(entry.bindings_json, binding_of(entry))
+    except (ValueError, TypeError) as e:
+        raise OperatorRefused(f"the registry's binding history: {e}" + hint) from None
+    seen = parse_utc_ts(marker["first_seen_ts"])
+    for b in hist[1:]:
+        if (parse_utc_ts(b["ts"]) - seen).total_seconds() >= -SKEW_S:
+            raise OperatorRefused(f"the registry records a rebind (seq {b['seq']}, {b['ts']}) "
+                                  f"after the legacy state's first sight "
+                                  f"({marker['first_seen_ts']})" + hint)
+
+
+def operator_migrate(cfg: Any, name: str, verb: str, reason: str, *,
+                     dry_run: bool = False,
+                     no_transport_history: Optional[int] = None) -> Dict[str, Any]:
+    """`router generation adopt|fence-legacy <name> --reason <text>
+    [--no-transport-history=N]`. In `reset`'s order: validate, take the
+    drain lock (fail-fast), read the registry fresh, refuse a held instance,
+    act, audit. `dry_run` takes no lock, writes nothing, and returns the
+    plan.
+
+    Refused: no registry; an unknown or registry-held name; an empty reason;
+    a journal of the OTHER verb; state already in the generation layout with
+    no journal of this verb; nothing pre-generation to migrate; generation
+    directories nothing lists; a legacy entry that is not a plain file or
+    directory; a transport counter that cannot be preserved or attested
+    (`legacy_basis`); for adopt, a root that cannot be opened and contrary
+    evidence (`adopt_evidence`); on resume, a binding (or for adopt a root)
+    that no longer matches the journal's. Re-running the same verb once it
+    is done changes nothing and says so."""
+    if verb not in VERBS:
+        raise OperatorRefused(f"unknown migration verb {verb!r}")
+    if cfg.registry_dir is None:
+        raise OperatorRefused("generations exist only under a registry (registry_dir)")
+    if name not in cfg.instances:
+        raise OperatorRefused(f"{name!r} names no configured instance")
+    if not (isinstance(reason, str) and reason.strip()):
+        raise OperatorRefused("a --reason is required; it is written to the audit log")
+    lk = _verb_lock(cfg, dry_run)
+    try:
+        report, entry = _fresh_entry(cfg, name, dry_run)
+        lid = entry.logical_id
+        binding = binding_of(entry)
+        try:
+            journal = read_journal(cfg.state_dir, lid)
+        except GenerationHeld as e:
+            raise OperatorRefused(str(e)) from None
+        if journal is not None and journal["verb"] != verb:
+            raise OperatorRefused(
+                f"{MIGRATION_FILE} records `{journal['verb']}` ({journal['phase']}); "
+                f"`{verb}` is refused")
+        if journal is not None and journal["phase"] == "done":
+            try:
+                migration_state(cfg.state_dir, lid, audit=True)
+            except GenerationHeld as e:
+                raise OperatorRefused(str(e)) from None
+            return {"name": name, "logical_id": lid, "verb": verb, "noop": True,
+                    "generation": journal.get("fresh_gen") or journal["gen"]}
+        if journal is None:
+            journal = _new_journal(cfg, name, verb, reason.strip(), lid, entry,
+                                   no_transport_history)
+        else:
+            _verify_source(cfg, name, journal, binding)
+        if dry_run:
+            return dict(_summary(name, journal), dry_run=True)
+        try:
+            return _run_journal(cfg, name, journal, report)
+        except (MigrationConflict, GenerationHeld) as e:
+            raise OperatorRefused(
+                f"state_layout_conflict: {e}; the journal is kept and the instance "
+                "stays held") from None
+    finally:
+        if lk is not None:
+            lk.release()
+
+
+def _new_journal(cfg: Any, name: str, verb: str, reason: str, lid: str, entry: Any,
+                 attested: Optional[int]) -> Dict[str, Any]:
+    """The plan for a first run (not yet written): every fact the verb will
+    act on, classified once."""
+    try:
+        doc = read_doc(cfg.state_dir, lid)
+    except GenerationHeld as e:
+        raise OperatorRefused(str(e)) from None
+    if doc is not None:
+        raise OperatorRefused("already in the generation layout; nothing to migrate")
+    if not legacy_entries(cfg.state_dir, lid):
+        raise OperatorRefused("no pre-generation state; the next poll begins the first generation")
+    try:
+        check_unlisted(cfg.state_dir, lid)
+    except GenerationHeld as e:
+        raise OperatorRefused(str(e)) from None
+    marker = legacy_marker(cfg.state_dir, lid)
+    if verb == VERB_ADOPT:
+        try:
+            root = root_identity(cfg.instances[name].root)
+        except GenerationHeld as e:
+            raise OperatorRefused(f"adopt needs the root it attests to: {e}") from None
+        adopt_evidence(cfg, name, entry, marker)
+    else:
+        root = _root_or_unknown(cfg.instances[name].root)
+    try:
+        paths = _plan_paths(cfg.state_dir, lid)
+    except MigrationConflict as e:
+        raise OperatorRefused(str(e)) from None
+    facts, manifest = classify_legacy(lid_dir(cfg.state_dir, lid))
+    facts["basis"] = legacy_basis(facts, attested)
+    journal: Dict[str, Any] = {
+        "schema": JOURNAL_SCHEMA, "verb": verb, "phase": "planned", "planned_ts": utc_ts(),
+        "name": name, "logical_id": lid, "reason": reason, "gen": secrets.token_hex(16),
+        "source": {"binding": binding_of(entry), "root": root}, "paths": paths,
+        "legacy": facts, "manifest": manifest,
+        "declared_root": marker["declared_root"] if marker else None,
+        "first_seen": marker,
+    }
+    if verb == VERB_FENCE_LEGACY:
+        journal["fresh_gen"] = secrets.token_hex(16)
+    return journal
+
+
+def _verify_source(cfg: Any, name: str, journal: Mapping[str, Any],
+                   binding: Mapping[str, Any]) -> None:
+    """A resume continues only while what the journal recorded still holds."""
+    if journal["source"].get("binding") != dict(binding):
+        raise OperatorRefused("the registry binding changed since the journal was written; "
+                              "it stays held for the operator")
+    if journal["verb"] == VERB_ADOPT:
+        try:
+            root = root_identity(cfg.instances[name].root)
+        except GenerationHeld as e:
+            raise OperatorRefused(f"adopt cannot resume: {e}") from None
+        if not same_root(journal["source"]["root"], root):
+            raise OperatorRefused("the instance root changed since the journal was written; "
+                                  "it stays held for the operator")
+
+
+def _summary(name: str, journal: Mapping[str, Any]) -> Dict[str, Any]:
+    out = {"name": name, "logical_id": journal["logical_id"], "verb": journal["verb"],
+           "phase": journal["phase"], "paths": [p["name"] for p in journal["paths"]],
+           "legacy": journal["legacy"], "root": journal["source"]["root"]}
+    if journal["verb"] == VERB_ADOPT:
+        out["generation"] = journal["gen"]
+    else:
+        out["fenced"] = journal["gen"]
+        out["generation"] = journal["fresh_gen"]
+    return out
+
+
+def _advance(cfg: Any, journal: Dict[str, Any], phase: str) -> None:
+    journal["phase"] = phase
+    _write_journal(cfg.state_dir, journal["logical_id"], journal)
+
+
+def _plan_audit(name: str, journal: Dict[str, Any]) -> None:
+    """The attestation line, planned ONCE (fixed bytes, fixed ts) into the
+    journal before it is `complete`. Its `journal_sha256` is the journal as
+    it stands without the two audit members."""
+    body = {k: v for k, v in journal.items() if k not in ("audit_line", "journal_sha256")}
+    body["phase"] = "complete"
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+    legacy = journal["legacy"]
+    line = audit_mod.build_line(audit_mod.EVENT_MIGRATION, name, {
+        "verb": journal["verb"], "reason": journal["reason"],
+        "binding": journal["source"]["binding"], "root": journal["source"]["root"],
+        "gen": journal["gen"], "fresh_gen": journal.get("fresh_gen"),
+        "counts": {k: legacy[k] for k in ("basis", "counter", "local", "transport",
+                                          "malformed", "inflight",
+                                          "positive_evidence_count")},
+        "converted": journal.get("converted"), "journal_sha256": digest,
+    })
+    journal["journal_sha256"] = digest
+    journal["audit_line"] = line.decode("utf-8")
+
+
+def _run_journal(cfg: Any, name: str, journal: Dict[str, Any], report: Any) -> Dict[str, Any]:
+    """Every phase from where the journal stands, each durable before the next."""
+    from . import registry as registry_mod
+    lid = journal["logical_id"]
+    state_dir = cfg.state_dir
+    if journal["phase"] == "planned" and not _present(journal_path(state_dir, lid)):
+        _write_journal(state_dir, lid, journal)       # durable before the first rename
+    if journal["phase"] == "planned":
+        _move_paths(state_dir, lid, journal)
+        _advance(cfg, journal, "renamed")
+    if journal["phase"] == "renamed":
+        if journal["verb"] == VERB_ADOPT:
+            view = keyed(registry_mod.keyed_config(cfg, report), {name: gen_key(lid, journal["gen"])})
+            journal["converted"] = _convert_pending(view, name, gen_dir(state_dir, lid, journal["gen"]))
+        _advance(cfg, journal, "converted")
+    if journal["phase"] == "converted":
+        _place_blocker(state_dir, lid, journal)
+        _advance(cfg, journal, "blocked")
+    if journal["phase"] == "blocked":
+        if journal["verb"] == VERB_FENCE_LEGACY:
+            start = successor_counter(gen_dir(state_dir, lid, journal["gen"]),
+                                      journal["legacy"], journal["manifest"])
+            atomic_write(_counter_path(gen_dir(state_dir, lid, journal["fresh_gen"])),
+                         str(start).encode("ascii"), durable_root=state_dir)
+        _plan_audit(name, journal)
+        _advance(cfg, journal, "complete")
+    # complete: the generations file, the attestation (durable, once), then done.
+    want = journal.get("fresh_gen") or journal["gen"]
+    doc = read_doc(state_dir, lid)
+    if doc is None:
+        _write_doc(state_dir, lid, _migrated_doc(journal, utc_ts()))
+    elif doc["current"] != want:
+        raise MigrationConflict(f"{GEN_FILE} names {doc['current']}, not {want}")
+    _check_made(state_dir, lid, journal)
+    try:
+        commit_audit(state_dir, name, lid, journal)
+    except GenerationHeld:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise OperatorRefused(
+            f"migrated, but the audit line could not be written ({type(e).__name__}: {e}); "
+            "the journal stays at `complete` and the instance held until a re-run "
+            "writes it") from None
+    _advance(cfg, journal, "done")
+    if journal["legacy"]["basis"] == BASIS_ATTESTED:
+        logger.warning("instance %r (%s): %s on an ATTESTED transport history (%d local "
+                       "anchor(s), no counter); a false attestation can reuse a transport "
+                       "id", name, lid, journal["verb"], journal["legacy"]["local"])
+    logger.warning("instance %r (%s): %s done; generation %s current", name, lid,
+                   journal["verb"], want)
+    return _summary(name, journal)
+
+
+def _convert_pending(view: Any, name: str, d: Path) -> Dict[str, str]:
+    """adopt only: each version-1 pending record gains a snapshot, from the
+    live request it names, when those bytes still match its digest
+    (`outbound.convert_v1_pending`). `{req_id: outcome}`."""
+    from . import outbound as outbound_mod
+    out: Dict[str, str] = {}
+    try:
+        names = sorted(e.name for e in os.scandir(d / "pending")
+                       if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
+    except FileNotFoundError:
+        return out
+    for fn in names:
+        req_id = fn[:-len(".json")]
+        out[req_id] = outbound_mod.convert_v1_pending(view, name, req_id)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +1919,9 @@ def status_doc(cfg: Any, report: Any) -> Optional[Dict[str, Any]]:
         fenced = fenced_work(cfg.state_dir, logical_id)
         if fenced:
             entry["fenced_work"] = fenced
+        legacy_attested = attested(cfg.state_dir, logical_id)
+        if legacy_attested:
+            entry["legacy_attested"] = legacy_attested
         damaged = damaged_anchors(cfg.state_dir, logical_id)
         if damaged:
             entry["fenced_damaged_anchors"] = damaged
