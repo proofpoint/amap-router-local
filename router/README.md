@@ -1438,9 +1438,12 @@ the registry, in which case the delivery holds exactly as a direct address
 would), `old`'s local part in that identity's registry name history (whose
 last element must be its current name), and `old` no other identity's
 current name by skeleton, and no other identity in the registry (served here
-or not, retired or not) holding `old`'s local part in its name history (a
-name reused by another identity never retargets an alias; an unreadable
-history anywhere holds). INACTIVE, deterministically, otherwise: a request
+or not, retired or not) having had `old`'s local part as a name, compared by
+skeleton (its name history, or its current name when it records none): a
+name reused by another identity never retargets an alias. An unreadable name
+history ANYWHERE in the registry holds every alias, which is fail-closed and
+broad, deliberately: it cannot be shown that the unreadable one never held
+the name. INACTIVE, deterministically, otherwise: a request
 naming an inactive alias is answered `rejected` / `recipient_unknown` right
 there, before any policy sees it. Matching is exact: the local part as
 written, the domain lowercased, so a case variant is not the alias.
@@ -1465,8 +1468,10 @@ holds as damaged rather than misread): a later expiry or table edit never
 retargets or refuses it, and a target rebound since holds as
 `identity_changed`. Pinned work keeps its pin-time target across a §2.4
 domain flip too (each pinned address maps to that target's address in the new
-domain). So drain pending work before a flip if the old addresses must stop
-working at once.
+domain). A pending draft that named its target in a different letter case
+than the pinned address is refused after a flip rather than guessed at. So
+drain pending work before a flip if the old addresses must stop working at
+once.
 
 **Expiry and tombstones.** At or after `expires` an alias is inactive
 whatever else happened. The poll's pre-pass then writes its tombstone to

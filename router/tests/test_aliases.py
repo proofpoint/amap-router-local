@@ -656,7 +656,8 @@ class AnotherIdentityTests(_Aliases):
         alias would hand bravo's old-era mail to it, so it is inactive."""
         self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
                        extra=[("alice", ["alice"], "active")])
-        self.assertEqual(self.decision().reason, aliases.NAME_REUSED)
+        # The new alice is ACTIVE, so it collides by its current name.
+        self.assertEqual(self.decision().status, aliases.INACTIVE)
         self.send(to=[self.OLDA])
         self.assertEqual(self.answered()["reason_code"], outbound.REASON_RECIPIENT_UNKNOWN)
 
@@ -743,3 +744,77 @@ class ReviewRoundTwoTests(_Aliases):
                     outbound._read_pending(path, "00000001")
         path.write_text(json.dumps(base))
         outbound._read_pending(path, "00000001")        # the plain version 1 is fine
+
+
+
+class ReviewRoundThreeTests(_Aliases):
+
+    def test_a_direct_pinned_target_survives_a_domain_flip(self):
+        """A record made with aliases in play but naming its target DIRECTLY
+        (no alias applied) still reaches it after the fleet's domain flips."""
+        root = self.cfg.instances["bravo"].root
+        shutil.move(str(root), str(root) + ".away")
+        self.send(to=[addr("bravo")])
+        rec = self.record()
+        self.assertEqual((rec["v"], rec["aliases"]), (2, {}))
+        self.assertEqual(rec["targets"][0]["address"], addr("bravo"))
+        self.cfg = replace(self.cfg, fleet_domain="flip.example.invalid")
+        shutil.move(str(root) + ".away", str(root))
+        self.poll()
+        self.assertEqual(self.bodies(), ["via the alias"])
+
+    def test_another_identity_without_history_holds_by_its_current_name(self):
+        """No name history (absent or null) means the current name is all
+        that is known, and it still blocks the alias: retired or not, served
+        here or not."""
+        olda = "alice@old.example.invalid"
+        self.table(AliasEntry(olda, addr("bravo"), FUTURE))
+        cases = {"retired, null history": ("retired", None),
+                 "unserved and active, absent history": ("active", "absent")}
+        for label, (state, hist) in cases.items():
+            with self.subTest(label):
+                self.doCleanups()
+                self.setUp()
+                self.table(AliasEntry(olda, addr("bravo"), FUTURE))
+                self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
+                               extra=[("alice", None, state)])
+                if hist == "absent":
+                    doc = json.loads((self.reg / registry.SNAPSHOT).read_text())
+                    for e in doc["entries"]:
+                        if e["name"] == "alice":
+                            e.pop("names")
+                    (self.reg / registry.SNAPSHOT).write_text(json.dumps(doc))
+                d = keyed_view(self).alias_view.decisions[olda]
+                # An active one collides by its current name; a retired one is
+                # caught only through the no-history fallback.
+                want = aliases.NAME_REUSED if state == "retired" else aliases.COLLISION
+                self.assertEqual(d.reason, want, label)
+
+    def test_a_past_name_blocks_by_skeleton_too(self):
+        olda = "alice@old.example.invalid"
+        self.table(AliasEntry(olda, addr("bravo"), FUTURE))
+        self.put_entry(bravo=self.names("bravo", ["alice", "bravo"]),
+                       extra=[("carol", ["ALICE", "carol"], "retired")])
+        self.assertEqual(keyed_view(self).alias_view.decisions[olda].reason, aliases.NAME_REUSED)
+
+    def test_an_earlier_tombstone_error_keeps_its_first_seen_time(self):
+        a, b = "a@old.example.invalid", "b@old.example.invalid"
+        self.table(AliasEntry(a, addr("bravo"), PAST), AliasEntry(b, addr("bravo"), PAST))
+        real = aliases.write_tombstone
+
+        def fail_on(bad):
+            def w(state_dir, store, old, expires):
+                if old in bad:
+                    raise OSError(errno.EIO, "injected")
+                return real(state_dir, store, old, expires)
+            return w
+        with mock.patch.object(aliases, "write_tombstone", fail_on({b})):
+            self.poll()                                # a written, b fails
+        since_b = aliases.LAST_TOMBSTONE_ERRORS[b]["since"]
+        self.table(AliasEntry("c@old.example.invalid", addr("bravo"), PAST),
+                   AliasEntry(b, addr("bravo"), PAST))
+        with mock.patch.object(aliases, "write_tombstone",
+                               fail_on({"c@old.example.invalid", b})):
+            self.poll()                                # c fails first; b never tried
+        self.assertEqual(aliases.LAST_TOMBSTONE_ERRORS.get(b, {}).get("since"), since_b,
+                         "an untried failure lost its first-seen time")

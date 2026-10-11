@@ -424,7 +424,8 @@ def _decide(cfg: Any, report: Any, store_state: str, store: Store, now) -> Dict[
                 except (ValueError, TypeError):
                     reuse = UNVERIFIABLE
                     break
-                if old_local in (hist if hist is not None else [e.name]):
+                past = hist if hist is not None else [e.name]
+                if skeleton(old_local) in {skeleton(n) for n in past}:
                     reuse = NAME_REUSED
             if names is None:
                 out[a.old] = Decision(INACTIVE, NO_HISTORY)
@@ -432,10 +433,12 @@ def _decide(cfg: Any, report: Any, store_state: str, store: Store, now) -> Dict[
                 out[a.old] = Decision(INACTIVE, NOT_IN_HISTORY)
             elif reuse == UNVERIFIABLE:
                 out[a.old] = Decision(UNVERIFIABLE, HELD_HISTORY)
-            elif reuse == NAME_REUSED:
-                out[a.old] = Decision(INACTIVE, NAME_REUSED)
             elif skeleton(old_local) in others:
+                # Another ACTIVE identity is called this now (by skeleton).
                 out[a.old] = Decision(INACTIVE, COLLISION)
+            elif reuse == NAME_REUSED:
+                # ...or some other identity was, or a retired one still is.
+                out[a.old] = Decision(INACTIVE, NAME_REUSED)
             else:
                 out[a.old] = Decision(ACTIVE, target=target)
     return out
@@ -469,8 +472,10 @@ def prepare(cfg: Any, report: Any, *, write: bool) -> AliasView:
                     # next pre-pass settles that (`ROW_RAISE_FLOOR`) first.
                     break
         if state == "ok":
+            # Cleared only by its own success: a failure this pass never got to
+            # (an earlier one stopped it) keeps its first-seen time.
             for old in list(LAST_TOMBSTONE_ERRORS):
-                if old not in errors:
+                if old in store.tombstones:
                     del LAST_TOMBSTONE_ERRORS[old]
         for old, err in errors.items():
             since = LAST_TOMBSTONE_ERRORS.get(old, {}).get("since") or utc_ts()

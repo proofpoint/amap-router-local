@@ -213,7 +213,7 @@ M = [
   [T + 'AnotherIdentityTests.test_an_unserved_identity_with_the_same_skeleton_collides']),
  ('O2 a reused name is not checked', AL,
   '            elif reuse == NAME_REUSED:\n', '            elif False:\n',
-  [T + 'AnotherIdentityTests.test_a_reused_name_never_retargets']),
+  [T + 'AnotherIdentityTests.test_a_retired_holder_counts']),
  ('O3 retired identities are not consulted', AL,
   '            for e in rest:\n                try:\n                    hist = parse_names(e)\n',
   '            for e in [x for x in rest if x.state == "active"]:\n                try:\n                    hist = parse_names(e)\n',
@@ -238,6 +238,22 @@ M = [
   '    allowed = _PENDING_KEYS_V1 if doc["v"] == 1 else _PENDING_KEYS_V2\n',
   '    allowed = _PENDING_KEYS_V2\n',
   [T + 'ReviewRoundTwoTests.test_a_version_1_record_with_later_members_is_damaged']),
+ # -- review round 3 ----------------------------------------------------------------
+ ('O9 a direct pinned target is not mapped after a flip', OB,
+  '    out = dict(now)\n', '    out = {}\n',
+  [T + 'ReviewRoundThreeTests.test_a_direct_pinned_target_survives_a_domain_flip']),
+ ('O10 no history means no name', AL,
+  '                past = hist if hist is not None else [e.name]\n',
+  '                past = hist if hist is not None else []\n',
+  [T + 'ReviewRoundThreeTests.test_another_identity_without_history_holds_by_its_current_name']),
+ ('O11 past names compared exactly', AL,
+  '                if skeleton(old_local) in {skeleton(n) for n in past}:\n',
+  '                if old_local in past:\n',
+  [T + 'ReviewRoundThreeTests.test_a_past_name_blocks_by_skeleton_too']),
+ ('O12 an untried failure is forgotten', AL,
+  '                if old in store.tombstones:\n                    del LAST_TOMBSTONE_ERRORS[old]\n',
+  '                if old not in errors:\n                    del LAST_TOMBSTONE_ERRORS[old]\n',
+  [T + 'ReviewRoundThreeTests.test_an_earlier_tombstone_error_keeps_its_first_seen_time']),
 ]
 
 def _red(r) -> bool:
