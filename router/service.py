@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
+from . import generations, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
 from .config import RouterConfig
 from .config import ConfigError, load
 from .status import StatusTracker, render_discovery
@@ -107,7 +107,8 @@ def registry_report(cfg: RouterConfig) -> "registry_mod.Report":
 
 
 def run_once(cfg: RouterConfig, transport: Any = _LOAD,
-             report: Optional["registry_mod.Report"] = None) -> Dict[str, Dict[str, int]]:
+             report: Optional["registry_mod.Report"] = None,
+             gen_keys: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, int]]:
     """Drain every configured instance's outbound/ once. Returns
     `{instance_name: drain_summary}` for logging/tests.
 
@@ -138,24 +139,42 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
         transport = start_transport(cfg)
     if report is None:
         report = registry_report(cfg)
+    if gen_keys is None:
+        # Every instance's generation is resolved (begun, fenced or held)
+        # BEFORE any instance drains, so a sender drained first never places
+        # into a recipient root that has been replaced this poll.
+        report, gen_keys = generations.apply(cfg, report)
     # Under a registry every resolved instance's private state is keyed by
-    # its logical_id from here on (`registry.keyed_config`).
-    cfg = registry_mod.keyed_config(cfg, report)
+    # its logical_id from here on (`registry.keyed_config`), and its
+    # generation-scoped state by its current generation.
+    cfg = generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys)
     summary: Dict[str, Dict[str, int]] = {}
     for name in sorted(cfg.instances):
         if report.state != "off" and name not in report.resolved:
             continue  # held by the registry (`registry_report` says why)
+        root_held = False
         try:
             result = outbound.drain_instance(cfg, name, transport=transport)
+        except generations.GenerationHeld as e:
+            # The instance's root no longer checks out against its
+            # generation: NOTHING more is done on its side this poll, the
+            # outcome consume included. The next pre-pass decides.
+            logger.warning("instance %r held for this poll: %s", name, e)
+            result = {"instance_errored": 1}
+            root_held = True
         except Exception:
             logger.exception(
                 "error draining instance %r — isolated, continuing with "
                 "the next instance", name,
             )
             result = {"instance_errored": 1}
-        if cfg.instances[name].peer_root is not None:
+        if cfg.instances[name].peer_root is not None and not root_held:
             try:
-                result.update(outcomes.consume_instance(cfg, name))
+                result.update(outbound.with_pinned_root(
+                    cfg, name, outcomes.consume_instance))
+            except generations.GenerationHeld as e:
+                logger.warning("instance %r: outcomes not consumed this poll: %s", name, e)
+                result = {**result, "peer_outcome_errored": 1}
             except Exception:
                 logger.exception(
                     "error consuming delivery outcomes for instance %r — "
@@ -223,11 +242,18 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
         # The no-plugin call keeps its exact shape (`run_once(cfg)`), so a
         # router without a plugin runs precisely the code it ran before.
         report = registry_report(cfg)
+        report, gen_keys = generations.apply(cfg, report)
         tracker.record_registry(report.to_doc() if report.state != "off" else None)
         if report.state == "off":
             summary = run_once(cfg) if transport is _LOAD else run_once(cfg, transport)
         else:
-            summary = run_once(cfg, transport, report)
+            summary = run_once(cfg, transport, report, gen_keys)
+            try:
+                tracker.record_generations(generations.status_doc(
+                    generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys),
+                    report))
+            except Exception:
+                logger.exception("error reading generations for status — isolated")
     except Exception:
         logger.exception(
             "error running a full poll — isolated, continuing the loop"

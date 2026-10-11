@@ -53,7 +53,7 @@ class TestWriteOrderWithAttachments(RouterTestCase):
         att = _va(b"attachment bytes")
         calls = []
 
-        def recording_write_agent_visible(root, target_path, data):
+        def recording_write_agent_visible(root, target_path, data, **kw):
             calls.append(str(target_path))
             return real_write_agent_visible(root, target_path, data)
 
@@ -98,7 +98,7 @@ class TestWriteOrderWithAttachments(RouterTestCase):
             order.append("publish_blobs")
             return real_publish(*args, **kwargs)
 
-        def recording_write_agent_visible(root, target_path, data):
+        def recording_write_agent_visible(root, target_path, data, **kw):
             order.append("write_agent_visible")
             return real_write_agent_visible(root, target_path, data)
 
@@ -121,7 +121,7 @@ class TestWriteOrderWithAttachments(RouterTestCase):
         cfg = self.make_config({"alice": ["bob"], "bob": ["alice"]})
         att = _va(b"pre-notice-crash bytes")
 
-        def failing_write_agent_visible(root, target_path, data):
+        def failing_write_agent_visible(root, target_path, data, **kw):
             if "notices/" in str(target_path) and "messages" not in str(target_path):
                 raise OSError("simulated failure writing the notice")
             return real_write_agent_visible(root, target_path, data)

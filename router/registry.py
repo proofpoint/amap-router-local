@@ -335,8 +335,14 @@ HELD_NAME_SHAPE = "name_shape"
 #: be mapped back to instances without it, so nothing drains until the
 #: operator restores `registry_dir` or drains/migrates that state.
 HELD_STRANDED = "registry_state_without_registry"
-#: The directories under a logical_id whose entries mean work in flight.
+#: The directories under a logical_id whose entries mean work in flight
+#: (`pending/` in the pre-generation layout).
 _IN_FLIGHT_DIRS = ("pending", "dsn-pending")
+#: The same inside each generation (`router/generations.py`).
+_GEN_IN_FLIGHT_DIRS = ("pending", "inflight")
+#: Files under a logical_id that are registry state in themselves: a
+#: generation chain, or a migration journal, cannot be read without it.
+_REGISTRY_FILES = ("generations.json", "migration.json")
 
 #: `state_dir` entries that are this router's own, never an instance's: the
 #: seq floor's directory and the status file (compared casefolded, for a
@@ -474,7 +480,17 @@ def stranded_state(state_dir: Path) -> List[str]:
             continue
         if not is_lid_dir:
             continue
-        for sub in _IN_FLIGHT_DIRS:
+        if any(_present(Path(e.path) / f) for f in _REGISTRY_FILES):
+            out.append(e.name)
+            continue
+        subs = list(_IN_FLIGHT_DIRS)
+        try:
+            subs += [os.path.join(g.name, sub) for g in os.scandir(e.path)
+                     if g.name.startswith("gen-") for sub in _GEN_IN_FLIGHT_DIRS]
+        except OSError:
+            out.append(e.name)
+            continue
+        for sub in subs:
             try:
                 if any(c.name.endswith(".json") for c in os.scandir(os.path.join(e.path, sub))):
                     out.append(e.name)

@@ -20,7 +20,8 @@ from unittest import mock
 from router import binding, deliver as deliver_mod, outbound, outcomes, registry, service
 from router.config import HELD_REPORT_MISSING
 from router.tests.helpers import (
-    RouterTestCase, list_notices, notices_dir, read_json, result_path, write_request,
+    RouterTestCase, adopt_test_markers, gen_state, keyed_for_poll, list_notices, notices_dir, read_json,
+    result_path, write_request,
 )
 from router.tests.peer_helpers import addr, list_peer_notices, make_peer_config, write_outcome
 
@@ -72,6 +73,7 @@ class _Fleet(RouterTestCase):
         self.seq = 2
         self.put()
         self.cfg = replace(plain, registry_dir=self.reg)
+        adopt_test_markers(self.cfg)
         service._REGISTRY_LOGGED.clear()
 
     # -- the registry ---------------------------------------------------
@@ -118,8 +120,7 @@ class _Fleet(RouterTestCase):
             log.disabled = False
 
     def keyed(self):
-        return registry.keyed_config(self.cfg, registry.report_for(
-            self.reg, self.state_dir, self.cfg.instances))
+        return keyed_for_poll(self.cfg)
 
     def recipient_side(self, name):
         """Every file a delivery to `name` could create: its trees, and its
@@ -131,13 +132,14 @@ class _Fleet(RouterTestCase):
         return sorted(out)
 
     def pending(self, sender, req_id):
-        return self.state_dir / LIDS[sender] / outbound.PENDING_DIR / f"{req_id}.json"
+        return gen_state(self.state_dir, LIDS[sender]) / outbound.PENDING_DIR / f"{req_id}.json"
 
     def assertRetained(self, sender, req_id):
         outbox = self.cfg.instances[sender].outbox_root
         self.assertTrue((outbox / f"req-{req_id}.json").is_file(), "the request was consumed")
         self.assertFalse(result_path(self.cfg, sender, req_id).exists(), "a Result was written")
-        self.assertFalse((self.state_dir / LIDS[sender] / "results" / f"{req_id}.json").exists())
+        self.assertFalse((gen_state(self.state_dir, LIDS[sender]) / "results"
+                          / f"{req_id}.json").exists())
 
     def result(self, sender, req_id):
         return read_json(result_path(self.cfg, sender, req_id))
@@ -926,7 +928,7 @@ class BarrierAfterReplaceTests(_Fleet):
             self.assertEqual(list_notices(self.cfg, "bravo"), [])
         self.poll()
         self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
-        nid = json.loads((self.state_dir / LIDS["alpha"] / "results" / "00000001.json")
+        nid = json.loads((gen_state(self.state_dir, LIDS["alpha"]) / "results" / "00000001.json")
                          .read_text())["result"]["message_id"]
         self.assertEqual(list_notices(self.cfg, "bravo"), [f"notice-{nid}.json"])
 

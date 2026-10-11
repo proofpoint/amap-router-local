@@ -121,6 +121,7 @@ other instance's.
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import hashlib
 import inspect
@@ -136,9 +137,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from datetime import timedelta
 
 from . import attachments as attachments_mod, binding, firstsight
+from . import generations as generations_mod
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
-from .config import (RouterConfig, address_for, instance_for, instance_state_dir, state_key,
+from .config import (RouterConfig, address_for, gen_state_dir, instance_for, state_key,
                      target_hold, target_known_id, target_logical_id)
 from .util import (
     DEFAULT_READ_CAP,
@@ -198,11 +200,11 @@ def _outbox_dir(cfg: RouterConfig, name: str) -> Path:
 
 
 def _private_result_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return instance_state_dir(cfg, name) / "results" / f"{req_id}.json"
+    return gen_state_dir(cfg, name) / "results" / f"{req_id}.json"
 
 
 def _held_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return instance_state_dir(cfg, name) / "held" / f"req-{req_id}.json"
+    return gen_state_dir(cfg, name) / "held" / f"req-{req_id}.json"
 
 
 class UnreadableRequest(OSError):
@@ -1202,9 +1204,11 @@ def _advance_one(
                 "verdict is kept privately and the new request is refused as %s",
                 name, req_id, result["outcome"], REASON_REQ_ID_REUSED,
             )
-            _write_anchor(cfg, name, req_id, result, req_digest=digest)
+            _write_anchor(cfg, name, req_id, result, req_digest=digest,
+                          transport_req_id=record.get("transport_req_id"))
             return result["outcome"]
-        return _finish(cfg, name, req_id, result, req_digest=digest)
+        return _finish(cfg, name, req_id, result, req_digest=digest,
+                       transport_req_id=record.get("transport_req_id"))
 
     anchor = _private_result_path(cfg, name, req_id)
     return inflight_mod.advance(
@@ -1277,7 +1281,7 @@ def _inflight_report(cfg: RouterConfig, name: str) -> Dict[str, int]:
 
 def _finish(
     cfg: RouterConfig, name: str, req_id: str, result: Dict[str, Any],
-    *, req_digest: Optional[str],
+    *, req_digest: Optional[str], transport_req_id: Optional[str] = None,
 ) -> str:
     """Write the private result (idempotency anchor), then copy it into the
     namespace's `outbound/results/`, then archive the request. Called
@@ -1290,7 +1294,8 @@ def _finish(
     even be read, e.g. it exceeded the read cap). `drain_instance`'s resume
     path compares this against the CURRENT on-disk bytes before ever
     replaying a stored verdict — see `REASON_REQ_ID_REUSED`."""
-    _write_anchor(cfg, name, req_id, result, req_digest=req_digest)
+    _write_anchor(cfg, name, req_id, result, req_digest=req_digest,
+                  transport_req_id=transport_req_id)
     result_bytes = json.dumps(result, sort_keys=True).encode("utf-8")
     _publish_result_and_archive(cfg, name, req_id, result_bytes)
     return result["outcome"]
@@ -1298,10 +1303,16 @@ def _finish(
 
 def _write_anchor(
     cfg: RouterConfig, name: str, req_id: str, result: Dict[str, Any],
-    *, req_digest: Optional[str],
+    *, req_digest: Optional[str], transport_req_id: Optional[str] = None,
 ) -> None:
-    """The private idempotency anchor alone (`_finish`'s first step)."""
+    """The private idempotency anchor alone (`_finish`'s first step). An
+    anchor settled from an in-flight record also records the transport id
+    that record held (`transport_req_id`): proof, whatever the verdict, that
+    the id was allocated, which a successor generation's counter must never
+    go below (`generations.next_counter`)."""
     envelope = {"digest": req_digest, "result": result}
+    if transport_req_id is not None:
+        envelope["transport_req_id"] = transport_req_id
     atomic_write(_private_result_path(cfg, name, req_id),
                  json.dumps(envelope, sort_keys=True).encode("utf-8"),
                  durable_root=cfg.state_dir)
@@ -1385,6 +1396,9 @@ def _publish_result_and_archive(
     archived = False
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
+        # Never publish into, or archive out of, a root the instance's current
+        # generation did not record (see `_verify_own_root`).
+        attachments_mod._check_root(root_fd, generations_mod.expected_root(cfg, name))
         outbox_fd = attachments_mod._mkdir_descend_pinned(
             root_fd, outbox_root.relative_to(root)
         )
@@ -1482,7 +1496,7 @@ def _quarantine_one(
     recipient. See `router/firstsight.py`'s module docstring for what the
     quarantine check does and does not guarantee."""
     first_seen_ts = marker_doc.get("first_seen_ts")
-    q_dir = instance_state_dir(cfg, name) / "quarantine"
+    q_dir = gen_state_dir(cfg, name) / "quarantine"
     try:
         atomic_write(q_dir / filename, raw)
         snap_entry = next(
@@ -1594,7 +1608,7 @@ class PendingDamaged(Exception):
 
 
 def _pending_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
-    return instance_state_dir(cfg, name) / PENDING_DIR / f"{req_id}.json"
+    return gen_state_dir(cfg, name) / PENDING_DIR / f"{req_id}.json"
 
 
 def _str_or_none(v: Any) -> bool:
@@ -2015,7 +2029,7 @@ def _sweep_answered_pending(cfg: RouterConfig, name: str) -> None:
     record leaves a record for a request already answered (and archived, so
     the resume path never sees it again). The private Result is the
     authority: its record goes."""
-    d = instance_state_dir(cfg, name) / PENDING_DIR
+    d = gen_state_dir(cfg, name) / PENDING_DIR
     try:
         names = [p.name for p in d.iterdir() if p.name.endswith(".json")]
     except (FileNotFoundError, NotADirectoryError):
@@ -2029,7 +2043,7 @@ def _sweep_answered_pending(cfg: RouterConfig, name: str) -> None:
 def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
     """Every pending request of `name`, for status.json: what is held, on
     whom, and why. A damaged record is listed as such."""
-    d = instance_state_dir(cfg, name) / PENDING_DIR
+    d = gen_state_dir(cfg, name) / PENDING_DIR
     try:
         names = sorted(p.name for p in d.iterdir() if p.name.endswith(".json"))
     except (FileNotFoundError, NotADirectoryError):
@@ -2050,7 +2064,84 @@ def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _pin_own_root(cfg: RouterConfig, name: str) -> Tuple[RouterConfig, Optional[int]]:
+    """Under a registry: open `name`'s root ONCE (`O_NOFOLLOW`), check that
+    descriptor is the directory its current generation recorded, and return
+    a view of `cfg` in which every path of that instance (root, outbox,
+    inbox, peer tree) goes THROUGH that descriptor (`/proc/self/fd/<fd>/…`,
+    which resolves to the opened directory wherever it has been moved). So
+    first sight, the listing, every read, the publish and the archive all
+    act on the verified directory: a root replaced after this check is never
+    read or written by this drain. The caller closes the descriptor.
+    Without a registry: `(cfg, None)`, unchanged."""
+    expected = generations_mod.expected_root(cfg, name)
+    if expected is None:
+        return cfg, None
+    inst = cfg.instances[name]
+    if not os.path.isdir(generations_mod.PINNED_PREFIX):
+        raise generations_mod.GenerationHeld(
+            generations_mod.HELD_CONNECTOR_UNVERIFIED,
+            f"registry mode needs {generations_mod.PINNED_PREFIX} (Linux /proc) to pin "
+            "an instance's root; it is not available here")
+    try:
+        fd = os.open(str(inst.root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise generations_mod.GenerationHeld(
+            generations_mod.HELD_CONNECTOR_UNVERIFIED,
+            f"{name!r}: the root cannot be opened: {type(e).__name__}") from None
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != expected:
+            raise generations_mod.GenerationHeld(
+                generations_mod.HELD_CONNECTOR_UNVERIFIED,
+                f"{name!r}: the root was replaced since this poll's generation check")
+        pinned = Path(f"{generations_mod.PINNED_PREFIX}{fd}")
+    except BaseException:
+        os.close(fd)
+        raise
+
+    def through(p: Optional[Path]) -> Optional[Path]:
+        return None if p is None else pinned / p.relative_to(inst.root)
+    view_inst = dataclasses.replace(
+        inst, root=pinned, inbox_root=through(inst.inbox_root),
+        outbox_root=through(inst.outbox_root), peer_root=through(inst.peer_root))
+    instances = dict(cfg.instances)
+    instances[name] = view_inst
+    return dataclasses.replace(cfg, instances=instances), fd
+
+
+def with_pinned_root(cfg: RouterConfig, name: str,
+                     fn: Callable[[RouterConfig, str], Any]) -> Any:
+    """`fn(view, name)` on `_pin_own_root`'s view: anything that reads or
+    writes inside an instance's root (the outcome consume, as the drain)
+    does it through the verified descriptor. Raises `GenerationHeld` when
+    the root does not check out; without a registry, `fn(cfg, name)`."""
+    view, fd = _pin_own_root(cfg, name)
+    try:
+        return fn(view, name)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def drain_instance(
+    cfg: RouterConfig, name: str,
+    *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
+    cold_policy: Optional[ColdPolicy] = None,
+    transport: Optional[inflight_mod.TransportPort] = None,
+) -> Dict[str, int]:
+    """See `_drain_instance`. Under a registry the drain runs on the view
+    `_pin_own_root` returns, so it can only act on the verified root."""
+    view, fd = _pin_own_root(cfg, name)
+    try:
+        return _drain_instance(view, name, deliver_backend=deliver_backend,
+                               cold_policy=cold_policy, transport=transport)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _drain_instance(
     cfg: RouterConfig, name: str,
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
     cold_policy: Optional[ColdPolicy] = None,
@@ -2104,6 +2195,9 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # open for exactly one poll. `record_first_sight` is idempotent after the
     # first call — it never re-snapshots, because that would move the
     # quarantine line forward over whatever appeared since.
+    # Under a registry `drain_instance` has already pinned this instance's
+    # root and checked it against the current generation's (`_pin_own_root`):
+    # every path below goes through that descriptor.
     marker_doc, first_sight = firstsight.record_first_sight(cfg, name)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)
 
@@ -2260,6 +2354,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                         cfg, name, req_id, json.dumps(fresh, sort_keys=True).encode("utf-8"),
                     )
                     reused += 1
+                    generations_mod.record_reuse(cfg, name)
                     outcomes["rejected"] += 1
             elif (cfg.registry_dir is not None
                   and _pending_path(cfg, name, req_id).exists()):

@@ -72,13 +72,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import firstsight as firstsight_mod
+from . import generations as generations_mod
 from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
 from . import registry as registry_mod
 from . import status as status_mod
-from .config import (MODE_NAMESPACE, RouterConfig, address_for, derive_matrix,
-                     instance_state_dir, state_key)
+from .config import (MODE_NAMESPACE, RouterConfig, StateKeyUnresolved, address_for,
+                     derive_matrix, gen_key, instance_state_dir, state_key)
 from .util import utc_ts
 
 #: One message body, for display. Larger bodies render truncated with a note
@@ -144,6 +145,17 @@ HOST_FACTS_MEANINGS = ("ok", "failed", "cannot_run", "declined")
 PHASE_CONTAINER = "router-container"   # running, network none, restart policy, mounts
 PHASE_ROUTER_HEALTH = "router-health"  # status.json freshness, from their side
 
+
+
+def _seen(cfg: RouterConfig, name: str) -> bool:
+    """Whether `name` has a first-sight marker in its generation-scoped state
+    (`config.gen_key`). An instance whose generation is not resolved has
+    none to show."""
+    try:
+        key = gen_key(cfg, name)
+    except StateKeyUnresolved:
+        return False
+    return firstsight_mod.read_marker(cfg.state_dir, name, state_key=key) is not None
 
 def _parse_ts(value: Any) -> Optional[datetime]:
     """An ISO-8601 `...Z` timestamp, or `None` for anything unparseable —
@@ -415,7 +427,8 @@ def gather(
     if cfg.registry_dir is not None:
         report = registry_mod.report_for(
             cfg.registry_dir, cfg.state_dir, cfg.instances, persist=False)
-        cfg = registry_mod.keyed_config(cfg, report)
+        cfg = generations_mod.keyed(registry_mod.keyed_config(cfg, report),
+                                    generations_mod.peek(cfg, report))
         held = dict(report.held or {})
     names = sorted(cfg.instances)
     status_doc = status_mod.read(cfg.state_dir) or {}
@@ -437,8 +450,7 @@ def gather(
             continue
         per_instance[name] = {
             "held": None,
-            "seen": firstsight_mod.read_marker(cfg.state_dir, name,
-                                               state_key=state_key(cfg, name)) is not None,
+            "seen": _seen(cfg, name),
             "mode": inst.mode,
             "peer_lane": inst.peer_root is not None,
             "address": address_for(name, cfg.fleet_domain),

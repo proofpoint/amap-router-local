@@ -282,3 +282,49 @@ def stage_outbound_sidecars(
 
 def inbound_sidecar_dir(cfg: RouterConfig, name: str, notice_id: str) -> Path:
     return notices_dir(cfg, name) / f"{notice_id}.attachments"
+
+
+# --- generations (router/generations.py) ---------------------------------
+
+def gen_state(state_dir: Path, logical_id: str) -> Path:
+    """`state_dir/<logical_id>/gen-<current>/`: where an identity's
+    generation-scoped state lives under a registry, after its first poll."""
+    from router import generations
+    doc = generations.read_doc(Path(state_dir), logical_id)
+    assert doc is not None, f"{logical_id} has no generations yet (no poll has run)"
+    return generations.gen_dir(Path(state_dir), logical_id, doc["current"])
+
+
+def keyed_for_poll(cfg: RouterConfig):
+    """`cfg` keyed exactly as a poll keys it: a fresh registry report, the
+    generation pre-pass applied (it may begin a generation), then both the
+    state keys and the generation keys attached. For tests that drive
+    `drain_instance` directly under a registry."""
+    from router import generations, registry
+    report = registry.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances)
+    report, keys = generations.apply(cfg, report)
+    return generations.keyed(registry.keyed_config(cfg, report), keys)
+
+
+def adopt_test_markers(cfg: RouterConfig) -> None:
+    """Move each resolved identity's pre-made first-sight marker (written by
+    the config helpers, in the pre-generation layout) into a first
+    generation begun for it, as an operator's adoption would. Test setup
+    only: it lets a fixture keep its "already first-sighted" instances under
+    the generation layout."""
+    import os
+    from router import generations, registry
+    report = registry.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
+                                 persist=False)
+    for name, entry in (report.resolved or {}).items():
+        lid = entry.logical_id
+        marker = cfg.state_dir / lid / "first-seen.json"
+        if not marker.exists() or generations.read_doc(cfg.state_dir, lid) is not None:
+            continue
+        gen = generations.begin(cfg.state_dir, name, lid, generations.binding_of(entry),
+                                generations.root_identity(cfg.instances[name].root),
+                                generations.REASON_FIRST)
+        gdir = generations.gen_dir(cfg.state_dir, lid, gen)
+        gdir.mkdir(parents=True, exist_ok=True)
+        (gdir / "first-sight.taken").write_text("adopted")
+        os.rename(marker, gdir / "first-seen.json")

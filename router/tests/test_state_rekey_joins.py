@@ -18,6 +18,7 @@ from pathlib import Path
 from router import (binding, config as config_mod, console, exposure, inflight, outbound,
                     outcomes, registry, reset, service)
 from router.config import ConfigError, load_obj
+from router.tests import helpers
 from router.tests.helpers import RouterTestCase, read_json, result_path, write_request
 from router.tests.peer_helpers import addr, list_peer_notices, make_peer_config, write_outcome
 from router.util import format_utc_ts, parse_utc_ts, utc_ts
@@ -60,14 +61,14 @@ class _Migrated(RouterTestCase):
         self.reg.mkdir()
         self.put(["a", "b"])
         self.cfg = replace(self.plain, registry_dir=self.reg)
+        helpers.adopt_test_markers(self.cfg)
         service._REGISTRY_LOGGED.clear()
 
     def put(self, names, seq=3):
         (self.reg / registry.SNAPSHOT).write_text(json.dumps(snapshot(names, seq)))
 
     def keyed(self):
-        report = registry.report_for(self.reg, self.state_dir, self.cfg.instances)
-        return registry.keyed_config(self.cfg, report)
+        return helpers.keyed_for_poll(self.cfg)
 
     def lid_dir(self, n):
         return self.state_dir / LIDS[n]
@@ -238,7 +239,7 @@ class QuarantineJoinTests(RouterTestCase):
         with self.assertLogs("amap_router_local"):
             service.run_once(cfg, None)     # first sight: snapshot
             service.run_once(cfg, None)     # the snapshotted request is quarantined
-        q = self.state_dir / LIDS["c"] / "quarantine"
+        q = helpers.gen_state(self.state_dir, LIDS["c"]) / "quarantine"
         self.assertTrue(q.is_dir() and any(q.iterdir()), "nothing quarantined under the lid")
         self.assertFalse((self.state_dir / "c").exists())
 

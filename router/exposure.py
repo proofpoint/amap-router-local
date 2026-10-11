@@ -72,7 +72,7 @@ from typing import Any, Dict, Optional, Set
 from . import firstsight as firstsight_mod
 from . import attachments as attachments_mod
 from . import binding
-from .config import RouterConfig, router_address, state_key
+from .config import RouterConfig, gen_key, router_address, state_key
 from .util import format_utc_ts, parse_utc_ts
 
 logger = logging.getLogger("amap_router_local.exposure")
@@ -94,7 +94,7 @@ def _window(cfg: RouterConfig, sender: str, now: datetime) -> datetime:
     ignored (the first-sight marker is router-private; a corrupt one is a bug
     to log, not a reason to widen the window)."""
     start = now - timedelta(seconds=cfg.sender_exposure_window_seconds)
-    doc = firstsight_mod.read_marker(cfg.state_dir, sender, state_key=state_key(cfg, sender))
+    doc = firstsight_mod.read_marker(cfg.state_dir, sender, state_key=gen_key(cfg, sender))
     if doc is not None:
         first_seen = parse_utc_ts(doc.get("first_seen_ts"))
         if first_seen is not None and first_seen > start:

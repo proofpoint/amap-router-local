@@ -31,7 +31,7 @@ class TestWriteOrder(RouterTestCase):
         cfg = self.make_config({"alice": ["bob"], "bob": ["alice"]})
         calls = []
 
-        def recording_write_agent_visible(root, target_path, data):
+        def recording_write_agent_visible(root, target_path, data, **kw):
             calls.append(str(target_path))
             return real_write_agent_visible(root, target_path, data)
 
@@ -54,7 +54,7 @@ class TestWriteOrder(RouterTestCase):
     def test_failure_on_notice_write_leaves_no_notice(self):
         cfg = self.make_config({"alice": ["bob"], "bob": ["alice"]})
 
-        def failing_write_agent_visible(root, target_path, data):
+        def failing_write_agent_visible(root, target_path, data, **kw):
             if "inbound/notices/" in str(target_path):
                 raise OSError("simulated failure writing the notice")
             return real_write_agent_visible(root, target_path, data)

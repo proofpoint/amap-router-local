@@ -431,6 +431,7 @@ class ServiceTests(helpers.RouterTestCase):
         # The operator's migration: alpha's private state moves from its name
         # to its logical_id (README, "Moving private state under a registry").
         (self.cfg.state_dir / "alpha").rename(self.cfg.state_dir / ALPHA_LID)
+        helpers.adopt_test_markers(self.cfg)
         service._REGISTRY_LOGGED.clear()
 
     def test_only_resolved_instances_are_drained(self):
@@ -484,6 +485,10 @@ class ServiceTests(helpers.RouterTestCase):
     def test_no_registry_means_no_registry_key_and_everything_drains(self):
         from dataclasses import replace
         cfg = replace(self.cfg, registry_dir=None)
+        # No registry state is left behind: a generation chain without its
+        # registry is stranded state (test_held_local's stranded case).
+        import shutil
+        shutil.rmtree(self.cfg.state_dir / ALPHA_LID)
         tracker = StatusTracker(interval_s=5.0)
         summary = service.poll_once(cfg, tracker, None)
         self.assertNotIn("registry", tracker.to_doc())

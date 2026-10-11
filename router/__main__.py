@@ -1,5 +1,5 @@
 """router/__main__.py — CLI entry point:
-`python3 -m router --config PATH {once|run|peers|status|provision|reset} ...`
+`python3 -m router --config PATH {once|run|peers|status|provision|reset|generation} ...`
 
   once [--json]                 drain every configured instance's outbound/ exactly once, then exit.
                                  --json prints the per-instance drain summary to stdout as
@@ -23,12 +23,20 @@
                                  router/reset.py); never deletes the mailbox roots themselves, so no
                                  sandbox relaunch is needed. clears the first-sight marker, so the next poll re-snapshots
                                  afterward. Refuses without `--yes`; `--dry-run` previews and removes nothing.
+                                 Under a registry it never deletes a generation: it fences the current
+                                 one and begins the next (router/generations.py).
+  generation new NAME --reason TEXT [--dry-run]
+                                 under a registry: fence NAME's current generation and begin the next
+                                 (for a connector counter reset the router cannot see). Needs the router
+                                 stopped (the drain lock is fail-fast); --dry-run prints the plan and
+                                 writes nothing.
 
 `--config PATH` is required for every subcommand. Logging goes to stderr
 only. Stdlib only throughout.
 
 Exit codes: 0 ok; 1 status-missing, provision-refused, or
-reset-refused (unknown instance, namespace escape, or missing --yes); 2 config error.
+reset-refused (unknown instance, namespace escape, or missing --yes), or
+generation-refused; 2 config error.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ import sys
 from pathlib import Path
 
 from .config import ConfigError, load
+from .generations import OperatorRefused, operator_new
 from .lock import LockHeldError, acquire as acquire_lock
 from .peers import render_peers, render_peers_json
 from .provision import ProvisionError, format_env, format_report, provision, report
@@ -123,6 +132,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="print exactly what would be removed; remove nothing",
     )
+
+    p_gen = sub.add_parser("generation", help="operator verbs on an instance's generations "
+                                              "(under a registry)")
+    gen_sub = p_gen.add_subparsers(dest="gen_command", required=True)
+    p_gen_new = gen_sub.add_parser(
+        "new", help="fence the current generation and begin the next")
+    p_gen_new.add_argument("name", help="instance name, as in config.instances")
+    p_gen_new.add_argument("--reason", required=True,
+                           help="why (written to the instance's audit log)")
+    p_gen_new.add_argument("--dry-run", action="store_true",
+                           help="print the plan; take no lock and write nothing")
 
     return parser
 
@@ -439,6 +459,15 @@ def main(argv=None) -> int:
             return 1
         for summary in summaries:
             print(_render_reset_summary(summary))
+        return 0
+
+    if args.command == "generation":
+        try:
+            plan = operator_new(cfg, args.name, args.reason, dry_run=args.dry_run)
+        except OperatorRefused as e:
+            print(f"router: generation new: refused: {e}", file=sys.stderr)
+            return 1
+        print(json.dumps(plan, sort_keys=True))
         return 0
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover — argparse prevents this

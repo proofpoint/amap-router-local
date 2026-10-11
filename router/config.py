@@ -496,6 +496,10 @@ class RouterConfig:
     #: `state_keys` by `registry.keyed_config`, never by a config file; None
     #: means no report was attached, which under a registry fails closed.
     registry_report: Any = field(default=None, compare=False)
+    #: Per poll, under a registry: instance name -> its CURRENT generation's
+    #: directory relative to `state_dir` (`<logical_id>/gen-<g>`), set by the
+    #: generation pre-pass (`router/generations.py`), never by a config file.
+    gen_keys: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -571,9 +575,23 @@ def target_hold(cfg: "RouterConfig", name: str) -> Optional[str]:
     report = cfg.registry_report
     if report is None:
         return HELD_REPORT_MISSING
-    if name in (report.resolved or {}):
-        return None
-    return (report.held or {}).get(name, "not_registered")
+    if name not in (report.resolved or {}):
+        return (report.held or {}).get(name, "not_registered")
+    # Resolved: its current generation must still vouch for the root a
+    # placement would write through (router/generations.py).
+    # A root replaced since the poll's pre-pass holds here, BEFORE anything
+    # is placed, so the request goes pending instead of failing.
+    from . import generations as generations_mod
+    try:
+        expected = generations_mod.expected_root(cfg, name)
+        if expected is None:
+            return None
+        seen = generations_mod.root_identity(cfg.instances[name].root)
+    except (LookupError, generations_mod.GenerationHeld):
+        return generations_mod.HELD_RECIPIENT_UNRESOLVED
+    if (seen["st_dev"], seen["st_ino"]) != expected:
+        return generations_mod.HELD_RECIPIENT_ROOT
+    return None
 
 
 def target_logical_id(cfg: "RouterConfig", name: str) -> Optional[str]:
@@ -599,8 +617,34 @@ def target_known_id(cfg: "RouterConfig", name: str) -> Optional[str]:
 
 
 def instance_state_dir(cfg: "RouterConfig", name: str) -> Path:
-    """`state_dir/<state_key>`: where `name`'s private state lives."""
+    """`state_dir/<state_key>`: where `name`'s PER-IDENTITY private state
+    lives (ledgers, audit, outcomes, DSN intents)."""
     return cfg.state_dir / state_key(cfg, name)
+
+
+def gen_key(cfg: "RouterConfig", name: str) -> str:
+    """The directory, relative to `cfg.state_dir`, holding `name`'s
+    GENERATION-scoped state: anchors, in-flight records and the transport
+    counter, pending deliveries, quarantine, held copies and the
+    first-sight marker (`router/generations.py`).
+
+    Without a registry: the instance's own name, exactly as before. Under a
+    registry: its current generation as THIS POLL's pre-pass resolved it,
+    and nothing else; an instance without one raises `StateKeyUnresolved`
+    (it is held), never falling back to the logical_id or the name."""
+    key = cfg.gen_keys.get(name)
+    if key is not None:
+        return key
+    if cfg.registry_dir is not None:
+        raise StateKeyUnresolved(
+            f"{name!r} has no current generation this poll (held); no generation "
+            "state is read or written for it")
+    return name
+
+
+def gen_state_dir(cfg: "RouterConfig", name: str) -> Path:
+    """`state_dir/<gen_key>`: where `name`'s generation-scoped state lives."""
+    return cfg.state_dir / gen_key(cfg, name)
 
 
 def address_for(name: str, fleet_domain: Optional[str] = None) -> str:
