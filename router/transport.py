@@ -288,7 +288,9 @@ class HopFsOps(Protocol):
         durable on return;
       * `rename_noreplace`: both directories, destination first; there is
         no fallback to link-then-unlink;
-      * `remove_pinned`: the directory, so the removal is durable on return;
+      * `remove_pinned`: the directory, even when the name was already
+        missing (an earlier remover's fsync may have failed), so the removal
+        is durable on return;
       * `fsync_file`, `fsync_dir`: exactly what they say."""
 
     #: This implementation's "committed not yet" result (above).

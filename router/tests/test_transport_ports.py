@@ -82,6 +82,7 @@ class HopFsOpsShapeTests(unittest.TestCase):
                        "whether or not this call created the directory",
                        "no fallback to link-then-unlink",
                        "returns its root fd UNPUBLISHED", "It never renames",
+                       "even when the name was already missing",
                        "then publishes it with `rename_noreplace`"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, doc)
