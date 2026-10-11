@@ -167,6 +167,29 @@ RenameResult = Literal["moved", "src_gone", "dst_exists"]
 #: raises `FileNotFoundError`; any other failure propagates as its own
 #: `OSError` and is never folded into a kind.
 EntryKind = Literal["file", "dir", "other"]
+#: `open_stage_dir`'s sides: the writer-private, 0700 stage directory of
+#: `"up"` (the upstream writer, `<gen>/up/stage/`) or `"down"` (the
+#: downstream writer, `<gen>/down/stage/`), where `tree_fd` is a generation
+#: tree; or `"intake"`, where `tree_fd` is one host intake directory and the
+#: stage is its `.stage/`. One `"intake"` value serves every host intake:
+#: each has its own `.stage/`, and the binding tells them apart.
+#:
+#: Checked BEFORE anything is opened, each raising `ValueError`: an unknown
+#: side, and a side that disagrees with `tree_fd`'s binding (`"up"`/`"down"`
+#: need a registered generation tree, `"intake"` a registered host intake).
+#: Otherwise `"intake"` on a generation tree would quietly create
+#: `<gen>/.stage/`, a stage no writer recovers from.
+#:
+#: A missing stage directory is created 0700 through the durable mkdir
+#: (unconditional parent fsync). An existing one must pass a non-following
+#: fstat: a real directory, owned by the calling writer's uid, mode exactly
+#: 0700. Anything else raises and is never repaired or chmodded. The
+#: intermediate `<gen>/up/` or `<gen>/down/` (the single-owner 0750 marker
+#: directory) and the deploy-created 2750 intake directory already exist;
+#: `open_stage_dir` creates neither. The fd is pinned once and reused for
+#: the writer's lifetime: a second call for the same (tree, side) returns an
+#: fd to the same inode.
+StageSide = Literal["up", "down", "intake"]
 
 
 @runtime_checkable
@@ -201,12 +224,23 @@ class HopFsOps(Protocol):
         fd-number reuse the binding is stale, so the live descriptor is
         verified against the recorded identity (device and inode, plus the
         directory, owner and mode checks);
-      * the tag is a canonical layout role (`outbound`, `results`,
-        `notices`, ...) in its tree scope: stable across restarts and
-        reopening, never derived from fd numbers, random traversal ids or
-        an opening's spelling, and unique among destinations sharing one
-        stage directory. An admitted tree keeps its FINAL role; a
-        temporary `.adm-*` name never reaches a tag;
+      * the tag is a canonical layout role in its tree scope (`outbound`,
+        `results` and `notices` are examples, not the list): stable across
+        restarts and reopening, never derived from fd numbers, random
+        traversal ids or an opening's spelling, and unique among
+        destinations sharing one stage directory;
+      * a destination that is one of many per-item directories (a
+        request's attachment directory, a per-candidate directory, a
+        notice's attachment directory) has a tag that INCLUDES THE ITEM'S
+        IDENTITY. A fixed tag shared by such directories would let one
+        item's stale-stage cleanup unlink another item's interrupted
+        commit, so it looked committed without its recovery ever running;
+      * tags match `[A-Za-z0-9._-]+`, never contain `/`, and
+        `<tag>.<name>` fits in NAME_MAX;
+      * an admitted tree keeps its FINAL role: the role of each directory
+        in it is derived RELATIVE TO THE `stage_tree` ROOT (the tree's own
+        layout), so the temporary parent name never enters it and the
+        implementation never needs to learn the final name;
       * an unknown, closed, mismatched, conflicting or ambiguous binding
         RAISES before anything is staged or published. Ambiguous means two
         bindings resolving to the same directory (`st_dev`, `st_ino`) with
@@ -218,7 +252,9 @@ class HopFsOps(Protocol):
 
     `open_regular_pinned` returns the file's bytes (`bytes`, exactly) once
     it is committed (link count 1), and `self.NOT_YET` for a commit still
-    in flight (link count 2). Any other link count raises. `NOT_YET` is one
+    in flight (link count 2), ON A HOP-TREE BINDING ONLY. Outside a hop
+    tree (an agent-writable volume), a link count of 2 raises like any
+    other count but 1. Any other link count raises. `NOT_YET` is one
     object per implementation, never a `bytes` instance and identical
     across calls; the two runtimes do not import each other, so there is
     no shared sentinel. Callers dispatch three ways, and the third is a
@@ -233,7 +269,22 @@ class HopFsOps(Protocol):
             ...
 
     Reading anything else as "not yet" would turn a bug (a `None`, a `str`,
-    a forgotten return) into a silent retry forever."""
+    a forgotten return) into a silent retry forever.
+
+    THE BARRIER EACH METHOD OWES before it returns (a failed barrier raises):
+
+      * `mkdir_and_pin`: fsyncs the parent, whether or not this call created
+        the directory (an earlier creator's fsync may have failed);
+      * `stage_tree`: the subtree is built complete and fsynced bottom-up,
+        published by a no-replace rename, then the parent is fsynced;
+      * `commit_durable`: the stage file and stage dir, then the
+        destination dir, then the stage dir again after the unlink (above);
+      * `replace_durable`: the file before its rename, the directory after:
+        durable on return;
+      * `rename_noreplace`: both directories, destination first; there is
+        no fallback to link-then-unlink;
+      * `remove_pinned`: the directory, so the removal is durable on return;
+      * `fsync_file`, `fsync_dir`: exactly what they say."""
 
     #: This implementation's "committed not yet" result (above).
     NOT_YET: object
@@ -245,7 +296,7 @@ class HopFsOps(Protocol):
     def stage_tree(self, parent_fd: int, staging_name: str) -> int: ...
     def commit_durable(self, stage_dirfd: int, dest_dirfd: int, name: str,
                        data: bytes, mode: int) -> CommitResult: ...
-    def open_stage_dir(self, tree_fd: int, side: str) -> int: ...
+    def open_stage_dir(self, tree_fd: int, side: StageSide) -> int: ...
     def replace_durable(self, dir_fd: int, name: str, data: bytes, mode: int) -> None: ...
     def rename_noreplace(self, src_fd: int, src: str,
                          dst_fd: int, dst: str) -> RenameResult: ...

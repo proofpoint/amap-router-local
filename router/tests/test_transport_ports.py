@@ -57,6 +57,34 @@ class HopFsOpsShapeTests(unittest.TestCase):
         self.assertIn("type(r) is bytes", doc)
         self.assertIn("protocol violation, never a skip", doc)
 
+    def test_the_stage_sides(self):
+        self.assertEqual(typing.get_args(transport.StageSide), ("up", "down", "intake"))
+        hints = typing.get_type_hints(transport.HopFsOps.open_stage_dir)
+        self.assertEqual(hints["side"], transport.StageSide)
+        import router.transport as mod
+        src = inspect.getsource(mod)
+        block = src[src.index("#: `open_stage_dir`'s sides"):src.index("StageSide = ")]
+        block = " ".join(block.replace("#:", " ").split())
+        for phrase in ("BEFORE anything is opened", "disagrees with `tree_fd`'s binding",
+                       "mode exactly 0700", "never repaired or chmodded",
+                       "creates neither", "same inode", "One `\"intake\"` value"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, block)
+
+    def test_per_item_tags_final_role_hop_only_not_yet_and_barriers(self):
+        doc = " ".join(transport.HopFsOps.__doc__.split())
+        for phrase in ("examples, not the list", "INCLUDES THE ITEM'S IDENTITY",
+                       "`[A-Za-z0-9._-]+`", "NAME_MAX",
+                       "RELATIVE TO THE `stage_tree` ROOT",
+                       "ON A HOP-TREE BINDING ONLY",
+                       "a link count of 2 raises like any other count but 1",
+                       "THE BARRIER EACH METHOD OWES",
+                       "whether or not this call created the directory",
+                       "no fallback to link-then-unlink",
+                       "published by a no-replace rename"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, doc)
+
     def test_entry_kind_precisions(self):
         import router.transport as mod
         src = inspect.getsource(mod)
