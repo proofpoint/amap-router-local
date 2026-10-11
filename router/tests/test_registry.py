@@ -340,7 +340,7 @@ class ConfigTests(helpers.RouterTestCase):
                     self._load({"registry_dir": bad})
 
     def test_an_instance_name_with_a_trailing_newline_is_refused(self):
-        """RL-02a-F2: `$` with `match` accepted "alpha\\n"."""
+        """`$` with `match` accepted "alpha\\n"."""
         root = self.tmp / "nl"
         root.mkdir()
         with self.assertRaises(config_mod.ConfigError):
