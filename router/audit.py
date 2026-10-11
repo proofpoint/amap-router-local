@@ -61,7 +61,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .util import utc_ts
 
@@ -83,12 +83,15 @@ class AuditError(Exception):
     notice is written) or is logged and skipped (a reset line)."""
 
 
-def audit_dir(state_dir: Path, instance: str) -> Path:
-    return Path(state_dir) / instance / AUDIT_DIR
+def audit_dir(state_dir: Path, instance: str, *, state_key: Optional[str] = None) -> Path:
+    """`state_dir/<key>/audit`. `state_key` is the directory the instance's
+    private state lives under (`config.state_key`); omitted, its name. The
+    line's `instance` field is always the NAME."""
+    return Path(state_dir) / (state_key or instance) / AUDIT_DIR
 
 
-def log_path(state_dir: Path, instance: str) -> Path:
-    return audit_dir(state_dir, instance) / AUDIT_FILENAME
+def log_path(state_dir: Path, instance: str, *, state_key: Optional[str] = None) -> Path:
+    return audit_dir(state_dir, instance, state_key=state_key) / AUDIT_FILENAME
 
 
 def build_line(event: str, instance: str, fields: Dict[str, Any]) -> bytes:
@@ -104,22 +107,25 @@ def build_line(event: str, instance: str, fields: Dict[str, Any]) -> bytes:
     return (json.dumps(doc, sort_keys=True) + "\n").encode("utf-8")
 
 
-def append(state_dir: Path, instance: str, event: str, **fields: Any) -> None:
+def append(state_dir: Path, instance: str, event: str, *,
+           state_key: Optional[str] = None, **fields: Any) -> None:
     """Append one line for `event` to `instance`'s log. See the module
     docstring for the write discipline and the symlink refusal."""
-    append_bytes(state_dir, instance, build_line(event, instance, fields))
+    append_bytes(state_dir, instance, build_line(event, instance, fields),
+                 state_key=state_key)
 
 
-def append_bytes(state_dir: Path, instance: str, line: bytes) -> None:
+def append_bytes(state_dir: Path, instance: str, line: bytes, *,
+                 state_key: Optional[str] = None) -> None:
     """`append` for a line already built by `build_line` — the form
     `deliver.py` uses so the line is composed before the commit sequence
     and written at its place in it."""
-    inst_dir = Path(state_dir) / instance
+    inst_dir = Path(state_dir) / (state_key or instance)
     if inst_dir.is_symlink():
         raise AuditError(
             f"refusing to append to the audit log: {inst_dir} is a symlink"
         )
-    d = audit_dir(state_dir, instance)
+    d = audit_dir(state_dir, instance, state_key=state_key)
     d.mkdir(parents=True, exist_ok=True)
     fd = os.open(
         str(d / AUDIT_FILENAME),
@@ -132,12 +138,13 @@ def append_bytes(state_dir: Path, instance: str, line: bytes) -> None:
         os.close(fd)
 
 
-def read_events(state_dir: Path, instance: str) -> List[Dict[str, Any]]:
+def read_events(state_dir: Path, instance: str, *,
+                state_key: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every line of `instance`'s log, parsed, in file order. `[]` when
     there is no log yet. A line that does not parse is returned as
     `{"_unparsed": "<text>"}` rather than dropped — a reader of an audit log
     must never be shown fewer records than exist."""
-    path = log_path(state_dir, instance)
+    path = log_path(state_dir, instance, state_key=state_key)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:

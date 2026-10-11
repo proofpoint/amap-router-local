@@ -76,12 +76,18 @@ from .config import ALLOW_ANY, RouterConfig
 _NOTICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
-def ledger_dir(state_dir: Path, recipient_instance: str) -> Path:
-    return state_dir / recipient_instance / "delivered"
+def ledger_dir(state_dir: Path, recipient_instance: str, *,
+               state_key: Optional[str] = None) -> Path:
+    """`state_dir/<key>/delivered`. `state_key` names the directory the
+    instance's private state lives under (its logical_id under a registry,
+    `config.state_key`); omitted, it is the instance name, as before."""
+    return state_dir / (state_key or recipient_instance) / "delivered"
 
 
-def ledger_path(state_dir: Path, recipient_instance: str, notice_id: str) -> Path:
-    return ledger_dir(state_dir, recipient_instance) / f"notice-{notice_id}.json"
+def ledger_path(state_dir: Path, recipient_instance: str, notice_id: str, *,
+                state_key: Optional[str] = None) -> Path:
+    return ledger_dir(state_dir, recipient_instance, state_key=state_key) / \
+        f"notice-{notice_id}.json"
 
 
 def record_delivery(
@@ -131,7 +137,8 @@ def record_delivery(
 
 
 def read_ledger_record(
-    state_dir: Path, sender_instance: str, in_reply_to: str
+    state_dir: Path, sender_instance: str, in_reply_to: str, *,
+    state_key: Optional[str] = None,
 ) -> Optional[dict]:
     """Like `resolve_binding`, but returns the FULL ledger record (not just
     `from_instance`) when it resolves — used by `outbound.py` to carry the
@@ -140,7 +147,7 @@ def read_ledger_record(
     `resolve_binding`: `None` on anything not cleanly resolved."""
     if not isinstance(in_reply_to, str) or not _NOTICE_ID_RE.match(in_reply_to):
         return None
-    path = ledger_path(state_dir, sender_instance, in_reply_to)
+    path = ledger_path(state_dir, sender_instance, in_reply_to, state_key=state_key)
     if not path.is_file():
         return None
     try:
@@ -152,7 +159,8 @@ def read_ledger_record(
     return doc
 
 
-def resolve_binding(state_dir: Path, sender_instance: str, in_reply_to: str) -> Optional[str]:
+def resolve_binding(state_dir: Path, sender_instance: str, in_reply_to: str, *,
+                    state_key: Optional[str] = None) -> Optional[str]:
     """Resolve an agent-supplied `in_reply_to` to the instance that
     originally sent the notice `sender_instance` claims to be replying to.
 
@@ -166,7 +174,7 @@ def resolve_binding(state_dir: Path, sender_instance: str, in_reply_to: str) -> 
     `in_reply_to` fails the charset check, no ledger record exists for it
     under `sender_instance`, or the record is unreadable/malformed.
     """
-    doc = read_ledger_record(state_dir, sender_instance, in_reply_to)
+    doc = read_ledger_record(state_dir, sender_instance, in_reply_to, state_key=state_key)
     if doc is None:
         return None
     from_instance = doc.get("from_instance")

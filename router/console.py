@@ -75,8 +75,10 @@ from . import firstsight as firstsight_mod
 from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
+from . import registry as registry_mod
 from . import status as status_mod
-from .config import MODE_NAMESPACE, RouterConfig, address_for, derive_matrix
+from .config import (MODE_NAMESPACE, RouterConfig, address_for, derive_matrix,
+                     instance_state_dir, state_key)
 from .util import utc_ts
 
 #: One message body, for display. Larger bodies render truncated with a note
@@ -242,7 +244,7 @@ def _ledger_records(cfg: RouterConfig, recipient: str) -> List[Dict[str, Any]]:
     """Every ledger record filed under `recipient`, newest first. Router-
     private and therefore the authority for who sent what to whom."""
     out: List[Dict[str, Any]] = []
-    d = binding.ledger_dir(cfg.state_dir, recipient)
+    d = binding.ledger_dir(cfg.state_dir, recipient, state_key=state_key(cfg, recipient))
     try:
         entries = sorted(p.name for p in os.scandir(d))
     except OSError:
@@ -265,7 +267,7 @@ def _outcome_for(cfg: RouterConfig, recipient: str, notice_id: str) -> Optional[
     """The latest recorded outcome for one notice, or `None` if none was
     recorded. Router-private; the outcome FILE the daemon wrote is long
     unlinked by the time this runs."""
-    d = cfg.state_dir / recipient / "outcomes"
+    d = instance_state_dir(cfg, recipient) / "outcomes"
     latest: Tuple[str, str] = ("", "")
     try:
         entries = list(os.scandir(d))
@@ -404,6 +406,12 @@ def gather(
     body_cap: int = BODY_DISPLAY_CAP,
 ) -> Dict[str, Any]:
     """Everything the page shows, read fresh. Stores nothing."""
+    # Under a registry, private state is keyed by logical_id: read the keys
+    # the way a poll would, without persisting the seq floor. A held
+    # instance keeps its name, which shows what is (or is not) there.
+    if cfg.registry_dir is not None:
+        cfg = registry_mod.keyed_config(cfg, registry_mod.report_for(
+            cfg.registry_dir, cfg.state_dir, cfg.instances, persist=False))
     names = sorted(cfg.instances)
     status_doc = status_mod.read(cfg.state_dir) or {}
     host = load_host_facts(host_facts_path)
@@ -412,12 +420,14 @@ def gather(
     for name in names:
         inst = cfg.instances[name]
         per_instance[name] = {
-            "seen": firstsight_mod.read_marker(cfg.state_dir, name) is not None,
+            "seen": firstsight_mod.read_marker(cfg.state_dir, name,
+                                               state_key=state_key(cfg, name)) is not None,
             "mode": inst.mode,
             "peer_lane": inst.peer_root is not None,
             "address": address_for(name, cfg.fleet_domain),
             "status": (status_doc.get("instances") or {}).get(name) or {},
-            "events": audit_mod.read_events(cfg.state_dir, name),
+            "events": audit_mod.read_events(cfg.state_dir, name,
+                                            state_key=state_key(cfg, name)),
         }
 
     # Traffic and messages both come off the ledger, which is router-private

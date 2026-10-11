@@ -60,6 +60,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from . import config as config_mod
 from .config import RouterConfig
 from .util import atomic_write, utc_ts
 
@@ -84,18 +85,21 @@ class FirstSightError(Exception):
     config doesn't know."""
 
 
-def marker_path(state_dir: Path, name: str) -> Path:
-    return state_dir / name / FIRST_SEEN_FILENAME
+def marker_path(state_dir: Path, name: str, *, state_key: Optional[str] = None) -> Path:
+    """`state_dir/<key>/first_seen.json`; `state_key` is `config.state_key`,
+    omitted it is `name`."""
+    return state_dir / (state_key or name) / FIRST_SEEN_FILENAME
 
 
-def read_marker(state_dir: Path, name: str) -> Optional[Dict[str, Any]]:
+def read_marker(state_dir: Path, name: str, *,
+                state_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Read + parse the router-private first-sight marker for `name`.
     `None` (never raises) if it doesn't exist, isn't readable, or isn't
     valid JSON — a corrupt/missing marker is treated exactly like "never
     seen" (fail closed: an ambiguous marker means `drain_instance` takes a
     fresh snapshot and quarantines what it finds, rather than draining an
     outbox it cannot vouch for)."""
-    path = marker_path(state_dir, name)
+    path = marker_path(state_dir, name, state_key=state_key)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -109,8 +113,8 @@ def read_marker(state_dir: Path, name: str) -> Optional[Dict[str, Any]]:
     return doc
 
 
-def has_been_seen(state_dir: Path, name: str) -> bool:
-    return read_marker(state_dir, name) is not None
+def has_been_seen(state_dir: Path, name: str, *, state_key: Optional[str] = None) -> bool:
+    return read_marker(state_dir, name, state_key=state_key) is not None
 
 
 def quarantined_filenames(marker_doc: Dict[str, Any]) -> Set[str]:
@@ -199,12 +203,13 @@ def record_first_sight(cfg: RouterConfig, name: str) -> Tuple[Dict[str, Any], bo
             f"first sight: {name!r} names no configured instance "
             f"(known: {sorted(cfg.instances)})"
         )
-    existing = read_marker(cfg.state_dir, name)
+    key = config_mod.state_key(cfg, name)
+    existing = read_marker(cfg.state_dir, name, state_key=key)
     if existing is not None:
         return existing, False
 
     inst = cfg.instances[name]
-    legacy = _read_json(cfg.state_dir / name / LEGACY_APPROVAL_FILENAME)
+    legacy = _read_json(cfg.state_dir / key / LEGACY_APPROVAL_FILENAME)
     if legacy is not None and isinstance(legacy.get("outbox_snapshot"), list):
         doc = dict(legacy)
         doc["schema"] = SCHEMA
@@ -239,7 +244,7 @@ def record_first_sight(cfg: RouterConfig, name: str) -> Tuple[Dict[str, Any], bo
             "a fresh req_id.", name, len(snapshot),
         )
     atomic_write(
-        marker_path(cfg.state_dir, name),
+        marker_path(cfg.state_dir, name, state_key=key),
         json.dumps(doc, sort_keys=True).encode("utf-8"),
     )
     return doc, True

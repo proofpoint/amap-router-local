@@ -245,7 +245,8 @@ from . import firstsight
 from . import audit as audit_mod
 from . import inflight as inflight_mod
 from . import lock as lock_mod
-from .config import RouterConfig
+from . import registry as registry_mod
+from .config import RouterConfig, instance_state_dir, state_key
 from .util import (
     NamespaceEscapeError, open_child_pinned, verify_namespace_containment,
 )
@@ -422,6 +423,23 @@ def _enumerate_mailbox_removals(
     return paths
 
 
+def _keyed(cfg: RouterConfig, names: Iterable[str]) -> RouterConfig:
+    """`cfg` with each named instance's state key resolved. Under a registry
+    a reset touches `state_dir/<logical_id>/`, so it reads the registry as a
+    poll does; a named instance the registry HOLDS has no resolved state
+    directory and is refused, never reset by its name."""
+    names = [n for n in names if n in cfg.instances]
+    if cfg.registry_dir is None or all(n in cfg.state_keys for n in names):
+        return cfg
+    report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances)
+    held = {n: report.held[n] for n in names if n in (report.held or {})}
+    if held:
+        raise ResetError(
+            f"reset: held by the registry, not reset: {dict(sorted(held.items()))} "
+            "(a held instance's private state is not resolved; see `status`)")
+    return registry_mod.keyed_config(cfg, report)
+
+
 def plan_reset(cfg: RouterConfig, name: str) -> ResetPlan:
     """Inspect (never mutate) what a reset of instance `name` would
     remove. Verifies namespace containment as part of inspection — a
@@ -436,9 +454,11 @@ def plan_reset(cfg: RouterConfig, name: str) -> ResetPlan:
             f"reset: {name!r} names no configured instance (known: {sorted(cfg.instances)})"
         )
     _verify_containment(cfg, name)
+    cfg = _keyed(cfg, [name])
 
     inst = cfg.instances[name]
-    first_seen_marker = firstsight.marker_path(cfg.state_dir, name)
+    first_seen_marker = firstsight.marker_path(cfg.state_dir, name,
+                                               state_key=state_key(cfg, name))
     was_seen = first_seen_marker.is_file()
 
     state_paths: List[Path] = []
@@ -450,7 +470,7 @@ def plan_reset(cfg: RouterConfig, name: str) -> ResetPlan:
     # actually included it) — surviving the reset entirely.
     if first_seen_marker.is_symlink() or first_seen_marker.exists():
         state_paths.append(first_seen_marker)
-    inst_state_dir = cfg.state_dir / name
+    inst_state_dir = instance_state_dir(cfg, name)
     if inst_state_dir.is_dir() and not inst_state_dir.is_symlink():
         try:
             rest = sorted(inst_state_dir.iterdir(), key=lambda p: p.name)
@@ -498,6 +518,7 @@ def plan_resets(cfg: RouterConfig, names: Iterable[str]) -> List[ResetPlan]:
         raise ResetError(
             f"reset: {unknown} names no configured instance (known: {sorted(cfg.instances)})"
         )
+    cfg = _keyed(cfg, names)
     return [plan_reset(cfg, name) for name in names]
 
 
@@ -774,11 +795,12 @@ def _clear_state(cfg: RouterConfig, name: str) -> int:
 
     Returns the count of entries removed (0 on an already-clean or
     symlinked instance dir — idempotent)."""
-    inst_state_dir = cfg.state_dir / name
+    inst_state_dir = instance_state_dir(cfg, name)
     if inst_state_dir.is_symlink() or not inst_state_dir.is_dir():
         return 0
     removed = 0
-    first_seen_marker = firstsight.marker_path(cfg.state_dir, name)
+    first_seen_marker = firstsight.marker_path(cfg.state_dir, name,
+                                               state_key=state_key(cfg, name))
     if first_seen_marker.is_symlink() or first_seen_marker.exists():
         _remove_path(first_seen_marker)
         removed += 1
@@ -805,6 +827,8 @@ def reset_instance(cfg: RouterConfig, name: str) -> Dict[str, Any]:
     Refuses (`ResetError`) if `name` doesn't name a configured instance;
     raises `NamespaceEscapeError` (propagated) on an escaping mailbox
     leaf, in both cases before anything is removed."""
+    if name in cfg.instances:
+        cfg = _keyed(cfg, [name])
     plan = plan_reset(cfg, name)  # validates name; fast, early containment probe
     state_removed = _clear_state(cfg, name)
     mailbox = _empty_mailboxes(cfg, name)
@@ -828,7 +852,7 @@ def reset_instance(cfg: RouterConfig, name: str) -> Dict[str, Any]:
     # never fatal — a reset that succeeded is not undone by a log failure.
     try:
         audit_mod.append(
-            cfg.state_dir, name, audit_mod.EVENT_RESET,
+            cfg.state_dir, name, audit_mod.EVENT_RESET, state_key=state_key(cfg, name),
             was_seen=plan.was_seen,
             state_removed=state_removed,
             mailbox_removed=mailbox["removed"],
@@ -892,6 +916,9 @@ def reset_instances(cfg: RouterConfig, names: Iterable[str]) -> List[Dict[str, A
     except lock_mod.LockHeldError as e:
         raise ResetError(f"reset: {e}") from e
     try:
+        # Under the lock, before anything is removed: a name the registry
+        # holds aborts the whole batch (`_keyed`).
+        cfg = _keyed(cfg, names)
         return [reset_instance(cfg, name) for name in names]
     finally:
         lk.release()

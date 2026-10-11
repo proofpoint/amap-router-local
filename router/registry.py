@@ -37,6 +37,8 @@ import os
 import re
 import stat
 import unicodedata
+import dataclasses
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -278,10 +280,14 @@ def _accepted_seq(state_dir: Path) -> Optional[int]:
     return int(text)
 
 
-def load(directory: Path, state_dir: Path) -> Registry:
+def load(directory: Path, state_dir: Path, *, persist: bool = True) -> Registry:
     """Read, validate, and check `seq` against the highest accepted; persist
     a new highest durably before returning. Raises RegistryUnavailable
-    (RegistryRolledBack for a lower seq); never returns a partial view."""
+    (RegistryRolledBack for a lower seq); never returns a partial view.
+
+    `persist=False` is for a reader that stores nothing (the console): the
+    floor is still READ and a rollback still refused, but it is not written.
+    A drain never passes it."""
     reg = parse(_read_snapshot(directory))
     prior = _accepted_seq(state_dir)
     if prior is not None and reg.seq < prior:
@@ -292,6 +298,8 @@ def load(directory: Path, state_dir: Path) -> Registry:
     # The floor is (re)written durably on EVERY load, equal seq included,
     # before any view built on it is used: a floor that is visible but whose
     # barrier failed is not a floor. Never lowered (the check above).
+    if not persist:
+        return reg
     try:
         atomic_write(seq_path(state_dir), str(reg.seq).encode("ascii"),
                      durable_root=state_dir)
@@ -310,6 +318,47 @@ HELD_UNAVAILABLE = "registry_unavailable"
 HELD_ROLLED_BACK = "registry_rolled_back"
 HELD_NOT_REGISTERED = "not_registered"
 HELD_COLLISION = "skeleton_collision"
+#: The instance has private state under its NAME (`state_dir/<name>/`, from
+#: before the registry) and none under its logical_id: the operator has not
+#: moved it. Draining would start a fresh first-sight snapshot and an empty
+#: reply ledger beside the old ones, so it is held until they do.
+HELD_NOT_MIGRATED = "state_not_migrated"
+#: State exists under BOTH the name and the logical_id. Which is current is
+#: not this router's to guess.
+HELD_STATE_CONFLICT = "state_conflict"
+#: The name is one this router can never key state by under a registry: shaped
+#: like a logical_id, or the name of a `state_dir` entry of its own.
+HELD_NAME_SHAPE = "name_shape"
+
+#: `state_dir` entries that are this router's own, never an instance's: the
+#: seq floor's directory and the status file (compared casefolded, for a
+#: case-insensitive state_dir).
+_OWN_STATE_ENTRIES = frozenset({SEQ_DIR.casefold(), "status.json"})
+_ID_SHAPED = re.compile(r"[0-9a-fA-F]{32}\Z")
+
+
+def _present(path: Path) -> bool:
+    """`lstat` says something is there, in any shape. A failure other than
+    "no such entry" counts as present: unreadable is not proof of absence."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _state_hold(state_dir: Path, name: str, logical_id: str) -> Optional[str]:
+    """Why `name`'s private state cannot yet be keyed by `logical_id`, or None."""
+    if _ID_SHAPED.fullmatch(name) or name.casefold() in _OWN_STATE_ENTRIES:
+        return HELD_NAME_SHAPE
+    legacy = _present(Path(state_dir) / name)
+    if not legacy:
+        return None
+    if _present(Path(state_dir) / logical_id):
+        return HELD_STATE_CONFLICT
+    return HELD_NOT_MIGRATED
 
 
 @dataclass(frozen=True)
@@ -342,7 +391,7 @@ OFF = Report(state="off", resolved={}, held={})
 
 
 def report_for(registry_dir: Optional[Path], state_dir: Path,
-               instances: Iterable[str]) -> Report:
+               instances: Iterable[str], *, persist: bool = True) -> Report:
     """Read the registry (if one is configured) and decide, per configured
     instance, whether it may be drained. Never raises: a registry that
     cannot be used holds every instance."""
@@ -350,7 +399,7 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
     if registry_dir is None:
         return OFF
     try:
-        reg = load(registry_dir, state_dir)
+        reg = load(registry_dir, state_dir, persist=persist)
     except RegistryRolledBack as e:
         return Report(state="rolled_back", code=e.code, detail=e.detail, resolved={},
                       held={n: HELD_ROLLED_BACK for n in names})
@@ -368,10 +417,24 @@ def report_for(registry_dir: Optional[Path], state_dir: Path,
         if n in colliding:
             held[n] = HELD_COLLISION
         elif n in active:
-            resolved[n] = active[n]
+            why = _state_hold(state_dir, n, active[n].logical_id)
+            if why is None:
+                resolved[n] = active[n]
+            else:
+                held[n] = why
         else:
             held[n] = HELD_NOT_REGISTERED
     return Report(state="ok", seq=reg.seq, resolved=resolved, held=held)
+
+
+def keyed_config(cfg: Any, report: Report) -> Any:
+    """`cfg` with `state_keys` set from `report`: every RESOLVED instance's
+    private state is keyed by its logical_id. Unchanged when no registry is
+    configured. A held instance has no key here and is never drained."""
+    if report.state == "off":
+        return cfg
+    keys = {n: e.logical_id for n, e in (report.resolved or {}).items()}
+    return dataclasses.replace(cfg, state_keys=types.MappingProxyType(keys))
 
 
 def state_key(report: Report, name: str) -> str:

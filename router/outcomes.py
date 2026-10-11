@@ -166,6 +166,7 @@ from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
 from . import deliver as deliver_mod
+from . import config as config_mod
 from .config import RouterConfig, address_for
 from .util import atomic_write, utc_ts
 
@@ -250,8 +251,10 @@ _DSN_MEANING = {
 DSN_SUBJECT_PREFIX = "Not delivered: "
 
 
-def record_path(state_dir: Path, recipient: str, tree: str, notice_id: str, outcome: str) -> Path:
-    return state_dir / recipient / "outcomes" / f"{tree}-{notice_id}.{outcome}.json"
+def record_path(state_dir: Path, recipient: str, tree: str, notice_id: str, outcome: str, *,
+                state_key: Optional[str] = None) -> Path:
+    """`state_dir/<key>/outcomes/...`; `state_key` is `config.state_key`."""
+    return state_dir / (state_key or recipient) / "outcomes" / f"{tree}-{notice_id}.{outcome}.json"
 
 
 class _Discard(Exception):
@@ -373,12 +376,14 @@ def _consume_one(
 
     try:
         doc = _parse_outcome(raw, notice_id)
-        record = binding.read_ledger_record(cfg.state_dir, name, notice_id)
+        record = binding.read_ledger_record(cfg.state_dir, name, notice_id,
+                                            state_key=config_mod.state_key(cfg, name))
         if record is None or record.get("tree") != deliver_mod.TREE_PEER:
             raise _Discard("unknown_notice_id",
                            "no peer notice with this id was ever issued to this instance")
         outcome = doc["outcome"]
-        rec_path = record_path(cfg.state_dir, name, deliver_mod.TREE_PEER, notice_id, outcome)
+        rec_path = record_path(cfg.state_dir, name, deliver_mod.TREE_PEER, notice_id, outcome,
+                               state_key=config_mod.state_key(cfg, name))
         if rec_path.exists():
             raise _Discard("duplicate", f"{outcome} already recorded for this notice")
 
@@ -397,6 +402,7 @@ def _consume_one(
         atomic_write(rec_path, json.dumps(stored, sort_keys=True).encode("utf-8"))
         audit_mod.append(
             cfg.state_dir, name, audit_mod.EVENT_OUTCOME_CONSUMED,
+            state_key=config_mod.state_key(cfg, name),
             tree=deliver_mod.TREE_PEER, notice_id=notice_id, outcome=outcome,
             outcome_ts=doc["ts"], detail=doc.get("detail"),
             from_instance=sender, to_instance=name,
@@ -432,6 +438,7 @@ def _consume_one(
         try:
             audit_mod.append(
                 cfg.state_dir, name, audit_mod.EVENT_OUTCOME_DISCARDED,
+                state_key=config_mod.state_key(cfg, name),
                 tree=deliver_mod.TREE_PEER, notice_id=notice_id,
                 cause=d.cause, detail=d.detail,
             )
@@ -479,7 +486,7 @@ def placed_but_denied(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
     say `tree: "peer"`, drops the notice — the router placed nothing it can
     be told was denied. Read from router-private state only; nothing here
     touches an agent-writable directory."""
-    rec_dir = cfg.state_dir / name / "outcomes"
+    rec_dir = config_mod.instance_state_dir(cfg, name) / "outcomes"
     try:
         entries = list(os.scandir(rec_dir))
     except FileNotFoundError:
@@ -508,7 +515,8 @@ def placed_but_denied(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
         doc = latest[nid][1]
         if doc.get("outcome") not in DSN_OUTCOMES:
             continue
-        ledger = binding.read_ledger_record(cfg.state_dir, name, nid)
+        ledger = binding.read_ledger_record(cfg.state_dir, name, nid,
+                                            state_key=config_mod.state_key(cfg, name))
         if ledger is None or ledger.get("tree") != deliver_mod.TREE_PEER:
             continue
         out.append({

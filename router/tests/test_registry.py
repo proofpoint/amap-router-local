@@ -21,6 +21,7 @@ from router.status import StatusTracker
 from router.tests import helpers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "registry"
+ALPHA_LID = "72a96bbced1aa04414517b96ebbb6179"  # snapshot.json's active entry
 #: amap-host 3f28c782b41df5b701e259c535732e859553ddef:tests/fixtures/skeleton_vectors.json
 SKELETON_SOURCE_SHA = "3f28c782b41df5b701e259c535732e859553ddef"
 SKELETON_SHA256 = "7d4088dc1686aa8daa9a65a4a820ec118bf214ebd51ed112880a81a2955a6d1c"
@@ -427,6 +428,9 @@ class ServiceTests(helpers.RouterTestCase):
         (self.reg / registry.SNAPSHOT).write_text(json.dumps(doc))
         from dataclasses import replace
         self.cfg = replace(self.make_config({"alpha": [], "beta": []}), registry_dir=self.reg)
+        # The operator's migration: alpha's private state moves from its name
+        # to its logical_id (README, "Moving private state under a registry").
+        (self.cfg.state_dir / "alpha").rename(self.cfg.state_dir / ALPHA_LID)
         service._REGISTRY_LOGGED.clear()
 
     def test_only_resolved_instances_are_drained(self):

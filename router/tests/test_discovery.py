@@ -829,7 +829,10 @@ class ReplyBindingSurvivesARootChangeTests(_Tree):
         import inspect
         from router.binding import read_ledger_record
         params = list(inspect.signature(read_ledger_record).parameters)
-        self.assertEqual(params, ["state_dir", "sender_instance", "in_reply_to"])
+        # `state_key` is not a root: it names the directory UNDER state_dir
+        # (the logical_id under a registry), which survives a root change by
+        # construction.
+        self.assertEqual(params, ["state_dir", "sender_instance", "in_reply_to", "state_key"])
 
 
 class PeersJsonAbsentIsNotEmptyTests(_Tree):

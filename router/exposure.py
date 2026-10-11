@@ -72,7 +72,7 @@ from typing import Any, Dict, Optional, Set
 from . import firstsight as firstsight_mod
 from . import attachments as attachments_mod
 from . import binding
-from .config import RouterConfig, router_address
+from .config import RouterConfig, router_address, state_key
 from .util import format_utc_ts, parse_utc_ts
 
 logger = logging.getLogger("amap_router_local.exposure")
@@ -94,7 +94,7 @@ def _window(cfg: RouterConfig, sender: str, now: datetime) -> datetime:
     ignored (the first-sight marker is router-private; a corrupt one is a bug
     to log, not a reason to widen the window)."""
     start = now - timedelta(seconds=cfg.sender_exposure_window_seconds)
-    doc = firstsight_mod.read_marker(cfg.state_dir, sender)
+    doc = firstsight_mod.read_marker(cfg.state_dir, sender, state_key=state_key(cfg, sender))
     if doc is not None:
         first_seen = parse_utc_ts(doc.get("first_seen_ts"))
         if first_seen is not None and first_seen > start:
@@ -103,7 +103,8 @@ def _window(cfg: RouterConfig, sender: str, now: datetime) -> datetime:
 
 
 def _scan_ledger(
-    state_dir: Path, sender: str, start: datetime, end: datetime,
+    state_dir: Path, sender: str, start: datetime, end: datetime, *,
+    key: Optional[str] = None,
 ) -> "tuple[Set[str], Optional[datetime]]":
     """Source 1. Returns `(ledgered_ids, latest_external_ts_in_window)`.
     Every record's id is collected regardless of window (source 2 needs
@@ -111,7 +112,7 @@ def _scan_ledger(
     records move the timestamp."""
     ids: Set[str] = set()
     latest: Optional[datetime] = None
-    ledger = binding.ledger_dir(state_dir, sender)
+    ledger = binding.ledger_dir(state_dir, sender, state_key=key)
     try:
         entries = list(os.scandir(ledger))
     except OSError:
@@ -121,7 +122,7 @@ def _scan_ledger(
         if not m:
             continue
         ids.add(m.group(1))
-        record = binding.read_ledger_record(state_dir, sender, m.group(1))
+        record = binding.read_ledger_record(state_dir, sender, m.group(1), state_key=key)
         if not record or record.get("origin") != ORIGIN_EXTERNAL:
             continue
         ts = parse_utc_ts(record.get("ts"))
@@ -197,7 +198,8 @@ def assess(cfg: RouterConfig, sender: str, *, now: str) -> Optional[Dict[str, An
     if asserted_by is None or end is None:
         return None
     start = _window(cfg, sender, end)
-    ledgered, latest = _scan_ledger(cfg.state_dir, sender, start, end)
+    ledgered, latest = _scan_ledger(cfg.state_dir, sender, start, end,
+                                    key=state_key(cfg, sender))
     try:
         assessed, latest_unledgered = _scan_unledgered_notices(cfg, sender, ledgered, start, end)
     except OSError as e:

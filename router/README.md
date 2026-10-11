@@ -1097,6 +1097,9 @@ under `registry.held` with a reason:
 | `skeleton_collision` | two active entries' names fold to the same skeleton; both are held, never guessed between |
 | `registry_unavailable` | the snapshot is absent, unreadable, not a regular file, too large, not strict JSON, an unknown schema token, or a field of the wrong shape (`registry.code` says which) |
 | `registry_rolled_back` | the snapshot's `seq` is lower than one already accepted |
+| `state_not_migrated` | the instance has private state under its name and none under its logical_id (below) |
+| `state_conflict` | private state exists under both its name and its logical_id; which is current is not guessed |
+| `name_shape` | the name can never key state under a registry: 32 hex digits (either case), or `registry` / `status.json` (this router's own `state_dir` entries) |
 
 Without `registry_dir`, nothing changes. The router never writes the
 registry. It checks the schema token, `seq` and the fields it uses, and
@@ -1116,8 +1119,54 @@ the next snapshot is accepted whatever its `seq`, a rolled-back one
 included. Restoring or recreating `state_dir` is therefore an operator
 event to check against the registry, not a routine restart.
 
-Private state is still keyed by instance name in this version; moving it to
-`state_dir/<logical_id>/` is a separate, guarded step.
+### Private state is keyed by logical_id
+
+Under a registry, every resolved instance's private state lives at
+`state_dir/<logical_id>/`, not `state_dir/<name>/`: the first-sight marker,
+the reply ledger (`delivered/`), private results, held and quarantined
+requests, in-flight counters, outcome records and the audit log. Renaming an
+identity (an operator override in the registry) therefore moves none of it.
+Without `registry_dir`, everything stays keyed by name, exactly as before.
+
+**Moving private state under a registry is an operator step, and the router
+holds until it is done.** An instance whose `state_dir/<name>` exists (in any
+shape) while `state_dir/<logical_id>` does not is held as
+`state_not_migrated`: draining it would take a fresh first-sight snapshot and
+start an empty reply ledger beside the old one, so earlier notices could no
+longer be replied to. To migrate, with the router stopped:
+
+    mv state_dir/<name> state_dir/<logical_id>
+
+(the logical_id is the instance's entry in the registry snapshot). If both
+exist, the instance is held as `state_conflict` until the operator removes or
+merges one; this router does not choose. An unreadable entry counts as present.
+
+**`reset` follows the same keys.** Under a registry, `reset <name>` reads the
+registry and clears `state_dir/<logical_id>/`. It refuses, removing nothing,
+for an instance the registry holds: a held instance has no resolved state
+directory.
+
+**Names shaped like a logical_id cannot run under a registry.** A static
+instance named with 32 hex digits (either case, for a case-insensitive
+`state_dir`) is refused at config load when `registry_dir` is set, and
+discovery skips such a directory (the host keys its own per-identity
+directories that way; the registry never issues that shape as a name). The
+name rule itself is unchanged without a registry.
+
+**Known limits, recorded rather than fixed here:**
+
+- An instance the registry holds can still be the TARGET of a local delivery
+  from a resolved sender, and that delivery's ledger is written under the
+  held instance's name. Whether a held recipient should receive at all is a
+  separate decision.
+- A name the registry has overridden is `not_registered` until aliases exist:
+  the snapshot's `names` history is not read yet.
+- The casefold incumbency check during discovery still looks for
+  `state_dir/<name>`; under a registry, two registered names that fold
+  together are held as `skeleton_collision` instead.
+- `binding.ledger_dir`, `ledger_path`, `read_ledger_record` and
+  `resolve_binding` (public) take an optional keyword-only `state_key`;
+  omitted, they key by the instance name as before.
 
 ## Approved but NOT BUILT: discovery and the published directory
 

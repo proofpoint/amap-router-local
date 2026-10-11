@@ -161,6 +161,14 @@ ALLOW_ANY = "ALLOW_ANY"
 # component.
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
+#: A name shaped like a logical_id: 32 hex digits, EITHER case. Under a
+#: registry, private state lives at `state_dir/<logical_id>/`, so such a name
+#: would be indistinguishable from an identity's state directory, and on a
+#: case-insensitive filesystem the upper-case spelling folds onto it too.
+#: The host registry refuses to issue one (its `name_shape` rule); this
+#: router refuses to run one under a registry.
+ID_SHAPED_NAME_RE = re.compile(r"[0-9a-fA-F]{32}\Z")
+
 #: Connector ids for `outbound/ext/<id>/outcomes/` — the directories
 #: `outcomes._consume_dir` scans, in this order. The spec ("The Volume
 #: Layout", `outbound/ext/<name>/`) makes `<name>` a stable connector id,
@@ -467,6 +475,11 @@ class RouterConfig:
     #: The host registry's directory, or None for none (`registry_dir` in
     #: the module docstring).
     registry_dir: Optional[Path] = None
+    #: Per poll, under a registry: instance name -> the directory name its
+    #: private state lives under (its logical_id). Empty otherwise, and a
+    #: name absent from it keeps its own name (`state_key`). Set by the
+    #: service from the poll's registry report, never by a config file.
+    state_keys: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -496,6 +509,18 @@ def _transport_plugin(top: Dict[str, Any]) -> Optional[TransportPluginPin]:
     if not (isinstance(sha, str) and _SHA256_HEX_RE.match(sha)):
         raise ConfigError("config.transport_plugin.sha256: expected 64 lowercase hex digits")
     return TransportPluginPin(path=str(path), sha256=sha)
+
+
+def state_key(cfg: "RouterConfig", name: str) -> str:
+    """The directory under `cfg.state_dir` holding `name`'s private state:
+    its logical_id when this poll's registry resolved it, else its own name.
+    Every `state_dir/<instance>` join in the package goes through this."""
+    return cfg.state_keys.get(name, name)
+
+
+def instance_state_dir(cfg: "RouterConfig", name: str) -> Path:
+    """`state_dir/<state_key>`: where `name`'s private state lives."""
+    return cfg.state_dir / state_key(cfg, name)
 
 
 def address_for(name: str, fleet_domain: Optional[str] = None) -> str:
@@ -688,7 +713,7 @@ def _has_state(state_dir: Path, name: str) -> bool:
 
 
 def _discover_instances(
-    instances_dir: Path, selected_json: Path, state_dir: Path
+    instances_dir: Path, selected_json: Path, state_dir: Path, registry: bool = False,
 ) -> Tuple[Dict[str, Dict[str, str]], DiscoveryReport, frozenset]:
     """The instance set, from directories under `instances_dir`, ADMITTED by
     the host's verdict.
@@ -735,6 +760,13 @@ def _discover_instances(
             continue
         if slug.casefold() == ROUTER_LOCAL_PART.casefold():
             skipped[slug] = "this router's own address local-part"
+            continue
+        if registry and ID_SHAPED_NAME_RE.fullmatch(slug):
+            # Under a registry the host keys its own per-identity directories
+            # by logical_id, so a 32-hex directory here is one of those, not a
+            # sandbox slug (and could not be one: the registry refuses to issue
+            # that shape as a name).
+            skipped[slug] = "shaped like a logical_id; under a registry that is not a slug"
             continue
         # CASEFOLD: skip the NEWCOMER, keep the INCUMBENT. `state_dir/<name>/`
         # holds the first-sight marker, the reply ledger and the quarantine,
@@ -909,7 +941,7 @@ def load_obj(
                     f"the host writes"
                 )
         instances_raw, discovery, host_knows = _discover_instances(
-            instances_dir, selected_json, state_dir)
+            instances_dir, selected_json, state_dir, registry="registry_dir" in top)
         # NOT an error when empty. A fleet whose sandboxes have not launched
         # yet, or whose verdict is unreadable, is a fleet with nothing to
         # drain — which `run` handles by draining nothing. Refusing here would
@@ -1292,6 +1324,13 @@ def load_obj(
                     f"config.registry_dir ({registry_dir}) and config.instances.{name}."
                     f"{root_key} ({root}) must not be nested inside one another: an "
                     "agent-reachable registry would let an agent choose identities")
+        shaped = sorted(n for n in instances if ID_SHAPED_NAME_RE.fullmatch(n))
+        if shaped:
+            raise ConfigError(
+                f"config.registry_dir: instance name(s) {shaped} are shaped like a "
+                "logical_id (32 hex digits). Under a registry private state lives at "
+                "state_dir/<logical_id>/, so such a name cannot be told from an "
+                "identity's state; rename the instance")
 
     cfg = RouterConfig(
         state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
