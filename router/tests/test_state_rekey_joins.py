@@ -157,6 +157,42 @@ class ConsoleWithAHeldInstanceTests(_Migrated):
         self.assertEqual(data["messages"], [], "b's ledger was read although b is held")
         self.assertIn("HELD: not_registered", self.page())
 
+    def test_state_conflict(self):
+        (self.state_dir / "b").mkdir()                     # beside b's logical_id dir
+        data = console.gather(self.cfg)
+        self.assertEqual(data["instances"]["b"]["held"], registry.HELD_STATE_CONFLICT)
+        self.assertEqual(data["messages"], [])
+        self.assertIn("HELD: state_conflict", self.page())
+
+    def test_registry_unavailable(self):
+        (self.reg / registry.SNAPSHOT).unlink()
+        data = console.gather(self.cfg)
+        self.assertEqual({n: i["held"] for n, i in data["instances"].items()},
+                         {"a": registry.HELD_UNAVAILABLE, "b": registry.HELD_UNAVAILABLE})
+        self.assertIn("HELD: registry_unavailable", self.page())
+
+    def test_registry_rolled_back_and_the_floor_is_preserved(self):
+        self.put(["a", "b"], seq=9)
+        registry.report_for(self.reg, self.state_dir, ["a"])     # a poll accepts seq 9
+        floor = registry.seq_path(self.state_dir)
+        before = floor.read_bytes()
+        self.put(["a", "b"], seq=3)
+        data = console.gather(self.cfg)
+        self.assertEqual({n: i["held"] for n, i in data["instances"].items()},
+                         {"a": registry.HELD_ROLLED_BACK, "b": registry.HELD_ROLLED_BACK})
+        self.assertIn("HELD: registry_rolled_back", self.page())
+        self.assertEqual(floor.read_bytes(), before, "the console touched the seq floor")
+
+    def test_healthy_twin(self):
+        """No hold: nothing is marked held, and the task is listed."""
+        data = console.gather(self.cfg)
+        self.assertEqual({n: i["held"] for n, i in data["instances"].items()},
+                         {"a": None, "b": None})
+        self.assertIn(self.task_id, [m["notice_id"] for m in data["messages"]])
+        self.assertNotIn("HELD:", self.page())
+        self.assertFalse(registry.seq_path(self.state_dir).exists(),
+                         "the console wrote a seq floor")
+
 
 class ExposureJoinTests(_Migrated):
     """exposure.assess reads the sender's ledger under its logical_id."""
