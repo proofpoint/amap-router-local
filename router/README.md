@@ -1261,11 +1261,38 @@ a held instance holds (below), and so does one whose root was replaced after
 the poll's check: every placement writes through a root descriptor that must
 be the directory the recipient's current generation recorded.
 
-**Not yet built** (later steps): a fenced generation's
-in-flight and pending records are kept and shown in `status.json`
-(`generations.<name>.fenced_work`) but not stepped; the operator verbs that
-adopt or fence pre-generation state are not here yet, so such an instance
-stays held.
+**A fenced generation's work is finished, privately when it must be.** Its
+in-flight records keep advancing under their own transport ids (it never
+allocates a new one), and its pending records replay from their snapshots
+(below). Each publishes its Result only while the root is still the one the
+generation recorded and the live outbox entry is still its request;
+otherwise the verdict stays in that generation (an anchor, nothing published,
+nothing archived). A file such work still owns is neither taken into the new
+generation's first sight nor drained by it. What fenced generations still
+hold is shown as `generations.<name>.fenced_work`.
+
+**Pending requests carry a private snapshot.** Before a pending record is
+written, the raw request and every verified attachment are written, durably,
+into `pending/<req_id>.<nonce>.snap/`; the record names them by digest and
+nonce, and every replay re-verifies them (`snapshot_damaged` holds). In the
+current generation the live entry is still read every poll: gone, the work
+continues and its Result is published; changed (a reused id), the ORIGINAL
+request is still the one delivered, it settles privately, and the changed
+file is then refused as `req_id_reused`. A version-1 record (no snapshot)
+still needs its live entry, and in a fenced generation it holds
+(`legacy_snapshot_missing`).
+
+**`recipient_generation_changed`.** A placement begun for a recipient (its
+target `delivering`) records the recipient's generation. If that generation
+has changed by the replay, the target HOLDS: it is never continued into the
+new generation's root, and nothing answers it automatically, so the sender
+sees only "not yet". Runbook: look at the recipient's old generation; if the
+notice was placed there, the operator decides whether that counts (the
+request can be answered by fencing the SENDER's generation, or left held);
+if it was not, the request stays held until the operator acts.
+
+**Not yet built** (later steps): the operator verbs that adopt or fence
+pre-generation state, so such an instance stays held; aliases.
 
 ### Held local delivery
 

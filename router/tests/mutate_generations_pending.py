@@ -1,0 +1,148 @@
+"""Single-rule mutants for pending snapshots and fenced generations
+(`router/tests/test_generations_pending.py`), each run against the test that
+names it.
+
+Run from the repository root:
+
+    AMAP_SPEC_REPO=<amap-spec checkout> python3 -B router/tests/mutate_generations_pending.py
+
+Same discipline as `mutate_reuse.py`: one rule per mutant, bytecode caching
+OFF and `__pycache__` cleared before each run, the file restored after;
+every named test must pass unmutated first, and a mutant is RED only when
+unittest reports a FAILURE of the named test (an ERROR is printed and is
+not red). Exit 0 only when every mutant turns every named test red. Not a
+test module itself (its name keeps it out of discovery).
+"""
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+P = "router.tests.test_generations_pending."
+H = "router.tests.test_held_local."
+OB = "router/outbound.py"
+
+M = [
+ # -- the snapshot -----------------------------------------------------------
+ ('S1 the record is written before its snapshot', OB,
+  '    snapshot = _write_snapshot(cfg, name, req_id, raw, list(attachments or []))\n',
+  '    snapshot = {"nonce": secrets.token_hex(16), "attachments": []}\n',
+  [P + 'SnapshotTests.test_the_snapshot_is_written_before_the_record']),
+ ('S2 the snapshot digest is not verified', OB,
+  '    if hashlib.sha256(raw).hexdigest() != rec["request_sha256"]:\n        raise SnapshotDamaged("request digest")\n',
+  '',
+  [P + 'SnapshotTests.test_a_damaged_snapshot_holds_and_places_nothing']),
+ ('S3 a version-2 record is drained like version 1', OB,
+  '    if rec["v"] == 1:\n        if fenced:\n',
+  '    if True:\n        if fenced:\n',
+  [P + 'SnapshotTests.test_a_vanished_live_entry_continues_from_the_snapshot',
+   H + 'RequestIdentityTests.test_a_changed_request_does_not_change_the_held_work']),
+ ('S4 a changed live entry does not make the settle private', OB,
+  '    private = live or (fenced and not _same_root(cfg, name))\n',
+  '    private = fenced and not _same_root(cfg, name)\n',
+  [H + 'RequestIdentityTests.test_a_changed_request_does_not_change_the_held_work']),
+ ('S5 the snapshot goes before the record', OB,
+  '    _remove_pending(path)\n    _remove_snapshot(cfg, name, rec)\n    return outcome\n',
+  '    _remove_snapshot(cfg, name, rec)\n    _remove_pending(path)\n    return outcome\n',
+  [P + 'SnapshotTests.test_completion_removes_record_then_snapshot']),
+ ('S6 the sweep leaves orphan snapshots', OB,
+  '        if _private_result_path(cfg, name, req_id).is_file():\n            shutil.rmtree(p, ignore_errors=True)\n',
+  '        if False:\n            shutil.rmtree(p, ignore_errors=True)\n',
+  [P + 'SnapshotTests.test_the_snapshot_is_written_before_the_record']),
+ ('S7 a pending request with no live file is never drained', OB,
+  '        for req_id in sorted(set(_pending_ids(cfg, name)) - listed):\n',
+  '        for req_id in []:\n',
+  [P + 'SnapshotTests.test_a_vanished_live_entry_continues_from_the_snapshot']),
+ ('S8 a held reused id is not audited', OB,
+  '    if live and not fenced:\n        generations_mod.note_reuse_pending(cfg, name, req_id)\n', '',
+  [P + 'SnapshotTests.test_a_changed_live_entry_is_audited_held_then_refused']),
+ # -- fenced generations ------------------------------------------------------------
+ ('F1 fenced work is not stepped', OB,
+  '    for view in _fenced_views(cfg, name):\n', '    for view in []:\n',
+  [P + 'FencedTests.test_a_fenced_pending_request_completes_and_is_answered_at_the_same_root',
+   P + 'FencedTests.test_a_fenced_in_flight_record_settles_under_its_own_id']),
+ ('F2 a fenced generation publishes into a replaced root', OB,
+  '    private = live or (fenced and not _same_root(cfg, name))\n',
+  '    private = live\n',
+  [P + 'FencedTests.test_a_fenced_generation_with_a_replaced_root_settles_privately']),
+ ('F3 a fenced version-1 record is drained from the live file', OB,
+  '        if fenced:\n            return _block(cfg, name, req_id, rec, BLOCK_LEGACY_SNAPSHOT_MISSING)\n', '',
+  [P + 'FencedTests.test_a_fenced_version_1_record_holds']),
+ ('F4 first sight takes fenced work\'s files (C1)', 'router/firstsight.py',
+  '                    if e.get("filename") not in excluded]\n', '                    if True]\n',
+  [P + 'FencedTests.test_a_fenced_in_flight_record_settles_under_its_own_id']),
+ ('F5 the current generation drains fenced work\'s files', OB,
+  '        if filename in fenced_owned:\n            continue', '        if False:\n            continue',
+  [P + 'FencedTests.test_a_fenced_in_flight_record_settles_under_its_own_id']),
+ # -- pinned listing --------------------------------------------------------------
+ ('L1 the listing follows a symlinked outbound', OB,
+  '        out_fd = attachments_mod._descend_pinned(root_fd, inst.outbox_root.relative_to(inst.root))\n',
+  '        out_fd = os.open(str(inst.outbox_root), os.O_RDONLY | os.O_DIRECTORY)\n',
+  [P + 'PinnedListingTests.test_a_symlinked_outbound_lists_nothing']),
+ ('L2 first sight is taken through a symlinked outbound', 'router/firstsight.py',
+  '            if kind != "dir":\n                raise FirstSightError(\n',
+  '            if kind != "dir":\n                return None\n                raise FirstSightError(\n',
+  [P + 'PinnedListingTests.test_first_sight_is_never_taken_through_a_symlinked_outbound']),
+ ('L3 no /proc check', OB,
+  '    if not os.path.isdir(generations_mod.PINNED_PREFIX):\n', '    if False:\n',
+  [P + 'PinnedListingTests.test_registry_mode_without_proc_holds']),
+ # -- the recipient ------------------------------------------------------------------
+ ('R1 delivering records no recipient generation', OB,
+  '        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts(),\n                 recipient_gen=_recipient_gen(cfg, t["recipient"]))\n',
+  '        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts())\n',
+  [P + 'RecipientGenerationTests.test_a_begun_placement_holds_when_the_recipient_generation_changes']),
+ ('R2 a changed recipient generation is not held', OB,
+  '            and _recipient_gen(cfg, r) != target["recipient_gen"]:\n',
+  '            and False:\n',
+  [P + 'RecipientGenerationTests.test_a_begun_placement_holds_when_the_recipient_generation_changes']),
+ ('R3 a mid-pass hold fails the recipient', OB,
+  '            held_now.append(r)    # nothing placed for it: it goes pending, below\n',
+  '            failed.append(r)\n',
+  [P + 'RecipientGenerationTests.test_a_root_swapped_mid_pass_goes_pending_not_failed']),
+]
+
+
+def _red(r) -> bool:
+    out = r.stdout + r.stderr
+    return (r.returncode != 0 and "\nFAIL: " in "\n" + out
+            and "FAILED (failures=" in out)
+
+
+def main() -> int:
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    ok = True
+    for d in pathlib.Path("router").rglob("__pycache__"):
+        shutil.rmtree(d, ignore_errors=True)
+    named = sorted({t for *_, tests in M for t in tests})
+    clean = subprocess.run([sys.executable, "-B", "-m", "unittest", *named],
+                           capture_output=True, text=True)
+    if clean.returncode != 0:
+        print("the named tests are not green on unmutated code:\n" + clean.stderr[-2000:])
+        return 1
+    for label, f, old, new, tests in M:
+        path = pathlib.Path(f)
+        orig = path.read_text()
+        if orig.count(old) != 1:
+            print(f"{label}: ANCHOR FOUND {orig.count(old)} TIMES")
+            ok = False
+            continue
+        path.write_text(orig.replace(old, new))
+        for d in pathlib.Path("router").rglob("__pycache__"):
+            shutil.rmtree(d, ignore_errors=True)
+        try:
+            for t in tests:
+                r = subprocess.run([sys.executable, "-B", "-m", "unittest", t],
+                                   capture_output=True, text=True)
+                red = _red(r)
+                ok &= red
+                verdict = "RED" if red else ("ERROR only (not RED)" if r.returncode else "GREEN (survived)")
+                print(f"{label:52s} {t.split('.')[-1][:58]}: {verdict}")
+        finally:
+            path.write_text(orig)
+    print(f"{len(M)} mutants: " + ("ALL RED" if ok else "SOME SURVIVED OR MISSING"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

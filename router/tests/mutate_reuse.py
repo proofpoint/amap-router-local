@@ -20,8 +20,8 @@ R = "router.tests.test_reuse."
 
 M = [
  ('U1 in flight: settle never compares the live entry', 'router/outbound.py',
-  '        if _live_differs(cfg, name, req_id, digest):\n',
-  '        if False:\n',
+  '        if _live_differs(cfg, name, req_id, digest) or (fenced and not _same_root(cfg, name)):\n',
+  '        if fenced and not _same_root(cfg, name):\n',
   [R + 'InflightReuseTests.test_a_reused_id_never_settles_with_the_old_verdict',
    R + 'InflightReuseTests.test_an_oversized_reuse_is_refused_too',
    'router.tests.test_inflight.LifecycleTests.test_the_staged_copy_is_sent_not_the_agents_later_bytes']),

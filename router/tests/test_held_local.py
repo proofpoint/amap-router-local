@@ -410,14 +410,48 @@ class RequestIdentityTests(_Fleet):
         self.poll()
         self.assertTrue(self.pending("alpha", "00000001").is_file())
 
-    def test_a_changed_request_blocks_and_delivers_nothing(self):
+    def test_a_changed_request_does_not_change_the_held_work(self):
+        """A version-2 record carries its own snapshot: when the file under
+        its id changes (a reused id), the ORIGINAL request is still the one
+        delivered, it settles privately (nothing published or archived for
+        it), and the changed file is then refused as req_id_reused."""
         self.make_pending()
+        original = self.cfg.instances["alpha"].outbox_root / "req-00000001.json"
+        sent = json.loads(original.read_text())["draft"]["body_text"]
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="CHANGED")
+        self.recover("not_registered", "bravo")
+        self.poll()
+        notices = list_notices(self.cfg, "bravo")
+        self.assertEqual(len(notices), 1, "the held work was not delivered")
+        spool = json.loads((self.cfg.instances["bravo"].inbox_root / "messages" / notices[0])
+                           .read_text())
+        self.assertEqual(spool["body_text"], sent, "the changed file was delivered")
+        anchor = gen_state(self.state_dir, LIDS["alpha"]) / "results" / "00000001.json"
+        self.assertEqual(json.loads(anchor.read_text())["result"]["outcome"], "accepted")
+        self.assertFalse(self.pending("alpha", "00000001").exists())
+        self.poll()
+        r = self.result("alpha", "00000001")
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "req_id_reused"))
+        self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
+
+    def test_a_changed_request_blocks_a_version_1_record(self):
+        """A version-1 record (no snapshot) still requires the live file to
+        be its request: changed, it blocks and delivers nothing."""
+        self.make_pending()
+        path = self.pending("alpha", "00000001")
+        rec = json.loads(path.read_text())
+        rec["v"] = 1
+        for k in ("snapshot", "source_gen", "from_address"):
+            rec.pop(k, None)
+        for t in rec["targets"]:
+            t.pop("recipient_gen", None)
+        path.write_text(json.dumps(rec))
         write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="CHANGED")
         self.recover("not_registered", "bravo")
         self.poll()
         self.assertRetained("alpha", "00000001")
         self.assertEqual(list_notices(self.cfg, "bravo"), [])
-        rec = json.loads(self.pending("alpha", "00000001").read_text())
+        rec = json.loads(path.read_text())
         self.assertEqual(rec["block"], outbound.BLOCK_REQUEST_CHANGED)
         held = outbound.held_report(self.keyed(), "alpha")
         self.assertEqual(held[0]["block"], outbound.BLOCK_REQUEST_CHANGED)

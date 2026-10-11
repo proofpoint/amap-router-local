@@ -84,6 +84,10 @@ EVENT_DSN_HELD = "dsn_held"
 #: the generation it fenced, the carried transport counter, and the binding
 #: and root it records; an operator's `--reason` as `note`.
 EVENT_GENERATION_MINTED = "generation_minted"
+#: A request under an id whose earlier work is unsettled began to be held
+#: (`state: "held"`), and later was refused as `req_id_reused`
+#: (`state: "refused"`): one line per transition, never per poll.
+EVENT_REUSE_PENDING = "req_id_reused_pending"
 
 
 class AuditError(Exception):

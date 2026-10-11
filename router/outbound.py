@@ -129,10 +129,12 @@ import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from datetime import timedelta
 
@@ -339,21 +341,45 @@ def list_outbound(cfg: RouterConfig, name: str) -> Tuple[List[str], int]:
     `(names, skipped_symlink_count)` so the caller can fold the count into
     its `outbound_skipped_bad_name` tally. Missing `outbound/` -> `([], 0)`,
     not an error."""
-    outbound_dir = _outbox_dir(cfg, name)
-    if not outbound_dir.is_dir():
+    inst = cfg.instances[name]
+    # The directory is reached the way every read reaches it: an O_NOFOLLOW
+    # descent from the root. An `outbound/` that is not a real directory
+    # (a symlink to elsewhere) lists nothing, rather than enumerating a
+    # tree the reads would refuse.
+    root_fd = os.open(str(inst.root), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        out_fd = attachments_mod._descend_pinned(root_fd, inst.outbox_root.relative_to(inst.root))
+    finally:
+        os.close(root_fd)
+    if out_fd is None:
+        try:
+            st = os.lstat(inst.outbox_root)
+        except FileNotFoundError:
+            return [], 0          # missing outbound/: not an error
+        if stat.S_ISDIR(st.st_mode):
+            # A real directory that cannot be opened: a fault, not an empty
+            # outbox. It propagates (the instance errors this poll).
+            os.listdir(inst.outbox_root)
+            raise PermissionError(f"outbound/ of {name!r} cannot be opened")
+        logger.warning("outbound listing for instance %r: outbound/ is not a real "
+                       "directory; nothing listed", name)
         return [], 0
     names: List[str] = []
     skipped_symlinks = 0
-    for p in sorted(outbound_dir.iterdir(), key=lambda p: p.name):
-        if p.is_symlink():
+    try:
+        entries = sorted(os.scandir(out_fd), key=lambda e: e.name)
+    finally:
+        os.close(out_fd)
+    for e in entries:
+        if e.is_symlink():
             skipped_symlinks += 1
             logger.warning(
                 "outbound listing for instance %r has a symlinked entry, "
-                "never opened, skipping: %r", name, p.name,
+                "never opened, skipping: %r", name, e.name,
             )
             continue
-        if p.is_file():
-            names.append(p.name)
+        if e.is_file(follow_symlinks=False):
+            names.append(e.name)
     return names, skipped_symlinks
 
 
@@ -700,6 +726,17 @@ def _drain_reply(
             cfg, cfg.state_dir, name, bound_instance, doc,
             reply_to_record=record, attachments=attachments,
         )
+    except deliver_mod.RecipientHeld:
+        # The recipient became held between the check above and the write
+        # (its root replaced): nothing was placed, so the request goes
+        # pending exactly as the check would have sent it.
+        if req_digest is None or cfg.registry_dir is None:
+            raise
+        return _begin_pending(
+            cfg, name, req_id, doc, kind="mail", recipients=[bound_instance],
+            pin={"in_reply_to": str(in_reply_to), "bound_instance": bound_instance,
+                 "record": record, "evaluated_ts": utc_ts(), "window_ok": True},
+            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend)
     except Exception as e:  # noqa: BLE001 — must still answer exactly once
         logger.warning(
             "instance %r req %r: reply delivery to %r failed, answering "
@@ -951,6 +988,12 @@ def _drain_peer_route(
             cfg, cfg.state_dir, name, recipient, doc,
             reply_to_record=reply_to_record, attachments=attachments,
         )
+    except deliver_mod.RecipientHeld:
+        if req_digest is None or cfg.registry_dir is None:
+            raise
+        return _begin_pending(
+            cfg, name, req_id, doc, kind="peer", recipients=[recipient], pin=pin,
+            req_digest=req_digest, attachments=attachments, deliver_backend=None)
     except Exception as e:  # noqa: BLE001 — must still answer exactly once
         logger.warning(
             "instance %r req %r: peer delivery to %r failed, answering "
@@ -1101,11 +1144,17 @@ def _drain_cold(
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
     delivered: List[Dict[str, Any]] = []
     failed: List[str] = []
+    held_now: List[str] = []
     for r in recipients:
         try:
             delivered.append(
                 backend(cfg, cfg.state_dir, name, r, doc, attachments=attachments)
             )
+        except deliver_mod.RecipientHeld:
+            if req_digest is None or cfg.registry_dir is None:
+                failed.append(r)
+                continue
+            held_now.append(r)    # nothing placed for it: it goes pending, below
         except Exception as e:  # noqa: BLE001 — one recipient must not sink the request
             failed.append(r)
             logger.warning(
@@ -1113,6 +1162,15 @@ def _drain_cold(
                 "remaining recipients: %s: %s", name, req_id, r, type(e).__name__, e,
             )
 
+    if held_now:
+        # A recipient became held between the check and its write (its root
+        # replaced): the request goes pending with what this pass already
+        # did recorded as done, so nothing is placed twice and nothing is
+        # answered before the held recipient resolves.
+        return _begin_pending(
+            cfg, name, req_id, doc, kind="mail", recipients=recipients, pin=None,
+            req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend,
+            settled={**{d["recipient"]: d for d in delivered}, **{r: None for r in failed}})
     ok_addrs = [address_for(d["recipient"], cfg.fleet_domain) for d in delivered]
     message_id = delivered[0]["message_id"] if len(delivered) == 1 and not failed else None
 
@@ -1184,7 +1242,7 @@ def _begin_external(
 
 def _advance_one(
     cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
-    transport: inflight_mod.TransportPort,
+    transport: inflight_mod.TransportPort, *, fenced: bool = False,
 ) -> str:
     """`inflight.advance` with `_finish` as the settle step.
 
@@ -1197,7 +1255,9 @@ def _advance_one(
     new file as `req_id_reused`."""
     def settle(verdict: Dict[str, Any], digest: Optional[str]) -> str:
         result = _result_doc(req_id, **verdict)
-        if _live_differs(cfg, name, req_id, digest):
+        # A FENCED generation's record publishes only into the root it
+        # recorded, and only while the live entry is still its request.
+        if _live_differs(cfg, name, req_id, digest) or (fenced and not _same_root(cfg, name)):
             logger.warning(
                 "instance %r req_id %r: the in-flight request settled %r, but "
                 "the outbox now holds a different request under this id; the "
@@ -1225,7 +1285,7 @@ _STALE_WARNED: set = set()
 
 def _advance_inflight(
     cfg: RouterConfig, name: str, transport: Optional[inflight_mod.TransportPort],
-    outcomes: Dict[str, int],
+    outcomes: Dict[str, int], *, fenced: bool = False,
 ) -> Dict[str, int]:
     """One step for every in-flight record of `name`, isolated per record.
     Runs BEFORE the outbox listing, so a request settled here is seen by the
@@ -1246,7 +1306,7 @@ def _advance_inflight(
                 record = inflight_mod.read_record(cfg, name, req_id)
                 if record is None:
                     continue
-                state = _advance_one(cfg, name, req_id, record, transport)
+                state = _advance_one(cfg, name, req_id, record, transport, fenced=fenced)
             except Exception:
                 logger.exception(
                     "instance %r: error advancing in-flight request %r — isolated, "
@@ -1282,6 +1342,7 @@ def _inflight_report(cfg: RouterConfig, name: str) -> Dict[str, int]:
 def _finish(
     cfg: RouterConfig, name: str, req_id: str, result: Dict[str, Any],
     *, req_digest: Optional[str], transport_req_id: Optional[str] = None,
+    private: bool = False,
 ) -> str:
     """Write the private result (idempotency anchor), then copy it into the
     namespace's `outbound/results/`, then archive the request. Called
@@ -1296,6 +1357,11 @@ def _finish(
     replaying a stored verdict — see `REASON_REQ_ID_REUSED`."""
     _write_anchor(cfg, name, req_id, result, req_digest=req_digest,
                   transport_req_id=transport_req_id)
+    if private:
+        # Settled PRIVATELY: the file under this id in the outbox is not the
+        # request this verdict answers (or no longer this generation's to
+        # write), so nothing is published there and nothing is archived.
+        return result["outcome"]
     result_bytes = json.dumps(result, sort_keys=True).encode("utf-8")
     _publish_result_and_archive(cfg, name, req_id, result_bytes)
     return result["outcome"]
@@ -1397,7 +1463,7 @@ def _publish_result_and_archive(
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
         # Never publish into, or archive out of, a root the instance's current
-        # generation did not record (see `_verify_own_root`).
+        # generation did not record (see `_pin_own_root`).
         attachments_mod._check_root(root_fd, generations_mod.expected_root(cfg, name))
         outbox_fd = attachments_mod._mkdir_descend_pinned(
             root_fd, outbox_root.relative_to(root)
@@ -1585,7 +1651,10 @@ def _quarantine_one(
 #: `drain_instance`'s tally for a request left pending this poll.
 HELD = "held"
 PENDING_DIR = "pending"
-PENDING_VERSION = 1
+#: Version 2 carries a private snapshot of the request and its attachments
+#: (PENDING SNAPSHOTS, below); version 1 records (no snapshot) are still read.
+PENDING_VERSION = 2
+_PENDING_VERSIONS = (1, 2)
 _TARGET_STATES = frozenset({"held", "ready", "delivering", "delivered", "failed"})
 _PENDING_KINDS = frozenset({"mail", "peer"})
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z")
@@ -1597,7 +1666,16 @@ BLOCK_REQUEST_UNREADABLE = "request_unreadable"
 BLOCK_REQUEST_CHANGED = "request_changed"
 BLOCK_ATTACHMENTS_CHANGED = "attachments_changed"
 BLOCK_ROUTE_CHANGED = "route_changed"
+#: A snapshot that no longer matches the digests its record names.
+BLOCK_SNAPSHOT_DAMAGED = "snapshot_damaged"
+#: A fenced generation's version-1 record: no snapshot to replay from, and
+#: the live entry is no longer this generation's to read.
+BLOCK_LEGACY_SNAPSHOT_MISSING = "legacy_snapshot_missing"
 HOLD_IDENTITY_CHANGED = "identity_changed"
+#: A placement begun (`delivering`) for a recipient whose generation has
+#: changed since: never continued into the new generation's root. No
+#: automatic outcome; the sender sees "not yet" (router/README.md, runbook).
+HOLD_RECIPIENT_GENERATION_CHANGED = "recipient_generation_changed"
 #: An injected delivery backend that cannot take the pre-minted identity:
 #: held, never placed with a fresh one.
 HOLD_BACKEND_NO_PRESET = "backend_no_preset"
@@ -1620,7 +1698,7 @@ def _check_target(t: Any) -> None:
         raise PendingDamaged("target")
     if t.get("state") not in _TARGET_STATES:
         raise PendingDamaged("target state")
-    for k in ("lid", "reason", "message_id", "error"):
+    for k in ("lid", "reason", "message_id", "error", "recipient_gen"):
         if not _str_or_none(t.get(k)):
             raise PendingDamaged(f"target {k}")
     if t.get("kind") not in _PENDING_KINDS:
@@ -1643,8 +1721,22 @@ def _check_target(t: Any) -> None:
 
 def _check_pending(doc: Any, req_id: str) -> Dict[str, Any]:
     """The record, or PendingDamaged. Strict: anything unexpected is damage."""
-    if not isinstance(doc, dict) or doc.get("v") != PENDING_VERSION:
+    if not isinstance(doc, dict) or doc.get("v") not in _PENDING_VERSIONS:
         raise PendingDamaged("version")
+    if doc["v"] == 2:
+        snap = doc.get("snapshot")
+        if not (isinstance(snap, dict) and isinstance(snap.get("nonce"), str)
+                and _HEX32.fullmatch(snap["nonce"])
+                and isinstance(snap.get("attachments"), list)):
+            raise PendingDamaged("snapshot")
+        for a in snap["attachments"]:
+            if not (isinstance(a, dict) and isinstance(a.get("size_bytes"), int)
+                    and isinstance(a.get("sha256"), str) and _HEX64.fullmatch(a["sha256"])
+                    and isinstance(a.get("filename"), str)
+                    and isinstance(a.get("media_type"), str)):
+                raise PendingDamaged("snapshot attachment")
+        if not _str_or_none(doc.get("source_gen")) or not _str_or_none(doc.get("from_address")):
+            raise PendingDamaged("source_gen/from_address")
     if doc.get("req_id") != req_id:
         raise PendingDamaged("req_id")
     if not (isinstance(doc.get("request_sha256"), str) and _HEX64.fullmatch(doc["request_sha256"])):
@@ -1723,7 +1815,21 @@ def _hold_reason(cfg: RouterConfig, target: Dict[str, Any]) -> Optional[str]:
     if reason is None and target.get("lid") is not None and \
             target_logical_id(cfg, r) != target["lid"]:
         return HOLD_IDENTITY_CHANGED
+    if reason is None and target["state"] == "delivering" \
+            and target.get("recipient_gen") is not None \
+            and _recipient_gen(cfg, r) != target["recipient_gen"]:
+        # Begun under the recipient's earlier generation: never continued
+        # into its new root (router/README.md, "recipient_generation_changed").
+        return HOLD_RECIPIENT_GENERATION_CHANGED
     return reason
+
+
+def _recipient_gen(cfg: RouterConfig, recipient: str) -> Optional[str]:
+    """The recipient's current generation id this poll, or None without one."""
+    key = cfg.gen_keys.get(recipient)
+    if key is None:
+        return None
+    return key.partition("/")[2][len(generations_mod.GEN_PREFIX):]
 
 
 def _any_held(cfg: RouterConfig, recipients: List[str]) -> bool:
@@ -1731,21 +1837,118 @@ def _any_held(cfg: RouterConfig, recipients: List[str]) -> bool:
         r in cfg.instances and target_hold(cfg, r) is not None for r in recipients)
 
 
+# ---------------------------------------------------------------------------
+# PENDING SNAPSHOTS (version 2)
+#
+# A pending request is a complete, immutable PRIVATE transaction: before its
+# record exists, the raw request bytes and every verified attachment are
+# written as private files in `pending/<req_id>.<nonce>.snap/` (each durable,
+# then the directory), and the record names them by digest and nonce. A
+# reused req_id can therefore never adopt an orphan snapshot. Every replay
+# re-verifies the digests (`snapshot_damaged` holds otherwise). Completion
+# order: the anchor, then the record, then the snapshot directory; a crash at
+# any point leaves either a record to finish or an orphan the sweep removes
+# once the anchor exists. The current generation still checks the live entry
+# every poll; a FENCED generation replays from its snapshot alone.
+# ---------------------------------------------------------------------------
+
+def _snap_dir(cfg: RouterConfig, name: str, req_id: str, nonce: str) -> Path:
+    return gen_state_dir(cfg, name) / PENDING_DIR / f"{req_id}.{nonce}.snap"
+
+
+def _write_snapshot(cfg: RouterConfig, name: str, req_id: str, raw: bytes,
+                    attachments: List[attachments_mod.VerifiedAttachment]) -> Dict[str, Any]:
+    """Write the snapshot files, durably, and return the record's
+    `snapshot` member. Nothing names them until the record is written."""
+    nonce = secrets.token_hex(16)
+    d = _snap_dir(cfg, name, req_id, nonce)
+    atomic_write(d / "request", raw, durable_root=cfg.state_dir)
+    for i, att in enumerate(attachments):
+        atomic_write(d / f"a{i}", att.data, durable_root=cfg.state_dir)
+    return {"nonce": nonce, "attachments": [
+        {"filename": a.filename, "media_type": a.media_type, "size_bytes": a.size_bytes,
+         "sha256": a.sha256} for a in attachments]}
+
+
+class SnapshotDamaged(Exception):
+    """The snapshot does not match its record."""
+
+
+def _read_snapshot(cfg: RouterConfig, name: str, rec: Dict[str, Any]
+                   ) -> Tuple[bytes, Dict[str, Any], List[attachments_mod.VerifiedAttachment]]:
+    """`(raw, doc, attachments)` from a version-2 record's snapshot, every
+    digest re-verified. Raises `SnapshotDamaged`."""
+    snap = rec["snapshot"]
+    d = _snap_dir(cfg, name, rec["req_id"], snap["nonce"])
+    try:
+        raw = read_capped(d / "request", DEFAULT_READ_CAP)
+    except (OSError, ReadTooLargeError) as e:
+        raise SnapshotDamaged(f"request: {type(e).__name__}") from None
+    if hashlib.sha256(raw).hexdigest() != rec["request_sha256"]:
+        raise SnapshotDamaged("request digest")
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SnapshotDamaged("request is not JSON") from None
+    out = []
+    for i, a in enumerate(snap["attachments"]):
+        try:
+            data = read_capped(d / f"a{i}", a["size_bytes"])
+        except (OSError, ReadTooLargeError) as e:
+            raise SnapshotDamaged(f"attachment {i}: {type(e).__name__}") from None
+        if len(data) != a["size_bytes"] or hashlib.sha256(data).hexdigest() != a["sha256"]:
+            raise SnapshotDamaged(f"attachment {i} digest")
+        out.append(attachments_mod.VerifiedAttachment(
+            filename=a["filename"], media_type=a["media_type"], size_bytes=a["size_bytes"],
+            sha256=a["sha256"], data=data))
+    return raw, doc, out
+
+
+def _remove_snapshot(cfg: RouterConfig, name: str, rec: Dict[str, Any]) -> None:
+    """After the record: the snapshot directory goes, durably."""
+    snap = rec.get("snapshot")
+    if not snap:
+        return
+    d = _snap_dir(cfg, name, rec["req_id"], snap["nonce"])
+    try:
+        shutil.rmtree(d)
+    except FileNotFoundError:
+        return
+    fsync_dir(d.parent)
+
+
 def _begin_pending(
     cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], *,
     kind: str, recipients: List[str], pin: Optional[Dict[str, Any]],
     req_digest: str, attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     deliver_backend: Optional[deliver_mod.DeliveryBackend],
+    settled: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
 ) -> str:
     """At least one target is held: make the request pending (durably, before
     anything is placed) and advance whatever can go now. A reply's target is
     pinned to the logical_id its ledger record names (the identity the task
-    came from), else the one the registry knows now."""
+    came from), else the one the registry knows now. `settled` names targets
+    already delivered (with their delivery) or failed (None) by the pass
+    that discovered the hold mid-way."""
     pinned = {}
     if pin is not None and isinstance(pin.get("record"), dict) and pin["record"].get("from_lid"):
         pinned[pin["bound_instance"]] = pin["record"]["from_lid"]
     targets = []
+    settled = settled or {}
     for r in recipients:
+        if r in settled:
+            d = settled[r]
+            targets.append({
+                "recipient": r, "kind": kind,
+                "lid": pinned.get(r) or (target_known_id(cfg, r) if r in cfg.instances else None),
+                "state": "delivered" if d else "failed", "reason": None,
+                "notice_id": (d.get("notice_id") or mint_notice_id()) if d else None,
+                "ts": utc_ts() if d else None,
+                "message_id": d.get("message_id") if d else None,
+                "error": None if d else "failed before the hold",
+                "recipient_gen": _recipient_gen(cfg, r) if d else None,
+            })
+            continue
         reason = target_hold(cfg, r) if r in cfg.instances else None
         targets.append({
             "recipient": r, "kind": kind,
@@ -1755,10 +1958,25 @@ def _begin_pending(
             "state": "held" if reason else "ready", "reason": reason,
             "notice_id": None, "ts": None, "message_id": None, "error": None,
         })
+    # The snapshot is of the bytes that were EVALUATED: re-read with the same
+    # pinned read and required to carry their digest. If the agent changed
+    # the file since, nothing is recorded or placed; the next poll takes the
+    # new file from the start.
+    try:
+        raw = _read_request_pinned(cfg, name, f"req-{req_id}.json")
+    except (ReadTooLargeError, OSError):
+        return HELD
+    if hashlib.sha256(raw).hexdigest() != req_digest:
+        return HELD
+    snapshot = _write_snapshot(cfg, name, req_id, raw, list(attachments or []))
+    gen = cfg.gen_keys.get(name, "").partition("/")[2]
     rec = {
         "v": PENDING_VERSION, "req_id": req_id, "request_sha256": req_digest,
         "kind": kind, "sender_lid": target_logical_id(cfg, name),
+        "source_gen": gen[len(generations_mod.GEN_PREFIX):] if gen else None,
+        "from_address": address_for(name, cfg.fleet_domain),
         "created_ts": utc_ts(), "block": None, "binding": pin, "targets": targets,
+        "snapshot": snapshot,
     }
     path = _pending_path(cfg, name, req_id)
     _write_pending(cfg, path, rec)
@@ -1814,7 +2032,8 @@ def _place_one(
     if t["state"] in ("held", "ready"):
         if t["recipient"] in cfg.instances and t["lid"] is None:
             t["lid"] = target_logical_id(cfg, t["recipient"])   # never known until now
-        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts())
+        t.update(state="delivering", notice_id=mint_notice_id(), ts=utc_ts(),
+                 recipient_gen=_recipient_gen(cfg, t["recipient"]))
     t["reason"] = None
     # Durable BEFORE the recipient is touched, on a REPLAY too: a record can
     # be visible after its directory barrier failed, and a placement must
@@ -1842,12 +2061,13 @@ def _advance_pending(
     cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], doc: Dict[str, Any],
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     deliver_backend: Optional[deliver_mod.DeliveryBackend],
-    *, settle_only: bool = False,
+    *, settle_only: bool = False, private: bool = False,
 ) -> str:
     """Advance every target that this poll's report resolves (P4'), then
     answer the request iff nothing is still pending. `settle_only` replays
     only targets already `delivering` (a refusal must first know every
-    placement it would report) and never answers."""
+    placement it would report) and never answers. `private` settles the
+    answer as an anchor alone (`_finish`)."""
     path = _pending_path(cfg, name, req_id)
     dirty = False
     for t in rec["targets"]:
@@ -1870,8 +2090,9 @@ def _advance_pending(
     if settle_only or any(t["state"] not in ("delivered", "failed") for t in rec["targets"]):
         return HELD
     outcome = _finish(cfg, name, req_id, _pending_result(cfg, req_id, rec, attachments),
-                      req_digest=rec["request_sha256"])
+                      req_digest=rec["request_sha256"], private=private)
     _remove_pending(path)
+    _remove_snapshot(cfg, name, rec)
     return outcome
 
 
@@ -1971,15 +2192,106 @@ def _block(cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any], why: 
 def _drain_pending(
     cfg: RouterConfig, name: str, filename: str, req_id: str,
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
-    cold_policy: Optional[ColdPolicy] = None,
+    cold_policy: Optional[ColdPolicy] = None, fenced: bool = False,
 ) -> str:
-    """One poll for a request that has a pending record."""
+    """One poll for a request that has a pending record.
+
+    Version 2 (a snapshot): the request, its attachments and the policy are
+    all taken from the SNAPSHOT. In the current generation the live entry is
+    read too: gone, the work continues and the Result is published (nothing
+    to archive); the same bytes, as ever; DIFFERENT (a reused id), the old
+    work continues and settles PRIVATELY, after which the live file is
+    refused as `req_id_reused`. In a FENCED generation (`fenced`), the
+    snapshot is the only source, and the Result is published only if the
+    root is still the one the generation recorded and the live entry is the
+    same request; otherwise it settles privately.
+
+    Version 1 (no snapshot): as before, the live entry must still be the
+    request; a fenced generation's version-1 record holds
+    (`legacy_snapshot_missing`)."""
     try:
         rec = _read_pending(_pending_path(cfg, name, req_id), req_id)
     except PendingDamaged as e:
         logger.warning("instance %r req %r: pending record damaged (%s) — held, "
                        "nothing delivered", name, req_id, e)
         return HELD
+    if rec["v"] == 1:
+        if fenced:
+            return _block(cfg, name, req_id, rec, BLOCK_LEGACY_SNAPSHOT_MISSING)
+        return _drain_pending_v1(cfg, name, filename, req_id, rec,
+                                 deliver_backend=deliver_backend, cold_policy=cold_policy)
+    try:
+        _raw, doc, attachments = _read_snapshot(cfg, name, rec)
+    except SnapshotDamaged as e:
+        logger.warning("instance %r req %r: pending snapshot damaged (%s) — held",
+                       name, req_id, e)
+        return _block(cfg, name, req_id, rec, BLOCK_SNAPSHOT_DAMAGED)
+    try:
+        live = _live_differs(cfg, name, req_id, rec["request_sha256"])
+    except OSError:
+        return HELD                        # a transient fault decides nothing
+    private = live or (fenced and not _same_root(cfg, name))
+    if live and not fenced:
+        generations_mod.note_reuse_pending(cfg, name, req_id)
+    decided = _pending_policy(cfg, name, rec, doc, cold_policy)
+    if decided == BLOCK_ROUTE_CHANGED:
+        return _block(cfg, name, req_id, rec, BLOCK_ROUTE_CHANGED)
+    if isinstance(decided, ColdRefusal):
+        return _refuse_pending(cfg, name, req_id, rec, doc, attachments, decided,
+                               deliver_backend, private=private)
+    if rec.get("block") is not None:
+        rec["block"] = None
+        _write_pending(cfg, _pending_path(cfg, name, req_id), rec)
+    return _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend,
+                            private=private)
+
+
+def _same_root(cfg: RouterConfig, name: str) -> bool:
+    """Whether `name`'s root is still the one its generation (as `cfg` keys
+    it) recorded. Without a registry, always."""
+    try:
+        expected = generations_mod.expected_root(cfg, name)
+        if expected is None:
+            return True
+        seen = generations_mod.root_identity(cfg.instances[name].root)
+    except (LookupError, generations_mod.GenerationHeld):
+        return False
+    return (seen["st_dev"], seen["st_ino"]) == expected
+
+
+def _refuse_pending(cfg: RouterConfig, name: str, req_id: str, rec: Dict[str, Any],
+                    doc: Dict[str, Any], attachments, decided: "ColdRefusal",
+                    deliver_backend, *, private: bool = False) -> str:
+    """A fresh policy refusal for a pending request (both versions). Every
+    placement already begun is settled first (replayed with its identity),
+    so the terminal Result can report EVERY target whose notice was placed.
+    One that cannot settle now (held, failing) defers the refusal."""
+    if any(t["state"] == "delivering" for t in rec["targets"]):
+        _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend,
+                         settle_only=True)
+        if any(t["state"] == "delivering" for t in rec["targets"]):
+            return HELD
+    if decided.hold and not private:
+        _write_held_copy(cfg, name, req_id)
+    if decided.reason_code in _PEER_REFUSALS:
+        _audit_peer_refusal(cfg, name, req_id, decided.reason_code,
+                            recipients=[t["recipient"] for t in rec["targets"]])
+    outcome = _finish(cfg, name, req_id,
+                      _pending_refusal(cfg, req_id, rec, decided.outcome,
+                                       decided.reason_code, decided.detail),
+                      req_digest=rec["request_sha256"], private=private)
+    _remove_pending(_pending_path(cfg, name, req_id))
+    _remove_snapshot(cfg, name, rec)
+    return outcome
+
+
+def _drain_pending_v1(
+    cfg: RouterConfig, name: str, filename: str, req_id: str, rec: Dict[str, Any],
+    *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
+    cold_policy: Optional[ColdPolicy] = None,
+) -> str:
+    """A version-1 record in the current generation: the live entry must
+    still be the request it was made for."""
     try:
         raw = _read_request_pinned(cfg, name, filename)
     except FileNotFoundError:
@@ -1998,26 +2310,8 @@ def _drain_pending(
     if decided == BLOCK_ROUTE_CHANGED:
         return _block(cfg, name, req_id, rec, BLOCK_ROUTE_CHANGED)
     if isinstance(decided, ColdRefusal):
-        # Every placement already begun is settled first (replayed with its
-        # identity), so the terminal Result can report EVERY target whose
-        # notice was placed. One that cannot settle now (held, failing)
-        # defers the refusal: a later poll reports it.
-        if any(t["state"] == "delivering" for t in rec["targets"]):
-            _advance_pending(cfg, name, req_id, rec, doc, attachments, deliver_backend,
-                             settle_only=True)
-            if any(t["state"] == "delivering" for t in rec["targets"]):
-                return HELD
-        if decided.hold:
-            _write_held_copy(cfg, name, req_id)
-        if decided.reason_code in _PEER_REFUSALS:
-            _audit_peer_refusal(cfg, name, req_id, decided.reason_code,
-                                recipients=[t["recipient"] for t in rec["targets"]])
-        outcome = _finish(cfg, name, req_id,
-                          _pending_refusal(cfg, req_id, rec, decided.outcome,
-                                           decided.reason_code, decided.detail),
-                          req_digest=rec["request_sha256"])
-        _remove_pending(_pending_path(cfg, name, req_id))
-        return outcome
+        return _refuse_pending(cfg, name, req_id, rec, doc, attachments, decided,
+                               deliver_backend)
     if rec.get("block") is not None:
         rec["block"] = None
         _write_pending(cfg, _pending_path(cfg, name, req_id), rec)
@@ -2028,16 +2322,38 @@ def _sweep_answered_pending(cfg: RouterConfig, name: str) -> None:
     """A crash between a pending request's Result and the removal of its
     record leaves a record for a request already answered (and archived, so
     the resume path never sees it again). The private Result is the
-    authority: its record goes."""
+    authority: its record goes, then its snapshot. A snapshot no record
+    names is an orphan (a crash before its record was written, or after the
+    record was removed); it is removed once its request's anchor exists, and
+    otherwise left alone, never trusted."""
     d = gen_state_dir(cfg, name) / PENDING_DIR
     try:
-        names = [p.name for p in d.iterdir() if p.name.endswith(".json")]
+        entries = list(d.iterdir())
     except (FileNotFoundError, NotADirectoryError):
         return
-    for fn in names:
-        req_id = fn[:-len(".json")]
+    named = set()
+    for p in entries:
+        if not p.name.endswith(".json"):
+            continue
+        req_id = p.name[:-len(".json")]
+        try:
+            rec = _read_pending(p, req_id)
+        except PendingDamaged:
+            rec = None
         if _private_result_path(cfg, name, req_id).is_file():
-            _remove_pending(d / fn)
+            _remove_pending(p)
+            if rec is not None:
+                _remove_snapshot(cfg, name, rec)
+            continue
+        if rec is not None and rec.get("snapshot"):
+            named.add(f"{req_id}.{rec['snapshot']['nonce']}.snap")
+    for p in entries:
+        if not p.name.endswith(".snap") or p.name in named:
+            continue
+        req_id = p.name.split(".", 1)[0]
+        if _private_result_path(cfg, name, req_id).is_file():
+            shutil.rmtree(p, ignore_errors=True)
+            fsync_dir(d)
 
 
 def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
@@ -2061,6 +2377,83 @@ def held_report(cfg: RouterConfig, name: str) -> List[Dict[str, Any]]:
             "targets": [{"recipient": t["recipient"], "state": t["state"], "reason": t["reason"]}
                         for t in rec["targets"] if t["state"] not in ("delivered", "failed")],
         })
+    return out
+
+
+def _fenced_views(cfg: RouterConfig, name: str) -> List[RouterConfig]:
+    """For each FENCED generation of `name` that still holds in-flight or
+    pending work, a view of `cfg` whose generation key for `name` is that
+    generation's, so every generation-scoped path resolves into it. The
+    other instances keep their current generations."""
+    if cfg.registry_dir is None or name not in cfg.gen_keys:
+        return []
+    lid = cfg.gen_keys[name].partition("/")[0]
+    out = []
+    for gen in generations_mod.fenced_work(cfg.state_dir, lid):
+        keys = dict(cfg.gen_keys)
+        keys[name] = generations_mod.gen_key(lid, gen)
+        out.append(generations_mod.keyed(cfg, keys))
+    return out
+
+
+def _drain_fenced(
+    cfg: RouterConfig, name: str, transport: Optional[inflight_mod.TransportPort],
+    *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
+    cold_policy: Optional[ColdPolicy] = None,
+) -> Set[str]:
+    """Step every fenced generation's work. Its in-flight records advance
+    under their existing transport ids (a fenced generation never allocates
+    one); its pending records replay from their snapshots. Each settles
+    privately unless the root is still the one it recorded and the live
+    entry is still its request (`_advance_one`, `_drain_pending`). Isolated
+    per generation and per record; nothing is added to the drain summary.
+
+    Returns the outbox filenames still owned by fenced work at the SAME root
+    with matching bytes: the current generation neither takes them into its
+    first-sight snapshot nor drains them (they are already handed over)."""
+    owned: Set[str] = set()
+    for view in _fenced_views(cfg, name):
+        try:
+            if transport is not None and inflight_mod.list_records(view, name):
+                _advance_inflight(view, name, transport, {}, fenced=True)
+            for req_id in sorted(_pending_ids(view, name)):
+                _drain_pending(view, name, f"req-{req_id}.json", req_id, fenced=True,
+                               deliver_backend=deliver_backend, cold_policy=cold_policy)
+            if _same_root(view, name):
+                for req_id, digest in _owned_digests(view, name):
+                    try:
+                        if not _live_differs(cfg, name, req_id, digest) and \
+                                (cfg.instances[name].outbox_root / f"req-{req_id}.json").exists():
+                            owned.add(f"req-{req_id}.json")
+                    except OSError:
+                        owned.add(f"req-{req_id}.json")    # cannot be shown not to be ours
+        except Exception:
+            logger.exception("instance %r: error stepping a fenced generation — isolated", name)
+    return owned
+
+
+def _pending_ids(cfg: RouterConfig, name: str) -> List[str]:
+    d = gen_state_dir(cfg, name) / PENDING_DIR
+    try:
+        return [p.name[:-len(".json")] for p in d.iterdir() if p.name.endswith(".json")]
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def _owned_digests(cfg: RouterConfig, name: str) -> List[Tuple[str, Optional[str]]]:
+    """(req_id, digest) of every in-flight and pending record left in
+    `cfg`'s generation for `name`."""
+    out: List[Tuple[str, Optional[str]]] = []
+    for req_id in inflight_mod.list_records(cfg, name):
+        rec = inflight_mod.read_record(cfg, name, req_id)
+        if rec is not None:
+            out.append((req_id, rec.get("digest")))
+    for req_id in _pending_ids(cfg, name):
+        try:
+            out.append((req_id, _read_pending(_pending_path(cfg, name, req_id), req_id)
+                        ["request_sha256"]))
+        except PendingDamaged:
+            out.append((req_id, None))
     return out
 
 
@@ -2198,7 +2591,12 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # Under a registry `drain_instance` has already pinned this instance's
     # root and checked it against the current generation's (`_pin_own_root`):
     # every path below goes through that descriptor.
-    marker_doc, first_sight = firstsight.record_first_sight(cfg, name)
+    # A fenced generation's work first (its own transport ids, its own
+    # snapshots); what it still owns at this root is neither first-sighted
+    # nor drained by the current generation.
+    fenced_owned = _drain_fenced(cfg, name, transport, deliver_backend=deliver_backend,
+                                 cold_policy=cold_policy)
+    marker_doc, first_sight = firstsight.record_first_sight(cfg, name, exclude=fenced_owned)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)
 
     outcomes: Dict[str, int] = {"accepted": 0, "rejected": 0, "queued_for_human": 0}
@@ -2225,6 +2623,8 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
             continue
 
         req_id = filename[len("req-") : -len(".json")]
+        if filename in fenced_owned:
+            continue    # a fenced generation's own request, still in its hands
         private_path = _private_result_path(cfg, name, req_id)
 
         try:
@@ -2354,7 +2754,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                         cfg, name, req_id, json.dumps(fresh, sort_keys=True).encode("utf-8"),
                     )
                     reused += 1
-                    generations_mod.record_reuse(cfg, name)
+                    generations_mod.record_reuse(cfg, name, req_id)
                     outcomes["rejected"] += 1
             elif (cfg.registry_dir is not None
                   and _pending_path(cfg, name, req_id).exists()):
@@ -2381,6 +2781,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                         name, req_id,
                     )
                     reused_pending += 1
+                    generations_mod.note_reuse_pending(cfg, name, req_id)
                     continue
                 inflight_waiting += 1
                 continue
@@ -2426,6 +2827,27 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
             continue
 
         drained += 1
+
+    # A pending request whose live file is gone is not in the listing; its
+    # record still carries it (from its snapshot, or blocked if version 1).
+    if cfg.registry_dir is not None:
+        listed = {f[len("req-"):-len(".json")] for f in filenames if REQ_NAME_RE.fullmatch(f)}
+        for req_id in sorted(set(_pending_ids(cfg, name)) - listed):
+            if _private_result_path(cfg, name, req_id).is_file():
+                continue
+            try:
+                outcome = _drain_pending(cfg, name, f"req-{req_id}.json", req_id,
+                                         deliver_backend=deliver_backend,
+                                         cold_policy=cold_policy)
+            except Exception:
+                logger.exception("instance %r: error draining pending %r — isolated",
+                                 name, req_id)
+                errored += 1
+                continue
+            if outcome == HELD:
+                held += 1
+            elif outcome in outcomes:
+                outcomes[outcome] += 1
 
     return {
         # Surfaced so `status` can say once why a full outbox went quiet.

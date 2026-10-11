@@ -196,7 +196,7 @@ M = [
   '    generation = None\n    _clear_state(cfg, name)\n    if gen_inputs is not None:\n',
   [G + 'ResetGenerationTests.test_the_generation_is_begun_before_anything_is_wiped']),
  ('Q1 settled reuse is not counted', 'router/outbound.py',
-  '                    generations_mod.record_reuse(cfg, name)\n', '',
+  '                    generations_mod.record_reuse(cfg, name, req_id)\n', '',
   [G + 'ReuseCountTests.test_status_counts_settled_reuse_per_generation']),
  ('Q2 a failed audit line still commits the verb', GEN,
   '        if audit_required:\n            if prior is None:\n',

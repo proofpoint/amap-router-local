@@ -50,8 +50,13 @@ HOLDS, never guesses. An instance is held for the poll, with a reason, when:
     line forward over everything since);
   * a successor's counter cannot be established (`transport_counter_unverified`).
 
-INTERIM (until the pending-v2 step): a fenced generation's in-flight and
-pending records are kept, reported, and not stepped.
+A FENCED generation's work is still stepped every poll (`outbound`): its
+in-flight records advance under their existing transport ids, and its
+pending records replay from their private snapshots. Each settles privately
+(an anchor in that generation, nothing published, nothing archived) unless
+the root is still the one it recorded and the live outbox entry is still its
+request; and the current generation neither first-sights nor drains a file
+that work still owns.
 """
 from __future__ import annotations
 
@@ -725,7 +730,7 @@ REUSE_HINT = ("a different request is held under an id still in flight. Same-roo
 REUSE_COUNT_FILE = "req_id_reused"
 
 
-def record_reuse(cfg: Any, name: str) -> None:
+def record_reuse(cfg: Any, name: str, req_id: Optional[str] = None) -> None:
     """Count one `req_id_reused` refusal in `name`'s current generation (under
     a registry; nothing without one). A statistic for status: a fault here is
     logged and never fails the refusal it counts."""
@@ -740,6 +745,43 @@ def record_reuse(cfg: Any, name: str) -> None:
         atomic_write(path, str(n + 1).encode("ascii"), durable_root=cfg.state_dir)
     except Exception:  # noqa: BLE001
         logger.exception("instance %r: could not count a req_id_reused refusal", name)
+    if req_id is not None:
+        _release_reuse_pending(cfg, name, req_id)
+
+
+#: In a generation: one marker per request held as `req_id_reused_pending`,
+#: so its audit line is written once per transition.
+REUSE_PENDING_DIR = "reuse-pending"
+
+
+def note_reuse_pending(cfg: Any, name: str, req_id: str) -> None:
+    """The first time a request under `req_id` is held as a reused id in
+    `name`'s current generation: a marker and one audit line. Best effort."""
+    if cfg.registry_dir is None or name not in cfg.gen_keys:
+        return
+    marker = Path(cfg.state_dir) / cfg.gen_keys[name] / REUSE_PENDING_DIR / req_id
+    if marker.exists():
+        return
+    try:
+        atomic_write(marker, b"", durable_root=cfg.state_dir)
+        audit_mod.append(cfg.state_dir, name, audit_mod.EVENT_REUSE_PENDING,
+                         state_key=cfg.gen_keys[name].partition("/")[0],
+                         req_id=req_id, state="held")
+    except Exception:  # noqa: BLE001
+        logger.exception("instance %r: could not record a reused id held", name)
+
+
+def _release_reuse_pending(cfg: Any, name: str, req_id: str) -> None:
+    marker = Path(cfg.state_dir) / cfg.gen_keys[name] / REUSE_PENDING_DIR / req_id
+    if not marker.exists():
+        return
+    try:
+        audit_mod.append(cfg.state_dir, name, audit_mod.EVENT_REUSE_PENDING,
+                         state_key=cfg.gen_keys[name].partition("/")[0],
+                         req_id=req_id, state="refused")
+        marker.unlink()
+    except Exception:  # noqa: BLE001
+        logger.exception("instance %r: could not record a reused id released", name)
 
 
 def reuse_counts(state_dir: Path, logical_id: str) -> Dict[str, int]:
@@ -758,23 +800,20 @@ def reuse_counts(state_dir: Path, logical_id: str) -> Dict[str, int]:
 
 def reuse_pending(cfg: Any, name: str) -> List[Dict[str, Any]]:
     """Each live request held as `req_id_reused_pending` in `name`'s current
-    generation (a DIFFERENT request under an id still in flight), with its
-    age from the live file's mtime. Read only; a fault reading an entry
-    skips it (it is shown next poll)."""
+    generation (a DIFFERENT request under an id whose in-flight or pending
+    work is unsettled), with its age from the live file's mtime. Read only;
+    a fault reading an entry skips it (it is shown next poll)."""
     import time
-    from . import inflight as inflight_mod
     from . import outbound as outbound_mod
     out: List[Dict[str, Any]] = []
     try:
-        req_ids = inflight_mod.list_records(cfg, name)
+        owned = outbound_mod._owned_digests(cfg, name)
     except Exception:  # noqa: BLE001 -- status never fails a poll
         return out
     now = time.time()
-    for req_id in req_ids:
+    for req_id, digest in owned:
         try:
-            record = inflight_mod.read_record(cfg, name, req_id)
-            if record is None or not outbound_mod._live_differs(
-                    cfg, name, req_id, record.get("digest")):
+            if not outbound_mod._live_differs(cfg, name, req_id, digest):
                 continue
             st = os.stat(cfg.instances[name].outbox_root / f"req-{req_id}.json",
                          follow_symlinks=False)
