@@ -14,6 +14,7 @@ import hashlib
 import multiprocessing
 import os
 import shutil
+import time
 import signal
 import unittest
 from unittest import mock
@@ -586,9 +587,15 @@ class TestOutboundSidecarTOCTOU(RouterTestCase):
         did — the hash check rejects the secret whatever the pinning does,
         and this test stayed green with BOTH `O_NOFOLLOW` guards removed.
 
-        Companions: the attacker completed swaps while ingests ran, and it
-        exited cleanly. A stress test whose attacker never ran is the no-op
-        form of this test."""
+        Companions, REQUIRED rather than checked after the fact: the attacker
+        is swapping before the first ingest; at least MIN_OVERLAP ingests ran
+        while it completed swaps; at least one ingest WITNESSED the attacker's
+        state (refused because the pinned lookup met the planted symlink or
+        the parked directory, never an ordinary size mismatch); and it exits
+        cleanly. Any of those unmet by the
+        deadline FAILS the test. (It used to assert only that the attacker
+        had swapped at some point, and could report "no race ran" when 150
+        ingests finished before the attacker process got going.)"""
         secret_dir = self.tmp / "victim-live-race"
         secret_dir.mkdir()
         secret_bytes = b"live-race secret bytes"
@@ -607,12 +614,40 @@ class TestOutboundSidecarTOCTOU(RouterTestCase):
         )
         proc.start()
         leaked = False
+        ingests = overlapped = witnessed = 0
         try:
-            for _ in range(150):
+            # THE RACE IS REQUIRED, not hoped for. "no race ran" was 150
+            # ingests finishing before a freshly started attacker process had
+            # swapped once. So: wait for the attacker to be swapping, then
+            # keep ingesting until (a) at least MIN_INGESTS ran, (b) at least
+            # MIN_OVERLAP of them ran WHILE the attacker completed swaps, and
+            # (c) at least one ingest WITNESSED the attacker's state: refused
+            # because the pinned lookup met the planted symlink or the parked
+            # (missing) directory. NOT any refusal: the descriptor declares the
+            # secret's size, so every ingest of the real directory is refused
+            # for a size mismatch anyway, and counting those certified a race
+            # the reader never met. If the deadline passes first, this FAILS.
+            deadline = time.monotonic() + RACE_DEADLINE_S
+            while swaps.value == 0:
+                if time.monotonic() > deadline:
+                    self.fail("the attacker process never completed a swap before the deadline")
+                time.sleep(0.001)
+            while not (ingests >= MIN_INGESTS and overlapped >= MIN_OVERLAP and witnessed >= 1):
+                if time.monotonic() > deadline:
+                    self.fail(
+                        f"the race did not run as required before the deadline: "
+                        f"{ingests} ingests, {overlapped} overlapping attacker swaps, "
+                        f"{witnessed} refused on the attacker's swapped or parked state")
+                before = swaps.value
                 try:
                     got = _try_ingest(self.cfg, "alice", req_id, [desc])
-                except attachments_mod.AttachmentIngestError:
-                    continue
+                except attachments_mod.AttachmentIngestError as e:
+                    if _race_witnessed(e):
+                        witnessed += 1
+                    got = []
+                ingests += 1
+                if swaps.value != before:
+                    overlapped += 1
                 if any(att.data == secret_bytes for att in got):
                     leaked = True
         finally:
@@ -623,7 +658,6 @@ class TestOutboundSidecarTOCTOU(RouterTestCase):
                 proc.join(timeout=2)
         self.assertFalse(leaked, "TOCTOU: the secret was read through the swapped path")
         self.assertEqual(proc.exitcode, 0, "the attacker process did not exit cleanly")
-        self.assertGreater(swaps.value, 0, "the attacker never completed a swap — no race ran")
 
 
 class TestOutboundSidecarEveryInterleaving(RouterTestCase):
@@ -815,6 +849,23 @@ def _open_child_FOLLOWING(parent_fd, name):
         return "missing", None
     except OSError:
         return "other", None
+
+
+#: The live race's REQUIRED evidence (see the test): ingests run, ingests that
+#: overlapped completed attacker swaps, and a deadline after which the test
+#: fails rather than passing without a race.
+MIN_INGESTS = 150
+MIN_OVERLAP = 50
+RACE_DEADLINE_S = 60.0
+
+
+#: The reader's refusals that only the attacker's swap can cause: the pinned
+#: lookup met the planted symlink, or the real directory parked mid-swap.
+_RACE_REFUSALS = ("not a real directory", "sidecar dir missing")
+
+
+def _race_witnessed(error) -> bool:
+    return any(marker in str(error.detail) for marker in _RACE_REFUSALS)
 
 
 def _attacker_swap_loop(side_dir: str, secret_dir: str, stop, swaps) -> None:

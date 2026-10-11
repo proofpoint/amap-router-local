@@ -1429,3 +1429,70 @@ class DsnErrorUpdateIsolatedTests(_Fleet):
         self.assertEqual(first.read_bytes(), frozen, "the failing intent's state changed")
         self.assertIn({"notice_id": failing_nid, "outcome": "denied", "target": "alpha",
                        "reason": "barrier_failed"}, summary["delta"]["dsn_held"])
+
+
+
+class DsnRemovalFailureIsolatedTests(_Fleet):
+    """A DSN placed, then the removal of its intent fails (the unlink, or the
+    directory fsync after it): that intent is NOT lost and NOT duplicated
+    under a new id, and the pass goes on to its neighbour."""
+
+    def setup_two(self):
+        nids = []
+        for req in ("00000001", "00000002"):
+            write_request(self.cfg, "alpha", req, to=[addr("delta")])
+            self.poll()
+            nids.append(self.result("alpha", req)["message_id"])
+        self.hold("not_registered", "alpha")
+        for nid in nids:
+            write_outcome(self.cfg, "delta", nid, "denied")
+        self.poll()
+        d = self.state_dir / LIDS["delta"] / outcomes.DSN_DIR
+        first, second = sorted(d.glob("*.json"))
+        ids = [json.loads(p.read_text())["dsn_notice_id"] for p in (first, second)]
+        self.recover("not_registered", "alpha")
+        return d, first, ids
+
+    def check(self, ids):
+        self.assertEqual(sorted(list_notices(self.cfg, "alpha")),
+                         sorted(f"notice-{i}.json" for i in ids),
+                         "a DSN was lost or offered under a second id")
+
+    def test_unlink_failure(self):
+        d, first, ids = self.setup_two()
+        real = os.unlink
+
+        def unlink(path, *a, **kw):
+            if Path(path) == first:
+                raise OSError(5, "EIO at the unlink")
+            return real(path, *a, **kw)
+        with mock.patch.object(outcomes.os, "unlink", unlink):
+            self.poll()
+        self.check(ids)                               # the neighbour went too
+        self.assertTrue(first.is_file())              # kept, so it replays
+        self.poll()                                   # replay: the SAME id, then removed
+        self.check(ids)
+        self.assertEqual(list(d.glob("*.json")), [])
+
+    def test_directory_fsync_failure(self):
+        """The unlink happened but its directory barrier failed: after a crash
+        the intent may come back. Restored as that crash survivor, it is
+        replayed with the SAME id and only then removed."""
+        d, first, ids = self.setup_two()
+        frozen = first.read_bytes()
+        real = outcomes.fsync_dir
+        calls = {"n": 0}
+
+        def fsync_dir(path):
+            if Path(path) == d and calls["n"] == 0:
+                calls["n"] += 1
+                raise OSError(5, "EIO at the directory fsync")
+            return real(path)
+        with mock.patch.object(outcomes, "fsync_dir", fsync_dir):
+            self.poll()
+        self.assertEqual(calls["n"], 1, "the injected directory-fsync fault never fired")
+        self.check(ids)                               # the neighbour went too
+        first.write_bytes(frozen)                     # the crash survivor
+        self.poll()                                   # replay: the SAME id, then removed
+        self.check(ids)
+        self.assertEqual(list(d.glob("*.json")), [])
