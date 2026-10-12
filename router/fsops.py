@@ -65,6 +65,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import heapq
 import re
 import fcntl
 import logging
@@ -75,6 +76,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+from . import transport as transport_mod
 
 logger = logging.getLogger("amap_router_local.fsops")
 
@@ -142,6 +145,27 @@ _WALK_MOVED = frozenset({errno.ENOENT, errno.ELOOP, errno.ENOTDIR})
 #: `DependencyAnomaly.cause` values (`transport.HopFsOps`, DEPENDENCIES).
 DEPENDENCY_CAUSES = ("binding_moved", "missing", "not_regular", "link_count",
                      "size", "digest")
+
+
+class ListingTooLarge(Exception):
+    """`list_pinned` visited more than `transport.LIST_SCAN_MAX` names and
+    stopped. Exposed as `FsOps.ListingTooLarge`, the Protocol attribute. It
+    is deliberately NOT an `OSError` and not related to `UnsafeRead` either
+    way, so a caller can never mistake it for an I/O failure or a refused
+    read (`transport.check_fsops_classes`)."""
+
+
+class _Larger:
+    """A max-heap key for `str`: `heapq` keeps the SMALLEST names by holding
+    the largest on top, so a scan keeps at most `k` of them."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __lt__(self, other: "_Larger") -> bool:
+        return self.name > other.name
 
 
 class DependencyAnomaly(FsOpsError):
@@ -287,6 +311,7 @@ class FsOps:
 
     NOT_YET = NOT_YET
     UnsafeRead = UnsafeRead
+    ListingTooLarge = ListingTooLarge
 
     def __init__(self, *, hop_root: Optional[Union[str, Path]] = None,
                  private_roots: Iterable[Union[str, Path]] = ()):
@@ -1090,6 +1115,51 @@ class FsOps:
     @staticmethod
     def fsync_dir(fd: int) -> None:
         os.fsync(fd)
+
+    def list_pinned(self, dir_fd: int, *, limit: int,
+                    after: Optional[str] = None) -> Tuple[List[str], bool]:
+        """`transport.HopFsOps.list_pinned`: the `limit` smallest names
+        strictly greater than `after`, sorted, and whether more exist.
+
+        The arguments are checked first, then `dir_fd`'s binding. The scan
+        streams a FRESH open description of that directory (`os.open(".",
+        dir_fd=...)`), never a dup: a dup shares the pinned descriptor's
+        offset, and reading it would move the caller's position. The fresh
+        descriptor is checked to be the same directory before it is read,
+        and closed afterwards. At most `limit + 1` names are held (a bounded
+        heap), so memory is O(limit) whatever the directory holds; on
+        visiting name `transport.LIST_SCAN_MAX + 1` the scan stops at once
+        and raises `ListingTooLarge`. Names are `str` as the kernel's bytes
+        decode with `surrogateescape`; `.` and `..` never appear. A failure
+        raises; it never returns an empty list for an error."""
+        transport_mod.check_list_args(limit, after)
+        b = self.binding(dir_fd)
+        fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=dir_fd)
+        try:
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) != (b.dev, b.ino):
+                raise BindingError(f"fd {dir_fd}'s directory changed under the listing")
+            keep = limit + 1
+            heap: List[_Larger] = []
+            visited = 0
+            with os.scandir(fd) as it:
+                for entry in it:
+                    visited += 1
+                    if visited > transport_mod.LIST_SCAN_MAX:
+                        raise ListingTooLarge(
+                            f"more than {transport_mod.LIST_SCAN_MAX} names; the scan stopped")
+                    name = entry.name
+                    if after is not None and name <= after:
+                        continue
+                    if len(heap) < keep:
+                        heapq.heappush(heap, _Larger(name))
+                    elif name < heap[0].name:
+                        heapq.heapreplace(heap, _Larger(name))
+        finally:
+            os.close(fd)
+        names = sorted(h.name for h in heap)
+        return names[:limit], len(names) > limit
 
 
 def _inside_stage(b: Binding) -> bool:
