@@ -1325,7 +1325,10 @@ can make, computed exactly at load (`hoplink.document_floor`), or the
 config is refused. The floor counts the attachment caps (the smaller of
 the plugin's and this router's), so at this router's defaults it is about
 43.7 MiB. A reload that changes `hop` is refused, like one that
-changes the plugin.
+changes the plugin. Every instance's address must be able to serve as a
+handover's `from_address` (at most 254 octets, a local part of at most 64,
+the bare addr-spec pattern): one that cannot is refused at load, by the
+same check begin runs.
 
 **One sender per generation.** The drain asks for the current
 generation's sender on first use. Before the first construction this router
@@ -1369,8 +1372,10 @@ retry can change LATCHES a hold on that generation's hand-overs, in
 generation new` moves the instance on. Anything else is retried next poll
 with the same record and transport id, under a named status:
 `hop_version_unavailable` (the peer does not read `version_write` yet) and
-`hop_peer_not_ready` log a WARNING until stale (one hour), then an ERROR, as
-does `hop_io_error`; `hop_owner_mismatch`, `hop_anomaly:<reason>`,
+`hop_layout` log a WARNING until stale (one hour), then an ERROR, as does
+`hop_io_error`. `hop_layout` has two causes, and its status entry carries a
+hint naming both: the peer's `down/` not existing yet, which clears, or this
+router's own tree directories missing, which does not. `hop_anomaly:<reason>`,
 `hop_unsafe_read:<reason>` and `hop_object_closed` (the sender is rebuilt)
 log an ERROR every poll. An exception the table does not name is
 `hop_unexpected`, logged with its traceback. A failed status probe never

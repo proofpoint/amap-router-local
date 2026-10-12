@@ -101,6 +101,34 @@ class HopConfigTests(helpers.RouterTestCase):
         self.assertEqual(config_mod.load_obj(self.doc(version_write=top)).hop.version_write, top)
         self.refused(self.doc(version_write=top + 1), "config.hop.version_write")
 
+    def named(self, name, fleet_domain=None, *, hop=True):
+        root = self.tmp / "ns"
+        root.mkdir(exist_ok=True)
+        doc = {"state_dir": str(self.state_dir), "instances": {name: {"namespace": str(root)}}}
+        if fleet_domain is not None:
+            doc["fleet_domain"] = fleet_domain
+        if hop:
+            doc = helpers.with_hop(dict(doc, transport_plugin={"path": "/opt/p.py",
+                                                               "sha256": SHA}), self.tmp)
+        return doc
+
+    def test_every_address_can_be_a_from_address_at_254_octets_and_not_255(self):
+        name = "n" * 64
+        d189 = ".".join(["a" * 63, "b" * 63, "c" * 61])
+        d190 = ".".join(["a" * 63, "b" * 63, "c" * 62])
+        self.assertEqual(len(f"{name}@{d189}"), 254)
+        config_mod.load_obj(self.named(name, d189))
+        self.refused(self.named(name, d190), f"config.instances.{name}", "from_address", "255")
+        config_mod.load_obj(self.named(name, d190, hop=False))   # control: only with a hop
+
+    def test_the_local_part_at_64_octets_and_not_65(self):
+        """Without a fleet domain the address is `agent.<name>@local`."""
+        ok, long = "m" * 58, "m" * 59
+        self.assertEqual(len(config_mod.address_for(ok).split("@")[0]), 64)
+        config_mod.load_obj(self.named(ok))
+        self.refused(self.named(long), f"config.instances.{long}", "local part")
+        config_mod.load_obj(self.named(long, hop=False))          # control: only with a hop
+
     def test_peer_uid_zero_is_allowed(self):
         self.assertEqual(config_mod.load_obj(self.doc(peer_uid=0)).hop.peer_uid, 0)
 

@@ -1622,6 +1622,19 @@ def load_obj(
                state_dir=state_dir, intake_dir=intake_dir, roots=roots,
                attachment_caps=(attachment_max_count, attachment_max_bytes,
                                 attachment_max_total_bytes))
+    if hop is not None:
+        # Every handover's envelope carries its instance's address as
+        # `from_address`, and the document floor assumes it is at most 254
+        # octets: an instance whose address cannot be one is refused here, by
+        # the same check begin runs (`hoplink.from_address_problem`).
+        from .hoplink import from_address_problem  # local, as `_hop`'s
+        for name in sorted(roots):
+            why = from_address_problem(address_for(name, fleet_domain))
+            if why is not None:
+                raise ConfigError(
+                    f"config.instances.{name}: its address "
+                    f"{address_for(name, fleet_domain)!r} cannot be a handover's "
+                    f"from_address ({why})")
 
     trusted, fleet_hosts, egress, per_instance = _classification(
         top, fleet_domain, classify_raw)

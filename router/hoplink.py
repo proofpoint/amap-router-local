@@ -529,10 +529,11 @@ def evict_sender(cfg: Any, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 #: A plugin `.reason` from `write_request` that is retried, and its status.
+#: `owner` is not one: only an intake reader raises it, so from a sender it
+#: is unexpected.
 RETRY_WRITE_REASONS: Dict[str, str] = {
     "version": "hop_version_unavailable",
-    "layout": "hop_peer_not_ready",
-    "owner": "hop_owner_mismatch",
+    "layout": "hop_layout",
     "heal_state": "hop_anomaly:heal_state",
     "protocol_violation": "hop_anomaly:protocol_violation",
     "marker_unreadable": "hop_anomaly:marker_unreadable",
@@ -542,7 +543,12 @@ RETRY_WRITE_REASONS: Dict[str, str] = {
 #: first; the peer not yet ready): WARNING when first seen, ERROR only once
 #: older than `inflight.STALE_AFTER_S`. Every other retry is an ERROR on
 #: every poll.
-QUIET_RETRIES = ("hop_version_unavailable", "hop_peer_not_ready", "hop_io_error")
+QUIET_RETRIES = ("hop_version_unavailable", "hop_layout", "hop_io_error")
+#: What a status means, where its name alone could mislead.
+RETRY_HINTS: Dict[str, str] = {
+    "hop_layout": ("the peer's down/ does not exist yet (clears once it does), OR this "
+                   "router's own tree directories are missing (does NOT clear by itself)"),
+}
 #: The status for an exception the closed table does not name: retried, and
 #: logged with its traceback.
 RETRY_UNEXPECTED = "hop_unexpected"
@@ -614,6 +620,8 @@ def status_doc(cfg: Any, names: Iterable[str]) -> Dict[str, Any]:
                     "status": retry["status"], "transport_req_id": retry["transport_req_id"],
                     "detail": retry["detail"], "since": retry["since_ts"],
                     "age_s": int(now - retry["since"])}
+                if retry["status"] in RETRY_HINTS:
+                    entry["retry"]["hint"] = RETRY_HINTS[retry["status"]]
         if entry:
             if key is not None:
                 entry["generation"] = key

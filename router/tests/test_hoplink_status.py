@@ -95,8 +95,8 @@ class RetryStatusTests(_Status):
 
     def test_every_named_retry_status(self):
         cases = {   # the frozen table's statuses, written out: never read from the module
-            "version": "hop_version_unavailable", "layout": "hop_peer_not_ready",
-            "owner": "hop_owner_mismatch", "heal_state": "hop_anomaly:heal_state",
+            "version": "hop_version_unavailable", "layout": "hop_layout",
+            "heal_state": "hop_anomaly:heal_state",
             "protocol_violation": "hop_anomaly:protocol_violation",
             "marker_unreadable": "hop_anomaly:marker_unreadable"}
         # "closed" evicts: its own test below.
@@ -110,9 +110,26 @@ class RetryStatusTests(_Status):
                 self.assertEqual(got.get("status"), status)
 
     def test_an_anomaly_is_loud_on_the_first_poll(self):
-        self.first_poll_with(_Reasoned("owner"))
+        self.first_poll_with(_Reasoned("protocol_violation"))
         _, records = self.logs(self.drain)
         self.assertEqual([r.levelname for r in records], ["ERROR"])
+
+    def test_owner_from_a_sender_is_unexpected(self):
+        """Only an intake reader raises `owner`: from write_request it is no
+        row of the table, so it is retried as unexpected, with its traceback."""
+        self.first_poll_with(_Reasoned("owner"))
+        k, summary = self.drain()
+        retry = self.section(k)["instances"].get("alpha", {}).get("retry", {})
+        self.assertEqual(retry.get("status"), hoplink.RETRY_UNEXPECTED)
+        self.assertEqual(summary["outbound_errored"], 1)
+
+    def test_layout_names_both_causes(self):
+        self.first_poll_with(_Reasoned("layout"))
+        k, _ = self.drain()
+        retry = self.section(k)["instances"].get("alpha", {}).get("retry", {})
+        self.assertEqual(retry.get("status"), "hop_layout")
+        self.assertIn("down/", retry.get("hint", ""))
+        self.assertIn("own tree directories", retry.get("hint", ""))
 
     def test_an_io_error_is_hop_io_error(self):
         self.first_poll_with(OSError(5, "EIO"))
