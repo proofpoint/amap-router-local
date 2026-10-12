@@ -155,6 +155,9 @@ REFUSAL_REASONS = (
 # `role_mismatch` is the sibling runtime's: its link role and its plugin pin
 # disagree, in either direction. This router has no link role and never
 # raises it; the reason is listed so both loaders share one vocabulary.
+# `fsops_unavailable` likewise: this router raised it for every plugin until
+# its filesystem port was activated (`service.start_transport`), and no
+# longer does.
 
 
 class PluginRefused(Exception):

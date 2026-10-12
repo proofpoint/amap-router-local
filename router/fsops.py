@@ -3,9 +3,8 @@
 Every filesystem operation a transport plugin may perform goes through an
 instance of `FsOps`, on descriptors it pinned. The Protocol, its result
 vocabularies and the invariants owed are in `router/transport.py`; this
-module keeps them. It is not activated: nothing in this package hands an
-`FsOps` to a plugin yet (`service.start_transport` still refuses every
-plugin with `fsops_unavailable`).
+module keeps them. `service.start_transport` builds one per process, for
+the configured hop root, and hands it to the plugin's factories.
 
 ROOTS. An `FsOps` knows the directories it may open, by kind:
 
