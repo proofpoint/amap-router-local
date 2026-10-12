@@ -438,6 +438,8 @@ def resolve(transport: Any, cfg: Any, name: str) -> Tuple[Any, Any]:
     given for both."""
     if not is_runtime(transport):
         return transport, transport
+    if transport.fsops is not None and not _RUNTIME_CLASSES:
+        _RUNTIME_CLASSES.extend(transport_mod.check_fsops_classes(transport.fsops))
     key = (str(cfg.state_dir), name)
     try:
         port = sender_for(transport, cfg, name)
@@ -449,3 +451,64 @@ def resolve(transport: Any, cfg: Any, name: str) -> Tuple[Any, Any]:
         return Held(e), None
     HOLDS.pop(key, None)
     return port, None
+
+
+# ---------------------------------------------------------------------------
+# The write_request row of the closed exception table: what LATCHES a hold
+# on this generation's hand-overs, and what is retried with the same id.
+# ---------------------------------------------------------------------------
+
+HOLD_FILE = "hold.json"
+
+#: A plugin `.reason` from `write_request` that no retry can change, and the
+#: hold it latches on THIS generation's hand-overs (results are still read).
+#: Every other reason, and every other exception, is retried next poll with
+#: the same record and the same transport id.
+LATCHED_WRITE_REASONS: Dict[str, str] = {
+    "request_exists_different": "hop_request_conflict",
+    "request_exists_withdrawn": "hop_request_withdrawn",
+    "request_exists_settled": "hop_request_settled",
+    "below_frontier": "hop_frontier_undecidable",
+    "handover_invalid": "hop_handover_invalid",
+    "exists_different": "hop_heal:exists_different",
+    "reconcile": "hop_heal:reconcile",
+    "sidecars": "hop_heal:sidecars",
+    "sidecars_orphaned": "hop_heal:sidecars_orphaned",
+}
+
+#: The runtime's own classes with their roles, from the last runtime
+#: resolved in this process, so `classify` sees them before any `.reason`.
+_RUNTIME_CLASSES: List[Tuple[type, str]] = []
+
+
+def write_hold(cfg: Any, name: str) -> Optional[Dict[str, Any]]:
+    """This generation's latched hand-over hold, or None."""
+    return _read_json_file(transport_dir(cfg, name) / HOLD_FILE)
+
+
+def latch_for_write(exc: BaseException) -> Optional[str]:
+    """The hold `exc` latches, or None for a retry."""
+    kind, detail = transport_mod.classify(exc, runtime=tuple(_RUNTIME_CLASSES))
+    if kind == "reason":
+        return LATCHED_WRITE_REASONS.get(detail)
+    return None
+
+
+def set_write_hold(cfg: Any, name: str, reason: str, detail: str, n: str) -> None:
+    """Latch it durably: only an operator act (`router generation new`, which
+    fences this generation) moves the instance on; the record that hit it is
+    left for disposal and never handed over again."""
+    atomic_write(transport_dir(cfg, name) / HOLD_FILE,
+                 canonical({"reason": reason, "detail": detail[:1024], "transport_req_id": n}),
+                 durable_root=cfg.state_dir)
+
+
+def evict_sender(cfg: Any, name: str) -> None:
+    """Drop (and close) `name`'s current generation's cached sender, so the
+    next poll constructs a fresh one: a sender that said it is closed."""
+    lid, gen = split_gen_key(config_mod.gen_key(cfg, name))
+    for key in [k for k in _SENDERS if k[1:4] == (str(cfg.state_dir), lid, gen)]:
+        try:
+            _SENDERS.pop(key).close()
+        except Exception:  # noqa: BLE001 -- close is cleanup
+            logger.exception("closing a hop sender failed")

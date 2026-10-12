@@ -116,6 +116,35 @@ class SenderTests(_Senders):
         self.assertEqual(pin["admitted_at"], "2001-02-03T04:05:06Z")
 
 
+class SettlementRecordTests(_Senders):
+    """`inflight.settlement_record`, the fixture's probe, on the real layout."""
+
+    def test_inflight_then_settled_then_none(self):
+        write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
+        k, _ = self.drain()
+        lid, gen = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))
+        n = self.plugin.ports[0].writes[0]
+        self.assertEqual(inflight.settlement_record(self.state_dir, lid, gen, n),
+                         {"state": "inflight", "req_id": "00000001", "outcome": None})
+        self.plugin.ports[0].send_all()
+        self.drain()
+        self.assertEqual(inflight.settlement_record(self.state_dir, lid, gen, n),
+                         {"state": "settled", "req_id": "00000001", "outcome": "accepted"})
+        self.assertIsNone(inflight.settlement_record(self.state_dir, lid, gen, "99999999"))
+        for bad in (1, "1", "0000000x"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    inflight.settlement_record(self.state_dir, lid, gen, bad)
+
+    def test_a_damaged_record_raises_never_absent(self):
+        write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
+        k, _ = self.drain()
+        lid, gen = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))
+        inflight.record_path(k, "alpha", "00000001").write_text("{not json")
+        with self.assertRaises(Exception):
+            inflight.settlement_record(self.state_dir, lid, gen, "00000002")
+
+
 class PinTests(_Senders):
 
     def test_a_changed_binding_holds_and_constructs_nothing(self):

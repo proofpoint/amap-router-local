@@ -657,10 +657,29 @@ def advance(
             return SETTLED
         if _repin(name, req_id, record, rc):
             _write_record(cfg, name, req_id, record, "repin")
+    held = hoplink.write_hold(cfg, name)
+    if held is not None:
+        logger.error(
+            "instance %r req %r: NOT handed over: this generation's hand-overs are held "
+            "(%s, latched by transport id %s); `router generation new` moves the instance "
+            "on, and this record is left for disposal", name, req_id, held.get("reason"),
+            held.get("transport_req_id"))
+        return BLOCKED
     data = transport_request_bytes(cfg, name, record)
     _effect("handed", atomic_write, handed, n.encode("ascii"),
             durable_root=cfg.state_dir)
-    _effect("transport", port.write_request, n, data)
+    try:
+        _effect("transport", port.write_request, n, data)
+    except Exception as e:  # noqa: BLE001 -- the closed table decides, then re-raises
+        latched = hoplink.latch_for_write(e)
+        if latched is None:
+            if getattr(e, "reason", None) == "closed":
+                hoplink.evict_sender(cfg, name)
+            raise   # a retry: same record, same transport id, next poll
+        hoplink.set_write_hold(cfg, name, latched, str(e), n)
+        logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
+                     name, req_id, latched, e)
+        return BLOCKED
     return WRITTEN
 
 
@@ -812,3 +831,42 @@ def summarize(
         {"inflight": count, "inflight_oldest_age_s": oldest, "inflight_stale": len(stale)},
         stale,
     )
+
+
+_TRANSPORT_ID_RE = re.compile(r"[0-9]{8,18}\Z")
+
+
+def settlement_record(state_dir: Path, logical_id: str, gen: str,
+                      n: str) -> Optional[Dict[str, Any]]:
+    """Where transport request `n` of generation `gen` stands, read-only, for
+    the hop conformance fixture (and an operator): `{"state": "settled",
+    "req_id", "outcome"}` from its private anchor, `{"state": "inflight",
+    "req_id", "outcome": None}` from its in-flight record, or None when
+    neither names `n` (a burned id, or an id never allocated). An anchor
+    wins over a lingering record (the window between settling and deleting
+    the record). A damaged record or anchor RAISES; it is never read as
+    absent. `n` is the 8-18 digit string throughout."""
+    if not (isinstance(n, str) and _TRANSPORT_ID_RE.fullmatch(n)):
+        raise ValueError(f"{n!r} is not a transport id")
+    gdir = Path(state_dir) / logical_id / f"gen-{gen}"
+    results = gdir / "results"
+    if results.is_dir():
+        for p in sorted(results.iterdir()):
+            if not p.name.endswith(".json"):
+                continue
+            doc = json.loads(p.read_bytes().decode("utf-8"))
+            if not (isinstance(doc, dict) and isinstance(doc.get("result"), dict)):
+                raise RecordDamaged(f"{p}: not an anchor envelope")
+            if doc.get("transport_req_id") == n:
+                return {"state": "settled", "req_id": p.name[: -len(".json")],
+                        "outcome": doc["result"].get("outcome")}
+    d = gdir / INFLIGHT_DIR
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if not p.name.endswith(".json"):
+                continue
+            rec = check_record(json.loads(p.read_bytes().decode("utf-8")))
+            if rec["transport_req_id"] == n:
+                return {"state": "inflight", "req_id": p.name[: -len(".json")],
+                        "outcome": None}
+    return None
