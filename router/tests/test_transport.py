@@ -382,7 +382,8 @@ class ConfigTests(helpers.RouterTestCase):
 
     def test_path_and_sha256_together(self):
         sha = "a" * 64
-        cfg = self._write_and_load({"transport_plugin": {"path": "/opt/p.py", "sha256": sha}})
+        cfg = self._write_and_load(helpers.with_hop(
+            {"transport_plugin": {"path": "/opt/p.py", "sha256": sha}}, self.tmp))
         self.assertEqual(cfg.transport_plugin, config_mod.TransportPluginPin("/opt/p.py", sha))
 
     def test_both_or_neither_and_the_shapes(self):
@@ -476,10 +477,10 @@ class CanonicalPathTests(_PluginDir):
 
     def test_the_config_keeps_the_path_as_written_and_startup_refuses_it(self):
         path, sha = self.symlink_decoy()
-        cfg = config_mod.load_obj({
+        cfg = config_mod.load_obj(helpers.with_hop({
             "state_dir": str(self.dir.parent / "state"),
             "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
-            "transport_plugin": {"path": path, "sha256": sha}})
+            "transport_plugin": {"path": path, "sha256": sha}}, self.dir.parent))
         self.assertEqual(cfg.transport_plugin.path, path, "the config rewrote the pin")
         real = transport.load_plugin
         with mock.patch.object(transport, "load_plugin",
@@ -495,9 +496,11 @@ class CanonicalPathTests(_PluginDir):
         """A consequence, stated in the README: the pin is compared as
         written, so respelling the same file is a changed plugin, and the
         reload is refused (fail closed) like any other plugin change."""
-        doc = {"state_dir": str(self.dir.parent / "state"),
-               "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
-               "transport_plugin": {"path": str(self.path), "sha256": self.sha}}
+        doc = helpers.with_hop(
+            {"state_dir": str(self.dir.parent / "state"),
+             "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
+             "transport_plugin": {"path": str(self.path), "sha256": self.sha}},
+            self.dir.parent)
         cfg = config_mod.load_obj(doc)
         respelled = config_mod.load_obj(dict(doc, transport_plugin={
             "path": f"{self.dir}/./plugin.py", "sha256": self.sha}))
