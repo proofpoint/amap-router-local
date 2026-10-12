@@ -582,6 +582,11 @@ class FleetAndInternetTests(_Case):
 
 class OriginatedCodeTests(_Case):
 
+    # The drain classifies at `outbound.utc_ts()`, and the ages below are
+    # fixed against NOW: on the real clock "young" stops being young once
+    # NOW is far enough in the past. The clock is pinned, never the literal
+    # moved, so the test means the same thing on every date.
+    @mock.patch.object(outbound, "utc_ts", lambda: NOW)
     def test_each_code_with_its_outcome(self):
         """§9's table, for the codes this router originates at its own
         submit; each produced through the drain."""

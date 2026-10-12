@@ -226,6 +226,8 @@ class PeerColdSendTests(RouterTestCase):
         write_request(cfg, "a", "00000001", to=[addr("b")])
         with mock.patch.object(deliver, "deliver_peer", side_effect=OSError("disk")):
             outbound.drain_instance(cfg, "a")
+        self.assertTrue(result_path(cfg, "a", "00000001").exists(),
+                        "a failed peer delivery was left unanswered")
         result = read_json(result_path(cfg, "a", "00000001"))
         self.assertEqual((result["outcome"], result["reason_code"]),
                          ("queued_for_human", "delivery_failed"))

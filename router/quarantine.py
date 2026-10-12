@@ -54,7 +54,10 @@ module only lists them. ID is the candidate's 32-hex DIRECTORY name, and
 `show` gives METADATA ONLY (its `candidate.json`'s size, sha256 and mtime,
 read pinned and bounded) until the inbound step freezes their format. A
 `candidate.json` with exactly two links is a link-commit caught in
-progress: listed IN FLIGHT and not read. Any other link count is DAMAGED. The
+progress: listed IN FLIGHT and not read. Any other link count is DAMAGED.
+The writer commits `candidate.json` LAST, so a 32-hex directory without one
+is not yet an item: listed IN FLIGHT, and nothing in it is read, never
+DAMAGED. `.stage` is the writer's own stage and is not listed. The
 intake's path is the inbound step's to configure; until then the CLI takes
 it as `--control-dir`.
 
@@ -64,6 +67,7 @@ item's age and how long until its writer's sweep removes it.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -77,6 +81,11 @@ from typing import Any, Dict, List, Optional
 from .util import parse_utc_ts, utc_ts
 
 SCHEMA = "amap-router-local.ingress-quarantine/1"
+#: The `.control/` intake's writer stage: not an item, never listed.
+STAGE_NAME = ".stage"
+#: Why a control entry is IN FLIGHT.
+IN_FLIGHT_NO_SENTINEL = "no committed candidate.json yet"
+IN_FLIGHT_COMMITTING = "candidate.json is being committed"
 DIR_NAME = "ingress-quarantine"
 GEN_PREFIX = "gen-"
 
@@ -109,6 +118,13 @@ _EVIDENCE_KEY = re.compile(r"[\x20-\x7e]{1,%d}\Z" % EVIDENCE_KEY_MAX)
 class Damaged(ValueError):
     """An entry outside the format. `str(e)` is the reason, and never echoes
     the entry's content."""
+
+
+class Missing(Damaged):
+    """The name is not there (`ENOENT`)."""
+
+    def __init__(self):
+        super().__init__("not there")
 
 
 class Linked(Damaged):
@@ -230,8 +246,11 @@ def read_pinned(dir_fd: int, name: str, cap: int) -> "tuple[bytes, os.stat_resul
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
                      dir_fd=dir_fd)
     except OSError as e:
-        raise Damaged(f"cannot be opened without following a link ({os.strerror(e.errno)})"
-                      ) from None
+        if e.errno == errno.ENOENT:
+            raise Missing() from None
+        if e.errno == errno.ELOOP:
+            raise Damaged("a symbolic link, never followed") from None
+        raise Damaged(f"cannot be opened ({os.strerror(e.errno)})") from None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -340,6 +359,8 @@ def list_control(control_dir: Path, *, now: Optional[str] = None) -> List[Item]:
     try:
         out = []
         for entry in sorted(os.listdir(c_fd)):
+            if entry == STAGE_NAME:
+                continue    # the writer's own stage, never an item
             out.append(_control_item(c_fd, entry, now_dt))
         return out
     finally:
@@ -356,12 +377,18 @@ def _control_item(c_fd: int, entry: str, now: datetime) -> Item:
                     damaged="not a directory reachable without a link")
     try:
         raw, st = read_pinned(d_fd, "candidate.json", CANDIDATE_MAX_BYTES)
+    except Missing:
+        # Its writer commits candidate.json LAST: a directory without one is
+        # not yet an item, listed in flight, and nothing in it is read.
+        return Item(SOURCE_CONTROL, "-", "-", entry,
+                    meta={"in_flight": True, "why": IN_FLIGHT_NO_SENTINEL})
     except Linked as e:
         if e.nlink == 2:
             # Its writer commits candidate.json by link, then removes the
             # staged name: two links is a commit caught in progress, listed
             # as such and never read. Anything else stays DAMAGED.
-            return Item(SOURCE_CONTROL, "-", "-", entry, meta={"in_flight": True})
+            return Item(SOURCE_CONTROL, "-", "-", entry,
+                        meta={"in_flight": True, "why": IN_FLIGHT_COMMITTING})
         return Item(SOURCE_CONTROL, "-", "-", entry, damaged=f"candidate.json: {e}")
     except Damaged as e:
         return Item(SOURCE_CONTROL, "-", "-", entry, damaged=f"candidate.json: {e}")
@@ -380,7 +407,7 @@ def render_line(item: Item) -> str:
     if item.damaged is not None:
         return f"{item.key()} DAMAGED {display(item.damaged)}"
     if item.source == SOURCE_CONTROL and item.meta.get("in_flight"):
-        return f"{item.key()} IN FLIGHT (candidate.json is being committed)"
+        return f"{item.key()} IN FLIGHT ({item.meta['why']})"
     if item.source == SOURCE_CONTROL:
         return f"{item.key()} candidate age={item.age_s}s bytes={item.meta['candidate_bytes']}"
     causes = ",".join(item.doc["causes"])  # vocabulary-checked: printable as is
@@ -399,6 +426,7 @@ def render_show(item: Item) -> str:
         doc["reason"] = item.damaged
     elif item.source == SOURCE_CONTROL and item.meta.get("in_flight"):
         doc["status"] = "in_flight"
+        doc["why"] = item.meta["why"]
     elif item.source == SOURCE_CONTROL:
         doc["status"] = "candidate"
         doc.update(item.meta)

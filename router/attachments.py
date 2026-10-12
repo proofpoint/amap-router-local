@@ -82,10 +82,10 @@ REASON_ATTACHMENT_MISMATCH = "attachment_mismatch"
 REASON_ATTACHMENT_TOO_LARGE = "attachment_too_large"
 REASON_ATTACHMENT_COUNT_EXCEEDED = "attachment_count_exceeded"
 
-# result.schema.json's attachments[].outcome enum (AMAP v2.3.0) is
-# enum-locked to exactly these four values — never invent a fifth here.
+# result.schema.json's attachments[].outcome enum is locked to four values
+# (accepted, dlp_held, rejected_type, too_large); these are the ones this
+# router emits. Never invent a fifth here. A malformed attachment gets none.
 ATTACH_OUTCOME_ACCEPTED = "accepted"
-ATTACH_OUTCOME_REJECTED_TYPE = "rejected_type"
 ATTACH_OUTCOME_TOO_LARGE = "too_large"
 
 _READ_CHUNK = 256 * 1024
@@ -112,11 +112,13 @@ class AttachmentIngestError(Exception):
     is `"rejected"` (malformed/mismatched — §4's first path: never a
     partial send) or `"queued_for_human"` (a policy cap on an HONEST
     declaration — §4's second path, never conflated with the first).
-    `index`/`attachment_outcome`, when both given, let the caller attach
-    one diagnostic entry to the result's optional `attachments[]` array
-    (§4); omitted when the failure doesn't name a single offending index
-    (e.g. a whole-array count-cap breach, or a sidecar-dir shape
-    violation)."""
+    `index` names the offending attachment when there is one (not for a
+    whole-array count-cap breach or a sidecar-dir shape violation).
+    `attachment_outcome` is its §6.1 per-attachment verdict, and only a
+    POLICY refusal has one (`too_large`): a malformed attachment carries
+    None, since §6.1's vocabulary has no word for it (`rejected_type` is the
+    policy verdict for a disallowed type). How these reach the Result's
+    optional `attachments[]` is `outbound._refusal_diag`'s."""
 
     def __init__(
         self, outcome: str, reason_code: str, detail: str,
@@ -245,7 +247,7 @@ def _verify_one(side_fd: int, index: int, descriptor: Dict[str, Any]) -> Verifie
         raise AttachmentIngestError(
             "rejected", REASON_ATTACHMENT_MISMATCH,
             f"attachments[{index}]: cannot open sidecar ordinal {name!r}: {e}",
-            index=index, attachment_outcome=ATTACH_OUTCOME_REJECTED_TYPE,
+            index=index, attachment_outcome=None,
         )
     try:
         st = os.fstat(fd)
@@ -254,7 +256,7 @@ def _verify_one(side_fd: int, index: int, descriptor: Dict[str, Any]) -> Verifie
                 "rejected", REASON_ATTACHMENT_MISMATCH,
                 f"attachments[{index}]: sidecar ordinal {name!r} is not a "
                 f"regular file",
-                index=index, attachment_outcome=ATTACH_OUTCOME_REJECTED_TYPE,
+                index=index, attachment_outcome=None,
             )
         if st.st_nlink != 1:
             # A genuine agent-written sidecar is always nlink==1 (write +
@@ -267,7 +269,7 @@ def _verify_one(side_fd: int, index: int, descriptor: Dict[str, Any]) -> Verifie
                 "rejected", REASON_ATTACHMENT_MISMATCH,
                 f"attachments[{index}]: sidecar ordinal {name!r} is a hard "
                 f"link (nlink={st.st_nlink}) — refusing",
-                index=index, attachment_outcome=ATTACH_OUTCOME_REJECTED_TYPE,
+                index=index, attachment_outcome=None,
             )
         data = _read_capped(fd, declared_size)
         if len(data) != declared_size:
@@ -275,7 +277,7 @@ def _verify_one(side_fd: int, index: int, descriptor: Dict[str, Any]) -> Verifie
                 "rejected", REASON_ATTACHMENT_MISMATCH,
                 f"attachments[{index}]: descriptor declares size_bytes="
                 f"{declared_size} but the sidecar is a different size",
-                index=index, attachment_outcome=ATTACH_OUTCOME_REJECTED_TYPE,
+                index=index, attachment_outcome=None,
             )
         digest = hashlib.sha256(data).hexdigest()
         if digest != declared_sha:
@@ -283,7 +285,7 @@ def _verify_one(side_fd: int, index: int, descriptor: Dict[str, Any]) -> Verifie
                 "rejected", REASON_ATTACHMENT_MISMATCH,
                 f"attachments[{index}]: sha256 mismatch (descriptor declares "
                 f"{declared_sha}, computed {digest} over the sidecar bytes)",
-                index=index, attachment_outcome=ATTACH_OUTCOME_REJECTED_TYPE,
+                index=index, attachment_outcome=None,
             )
     finally:
         os.close(fd)
@@ -425,11 +427,17 @@ def _mkdir_and_pin(parent_fd: int, name: str) -> int:
     fresh `notice_id` collision is not), then return a freshly
     `O_NOFOLLOW`-pinned fd to it. Refuses (`NamespaceEscapeError`) if
     `name` exists but is not currently a real, non-symlink directory —
-    never descended into."""
+    never descended into.
+
+    The parent is fsynced every time, created now or not: a directory an
+    earlier, interrupted run created may never have been made durable, and
+    every file placed beneath it rests on its entry (`util._mkdir_durable`
+    does the same for `state_dir`)."""
     try:
         os.mkdir(name, dir_fd=parent_fd)
     except FileExistsError:
         pass
+    os.fsync(parent_fd)
     kind, fd = open_child_pinned(parent_fd, name)
     if kind != "dir":
         raise NamespaceEscapeError(
@@ -461,6 +469,14 @@ def _mkdir_descend_pinned(root_fd: int, rel: Path) -> int:
     return cur
 
 
+class PublishedNotDurable(OSError):
+    """The name WAS renamed into place, and the barrier after it (the
+    directory fsync) failed: the file is visible now and may not survive a
+    power loss. Distinct from a failure before the rename, after which
+    nothing was published: a caller that treats a failed write as "nothing
+    placed" must not treat this one so."""
+
+
 def _write_blob_pinned(dir_fd: int, name: Any, data: bytes) -> None:
     """Write `data` at `str(name)`, `dir_fd`-relative: a fresh,
     exclusively-created temp name, written, then renamed into place — both
@@ -471,7 +487,15 @@ def _write_blob_pinned(dir_fd: int, name: Any, data: bytes) -> None:
     it is NEVER used to build a path string; it is only ever the bare
     final component of a `dir_fd`-relative syscall, matching every other
     write in this module (leg (c) of the contract's write-side
-    discipline: a fresh `O_EXCL` create, never `O_TRUNC` in its place)."""
+    discipline: a fresh `O_EXCL` create, never `O_TRUNC` in its place).
+
+    DURABLE, as `util.atomic_write` is: the file is fsynced before the
+    rename and the directory after it, and a failure of either RAISES. The
+    commit order a placement relies on (blobs, spool, ledger, notice LAST)
+    is then an order on disk, not only in the page cache: without these, a
+    power loss could keep the private record that says "delivered" and lose
+    the notice it describes. A failure of the directory fsync, after the
+    rename, raises `PublishedNotDurable`."""
     tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
     fd = os.open(
         tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd
@@ -479,6 +503,8 @@ def _write_blob_pinned(dir_fd: int, name: Any, data: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         os.rename(tmp_name, str(name), src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
         try:
@@ -486,6 +512,11 @@ def _write_blob_pinned(dir_fd: int, name: Any, data: bytes) -> None:
         except OSError:
             pass
         raise
+    try:
+        os.fsync(dir_fd)
+    except OSError as e:
+        raise PublishedNotDurable(e.errno, f"published, but its directory was not made "
+                                  f"durable: {e.strerror}") from e
 
 
 class RootChanged(Exception):

@@ -856,6 +856,21 @@ conflated"). Both are configurable at the top level of the router config
 (`router/config.py`): `attachment_max_bytes`, `attachment_max_count`,
 `attachment_max_total_bytes`.
 
+**The refusal's `attachments[]`.** AMAP §6.1 gives a Result one diagnostic
+entry per SUBMITTED attachment, its `index` equal to its array position, 0
+through n-1. Ingest stops at the first failure, so the attachments after it
+have no verdict, and §6.1's vocabulary has no word for "not examined". The
+array is written only when every submitted attachment has a real verdict,
+which on a refusal means exactly one was submitted and it failed a POLICY
+cap (`too_large`). Otherwise the optional member is omitted and `detail`
+ends with the failing index and its outcome, `(attachment <i>: <outcome>)`.
+A MALFORMED attachment (a size or digest mismatch, a sidecar that cannot be
+opened, is not a regular file, or is linked) has no §6.1 per-attachment
+outcome at all: §6.1 makes it a top-level `rejected`, and `rejected_type` is
+the policy verdict for a disallowed type. It is never given an entry, alone
+or not, and `detail` ends `(attachment <i>: malformed)`. A verdict is never
+invented for an attachment nobody examined.
+
 **TOCTOU.** The sidecar dir is agent-owned and writable while the router
 reads it — the same defect class `reset.py` found and fixed for deletions
 (a path-based check-then-act let an agent redirect a removal outside its
@@ -1286,7 +1301,10 @@ runtime writes) are listed with `--control-dir`, keyed `- control - ID`
 with ID the candidate's 32-hex directory name, METADATA ONLY (the
 `candidate.json` size, sha256 and mtime) until the inbound step freezes their
 format; their path is not configured yet. A `candidate.json` caught
-mid-commit (exactly two links) is listed IN FLIGHT, not DAMAGED. Nothing is moved or written, and
+mid-commit (exactly two links) is listed IN FLIGHT, not DAMAGED. Its writer
+commits `candidate.json` LAST, so a directory without one is not yet an item:
+listed IN FLIGHT ("no committed candidate.json yet"), and nothing in it is
+read. `.stage` is the writer's own stage and is not listed. Nothing is moved or written, and
 the registry is read without recording its seq. Retention is
 `ingress_quarantine_days` (default 14, 1-365). `status` reports a count per
 agent under a registry.
@@ -1784,6 +1802,39 @@ transition:
   when none is pending, the request gets its ONE Result, as an unheld drain
   would have answered, and the record goes;
 - a damaged record fails closed: the request holds, listed as damaged.
+
+**Every direct placement uses the same record, as its intent.** Cold mail to
+local recipients, a bound reply and a peer route write the pending record
+(marked `"origin": "direct"`) before anything is placed, with or without a
+registry, and place through it with the pre-minted identity. The private
+anchor is written only after placement; if that write (or anything after the
+placement) fails, the request stays in `outbound/`, and the next poll finds
+the record and answers from it without placing again, instead of minting a
+second notice id. Two things differ from a held record: a delivery failure
+that is not a hold fails that target at once (the commit writes the notice
+last, so a raise means no notice was placed), exactly as the direct paths
+always answered; and the record is removed once the request is answered.
+The one raise that does not mean "nothing placed" is a failed barrier AFTER
+a file was renamed into place (`attachments.PublishedNotDurable`): the
+notice may be visible, so that target stays `delivering` and is replayed
+with the same identity, never failed.
+
+**Every agent-visible write is durable.** Sidecars, the message spool and
+the notice are each fsynced before they are renamed into place and their
+directory after, and every directory on the way is made durable in its
+parent; a failed barrier raises. So the commit order (blobs, spool, ledger,
+notice LAST) holds on disk across a power loss, not only across a process
+crash, and the private record can never say "delivered" over a notice the
+disk lost: a power loss lands in the re-presentation residual below. An
+injected backend that cannot take the `preset` and `from_address` keywords is
+called directly, as before, and keeps the old exposure: a failure after its
+placement can place again under a new id.
+
+A crash after the notice write but before the "delivered" mark replays with
+the SAME id. If the agent consumed the notice in that window, it reappears
+with the same notice_id. That is a re-presentation, not a second notice.
+Whether a connector dedups by notice_id is unspecified in the draft, so this
+router does not claim exactly-once delivery to the agent.
 
 **DSNs to a held sender.** A DSN is enqueued as a durable intent under the
 RECEIVER (`state_dir/<receiver>/dsn-pending/<tree>-<nid>.<outcome>.json`,

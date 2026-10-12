@@ -369,7 +369,12 @@ class RecipientRootTests(_Gens):
         write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
         k = keyed_for_poll(self.cfg)
         self.replace_root("bravo")
-        outbound.drain_instance(k, "alpha")
+        from router import deliver as deliver_mod
+        with mock.patch.object(deliver_mod, "deliver", wraps=deliver_mod.deliver) as spy:
+            outbound.drain_instance(k, "alpha")
+        # The hold check stops it BEFORE anything on the recipient's side is
+        # touched; the write's own root check (below) is the second guard.
+        self.assertEqual(spy.call_count, 0, "delivery was attempted into a replaced root")
         self.assertEqual(list_notices(self.cfg, "bravo"), [], "placed into a replaced root")
         self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists())
         self.poll()     # the next pre-pass begins bravo's generation for the new root

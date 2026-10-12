@@ -769,8 +769,10 @@ class DsnFairnessTests(_Fleet):
 
 
 class NoRegistryUnchangedTests(RouterTestCase):
-    """Without a registry: no pending records, no DSN queue, and the drain
-    and outcome summaries carry exactly the keys they always did."""
+    """Without a registry: no held state, no DSN queue, and the drain and
+    outcome summaries carry exactly the keys they always did. A direct
+    placement's intent record is written there too, and removed once the
+    request is answered."""
 
     def test_summaries_and_state_are_unchanged(self):
         cfg = make_peer_config(self, {"alpha": {}, "delta": {"peer_senders": ["alpha"]}})
@@ -784,7 +786,9 @@ class NoRegistryUnchangedTests(RouterTestCase):
         self.assertNotIn("dsn_held", summary["delta"])
         self.assertEqual(summary["delta"]["peer_dsn_sent"], 1)       # inline, as before
         self.assertFalse((self.state_dir / "delta" / outcomes.DSN_DIR).exists())
-        self.assertFalse((self.state_dir / "alpha" / outbound.PENDING_DIR).exists())
+        pending = self.state_dir / "alpha" / outbound.PENDING_DIR
+        self.assertEqual(sorted(pending.iterdir()) if pending.exists() else [], [],
+                         "an answered request left its intent record behind")
 
 
 class GlobalHoldSuppressesRecoveryTests(_Fleet):
