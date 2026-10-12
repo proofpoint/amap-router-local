@@ -569,6 +569,10 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 #: `hop.caps`'s members, exactly.
 HOP_CAPS = ("document", "request", "attachment", "total")
+#: The largest `hop.version_write`: the envelope's `hop_contract` is a JSON
+#: integer 1..2^31-1, and a larger one would load here and then have every
+#: handover refused.
+HOP_CONTRACT_MAX = 2 ** 31 - 1
 
 
 @dataclass(frozen=True)
@@ -586,9 +590,12 @@ class HopConfig:
         return dict(self.caps)[name]
 
 
-def _positive_int(value, what: str, *, minimum: int = 1) -> int:
+def _positive_int(value, what: str, *, minimum: int = 1,
+                  maximum: Optional[int] = None) -> int:
     if type(value) is not int or value < minimum:
         raise ConfigError(f"{what}: expected an integer >= {minimum}, got {value!r}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{what}: expected an integer <= {maximum}, got {value!r}")
     return value
 
 
@@ -631,7 +638,8 @@ def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
                 f"config.hop.root ({root}) and {what} ({other}) must not be nested inside "
                 "one another")
     peer_uid = _positive_int(raw["peer_uid"], "config.hop.peer_uid", minimum=0)
-    version_write = _positive_int(raw["version_write"], "config.hop.version_write")
+    version_write = _positive_int(raw["version_write"], "config.hop.version_write",
+                                  maximum=HOP_CONTRACT_MAX)
     caps = _require_object(raw["caps"], "config.hop.caps")
     if set(caps) != set(HOP_CAPS):
         raise ConfigError(f"config.hop.caps: needs exactly {list(HOP_CAPS)}; got {sorted(caps)}")

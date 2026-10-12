@@ -91,6 +91,11 @@ class HopConfigTests(helpers.RouterTestCase):
                     doc["hop"]["caps"][cap] = bad
                     self.refused(doc, f"config.hop.caps.{cap}")
 
+    def test_version_write_is_at_most_the_envelopes_maximum(self):
+        top = config_mod.HOP_CONTRACT_MAX
+        self.assertEqual(config_mod.load_obj(self.doc(version_write=top)).hop.version_write, top)
+        self.refused(self.doc(version_write=top + 1), "config.hop.version_write")
+
     def test_peer_uid_zero_is_allowed(self):
         self.assertEqual(config_mod.load_obj(self.doc(peer_uid=0)).hop.peer_uid, 0)
 
