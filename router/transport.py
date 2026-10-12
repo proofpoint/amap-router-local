@@ -290,10 +290,11 @@ class InboundPort(Protocol):
     codec layer, or a malformed descriptor or `content_ref`). Such an entry IS listed,
     never hidden; an uncommitted notice is not listed. The caller captures
     the class once, at construction (`capture_verdict_class`: two-way
-    disjoint from `OSError` and the runtime's `UnsafeRead`), and dispatches
-    on the captured class for kind `"notice"` only. An `OSError` or
-    `UnsafeRead` raised while reading a notice propagates as itself and is
-    never a verdict.
+    disjoint from `OSError` and both of the runtime's own classes,
+    `UnsafeRead` and `ListingTooLarge`), and dispatches on the captured
+    class for kind `"notice"` only. An `OSError`, `UnsafeRead` or
+    `ListingTooLarge` raised while reading or listing notices propagates as
+    itself and is never a verdict.
 
     A `"notice"` entry's bytes are the hop inbound bundle, which the hop
     codec's specification defines, not this module: a CLOSED, VERSIONED
@@ -386,7 +387,10 @@ class UpstreamMarkers(Protocol):
     `retired()`: `True` for a valid marker; `False` only for an
     owner-checked ENOENT of `up/retired` in an EXISTING tree whose `up/` is
     intact. An absent tree raises this object's `GenerationAbsent`, never
-    `False` (`False` means "the tree exists and is not retired"). Every
+    `False` (`False` means "the tree exists and is not retired"). The caller
+    captures `GenerationAbsent` once, at construction
+    (`capture_verdict_class`: two-way disjoint from `OSError` and both of the
+    runtime's own classes, `UnsafeRead` and `ListingTooLarge`). Every
     other condition RAISES ("cannot decide", so the caller holds): a wrong
     owner, not a regular file, a link count of 2 or more, a missing or
     damaged `up/`, or content other than EXACTLY the canonical

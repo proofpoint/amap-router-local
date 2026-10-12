@@ -117,12 +117,21 @@ class ShapeTests(unittest.TestCase):
                        "`limit + 1` committed entries", "a BOUND, not an exact count",
                        "propagates UNCHANGED", "IS listed, never hidden", "A `/1` bundle is refused",
                        "whose facts, spool or sidecars are missing",
+                       "The caller captures the class once, at construction "
+                       "(`capture_verdict_class`: two-way disjoint from `OSError` and both of "
+                       "the runtime's own classes, `UnsafeRead` and `ListingTooLarge`), and "
+                       "dispatches on the captured class for kind `\"notice\"` only.",
+                       "An `OSError`, `UnsafeRead` or `ListingTooLarge` raised while reading "
+                       "or listing notices propagates as itself and is never a verdict.",
                        "REQUIRED and never null"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, ip)
         um = " ".join(transport.UpstreamMarkers.__doc__.split())
         for phrase in ("never admits", "`\"absent\"` ONLY on an owner-checked ENOENT",
-                       "creating nothing", "never `False`", "EXACTLY the canonical"):
+                       "creating nothing", "never `False`", "EXACTLY the canonical",
+                       "The caller captures `GenerationAbsent` once, at construction "
+                       "(`capture_verdict_class`: two-way disjoint from `OSError` and both of "
+                       "the runtime's own classes, `UnsafeRead` and `ListingTooLarge`)."):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, um)
         fs = " ".join(transport.HopFsOps.__doc__.split())
