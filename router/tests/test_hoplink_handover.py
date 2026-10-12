@@ -1,0 +1,158 @@
+"""The handover a record makes (`inflight.transport_request_bytes`) and the
+settled frontier it carries (`inflight.settled_through`), plus the
+begin-time refusals through the real drain (`outbound._begin_external`).
+"""
+from __future__ import annotations
+
+import json
+import os
+import unittest
+from unittest import mock
+
+from router import hoplink, inflight
+from router.tests.helpers import read_json, result_path, write_request
+from router.tests.test_inflight import EXT, _InflightCase
+
+
+def _rec(n, req_id, **extra):
+    rec = {"transport_req_id": n, "recipients": [EXT], "written_ts": "2026-10-12T00:00:00Z",
+           "from_address": "alice@example.org",
+           "request": {"contract_version": "2", "req_id": req_id,
+                       "draft": {"to": [EXT], "subject": "s", "body_text": "b"}}}
+    rec.update(extra)
+    return rec
+
+
+class FrontierTests(_InflightCase):
+
+    def put(self, n, req_id):
+        rec = _rec(n, req_id)
+        inflight._write_record(self.cfg, "alice", req_id, rec, "record")
+        return rec
+
+    def test_lowest_live_minus_one(self):
+        self.put("00000003", "a0000001")
+        self.put("00000007", "a0000002")
+        self.assertEqual(inflight.settled_through(self.cfg, "alice"), 2)
+
+    def test_a_burned_first_id_is_not_live(self):
+        """Ids 1-4 were burned (allocated, never recorded): the frontier is
+        the first live id less one, at or above the carried counter less one."""
+        self.put("00000005", "a0000001")
+        self.assertEqual(inflight.settled_through(self.cfg, "alice"), 4)
+
+    def test_a_settled_record_not_yet_deleted_still_counts(self):
+        rec = self.put("00000002", "a0000001")
+        self.put("00000006", "a0000002")
+        # Its anchor may already be durable; its record is not gone, so it is live.
+        self.assertEqual(inflight.settled_through(self.cfg, "alice"), 1)
+        os.unlink(inflight.record_path(self.cfg, "alice", "a0000001"))
+        self.assertEqual(inflight.settled_through(self.cfg, "alice"), 5)
+        del rec
+
+    def test_any_unreadable_entry_makes_it_undecidable(self):
+        self.put("00000005", "a0000002")
+        d = inflight._inflight_dir(self.cfg, "alice")
+        cases = {
+            "damaged": lambda: (d / "a0000001.json").write_text("{not json"),
+            "wrong schema": lambda: (d / "a0000001.json").write_text(json.dumps({"x": 1})),
+            "a symlink": lambda: os.symlink(str(d / "a0000002.json"), str(d / "a0000001.json")),
+            "a directory": lambda: (d / "a0000001.json").mkdir(),
+        }
+        for why, make in cases.items():
+            with self.subTest(why=why):
+                make()
+                with self.assertRaises(inflight.FrontierUndecidable):
+                    inflight.settled_through(self.cfg, "alice")
+                p = d / "a0000001.json"
+                if p.is_dir() and not p.is_symlink():
+                    p.rmdir()
+                else:
+                    p.unlink()
+        self.assertEqual(inflight.settled_through(self.cfg, "alice"), 4, "control")
+
+    def test_a_listing_failure_is_undecidable_never_empty(self):
+        self.put("00000005", "a0000002")
+        with mock.patch.object(inflight.os, "listdir", side_effect=OSError(5, "EIO")):
+            with self.assertRaises(inflight.FrontierUndecidable):
+                inflight.settled_through(self.cfg, "alice")
+
+    def test_no_live_record_is_undecidable(self):
+        with self.assertRaises(inflight.FrontierUndecidable):
+            inflight.settled_through(self.cfg, "alice")
+
+
+class HandoverTests(_InflightCase):
+
+    def test_a_retry_changes_only_settled_through(self):
+        low = _rec("00000003", "a0000001")
+        high = _rec("00000005", "a0000002")
+        for req_id, rec in (("a0000001", low), ("a0000002", high)):
+            inflight._write_record(self.cfg, "alice", req_id, rec, "record")
+        first = json.loads(inflight.transport_request_bytes(self.cfg, "alice", high))
+        self.assertEqual(first["settled_through"], 2)
+        os.unlink(inflight.record_path(self.cfg, "alice", "a0000001"))   # 3 settled
+        second = json.loads(inflight.transport_request_bytes(self.cfg, "alice", high))
+        self.assertEqual(second["settled_through"], 4)
+        for key in ("attachments", "envelope", "request", "schema"):
+            self.assertEqual(first[key], second[key], key)
+
+    def test_the_bytes_are_canonical(self):
+        rec = _rec("00000003", "a0000001")
+        inflight._write_record(self.cfg, "alice", "a0000001", rec, "record")
+        data = inflight.transport_request_bytes(self.cfg, "alice", rec)
+        self.assertEqual(hoplink.canonical(json.loads(data)), data)
+        self.assertFalse(data.endswith(b"\n"))
+
+    def test_the_from_address_is_the_pinned_one_never_filled_in(self):
+        rec = _rec("00000003", "a0000001")
+        del rec["from_address"]
+        inflight._write_record(self.cfg, "alice", "a0000001", rec, "record")
+        with self.assertRaises(inflight.HandoverUnavailable):
+            inflight.transport_request_bytes(self.cfg, "alice", rec)
+
+    def test_the_frontier_must_be_below_the_id(self):
+        rec = _rec("00000003", "a0000001")
+        inflight._write_record(self.cfg, "alice", "a0000001", rec, "record")
+        with mock.patch.object(inflight, "settled_through", return_value=3):
+            with self.assertRaises(inflight.FrontierUndecidable):
+                inflight.transport_request_bytes(self.cfg, "alice", rec)
+
+
+class BeginRefusalTests(_InflightCase):
+    """Refused at begin: answered at once, with NO in-flight record, no
+    transport id allocated and nothing written to the transport."""
+
+    def assert_refused_at_begin(self, code):
+        self.drain()
+        r = read_json(result_path(self.cfg, "alice", "00000001"))
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", code))
+        self.assertEqual(self.port.writes, [])
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), [])
+        self.assertFalse(inflight.counter_path(self.cfg, "alice").exists(),
+                         "a transport id was allocated")
+
+    def test_101_recipients(self):
+        write_request(self.cfg, "alice", "00000001",
+                      to=[f"r{i}@example.com" for i in range(101)])
+        self.assert_refused_at_begin("too_many_recipients")
+
+    def test_100_recipients_go(self):
+        write_request(self.cfg, "alice", "00000001",
+                      to=[f"r{i}@example.com" for i in range(100)])
+        self.drain()
+        self.assertEqual(self.port.writes, ["00000001"])
+
+    def test_an_over_long_local_part(self):
+        write_request(self.cfg, "alice", "00000001", to=["l" * 65 + "@example.com"])
+        self.drain()
+        r = read_json(result_path(self.cfg, "alice", "00000001"))
+        # The classifier may already refuse it as malformed; either way it is
+        # refused before anything is allocated.
+        self.assertEqual(r["outcome"], "rejected")
+        self.assertEqual(self.port.writes, [])
+        self.assertFalse(inflight.counter_path(self.cfg, "alice").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

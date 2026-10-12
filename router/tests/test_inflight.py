@@ -227,7 +227,7 @@ class LifecycleTests(_InflightCase):
                       subject="rewritten")
         self.port.send_all()
         self.drain()
-        sent = json.loads(self.port.archived["00000001"])
+        sent = json.loads(self.port.archived["00000001"])["request"]   # inside the handover
         self.assertEqual(sent["draft"]["subject"], "original")
         self.assertEqual(sent["draft"]["to"], [EXT])
         self.assertEqual(self.port.writes, ["00000001"])
@@ -275,13 +275,28 @@ class LifecycleTests(_InflightCase):
 class TransportRequestTests(_InflightCase):
 
     def _record(self, **doc_overrides):
+        """A record as `begin` writes it, ON DISK: the handover's frontier is
+        read from this generation's in-flight directory."""
         doc = {"contract_version": "2", "req_id": "00000009",
                "draft": {"to": [EXT], "subject": "s", "body_text": "b"}}
         doc.update(doc_overrides)
-        return {"transport_req_id": "00000003", "request": doc, "recipients": [EXT]}
+        rec = {"transport_req_id": "00000003", "request": doc, "recipients": [EXT],
+               "written_ts": "2026-10-12T00:00:00Z", "from_address": "alice@example.org"}
+        inflight._write_record(self.cfg, "alice", "00000009", rec, "record")
+        return rec
 
-    def test_it_is_a_valid_submit_request_under_the_transport_id(self):
-        doc = json.loads(inflight.transport_request_bytes(self.cfg, "alice", self._record()))
+    def handover(self, rec):
+        return json.loads(inflight.transport_request_bytes(self.cfg, "alice", rec))
+
+    def test_it_is_a_handover_carrying_a_valid_submit_request(self):
+        whole = self.handover(self._record())
+        self.assertEqual(sorted(whole), ["attachments", "envelope", "request", "schema",
+                                         "settled_through"])
+        self.assertEqual(whole["schema"], "amap-hop-handover/1")
+        self.assertEqual(whole["envelope"], {"from_address": "alice@example.org",
+                                             "hop_contract": 1, "kind": "mail"})
+        self.assertEqual((whole["attachments"], whole["settled_through"]), ([], 2))
+        doc = whole["request"]
         ok, reason, detail = validate_mod.validate_request(doc)
         self.assertTrue(ok, (reason, detail))
         self.assertEqual(doc["req_id"], "00000003")
@@ -291,7 +306,7 @@ class TransportRequestTests(_InflightCase):
     def test_an_unmapped_threading_key_is_dropped_not_carried_across(self):
         rec = self._record(in_reply_to="n-agent")
         rec["request"]["draft"]["reply_to_message_id"] = "n-agent"
-        doc = json.loads(inflight.transport_request_bytes(self.cfg, "alice", rec))
+        doc = self.handover(rec)["request"]
         self.assertNotIn("in_reply_to", doc)
         self.assertNotIn("reply_to_message_id", doc["draft"])
 
@@ -553,7 +568,7 @@ class RecipientIntegrityTests(_InflightCase):
         write_request(self.cfg, "alice", "00000001", to=["Allowed@Example.ORG"], cc=[DENIED])
         self.drain(cold_policy=self._only("Allowed@example.org", DENIED))
         self.assertEqual(self.port.writes, ["00000001"])
-        sent = json.loads(self.port.pending["00000001"])
+        sent = json.loads(self.port.pending["00000001"])["request"]   # inside the handover
         self.assertEqual(sent["draft"]["to"], ["Allowed@Example.ORG"])
         self.assertEqual(sent["draft"]["cc"], [DENIED])
 
@@ -578,9 +593,11 @@ class RecipientIntegrityTests(_InflightCase):
         """Defence in depth: the builder itself refuses, so no caller can
         produce a transport request that skips the check."""
         rec = {"transport_req_id": "00000003", "recipients": [ALLOWED],
+               "written_ts": "2026-10-12T00:00:00Z", "from_address": "alice@example.org",
                "request": {"contract_version": "2", "req_id": "00000009",
                            "draft": {"to": [ALLOWED, DENIED], "subject": "s",
                                      "body_text": "b"}}}
+        inflight._write_record(self.cfg, "alice", "00000009", rec, "record")
         with self.assertRaises(inflight.RecipientSetMismatch):
             inflight.transport_request_bytes(self.cfg, "alice", rec)
         rec["request"]["draft"]["to"] = [ALLOWED]

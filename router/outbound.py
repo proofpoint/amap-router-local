@@ -144,6 +144,7 @@ from . import classify as classify_mod
 from . import generations as generations_mod
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
+from . import hoplink
 from .config import (RouterConfig, address_for, gen_state_dir, instance_for, state_key,
                      target_hold, target_known_id, target_logical_id)
 from .util import (
@@ -1353,10 +1354,38 @@ def _begin_external(
             recipients=[], detail="attachments on the external leg are not supported yet",
         )
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    # The begin-time checks (`router/hoplink.py`): what the transport would
+    # refuse for a reason no retry can change is answered NOW, before a
+    # transport id is allocated, or the request would stay in flight forever
+    # and hold this generation's frontier. Checked on the request exactly as
+    # it will be handed over, with the longest transport id it can carry.
+    from_address = address_for(name, cfg.fleet_domain)
+    why = hoplink.from_address_problem(from_address)
+    if why is not None:
+        logger.error("instance %r: its address %r cannot be a handover's from_address "
+                     "(%s); nothing is handed over", name, from_address, why)
+        result = _result_doc(
+            req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY, recipients=[],
+            detail="this instance's address cannot be handed to the external leg")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    probe = json.loads(json.dumps(doc))
+    probe["req_id"] = "9" * hoplink.TRANSPORT_ID_MAX_DIGITS
+    probe["agent_id"] = state_key(cfg, name)
+    probe.pop("in_reply_to", None)
+    probe.get("draft", {}).pop("reply_to_message_id", None) if isinstance(
+        probe.get("draft"), dict) else None
+    try:
+        hoplink.check_begin(probe, request_cap=(cfg.hop.cap("request")
+                                                if cfg.hop is not None else 1 << 62))
+    except hoplink.Refused as e:
+        result = _result_doc(req_id, e.outcome, reason_code=e.reason_code,
+                             recipients=[], detail=e.detail)
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
     record = inflight_mod.begin(
         cfg, name, req_id, digest=req_digest, request_doc=doc,
         recipients=list(route.recipients),
         policy_digest=classify_mod.policy_digest(cfg, name), route=klass,
+        from_address=from_address,
     )
     _advance_one(cfg, name, req_id, record, transport, cold_policy=cold_policy)
     return INFLIGHT
