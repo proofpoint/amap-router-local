@@ -239,7 +239,12 @@ from typing import Tuple  # noqa: E402
 from . import config as config_mod  # noqa: E402
 from . import generations as generations_mod  # noqa: E402
 from . import transport as transport_mod  # noqa: E402
-from .util import atomic_write  # noqa: E402
+import time  # noqa: E402
+
+from .util import atomic_write, utc_ts  # noqa: E402
+
+#: The clock hold and retry ages are measured on (tests replace it).
+_clock = time.monotonic
 
 logger = logging.getLogger("amap_router_local.hoplink")
 
@@ -265,6 +270,7 @@ class HopHold(Exception):
     def __init__(self, reason: str, detail: str, *, latched: bool, scope: str = "gen"):
         super().__init__(f"{reason}: {detail}")
         self.reason, self.detail, self.latched, self.scope = reason, detail, latched, scope
+        self.since, self.since_ts = _clock(), utc_ts()
 
 
 def split_gen_key(key: str) -> Tuple[str, str]:
@@ -444,9 +450,12 @@ def resolve(transport: Any, cfg: Any, name: str) -> Tuple[Any, Any]:
     try:
         port = sender_for(transport, cfg, name)
     except HopHold as e:
-        if HOLDS.get(key) is None or HOLDS[key].reason != e.reason:
+        prior = HOLDS.get(key)
+        if prior is None or prior.reason != e.reason:
             (logger.error if e.latched else logger.warning)(
                 "instance %r: no hop sender this poll (%s): %s", name, e.reason, e.detail)
+        else:
+            e.since, e.since_ts = prior.since, prior.since_ts   # the same hold, still
         HOLDS[key] = e
         return Held(e), None
     HOLDS.pop(key, None)
@@ -512,3 +521,102 @@ def evict_sender(cfg: Any, name: str) -> None:
             _SENDERS.pop(key).close()
         except Exception:  # noqa: BLE001 -- close is cleanup
             logger.exception("closing a hop sender failed")
+
+
+# ---------------------------------------------------------------------------
+# The write_request row's RETRIES: the status each one shows, how loudly it
+# is logged, and this process's record of them for status.json.
+# ---------------------------------------------------------------------------
+
+#: A plugin `.reason` from `write_request` that is retried, and its status.
+RETRY_WRITE_REASONS: Dict[str, str] = {
+    "version": "hop_version_unavailable",
+    "layout": "hop_peer_not_ready",
+    "owner": "hop_owner_mismatch",
+    "heal_state": "hop_anomaly:heal_state",
+    "protocol_violation": "hop_anomaly:protocol_violation",
+    "marker_unreadable": "hop_anomaly:marker_unreadable",
+    "closed": "hop_object_closed",
+}
+#: The retries that self-clear in a routine sequence (an upgrade, readers
+#: first; the peer not yet ready): WARNING when first seen, ERROR only once
+#: older than `inflight.STALE_AFTER_S`. Every other retry is an ERROR on
+#: every poll.
+QUIET_RETRIES = ("hop_version_unavailable", "hop_peer_not_ready", "hop_io_error")
+#: The status for an exception the closed table does not name: retried, and
+#: logged with its traceback.
+RETRY_UNEXPECTED = "hop_unexpected"
+
+#: This process's latest hand-over retry per (state_dir, instance, generation).
+RETRIES: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+
+def retry_status(exc: BaseException) -> str:
+    """The status a retried `write_request` exception shows."""
+    kind, detail = transport_mod.classify(exc, runtime=tuple(_RUNTIME_CLASSES))
+    if kind == "reason" and detail in RETRY_WRITE_REASONS:
+        return RETRY_WRITE_REASONS[detail]
+    if kind == "runtime":
+        why = getattr(exc, "reason", None)
+        return f"hop_{detail}:{why}" if type(why) is str else f"hop_{detail}"
+    if kind == "oserror":
+        return "hop_io_error"
+    return RETRY_UNEXPECTED
+
+
+def note_retry(cfg: Any, name: str, status: str, detail: str, n: str) -> float:
+    """Record a retry of transport id `n` with `status`, keeping its first
+    sighting while the status is unchanged; its age in seconds."""
+    key = (str(cfg.state_dir), name, config_mod.gen_key(cfg, name))
+    prior = RETRIES.get(key)
+    now = _clock()
+    if prior is None or (prior["status"], prior["transport_req_id"]) != (status, n):
+        prior = {"status": status, "transport_req_id": n, "since": now, "since_ts": utc_ts()}
+    prior["detail"] = detail[:1024]
+    RETRIES[key] = prior
+    return now - prior["since"]
+
+
+def clear_retry(cfg: Any, name: str) -> None:
+    RETRIES.pop((str(cfg.state_dir), name, config_mod.gen_key(cfg, name)), None)
+
+
+def status_doc(cfg: Any, names: Iterable[str]) -> Dict[str, Any]:
+    """`status.json`'s `hop` section: per instance, the sender hold, the
+    latched hand-over hold and the current retry, each with its age; and the
+    senders this process holds open. Never part of the drained summary line."""
+    now = _clock()
+    state = str(cfg.state_dir)
+    instances: Dict[str, Any] = {}
+    for name in sorted(names):
+        entry: Dict[str, Any] = {}
+        hold = HOLDS.get((state, name))
+        if hold is not None:
+            entry["sender_hold"] = {
+                "reason": hold.reason, "latched": hold.latched, "scope": hold.scope,
+                "detail": hold.detail[:1024], "since": hold.since_ts,
+                "age_s": int(now - hold.since)}
+        try:
+            key = config_mod.gen_key(cfg, name)
+        except Exception:  # noqa: BLE001 -- an instance with no generation this poll
+            key = None
+        if key is not None:
+            try:
+                held = write_hold(cfg, name)
+            except (OSError, ValueError) as e:
+                entry["write_hold"] = {"reason": "unreadable", "detail": str(e)[:1024]}
+            else:
+                if held is not None:
+                    entry["write_hold"] = held
+            retry = RETRIES.get((state, name, key))
+            if retry is not None:
+                entry["retry"] = {
+                    "status": retry["status"], "transport_req_id": retry["transport_req_id"],
+                    "detail": retry["detail"], "since": retry["since_ts"],
+                    "age_s": int(now - retry["since"])}
+        if entry:
+            if key is not None:
+                entry["generation"] = key
+            instances[name] = entry
+    return {"instances": instances,
+            "senders_open": sum(1 for k in _SENDERS if k[1] == state)}

@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 from . import aliases as aliases_mod
 from . import inflight as inflight_mod, quarantine as quarantine_mod
-from . import generations, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
+from . import generations, hoplink, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
 from .config import RouterConfig
 from .config import ConfigError, load
 from .status import StatusTracker, render_discovery
@@ -277,6 +277,11 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
                 keyed_cfg, report, None if transport is _LOAD else transport))
         except Exception:
             logger.exception("error reading the cross-host state for status — isolated")
+        if hoplink.is_runtime(transport):
+            try:
+                tracker.record_hop(hoplink.status_doc(keyed_cfg, keyed_cfg.instances))
+            except Exception:
+                logger.exception("error reading the hop state for status — isolated")
         if report.state != "off":
             try:
                 tracker.record_generations(generations.status_doc(

@@ -670,17 +670,36 @@ def advance(
             durable_root=cfg.state_dir)
     try:
         _effect("transport", port.write_request, n, data)
-    except Exception as e:  # noqa: BLE001 -- the closed table decides, then re-raises
+    except Exception as e:  # noqa: BLE001 -- the closed table decides
         latched = hoplink.latch_for_write(e)
-        if latched is None:
-            if getattr(e, "reason", None) == "closed":
-                hoplink.evict_sender(cfg, name)
-            raise   # a retry: same record, same transport id, next poll
-        hoplink.set_write_hold(cfg, name, latched, str(e), n)
-        logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
-                     name, req_id, latched, e)
+        if latched is not None:
+            hoplink.set_write_hold(cfg, name, latched, str(e), n)
+            logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
+                         name, req_id, latched, e)
+            return BLOCKED
+        # A retry: the same record and the same transport id, next poll.
+        status = hoplink.retry_status(e)
+        if status == "hop_object_closed":
+            hoplink.evict_sender(cfg, name)
+        if _is_hop(cfg):
+            age = hoplink.note_retry(cfg, name, status, f"{type(e).__name__}: {e}", n)
+        else:
+            age = 0.0
+        if status == hoplink.RETRY_UNEXPECTED:
+            raise   # logged with its traceback by the caller
+        quiet = status in hoplink.QUIET_RETRIES and age < STALE_AFTER_S
+        (logger.warning if quiet else logger.error)(
+            "instance %r req %r: NOT handed over this poll (%s, for %ds): %s; retried "
+            "next poll with transport id %s", name, req_id, status, age, e, n)
         return BLOCKED
+    if _is_hop(cfg):
+        hoplink.clear_retry(cfg, name)
     return WRITTEN
+
+
+def _is_hop(cfg: RouterConfig) -> bool:
+    """A generation-keyed config with a hop: where retries are tracked."""
+    return getattr(cfg, "hop", None) is not None and getattr(cfg, "registry_dir", None) is not None
 
 
 def _check_revocation(
