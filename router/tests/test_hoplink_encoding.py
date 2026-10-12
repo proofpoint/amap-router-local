@@ -34,7 +34,7 @@ class AddressTests(unittest.TestCase):
     def test_octet_boundaries(self):
         local64 = "l" * 64
         self.assertIsNone(hoplink.address_octets_problem(local64 + "@example.org"))
-        self.assertIn("local part", hoplink.address_octets_problem("l" * 65 + "@example.org"))
+        self.assertIn("local part", hoplink.address_octets_problem("l" * 65 + "@example.org") or "")
         at254 = "a" * 64 + "@" + "d" * (254 - 65)
         self.assertEqual(len(at254), 254)
         self.assertIsNone(hoplink.address_octets_problem(at254))

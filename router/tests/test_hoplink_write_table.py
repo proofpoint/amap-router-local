@@ -50,8 +50,21 @@ class _Case(_InflightCase):
 
 class LatchTests(_Case):
 
+    #: The frozen table's latched rows, written out: never read from the module.
+    LATCHED = {
+        "request_exists_different": "hop_request_conflict",
+        "request_exists_withdrawn": "hop_request_withdrawn",
+        "request_exists_settled": "hop_request_settled",
+        "below_frontier": "hop_frontier_undecidable",
+        "handover_invalid": "hop_handover_invalid",
+        "exists_different": "hop_heal:exists_different",
+        "reconcile": "hop_heal:reconcile",
+        "sidecars": "hop_heal:sidecars",
+        "sidecars_orphaned": "hop_heal:sidecars_orphaned",
+    }
+
     def test_each_latched_reason_holds_this_generation(self):
-        for reason, hold in hoplink.LATCHED_WRITE_REASONS.items():
+        for reason, hold in self.LATCHED.items():
             with self.subTest(reason=reason):
                 self.setUp()
                 write_request(self.cfg, "alice", "00000001", to=[EXT])

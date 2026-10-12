@@ -25,11 +25,16 @@ class HopConfigTests(helpers.RouterTestCase):
         return doc
 
     def refused(self, doc, *phrases):
-        with self.assertRaises(ConfigError) as cm:
+        """A wrong outcome (loaded, or another exception) is a FAILURE."""
+        try:
             config_mod.load_obj(doc)
-        for phrase in phrases:
-            self.assertIn(phrase, str(cm.exception))
-        return cm.exception
+        except ConfigError as e:
+            for phrase in phrases:
+                self.assertIn(phrase, str(e))
+            return e
+        except Exception as e:  # noqa: BLE001
+            self.fail(f"expected a ConfigError, got {type(e).__name__}: {e}")
+        self.fail("loaded; expected a ConfigError")
 
     def test_the_valid_twin_loads_with_the_root_verbatim(self):
         cfg = config_mod.load_obj(self.doc())

@@ -587,6 +587,23 @@ class StartupTests(_PluginDir):
         self.assertTrue(kept.reload_failed)
         self.assertFalse(cfg.reload_failed)
 
+    def test_a_reload_that_changes_hop_is_refused(self):
+        """The plugin unchanged, only the hop binding moved: refused by the
+        hop guard, which alone names `hop` in its log line."""
+        cfg = self._cfg(config_mod.TransportPluginPin(str(self.path), self.sha))
+        from dataclasses import replace
+        moved = replace(cfg, hop=replace(cfg.hop, root=cfg.hop.root + "-moved"))
+        with mock.patch.object(service, "load", return_value=moved):
+            with self.assertLogs("amap_router_local", logging.ERROR) as cm:
+                kept = service.reload_config("/unused", cfg)
+        self.assertEqual(kept.hop, cfg.hop)
+        self.assertTrue(kept.reload_failed)
+        self.assertIn("changed hop", "\n".join(cm.output))
+        same = replace(cfg, hop=replace(cfg.hop))
+        with mock.patch.object(service, "load", return_value=same):
+            self.assertFalse(service.reload_config("/unused", cfg).reload_failed,
+                             "control: an unchanged hop reloads")
+
 
 class ClaimedIsPendingTests(_InflightCase):
     """`TransportPort.has_pending` is true for a CLAIMED request as well as

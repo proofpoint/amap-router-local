@@ -209,7 +209,8 @@ class PredecessorTests(_Senders):
         self.drain()                                     # G2's first sight
         write_request(self.cfg, "alpha", "00000002", to=[EXTERNAL])
         k, _ = self.drain()
-        hold = hoplink.HOLDS[(str(k.state_dir), "alpha")]
+        hold = hoplink.HOLDS.get((str(k.state_dir), "alpha"))
+        self.assertIsNotNone(hold, "no hold: a successor sender was constructed")
         self.assertEqual((hold.reason, hold.scope), ("hop_predecessor_unretired", "instance"))
         self.assertEqual(len(self.plugin.calls), 1, "G2 was admitted before G1 was retired")
         self.assertTrue((k.instances["alpha"].outbox_root / "req-00000002.json").exists())

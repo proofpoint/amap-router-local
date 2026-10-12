@@ -7,9 +7,12 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from dataclasses import replace
 from unittest import mock
 
-from router import hoplink, inflight
+from router import config as config_mod
+from router import hoplink, inflight, outbound
+from router.tests import helpers
 from router.tests.helpers import read_json, result_path, write_request
 from router.tests.test_inflight import EXT, _InflightCase
 
@@ -108,8 +111,9 @@ class HandoverTests(_InflightCase):
         rec = _rec("00000003", "a0000001")
         del rec["from_address"]
         inflight._write_record(self.cfg, "alice", "a0000001", rec, "record")
-        with self.assertRaises(inflight.HandoverUnavailable):
+        with self.assertRaises(Exception) as cm:
             inflight.transport_request_bytes(self.cfg, "alice", rec)
+        self.assertIsInstance(cm.exception, inflight.HandoverUnavailable)
 
     def test_the_frontier_must_be_below_the_id(self):
         rec = _rec("00000003", "a0000001")
@@ -125,6 +129,8 @@ class BeginRefusalTests(_InflightCase):
 
     def assert_refused_at_begin(self, code):
         self.drain()
+        self.assertEqual(self.port.writes, [], "handed over: not refused at begin")
+        self.assertTrue(result_path(self.cfg, "alice", "00000001").exists(), "not answered")
         r = read_json(result_path(self.cfg, "alice", "00000001"))
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", code))
         self.assertEqual(self.port.writes, [])
@@ -153,6 +159,45 @@ class BeginRefusalTests(_InflightCase):
         self.assertEqual(self.port.writes, [])
         self.assertFalse(inflight.counter_path(self.cfg, "alice").exists())
 
+    def test_an_address_that_cannot_be_a_from_address(self):
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        with mock.patch.object(outbound, "address_for", return_value="Alice <alice@x.org>"):
+            self.drain()
+        self.assertEqual(self.port.writes, [], "handed over: the address was not checked")
+        self.assertTrue(result_path(self.cfg, "alice", "00000001").exists(), "not answered")
+        r = read_json(result_path(self.cfg, "alice", "00000001"))
+        self.assertEqual((r["outcome"], r["reason_code"]),
+                         ("queued_for_human", outbound.REASON_TRANSPORT_ANOMALY))
+        self.assertEqual(self.port.writes, [])
+        self.assertFalse(inflight.counter_path(self.cfg, "alice").exists())
+
+    def test_the_record_pins_the_address_at_begin(self):
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.drain()
+        rec = inflight.read_record(self.cfg, "alice", "00000001")
+        self.assertEqual(rec["from_address"],
+                         config_mod.address_for("alice", self.cfg.fleet_domain))
+
+    def test_the_cap_is_checked_at_the_longest_transport_id(self):
+        """A request that fits the cap under transport id 1 but not under an
+        18-digit one is refused at begin: a later id cannot make it fit."""
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        doc = read_json(self.cfg.instances["alice"].outbox_root / "req-00000001.json")
+        doc = dict(doc, req_id="00000001", agent_id=config_mod.state_key(self.cfg, "alice"))
+        size8 = hoplink.request_bytes_len(doc)
+
+        def with_request_cap(cap):
+            caps = dict(helpers.TEST_HOP_CAPS, request=cap)
+            self.cfg = replace(self.cfg, hop=config_mod.HopConfig(
+                root=str(self.tmp / "hop"), peer_uid=0, version_write=1,
+                caps=tuple(caps.items())))
+
+        with_request_cap(size8 + 9)        # 18 digits are 10 more than 8
+        self.assert_refused_at_begin("malformed_request")
+        write_request(self.cfg, "alice", "00000002", to=[EXT])   # the same size
+        with_request_cap(size8 + 10)
+        self.drain()
+        self.assertEqual(self.port.writes, ["00000001"], "control: it fits")
 
 if __name__ == "__main__":
     unittest.main()
