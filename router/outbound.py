@@ -1348,6 +1348,13 @@ def _begin_external(
         logger.warning("instance %r req %r: held unconsumed, the hop sender is held (%s)",
                        name, req_id, transport.hold.reason)
         return HELD
+    if transport is not None and hoplink.write_hold(cfg, name) is not None:
+        # This generation's hand-overs are latched: a request begun now would
+        # be stranded in it. Left unconsumed, it is decided once `router
+        # generation new` has moved the instance on.
+        logger.warning("instance %r req %r: held unconsumed, this generation's hand-overs "
+                       "are held", name, req_id)
+        return HELD
     if transport is None:
         result = _result_doc(
             req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
@@ -1359,6 +1366,14 @@ def _begin_external(
             req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
             recipients=[], detail="attachments on the external leg are not supported yet",
         )
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    # Mail only (D4): the hand-over carries kind "mail", so a request the
+    # classifier did not put in a cold mail class is refused before
+    # anything is allocated, never handed over as mail.
+    if klass not in (classify_mod.CLASS_FLEET, classify_mod.CLASS_INTERNET):
+        result = _result_doc(
+            req_id, "rejected", reason_code=classify_mod.REASON_NO_ROUTE, recipients=[],
+            detail="only mail of the fleet-host or internet class is handed to the hop")
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
     # The begin-time checks (`router/hoplink.py`): what the transport would
     # refuse for a reason no retry can change is answered NOW, before a

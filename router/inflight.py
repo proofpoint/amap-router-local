@@ -427,9 +427,20 @@ def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]
     if not frontier < int(record["transport_req_id"]):
         raise FrontierUndecidable(
             f"settled_through {frontier} is not below {record['transport_req_id']}")
+    if cfg.hop is not None:
+        # The envelope's inputs come from the record and the PIN, never the
+        # current config: the version this generation was pinned to.
+        pin = hoplink.read_pin(cfg, name)
+        if pin is None or type(pin.get("version_write")) is not int:
+            raise HandoverUnavailable("this generation has no pinned version_write")
+        version_write = pin["version_write"]
+    else:
+        # No `hop` configured: only a test's stand-in transport reaches here
+        # (`config.load` requires `hop` beside a plugin, so a deployment
+        # cannot), and the envelope's version is the first one.
+        version_write = 1
     return hoplink.build_handover(
-        doc, from_address=record["from_address"],
-        version_write=cfg.hop.version_write if cfg.hop is not None else 1,
+        doc, from_address=record["from_address"], version_write=version_write,
         attachments=(), settled_through=frontier)
 
 
@@ -665,7 +676,21 @@ def advance(
             "on, and this record is left for disposal", name, req_id, held.get("reason"),
             held.get("transport_req_id"))
         return BLOCKED
-    data = transport_request_bytes(cfg, name, record)
+    try:
+        data = transport_request_bytes(cfg, name, record)
+    except (FrontierUndecidable, HandoverUnavailable) as e:
+        # Decided BEFORE the handed marker: nothing is published, the record
+        # and its transport id stay as they are, and the hold is this
+        # generation's until `router generation new` (the closed table's
+        # deterministic rows: an undecidable frontier, a record that cannot
+        # make a valid handover).
+        hold = (hoplink.LATCHED_WRITE_REASONS["below_frontier"]
+                if isinstance(e, FrontierUndecidable)
+                else hoplink.LATCHED_WRITE_REASONS["handover_invalid"])
+        hoplink.set_write_hold(cfg, name, hold, f"{type(e).__name__}: {e}", n)
+        logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
+                     name, req_id, hold, e)
+        return BLOCKED
     _effect("handed", atomic_write, handed, n.encode("ascii"),
             durable_root=cfg.state_dir)
     try:

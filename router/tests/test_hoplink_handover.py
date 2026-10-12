@@ -123,6 +123,38 @@ class HandoverTests(_InflightCase):
                 inflight.transport_request_bytes(self.cfg, "alice", rec)
 
 
+class PinnedVersionTests(_InflightCase):
+    """With `hop` configured, the envelope's version is the PIN's, never the
+    current config's, and a generation with no pin cannot make a handover."""
+
+    def hop_cfg(self, version_write):
+        return replace(self.cfg, hop=config_mod.HopConfig(
+            root=str(self.tmp / "hop"), peer_uid=0, version_write=version_write,
+            caps=tuple(helpers.TEST_HOP_CAPS.items())))
+
+    def pin(self, cfg, version_write):
+        p = hoplink.transport_dir(cfg, "alice") / hoplink.PIN_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        doc = dict(hoplink.pin_doc(cfg.hop, "2026-10-12T00:00:00Z"), version_write=version_write)
+        p.write_bytes(hoplink.canonical(doc))
+
+    def test_the_version_is_the_pins(self):
+        cfg = self.hop_cfg(2)
+        self.pin(cfg, 1)
+        rec = _rec("00000003", "a0000001")
+        inflight._write_record(cfg, "alice", "a0000001", rec, "record")
+        doc = json.loads(inflight.transport_request_bytes(cfg, "alice", rec))
+        self.assertEqual(doc["envelope"]["hop_contract"], 1, "taken from the current config")
+
+    def test_no_pin_is_no_handover(self):
+        cfg = self.hop_cfg(1)
+        rec = _rec("00000003", "a0000001")
+        inflight._write_record(cfg, "alice", "a0000001", rec, "record")
+        with self.assertRaises(Exception) as cm:
+            inflight.transport_request_bytes(cfg, "alice", rec)
+        self.assertIsInstance(cm.exception, inflight.HandoverUnavailable)
+
+
 class BeginRefusalTests(_InflightCase):
     """Refused at begin: answered at once, with NO in-flight record, no
     transport id allocated and nothing written to the transport."""
@@ -196,6 +228,11 @@ class BeginRefusalTests(_InflightCase):
         self.assert_refused_at_begin("malformed_request")
         write_request(self.cfg, "alice", "00000002", to=[EXT])   # the same size
         with_request_cap(size8 + 10)
+        # A sender's construction pins the generation first; this stand-in
+        # port has none, so pin it as the construction would.
+        pin_path = hoplink.transport_dir(self.cfg, "alice") / hoplink.PIN_FILE
+        pin_path.parent.mkdir(parents=True, exist_ok=True)
+        pin_path.write_bytes(hoplink.canonical(hoplink.pin_doc(self.cfg.hop, "2026-10-12T00:00:00Z")))
         self.drain()
         self.assertEqual(self.port.writes, ["00000001"], "control: it fits")
 

@@ -33,7 +33,8 @@ from typing import Any, Dict, Iterable, List, Optional
 #: The handover document's schema (the plugin's `write_request`).
 HANDOVER_SCHEMA = "amap-hop-handover/1"
 #: The only envelope kind this router hands over. `peer` and `control` are
-#: signed kinds; a request of any other kind is refused `no_route`.
+#: signed kinds; a request of any other class is refused `no_route` at
+#: begin (`outbound._begin_external`), before anything is allocated.
 MAIL_KIND = "mail"
 #: The most raw `to` + `cc` (+ `bcc`) entries one request may name,
 #: duplicates counted (contract amendment E12, `too_many_recipients`).
@@ -331,6 +332,11 @@ def ensure_pin(cfg: Any, name: str) -> Dict[str, Any]:
     return have
 
 
+def read_pin(cfg: Any, name: str) -> Optional[Dict[str, Any]]:
+    """This generation's binding pin, or None before the first construction."""
+    return _read_json_file(transport_dir(cfg, name) / PIN_FILE)
+
+
 def settings_for(cfg: Any, name: str, pin: Dict[str, Any]) -> Dict[str, Any]:
     """The sender's settings, exactly the plugin's closed list, taken from the
     PIN (never the current config) and the generation key."""
@@ -344,15 +350,19 @@ def admitted(cfg: Any, name: str) -> bool:
     return (transport_dir(cfg, name) / ADMITTED_FILE).is_file()
 
 
-def fenced_admitted(cfg: Any, name: str) -> List[str]:
+def fenced_pinned(cfg: Any, name: str) -> List[str]:
     """The fenced predecessors of `name`'s current generation that this
-    router ADMITTED (an `admitted.json` beside their pin)."""
+    router PINNED (a `transport/hop.json`). The pin, not `admitted.json`, is
+    the fail-closed key: the pin is written before the first construction,
+    and a construction may admit the tree and then fail (or the process
+    crash) before `admitted.json` is written. Such a tree is live and
+    unretired all the same."""
     lid, current = split_gen_key(config_mod.gen_key(cfg, name))
     doc = generations_mod.read_doc(cfg.state_dir, lid)
     out = []
     for g in (doc or {}).get("gens", []):
         if g["gen"] != current and (generations_mod.gen_dir(cfg.state_dir, lid, g["gen"])
-                                    / TRANSPORT_DIR / ADMITTED_FILE).is_file():
+                                    / TRANSPORT_DIR / PIN_FILE).is_file():
             out.append(g["gen"])
     return out
 
@@ -360,14 +370,31 @@ def fenced_admitted(cfg: Any, name: str) -> List[str]:
 #: The per-process cache: (runtime id, state_dir, logical_id, gen, pin digest)
 #: -> the constructed sender. Filled only after a construction succeeded.
 _SENDERS: Dict[Tuple, Any] = {}
+#: The LATCHED construction holds, by the same key: consulted before any
+#: construction, so a latched hold is never re-attempted in this process.
+#: Released only by a restart, or by a new generation (a new key).
+_LATCHED: Dict[Tuple, "HopHold"] = {}
 
 
 def sender_for(runtime: Any, cfg: Any, name: str) -> Any:
     """`name`'s CURRENT generation's sender: constructed once per (generation,
     pin) per process, and only after the pin is durable. Its successful
     construction admitted the tree, so `admitted.json` is then written,
-    before the first request is handed over. Raises `HopHold`."""
-    fenced = fenced_admitted(cfg, name)
+    before the first request is handed over. Raises `HopHold`, and ONLY
+    `HopHold`: any other failure on the way (reading the generations record,
+    the pin, the admission confirmation) is a retried construction hold for
+    this generation, never an exception that aborts the instance's drain."""
+    try:
+        return _sender_for(runtime, cfg, name)
+    except HopHold:
+        raise
+    except Exception as e:  # noqa: BLE001 -- classified as a retried hold, never escaped
+        raise HopHold(f"{HOLD_CONSTRUCT_FAILED}:{type(e).__name__}", str(e),
+                      latched=False) from e
+
+
+def _sender_for(runtime: Any, cfg: Any, name: str) -> Any:
+    fenced = fenced_pinned(cfg, name)
     if fenced:
         # Retiring a fenced predecessor is the fence step's; until it has
         # run, no successor is admitted (one live generation, contract §4.1).
@@ -381,20 +408,37 @@ def sender_for(runtime: Any, cfg: Any, name: str) -> Any:
     port = _SENDERS.get(key)
     if port is not None:
         return port
+    if key in _LATCHED:
+        raise _LATCHED[key]
     try:
         port = runtime.plugin.make_sender(settings_for(cfg, name, pin), runtime.fsops)
     except Exception as e:  # noqa: BLE001 -- classified, never swallowed silently
-        raise _construction_hold(e) from e
-    atomic_write(transport_dir(cfg, name) / ADMITTED_FILE,
-                 canonical({"admitted_at": pin["admitted_at"], "hop_root": pin["hop_root"]}),
-                 durable_root=cfg.state_dir)
+        hold = _construction_hold(e)
+        if hold.latched:
+            _LATCHED[key] = hold
+        raise hold from e
+    try:
+        atomic_write(transport_dir(cfg, name) / ADMITTED_FILE,
+                     canonical({"admitted_at": pin["admitted_at"], "hop_root": pin["hop_root"]}),
+                     durable_root=cfg.state_dir)
+    except Exception as e:  # noqa: BLE001 -- not cached, so released here, then retried
+        # The constructed sender is neither cached nor returned: close it now,
+        # or every poll that fails this write leaks one.
+        try:
+            port.close()
+        except Exception:  # noqa: BLE001 -- close is cleanup
+            logger.exception("closing a hop sender after a failed admitted.json write failed")
+        raise HopHold(f"{HOLD_CONSTRUCT_FAILED}:admitted_not_recorded",
+                      f"{type(e).__name__}: {e}", latched=False) from e
     _SENDERS[key] = port
     return port
 
 
 def _construction_hold(e: BaseException) -> HopHold:
-    """The construction row of the closed exception table."""
-    kind, detail = transport_mod.classify(e)
+    """The construction row of the closed exception table. The runtime's own
+    classes are seen first, as on the write path, so an `UnsafeRead` that
+    happens to carry a colliding `.reason` is never latched."""
+    kind, detail = transport_mod.classify(e, runtime=tuple(_RUNTIME_CLASSES))
     if kind == "reason" and detail == "settings_invalid":
         return HopHold(HOLD_SETTINGS_REFUSED, str(e), latched=True)
     if kind == "reason" and detail == "exists_different":
@@ -412,6 +456,7 @@ def forget_senders() -> None:
         except Exception:  # noqa: BLE001 -- close is cleanup
             logger.exception("closing a hop sender failed")
     _SENDERS.clear()
+    _LATCHED.clear()
 
 
 class Held:
@@ -431,6 +476,13 @@ def is_runtime(transport: Any) -> bool:
     return all(hasattr(transport, a) for a in ("plugin", "fsops", "hop"))
 
 
+#: What a FENCED generation's work gets until fence-and-retire is built: a
+#: held transport, so nothing fenced is begun, handed over or settled (a
+#: `None` would read as "no transport configured" and settle).
+FENCED_UNTIL_RETIRED = HopHold("hop_fenced_unretired",
+                               "a fenced generation's work waits for its retirement",
+                               latched=False)
+
 #: This process's latest hold per (state_dir, instance), for status.
 HOLDS: Dict[Tuple[str, str], HopHold] = {}
 
@@ -438,16 +490,21 @@ HOLDS: Dict[Tuple[str, str], HopHold] = {}
 def resolve(transport: Any, cfg: Any, name: str) -> Tuple[Any, Any]:
     """`(current, fenced)`: the transport the drain uses for `name`'s current
     generation, and for its fenced generations' work. A runtime resolves to
-    the current generation's sender (or `Held`); fenced generations get none
-    here, since a fenced generation's sender may be constructed only after
-    its tree is retired. Anything else (a test's port, or `None`) is used as
-    given for both."""
+    the current generation's sender (or `Held`); fenced generations get a
+    `Held` (`FENCED_UNTIL_RETIRED`, or the instance's own hold), since a
+    fenced generation's sender may be constructed only after its tree is
+    retired. Anything else (a test's port, or `None`) is used as given for
+    both."""
     if not is_runtime(transport):
         return transport, transport
-    if transport.fsops is not None and not _RUNTIME_CLASSES:
-        _RUNTIME_CLASSES.extend(transport_mod.check_fsops_classes(transport.fsops))
     key = (str(cfg.state_dir), name)
     try:
+        if transport.fsops is not None and not _RUNTIME_CLASSES:
+            try:
+                _RUNTIME_CLASSES.extend(transport_mod.check_fsops_classes(transport.fsops))
+            except transport_mod.SeamRefused as e:
+                raise HopHold(HOLD_PLUGIN_VOCABULARY, str(e), latched=True,
+                              scope="instance") from e
         port = sender_for(transport, cfg, name)
     except HopHold as e:
         prior = HOLDS.get(key)
@@ -457,9 +514,9 @@ def resolve(transport: Any, cfg: Any, name: str) -> Tuple[Any, Any]:
         else:
             e.since, e.since_ts = prior.since, prior.since_ts   # the same hold, still
         HOLDS[key] = e
-        return Held(e), None
+        return Held(e), Held(e)
     HOLDS.pop(key, None)
-    return port, None
+    return port, Held(FENCED_UNTIL_RETIRED)
 
 
 # ---------------------------------------------------------------------------

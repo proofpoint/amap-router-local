@@ -27,10 +27,57 @@ SE = "router.tests.test_hoplink_senders."
 WT = "router.tests.test_hoplink_write_table."
 ST = "router.tests.test_hoplink_status."
 SU = "router.tests.test_transport.StartupTests."
+FP = "router.tests.test_hoplink_failure_paths."
 CF, HL, IF, OB, SV, SS = ("router/config.py", "router/hoplink.py", "router/inflight.py",
                           "router/outbound.py", "router/service.py", "router/status.py")
 
 M = [
+ # -- failure paths: holds, cleanup, the pin guard, mail only ----------------
+ ('F1 an undecidable frontier or missing field not latched', IF,
+  '    except (FrontierUndecidable, HandoverUnavailable) as e:\n        # Decided BEFORE',
+  '    except () as e:\n        # Decided BEFORE',
+  [FP + "FrontierAndFieldHoldTests.test_an_undecidable_frontier_latches_before_anything_is_handed",
+   FP + "FrontierAndFieldHoldTests.test_a_record_without_its_pinned_from_address_latches_handover_invalid"]),
+ ('F2 the sender not closed after a failed admission write', HL,
+  '        try:\n            port.close()\n        except Exception:  # noqa: BLE001 -- close is cleanup\n'
+  '            logger.exception("closing a hop sender after',
+  '        try:\n            pass\n        except Exception:  # noqa: BLE001 -- close is cleanup\n'
+  '            logger.exception("closing a hop sender after',
+  [FP + "ConstructionFailureTests.test_a_failed_admission_write_closes_the_sender_and_the_poll_goes_on"]),
+ ('F3 a non-hold failure escapes sender_for', HL,
+  '    except Exception as e:  # noqa: BLE001 -- classified as a retried hold, never escaped\n',
+  '    except ZeroDivisionError as e:  # noqa: BLE001 -- classified as a retried hold, never escaped\n',
+  [FP + "ConstructionFailureTests.test_a_damaged_pin_is_a_construction_hold_not_an_aborted_drain"]),
+ ('F4 the predecessor guard keyed on admitted.json', HL,
+  '                                    / TRANSPORT_DIR / PIN_FILE).is_file():\n',
+  '                                    / TRANSPORT_DIR / ADMITTED_FILE).is_file():\n',
+  [FP + "PinnedPredecessorTests.test_a_pinned_but_unconfirmed_predecessor_blocks_the_successor"]),
+ ('F5 a latched construction hold re-attempted', HL,
+  '    if key in _LATCHED:\n        raise _LATCHED[key]\n', '',
+  [FP + "ConstructionFailureTests.test_a_latched_construction_hold_is_not_reattempted"]),
+ ('F6 construction classified without the runtime classes', HL,
+  '    kind, detail = transport_mod.classify(e, runtime=tuple(_RUNTIME_CLASSES))\n'
+  '    if kind == "reason" and detail == "settings_invalid":\n',
+  '    kind, detail = transport_mod.classify(e)\n'
+  '    if kind == "reason" and detail == "settings_invalid":\n',
+  [FP + "ConstructionFailureTests.test_a_runtime_class_with_a_colliding_reason_is_never_latched"]),
+ ('F7 a latched hand-over hold consumes new requests', OB,
+  '    if transport is not None and hoplink.write_hold(cfg, name) is not None:\n',
+  '    if False:\n',
+  [FP + "WriteHoldUnconsumedTests.test_a_latched_handover_hold_leaves_new_requests_unconsumed"]),
+ ('F8 a non-mail class handed over as mail', OB,
+  '    if klass not in (classify_mod.CLASS_FLEET, classify_mod.CLASS_INTERNET):\n',
+  '    if False:\n',
+  [FP + "MailOnlyTests.test_a_request_outside_the_cold_mail_classes_is_no_route"]),
+ ('F9 the envelope version taken from the current config', IF,
+  '        version_write = pin["version_write"]\n', '        version_write = cfg.hop.version_write\n',
+  [HO + "PinnedVersionTests.test_the_version_is_the_pins"]),
+ ('F10 a missing pin filled in', IF,
+  '        if pin is None or type(pin.get("version_write")) is not int:\n'
+  '            raise HandoverUnavailable("this generation has no pinned version_write")\n'
+  '        version_write = pin["version_write"]\n',
+  '        version_write = (pin or {}).get("version_write", 1)\n',
+  [HO + "PinnedVersionTests.test_no_pin_is_no_handover"]),
  # -- config ---------------------------------------------------------------
  ('C1 version_write unbounded above', CF,
   '"config.hop.version_write",\n                                  maximum=HOP_CONTRACT_MAX)',

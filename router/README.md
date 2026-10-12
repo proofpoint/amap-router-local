@@ -1337,10 +1337,19 @@ writes the generation's binding pin, `transport/hop.json` (the root,
 from its durable record, never the clock). A later config that no longer
 matches the pin holds that generation (`hop_binding_changed`) rather than
 admit it a second time elsewhere. `transport/admitted.json` is written once
-the plugin's construction, which admits the tree, has succeeded. While a
-FENCED generation that was admitted is not yet retired, no successor is
-admitted (`hop_predecessor_unretired`, for the whole instance): one live
-generation per identity.
+the plugin's construction, which admits the tree, has succeeded; if that
+write fails, the constructed sender is closed and the generation is held
+for a retry, so nothing leaks. Any failure on the way to a sender (a
+damaged pin, an unreadable generations record) is likewise a retried
+construction hold (`hop_construct_failed:<class>`), never an error that
+stops the instance's local mail. A latched construction hold
+(`hop_settings_refused`, `hop_identity_conflict`, `hop_plugin_vocabulary`)
+is not re-attempted until a restart or a new generation. While a FENCED
+generation that was PINNED is not yet retired, no successor is admitted
+(`hop_predecessor_unretired`, for the whole instance): the pin, not
+`admitted.json`, is the key, since a construction can admit the tree and
+then fail before confirming it. One live generation per identity; a fenced
+generation's own work is left alone until it is retired.
 
 **The handover document** is built from the in-flight record only:
 `{"schema": "amap-hop-handover/1", "request", "envelope", "attachments",
@@ -1349,13 +1358,23 @@ trailing newline). The request's `req_id` is the transport id and its
 `agent_id` the logical_id. The envelope is `{"kind": "mail",
 "from_address", "hop_contract"}`, where `from_address` is pinned in the
 record when the request is begun, never filled in from a later config.
-`settled_through` is the lowest transport id still in flight, less one,
-and the hand-over is withheld when any in-flight entry cannot be read
-(`FrontierUndecidable`): skipping one would declare it settled. A retry
+`settled_through` is the lowest transport id still in flight, less one.
+When any in-flight entry cannot be read the frontier is undecidable:
+skipping one would declare it settled, so this generation's hand-overs are
+LATCHED (`hop_frontier_undecidable`), before anything is handed over, and
+only `router generation new` releases them. A record that cannot make a
+valid handover (one without its pinned `from_address`, a generation with no
+pin) latches `hop_handover_invalid` the same way. The envelope's
+`hop_contract` is the PIN's `version_write`, never the current config's. A retry
 changes `settled_through` and nothing else. `attachments` is always `[]`:
 a request with attachments on this leg is still answered
 `queued_for_human`/`transport_anomaly` ("not supported yet"), since the
 record keeps no copy of their bytes.
+
+**Mail only.** The hand-over carries kind `"mail"`, so a request the
+classifier did not put in a cold mail class (`fleet_host`, `internet`) is
+refused `rejected`/`no_route` before anything is allocated, never handed
+over as mail.
 
 **Refused at begin**, before a transport id is allocated: more than 100
 raw recipients across `to`, `cc` and `bcc` (`too_many_recipients`, with
@@ -1379,8 +1398,10 @@ router's own tree directories missing, which does not. `hop_anomaly:<reason>`,
 `hop_unsafe_read:<reason>` and `hop_object_closed` (the sender is rebuilt)
 log an ERROR every poll. An exception the table does not name is
 `hop_unexpected`, logged with its traceback. A failed status probe never
-settles anything. While a sender is held, an external request stays in the
-outbox, unconsumed.
+settles anything. While a sender is held, or this generation's hand-overs
+are latched, an external request stays in the outbox, unconsumed: it is
+decided once the hold clears or `router generation new` moves the instance
+on, never stranded in the held generation.
 
 **`status.json`** carries a `hop` section, never the drained summary line:
 per instance the sender hold, the latched hand-over hold and the current
