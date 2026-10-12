@@ -133,10 +133,34 @@ class TransportPort(Protocol):
     WHETHER OR NOT the downstream runtime has claimed it. A claimed request
     is still pending: the in-flight step must not read "claimed" as gone,
     or it would hand the request over again or settle it as an anomaly.
+    It is true ONLY for a COMMITTED handover. A publication still in flight,
+    or left partial by a crash, reads as NOT pending: it is not yet
+    claimable, and the caller must not wait on it, since its retry (below)
+    is what completes it.
 
-    `write_request(n, data)` hands request `n` over. It is called at most
-    once per `n` by a correct caller and must never overwrite: a request
-    already present under `n`, in any state, is an error."""
+    `write_request(n, data)` hands request `n` over, and never overwrites or
+    replaces anything. A correct caller calls it once per `n`, with one
+    exception: after a restart, when `has_result`, `has_pending` and
+    `has_archived` are all false for `n`, it calls it again with a document
+    carrying the same request, envelope and attachments, and the
+    implementation then completes the interrupted publication. The same
+    request, envelope and attachments already handed over (pending, claimed or processed) is a success that
+    writes nothing. A request under `n` that was withdrawn, or whose bytes
+    differ, raises with nothing written; the caller's record then stays in
+    flight.
+
+    `data` is the hop handover document, which the hop codec's
+    specification defines, not this module: a CLOSED, VERSIONED JSON object
+    with exactly the members `schema`, `request` (the submit-request),
+    `envelope`, `attachments` (each standard base64, without newlines) and
+    `settled_through`, in canonical encoding (sorted keys, compact
+    separators). Unknown members are refused. The implementation validates
+    the whole document before writing anything: the request's descriptors
+    match the attachments one for one by size and sha256, and the caps
+    apply to the decoded sizes. `settled_through` is an `n'` below `n` such
+    that every request at or below it is settled by this router or was
+    allocated and never written; it never decreases, and it is the one
+    member a retry may change."""
 
     def has_result(self, n: str) -> bool: ...
     def has_pending(self, n: str) -> bool: ...
@@ -151,7 +175,23 @@ class InboundPort(Protocol):
     `kind` is one of `INBOUND_KINDS`. `list_entries(kind)` names the entries
     ready to read, in arrival order; `read_entry(kind, entry_id)` returns
     one entry's bytes, which are HOSTILE input to the caller.
-    `entry_id`s are opaque to this router and unique within a kind."""
+    `entry_id`s are opaque to this router and unique within a kind.
+
+    A `"notice"` entry's bytes are the hop inbound bundle, which the hop
+    codec's specification defines, not this module: a CLOSED, VERSIONED
+    JSON object with exactly the members `schema`, `notice`, `spool` and
+    `attachments`, in canonical encoding. `attachments` is POSITIONAL, as
+    AMAP binds a sidecar to its descriptor's array index: entry `k` belongs
+    to the notice's `message.attachments[k]`, and is the standard base64 of
+    sidecar `k` if and only if that descriptor carries `content_ref` (which
+    AMAP permits only for a `"clean"` descriptor, and which must equal
+    `<notice_id>.attachments/<k>`). Every other position is null: a gap,
+    never a renumbering. A notice with no `message.attachments` has none.
+    An entry is listed only once its notice, written last, is committed.
+    The caller validates every part (the notice and spool against their
+    schemas, each attachment against descriptor `k`'s size and sha256) and
+    refuses the entry on any mismatch; the caps apply per part, to decoded
+    sizes."""
 
     def list_entries(self, kind: str) -> Sequence[str]: ...
     def read_entry(self, kind: str, entry_id: str) -> bytes: ...
@@ -302,9 +342,16 @@ class HopFsOps(Protocol):
     calling writer's uid with mode exactly 0700, and is otherwise refused,
     never repaired. The private root is fsynced before the descriptor is
     returned, whether this call created `.stage/` or found it. The
-    descriptor is pinned once; only a stage opened this way is accepted by
-    `commit_durable`, whose same-tree rule then confines it to its own
-    private tree. `.stage/` is never a destination and must never be swept
+    descriptor is pinned once. `commit_durable` accepts as `stage_dirfd`
+    only a directory THIS instance validated through `open_stage_dir` or
+    `open_private_stage_dir`, identified by `(st_dev, st_ino)` while the
+    instance's pinned stage descriptor holds it, and bound at that stage's
+    canonical path; another descriptor of that same directory at that path,
+    including one reached through `descend_pinned`, is the same stage. A
+    directory this instance never validated, one created in its place, or
+    the validated directory reached at any other path, is refused. The
+    same-tree rule then confines a private stage to its own private tree.
+    `.stage/` is never a destination and must never be swept
     while the writer runs. An implementation is constructed with its hop
     root and private roots, which must be pairwise disjoint (none equal to
     or containing another); otherwise construction raises.
