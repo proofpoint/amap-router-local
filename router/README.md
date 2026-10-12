@@ -1210,12 +1210,43 @@ descriptors; a plugin makes no filesystem call of its own), `KeyOps` (the
 signing key as bytes; the signer never opens a path), `Signer` and
 `Verifier`, plus the factory signatures (`make_sender`, `make_intake_reader`,
 `make_signer`, `make_verifier`, and the sibling runtime's four).
-`PLUGIN_API`'s major covers all of them. Two contracts on `HopFsOps` are
-worth knowing before implementing it: `commit_durable` derives its stage
-name's destination tag from a binding the implementation holds, never from
-a parameter or a bare descriptor number; and `open_regular_pinned` returns
-`bytes` or the port's own `NOT_YET`, with anything else a protocol
-violation that callers raise on, never skip.
+`PLUGIN_API`'s major covers all of them, and is `(2, 0)` since contract
+amendment E5: a `(1, x)` plugin is refused here, and a `(2, x)` plugin by a
+`(1, x)` runtime, before any factory is called. The contracts on
+`HopFsOps` worth knowing before implementing it:
+
+- `commit_durable` derives its stage name's destination tag from a binding
+  the implementation holds, never from a parameter or a bare descriptor
+  number.
+- `open_regular_pinned` returns `bytes` or the port's own `NOT_YET`, with
+  anything else a protocol violation that callers raise on, never skip. Its
+  refusals are the port's own `UnsafeRead` class with `.reason` in
+  `not_regular`, `link_count`, `too_large`; a missing name is a raw
+  `FileNotFoundError`; anything else propagates and is no verdict. The
+  reason classifies; the caller decides whether it is terminal.
+- `open_private_stage_dir` gives a writer's private root its own
+  `.stage/`, so `commit_durable` publishes into a private tree under the
+  same rule as a hop tree. NOT_YET is not widened: link count 2 in a
+  private tree raises on read. The hop root and private roots must be
+  pairwise disjoint.
+- `commit_durable(..., deps=...)` checks each earlier member of a
+  publication (its directory still at its path in its tree, then size and
+  sha256 by a bounded read) before and after the link or compare, on every
+  result path, raising on a mismatch. A dependency must be in the
+  destination's own tree and outside any stage directory, or it is refused
+  before anything is staged. Those are point-in-time observations: a
+  publication is complete only once its READER has verified what it
+  consumes. A caller treats any exception from `commit_durable` or
+  `mkdir_and_pin` as "not committed"; the implementation's anomaly classes
+  are not part of the Protocol.
+- `mkdir_and_pin` checks the final `fstat` of the descriptor it returns
+  (owner, permission bits, no setuid or sticky bit, the parent's setgid
+  bit), and never repairs an existing directory.
+
+`router/transport.py` names these at `(2, 0)`, beside the Protocols:
+`HOPFSOPS_METHODS` (methods only), `HOPFSOPS_ATTRIBUTES` (`NOT_YET`,
+`UnsafeRead`), `Dependency` (a `deps` element's type) and
+`UNSAFE_READ_REASONS`.
 
 **This router's implementation of `HopFsOps`** is `router/fsops.py`
 (internal). It is built and tested but NOT activated: nothing hands it to a

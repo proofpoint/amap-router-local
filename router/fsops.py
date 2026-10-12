@@ -14,11 +14,17 @@ ROOTS. An `FsOps` knows the directories it may open, by kind:
     `.runtime/<gen>/` are generation trees, and a staging subtree made by
     `stage_tree` is a generation tree that is not yet published;
   * `private_roots`: this writer's own state directories, each one tree.
-    They are opened, read and `replace_durable`d here, but they have no
-    stage directory, so `commit_durable` is for hop trees and host intakes
-    only (this router's private writes use `util.atomic_write`).
+    Each has one writer-private stage, `<root>/.stage/`, from
+    `open_private_stage_dir`, so `commit_durable` publishes into a private
+    tree exactly as into a hop tree (contract amendment E5). A link count
+    of 2 in a private tree still RAISES on read: NOT_YET stays on hop trees
+    and host intakes, and a private writer completes its recovery before it
+    reads.
 
-`open_root_nofollow` refuses any other path. There is no "anywhere" mode.
+The roots must be pairwise disjoint (none equal to or containing another),
+or construction raises: a nested root's `.stage/` would otherwise be an
+ordinary path inside the outer tree. `open_root_nofollow` refuses any other
+path. There is no "anywhere" mode.
 
 BINDINGS, AND THE DESTINATION TAG. Every directory descriptor this module
 returns is registered with a binding: the tree it is in (identified by the
@@ -58,6 +64,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import re
 import fcntl
 import logging
@@ -103,9 +110,57 @@ class CapabilityError(Exception):
     """The startup probe found a guarantee missing. Refuse to start."""
 
 
+#: `UnsafeRead.reason` values (`transport.UNSAFE_READ_REASONS`).
+UNSAFE_READ_REASONS = ("not_regular", "link_count", "too_large")
+
+
 class UnsafeRead(FsOpsError):
-    """`open_regular_pinned` refused the file (not regular, wrong link count,
-    too large)."""
+    """`open_regular_pinned` refused the file for what it IS: `.reason` is
+    exactly one of `UNSAFE_READ_REASONS`. Exposed as `FsOps.UnsafeRead`, the
+    Protocol attribute, so a caller dispatches on `isinstance` and `.reason`
+    and never on this module's name. Any other failure of the read is not
+    this class: a missing name is a raw `FileNotFoundError`, and anything
+    else (EACCES, EIO, ...) propagates as itself."""
+
+    def __init__(self, reason: str, detail: str):
+        if reason not in UNSAFE_READ_REASONS:
+            raise ValueError(f"unknown UnsafeRead reason {reason!r}")
+        super().__init__(detail)
+        self.reason = reason
+
+
+#: Errnos from the single-component `O_NOFOLLOW | O_NONBLOCK` open that name
+#: what the entry is: ELOOP for a symlink, ENXIO for a socket.
+_KIND_ERRNOS = frozenset({errno.ELOOP, errno.ENXIO})
+
+
+#: Errnos on the canonical walk that mean the binding is no longer at its
+#: path (gone, a symlink, not a directory). Anything else propagates.
+_WALK_MOVED = frozenset({errno.ENOENT, errno.ELOOP, errno.ENOTDIR})
+
+
+#: `DependencyAnomaly.cause` values (`transport.HopFsOps`, DEPENDENCIES).
+DEPENDENCY_CAUSES = ("binding_moved", "missing", "not_regular", "link_count",
+                     "size", "digest")
+
+
+class DependencyAnomaly(FsOpsError):
+    """A `commit_durable` dependency failed its check: `.cause` is one of
+    `DEPENDENCY_CAUSES`, `.index` its position in `deps`. Raised instead of
+    any result; the stage is kept."""
+
+    def __init__(self, cause: str, index: int, name: str, detail: str):
+        if cause not in DEPENDENCY_CAUSES:
+            raise ValueError(f"unknown dependency anomaly cause {cause!r}")
+        super().__init__(f"dependency {index} ({name!r}): {cause}: {detail}")
+        self.cause = cause
+        self.index = index
+        self.name = name
+
+
+class MkdirRefused(FsOpsError):
+    """`mkdir_and_pin`'s final-`fstat` predicate failed (`transport.HopFsOps`,
+    `mkdir_and_pin`). The directory is left as it is, never repaired."""
 
 
 class _NotYet:
@@ -183,7 +238,7 @@ class Binding:
     def is_stage(self) -> bool:
         if self.kind == GENERATION:
             return self.rel in (("up", "stage"), ("down", "stage"))
-        if self.kind == INTAKE:
+        if self.kind in (INTAKE, PRIVATE):
             return self.rel == (".stage",)
         return False
 
@@ -231,6 +286,7 @@ class FsOps:
     the same tags (module docstring)."""
 
     NOT_YET = NOT_YET
+    UnsafeRead = UnsafeRead
 
     def __init__(self, *, hop_root: Optional[Union[str, Path]] = None,
                  private_roots: Iterable[Union[str, Path]] = ()):
@@ -242,6 +298,8 @@ class FsOps:
 
         self._hop_root = canon(hop_root) if hop_root is not None else None
         self._private_roots = tuple(canon(p) for p in private_roots)
+        _check_disjoint(([self._hop_root] if self._hop_root is not None else [])
+                        + list(self._private_roots))
         self._by_fd: Dict[int, Binding] = {}
         self._by_dir: Dict[Tuple[int, int], Binding] = {}
         self._stage_cache: Dict[Tuple[Tuple[int, int], str], int] = {}
@@ -430,19 +488,34 @@ class FsOps:
         return fd
 
     def mkdir_and_pin(self, parent_fd: int, name: str, mode: int) -> int:
-        """Create `name` if missing, pin it, and fsync the parent either way
-        (an earlier creator's fsync may have failed). `mode` is subject to
-        the process umask, as `mkdir(2)` is; an existing directory's mode is
-        left as it is. Where a mode must be exact (stage directories), the
-        caller that owns it sets and checks it (`open_stage_dir`)."""
+        """Create `name` if missing, pin it, check the final `fstat` of the
+        pinned descriptor against one predicate, and fsync the parent either
+        way (an earlier creator's fsync may have failed).
+
+        A new directory is made with `mode & 0o777`. Only if the umask
+        removed bits is it `fchmod`ed to `(its setgid bit) | (mode & 0o777)`,
+        so an inherited setgid bit survives an ordinary umask. Then the
+        FINAL `fstat` must show (`_mkdir_predicate`): a directory owned by
+        this writer's uid, permission bits `mode & 0o777`, no setuid or
+        sticky bit, and the pinned parent's own setgid bit. An existing
+        directory is checked the same way and never repaired. The check is
+        on the descriptor this call returns, never a by-name lookup, so a
+        directory swapped in at the name cannot pass it for the one pinned."""
         parent = self.binding(parent_fd)
         _check_name(name)
+        want = mode & 0o777
+        created = True
         try:
-            os.mkdir(name, mode, dir_fd=parent_fd)
+            os.mkdir(name, want, dir_fd=parent_fd)
         except FileExistsError:
-            pass
+            created = False
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         try:
+            if created:
+                st = os.fstat(fd)
+                if stat.S_IMODE(st.st_mode) & 0o777 != want:
+                    os.fchmod(fd, (st.st_mode & stat.S_ISGID) | want)
+            _mkdir_predicate(os.fstat(fd), want, os.fstat(parent_fd), name)
             os.fsync(parent_fd)
             self._child(parent, name, fd)
         except BaseException:
@@ -548,6 +621,49 @@ class FsOps:
             self._validated_stages.add((st.st_dev, st.st_ino))
         return fd
 
+    def open_private_stage_dir(self, root_fd: int) -> int:
+        """The writer-private 0700 `.stage/` of a configured private root
+        (`transport.HopFsOps`). `root_fd` must be the private root itself;
+        anything else raises before anything is created. Created durably if
+        missing, validated otherwise and never repaired; the private root is
+        fsynced whether or not this call created it; pinned once."""
+        root = self.binding(root_fd)
+        if root.kind != PRIVATE or root.rel != ():
+            raise ValueError("open_private_stage_dir needs a configured private root itself")
+        key = (root.tree, "private")
+        with self._lock:
+            cached = self._stage_cache.get(key)
+        if cached is not None:
+            try:
+                self.binding(cached)
+                return cached
+            except BindingError:
+                pass
+        try:
+            os.mkdir(".stage", 0o700, dir_fd=root_fd)
+            created = True
+        except FileExistsError:
+            created = False
+        fd = os.open(".stage", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            if created:
+                os.fchmod(fd, 0o700)
+            st = os.fstat(fd)
+            if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
+                raise BindingError(
+                    f"private stage directory is not this writer's 0700 directory "
+                    f"(uid {st.st_uid}, mode {oct(stat.S_IMODE(st.st_mode))}); "
+                    "refusing, never repairing")
+            os.fsync(root_fd)
+            self._register(fd, PRIVATE, root.tree, (".stage",))
+        except BaseException:
+            os.close(fd)
+            raise
+        with self._lock:
+            self._stage_cache[key] = fd
+            self._validated_stages.add((st.st_dev, st.st_ino))
+        return fd
+
     # -- the commit -----------------------------------------------------------
 
     def _dest_lock(self, stage: Binding) -> threading.Lock:
@@ -555,13 +671,25 @@ class FsOps:
             return self._dest_locks.setdefault((stage.dev, stage.ino), threading.Lock())
 
     def commit_durable(self, stage_dirfd: int, dest_dirfd: int, name: str,
-                       data: bytes, mode: int) -> str:
-        """Contract §4.3's one rule. See `transport.HopFsOps`."""
+                       data: bytes, mode: int, *,
+                       deps: Sequence[Tuple[int, str, int, str]] = ()) -> str:
+        """Contract §4.3's one rule, with the dependency checks of E5. See
+        `transport.HopFsOps`."""
         stage = self.binding(stage_dirfd)
         dest = self.binding(dest_dirfd)
         _check_name(name)
         if not isinstance(data, bytes):
             raise FsOpsError("data must be the frozen bytes")
+        deps = _check_deps_shape(deps)
+        for i, (dep_fd, dep_name, _size, _digest) in enumerate(deps):
+            d = self.binding(dep_fd)
+            # The same publication: a dependency lives in the destination's
+            # own tree, never in a stage directory. Refused before anything
+            # is staged.
+            if d.kind != dest.kind or d.tree != dest.tree:
+                raise BindingError(f"dependency {i} ({dep_name!r}) is in another tree")
+            if _inside_stage(d):
+                raise BindingError(f"dependency {i} ({dep_name!r}) is inside a stage directory")
         if not stage.is_stage or (stage.dev, stage.ino) not in self._validated_stages:
             raise BindingError("stage_dirfd is not a stage directory opened by open_stage_dir")
         if _inside_stage(dest):
@@ -579,14 +707,18 @@ class FsOps:
             fcntl.flock(stage_dirfd, fcntl.LOCK_EX)
             try:
                 return self._commit_locked(stage_dirfd, dest_dirfd, name, stage_name,
-                                           data, mode)
+                                           data, mode, deps)
             finally:
                 fcntl.flock(stage_dirfd, fcntl.LOCK_UN)
 
     def _commit_locked(self, sfd: int, dfd: int, name: str, sname: str,
-                       data: bytes, mode: int) -> str:
+                       data: bytes, mode: int, deps=()) -> str:
+        # The entry observation, before any stage, compare, recovery or
+        # exists_* answer, so a broken publication never reports a result
+        # for the wrong reason.
+        self._check_deps(deps)
         if self._exists(dfd, name):
-            return self._on_exists(sfd, dfd, name, sname, data, mode)
+            return self._on_exists(sfd, dfd, name, sname, data, mode, deps)
         # A stale own stage with no final: unlink it, durably.
         if self._exists(sfd, sname):
             os.unlink(sname, dir_fd=sfd)
@@ -609,7 +741,7 @@ class FsOps:
                 # Raced: a final appeared. Judge it before touching our stage.
                 os.close(fd)
                 fd = -1
-                return self._on_exists(sfd, dfd, name, sname, data, mode)
+                return self._on_exists(sfd, dfd, name, sname, data, mode, deps)
             linked = os.stat(name, dir_fd=dfd, follow_symlinks=False)
             if (linked.st_dev, linked.st_ino) != (frozen.st_dev, frozen.st_ino):
                 # The stage pathname was substituted after we froze it. The
@@ -622,12 +754,106 @@ class FsOps:
             if fd >= 0:
                 os.close(fd)
         self._step("linked")
+        self._check_deps(deps)     # after the link, before the barrier
         os.fsync(dfd)
         self._step("dest_synced")
         os.unlink(sname, dir_fd=sfd)
         self._step("unlinked")
         os.fsync(sfd)
         return "created"
+
+    def _check_deps(self, deps) -> None:
+        for i, (dir_fd, name, size, digest) in enumerate(deps):
+            self._check_dep(i, dir_fd, name, size, digest)
+
+    def _check_dep(self, i: int, dir_fd: int, name: str, size: int, digest: str) -> None:
+        """One dependency (`transport.HopFsOps`, DEPENDENCIES): the binding
+        guard by a FRESH canonical walk, then the bounded content check
+        through that walk. Raises `DependencyAnomaly`."""
+        b = self.binding(dir_fd)
+        here = self._canonical_dir(b)
+        if here is None:
+            raise DependencyAnomaly("binding_moved", i, name,
+                                    f"{'/'.join(b.rel) or '.'} is no longer at its path")
+        try:
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=here)
+            except FileNotFoundError:
+                raise DependencyAnomaly("missing", i, name, "absent") from None
+            except OSError as e:
+                if e.errno in _KIND_ERRNOS:
+                    raise DependencyAnomaly("not_regular", i, name, os.strerror(e.errno)) from e
+                raise
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise DependencyAnomaly("not_regular", i, name, "not a regular file")
+                if st.st_nlink != 1:
+                    raise DependencyAnomaly("link_count", i, name, f"link count {st.st_nlink}")
+                got = self._read_all(fd, size)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(here)
+        if len(got) != size:
+            raise DependencyAnomaly("size", i, name, f"{len(got)} bytes, declared {size}")
+        if hashlib.sha256(got).hexdigest() != digest:
+            raise DependencyAnomaly("digest", i, name, "sha256 differs from the declared one")
+
+    def _canonical_dir(self, b: Binding) -> Optional[int]:
+        """A FRESH descriptor for `b`'s directory reached from its tree root
+        by `O_NOFOLLOW` steps, or None when what is at `b`'s path in its tree
+        is not `b`'s directory (moved, replaced, gone). The tree root is
+        found by walking up `len(b.rel)` levels from the live directory and
+        must be `b.tree`; the walk back down uses the recorded names only."""
+        live = self._live_fd(b)
+        if live is None:
+            return None
+        fd = live
+        try:
+            for part in [".."] * len(b.rel) + [None] + list(b.rel):
+                if part is None:     # at the top: it must be b's own tree root
+                    st = os.fstat(fd)
+                    if (st.st_dev, st.st_ino) != b.tree:
+                        os.close(fd)
+                        return None
+                    continue
+                try:
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError as e:
+                    # What is (or is not) at a path says the binding moved;
+                    # any other fault (EIO, EACCES, ...) says nothing and
+                    # propagates. The same on the way up and the way down.
+                    if e.errno in _WALK_MOVED:
+                        os.close(fd)
+                        return None
+                    raise
+                os.close(fd)
+                fd = nxt
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) != (b.dev, b.ino):
+                os.close(fd)
+                return None
+            return fd
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+    def _live_fd(self, b: Binding) -> Optional[int]:
+        """A dup of some live descriptor registered for `b`'s directory."""
+        with self._lock:
+            fds = [fd for fd, other in self._by_fd.items() if (other.dev, other.ino) == (b.dev, b.ino)]
+        for fd in fds:
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == (b.dev, b.ino):
+                return os.dup(fd)
+        return None
 
     @staticmethod
     def _exists(dir_fd: int, name: str) -> bool:
@@ -637,10 +863,16 @@ class FsOps:
         except FileNotFoundError:
             return False
 
-    def _different(self, dfd: int, name: str, why: str, fd: Optional[int] = None) -> str:
-        """The anomaly. Before it is returned, the existing file (when it is
-        a regular file we opened) and the destination are fsynced, as for
-        every exists_* result; any own stage is KEPT as evidence."""
+    def _different(self, dfd: int, name: str, why: str, fd: Optional[int] = None,
+                   deps=()) -> str:
+        """The anomaly. The dependencies are observed again first (E5: on
+        EVERY result path, so a broken publication is reported as such, not
+        as `exists_different`); a caller that has just checked them after
+        its own compare passes none. Before it is returned, the existing
+        file (when it is a regular file we opened) and the destination are
+        fsynced, as for every exists_* result; any own stage is KEPT as
+        evidence."""
+        self._check_deps(deps)
         if fd is not None:
             os.fsync(fd)
         os.fsync(dfd)
@@ -649,7 +881,7 @@ class FsOps:
         return "exists_different"
 
     def _on_exists(self, sfd: int, dfd: int, name: str, sname: str,
-                   data: bytes, mode: int) -> str:
+                   data: bytes, mode: int, deps=()) -> str:
         """`name` exists. Establish what it is, and make it durable, BEFORE
         any cleanup: an own stage is removed only once the final is known to
         be this commit and its barriers are taken, and is kept as evidence
@@ -659,16 +891,18 @@ class FsOps:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
         except OSError as e:
             if e.errno == errno.ELOOP:
-                return self._different(dfd, name, "a symlink")
+                return self._different(dfd, name, "a symlink", deps=deps)
             raise
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
-                return self._different(dfd, name, "not a regular file")
+                return self._different(dfd, name, "not a regular file", deps=deps)
             if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != mode:
-                return self._different(dfd, name, "owner or mode", fd)
+                return self._different(dfd, name, "owner or mode", fd, deps=deps)
             if st.st_nlink == 1:
-                if self._read_all(fd, len(data)) != data:
+                same = self._read_all(fd, len(data)) == data
+                self._check_deps(deps)     # after the compare, before the barrier
+                if not same:
                     return self._different(dfd, name, "different bytes", fd)
                 os.fsync(fd)
                 os.fsync(dfd)
@@ -684,13 +918,17 @@ class FsOps:
                 try:
                     sst = os.stat(sname, dir_fd=sfd, follow_symlinks=False)
                 except FileNotFoundError:
-                    return self._different(dfd, name, "a second link that is not our stage", fd)
+                    return self._different(dfd, name, "a second link that is not our stage", fd,
+                                           deps=deps)
                 if (sst.st_dev, sst.st_ino) != (st.st_dev, st.st_ino):
-                    return self._different(dfd, name, "our stage is a different inode", fd)
+                    return self._different(dfd, name, "our stage is a different inode", fd,
+                                           deps=deps)
                 # Our interrupted commit (F1). Everything is established with
                 # the stage still present, so readers keep seeing NOT_YET (H1).
                 self._step("recover_before_compare")
-                if self._read_all(fd, len(data)) != data:
+                same = self._read_all(fd, len(data)) == data
+                self._check_deps(deps)     # after the compare, before the barrier
+                if not same:
                     return self._different(dfd, name, "interrupted commit with different bytes",
                                            fd)
                 self._step("recover_after_compare")
@@ -702,7 +940,7 @@ class FsOps:
                 if os.fstat(fd).st_nlink != 1:
                     raise FsOpsError(f"{name!r} is not at link count 1 after recovery")
                 return "exists_same"
-            return self._different(dfd, name, f"link count {st.st_nlink}", fd)
+            return self._different(dfd, name, f"link count {st.st_nlink}", fd, deps=deps)
         finally:
             os.close(fd)
 
@@ -811,20 +1049,27 @@ class FsOps:
         replace the name between the two."""
         b = self.binding(dir_fd)
         _check_name(name)
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except FileNotFoundError:
+            raise
+        except OSError as e:
+            if e.errno in _KIND_ERRNOS:
+                raise UnsafeRead("not_regular", f"{name!r}: {os.strerror(e.errno)}") from e
+            raise
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
-                raise UnsafeRead(f"{name!r} is not a regular file")
+                raise UnsafeRead("not_regular", f"{name!r} is not a regular file")
             if st.st_nlink == 2 and b.trusted_links:
                 return NOT_YET
             if st.st_nlink != 1:
-                raise UnsafeRead(f"{name!r} has link count {st.st_nlink}")
+                raise UnsafeRead("link_count", f"{name!r} has link count {st.st_nlink}")
             if st.st_size > max_bytes:
-                raise UnsafeRead(f"{name!r} exceeds {max_bytes} bytes")
+                raise UnsafeRead("too_large", f"{name!r} exceeds {max_bytes} bytes")
             data = self._read_all(fd, max_bytes)
             if len(data) > max_bytes:
-                raise UnsafeRead(f"{name!r} exceeds {max_bytes} bytes")
+                raise UnsafeRead("too_large", f"{name!r} exceeds {max_bytes} bytes")
             return data
         finally:
             os.close(fd)
@@ -850,9 +1095,53 @@ class FsOps:
 def _inside_stage(b: Binding) -> bool:
     if b.kind == GENERATION:
         return b.rel[:2] in (("up", "stage"), ("down", "stage"))
-    if b.kind == INTAKE:
+    if b.kind in (INTAKE, PRIVATE):
         return b.rel[:1] == (".stage",)
     return False
+
+
+def _check_disjoint(roots: Sequence[str]) -> None:
+    """No root equals or contains another (paths already normalised and
+    absolute). Raises `FsOpsError` before anything is opened."""
+    for i, a in enumerate(roots):
+        for b in roots[i + 1:]:
+            if a == b or b.startswith(a.rstrip("/") + "/") or a.startswith(b.rstrip("/") + "/"):
+                raise FsOpsError(f"roots {a!r} and {b!r} are not disjoint")
+
+
+def _mkdir_predicate(final: os.stat_result, want: int, parent: os.stat_result,
+                     name: str) -> None:
+    """`mkdir_and_pin`'s predicate on the FINAL fstat (`transport.HopFsOps`)."""
+    why = None
+    if not stat.S_ISDIR(final.st_mode):
+        why = "not a directory"
+    elif final.st_uid != os.geteuid():
+        why = f"owned by uid {final.st_uid}"
+    elif stat.S_IMODE(final.st_mode) & 0o777 != want:
+        why = f"permission bits {oct(stat.S_IMODE(final.st_mode) & 0o777)}, wanted {oct(want)}"
+    elif final.st_mode & (stat.S_ISUID | stat.S_ISVTX):
+        why = "setuid or sticky bit set"
+    elif (final.st_mode & stat.S_ISGID) != (parent.st_mode & stat.S_ISGID):
+        why = "setgid bit differs from the parent's"
+    if why is not None:
+        raise MkdirRefused(f"{name!r}: {why}; refusing, never repairing")
+
+
+def _check_deps_shape(deps) -> Tuple[Tuple[int, str, int, str], ...]:
+    out = []
+    for d in deps:
+        if not (isinstance(d, tuple) and len(d) == 4):
+            raise FsOpsError(f"a dependency is (dir_fd, name, size, sha256), not {d!r}")
+        dir_fd, name, size, digest = d
+        if not isinstance(dir_fd, int) or isinstance(dir_fd, bool):
+            raise FsOpsError(f"dependency dir_fd {dir_fd!r} is not a descriptor")
+        _check_name(name)
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise FsOpsError(f"dependency size {size!r} is not a non-negative int")
+        if not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise FsOpsError(f"dependency sha256 {digest!r} is not lowercase hex")
+        out.append((dir_fd, name, size, digest))
+    return tuple(out)
 
 
 def _remove_tree(parent_fd: int, name: str) -> None:

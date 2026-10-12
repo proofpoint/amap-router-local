@@ -81,8 +81,11 @@ from typing import (Any, Callable, Iterable, Literal, Mapping, Optional, Protoco
 #: seam: `TransportPort`, `InboundPort`, `HopFsOps`, `KeyOps`, `Signer`,
 #: `Verifier` and the factory signatures. Changing any of them (a method,
 #: a parameter, a return vocabulary) is a major bump; adding an optional
-#: factory is a minor one.
-PLUGIN_API: Tuple[int, int] = (1, 0)
+#: factory is a minor one. `(2, 0)` is amendment E5: `HopFsOps` gained
+#: `open_private_stage_dir`, `commit_durable`'s keyword-only `deps` and the
+#: `UnsafeRead` attribute, so a `(1, x)` plugin is refused here and a
+#: `(2, x)` plugin by a `(1, x)` runtime, before any factory is called.
+PLUGIN_API: Tuple[int, int] = (2, 0)
 
 #: The factories this runtime calls. A plugin may define more; it must
 #: define these. `make_sender(settings, fsops) -> TransportPort` and
@@ -130,10 +133,34 @@ class TransportPort(Protocol):
     WHETHER OR NOT the downstream runtime has claimed it. A claimed request
     is still pending: the in-flight step must not read "claimed" as gone,
     or it would hand the request over again or settle it as an anomaly.
+    It is true ONLY for a COMMITTED handover. A publication still in flight,
+    or left partial by a crash, reads as NOT pending: it is not yet
+    claimable, and the caller must not wait on it, since its retry (below)
+    is what completes it.
 
-    `write_request(n, data)` hands request `n` over. It is called at most
-    once per `n` by a correct caller and must never overwrite: a request
-    already present under `n`, in any state, is an error."""
+    `write_request(n, data)` hands request `n` over, and never overwrites or
+    replaces anything. A correct caller calls it once per `n`, with one
+    exception: after a restart, when `has_result`, `has_pending` and
+    `has_archived` are all false for `n`, it calls it again with a document
+    carrying the same request, envelope and attachments, and the
+    implementation then completes the interrupted publication. The same
+    request, envelope and attachments already handed over (pending, claimed or processed) is a success that
+    writes nothing. A request under `n` that was withdrawn, or whose bytes
+    differ, raises with nothing written; the caller's record then stays in
+    flight.
+
+    `data` is the hop handover document, which the hop codec's
+    specification defines, not this module: a CLOSED, VERSIONED JSON object
+    with exactly the members `schema`, `request` (the submit-request),
+    `envelope`, `attachments` (each standard base64, without newlines) and
+    `settled_through`, in canonical encoding (sorted keys, compact
+    separators). Unknown members are refused. The implementation validates
+    the whole document before writing anything: the request's descriptors
+    match the attachments one for one by size and sha256, and the caps
+    apply to the decoded sizes. `settled_through` is an `n'` below `n` such
+    that every request at or below it is settled by this router or was
+    allocated and never written; it never decreases, and it is the one
+    member a retry may change."""
 
     def has_result(self, n: str) -> bool: ...
     def has_pending(self, n: str) -> bool: ...
@@ -148,7 +175,23 @@ class InboundPort(Protocol):
     `kind` is one of `INBOUND_KINDS`. `list_entries(kind)` names the entries
     ready to read, in arrival order; `read_entry(kind, entry_id)` returns
     one entry's bytes, which are HOSTILE input to the caller.
-    `entry_id`s are opaque to this router and unique within a kind."""
+    `entry_id`s are opaque to this router and unique within a kind.
+
+    A `"notice"` entry's bytes are the hop inbound bundle, which the hop
+    codec's specification defines, not this module: a CLOSED, VERSIONED
+    JSON object with exactly the members `schema`, `notice`, `spool` and
+    `attachments`, in canonical encoding. `attachments` is POSITIONAL, as
+    AMAP binds a sidecar to its descriptor's array index: entry `k` belongs
+    to the notice's `message.attachments[k]`, and is the standard base64 of
+    sidecar `k` if and only if that descriptor carries `content_ref` (which
+    AMAP permits only for a `"clean"` descriptor, and which must equal
+    `<notice_id>.attachments/<k>`). Every other position is null: a gap,
+    never a renumbering. A notice with no `message.attachments` has none.
+    An entry is listed only once its notice, written last, is committed.
+    The caller validates every part (the notice and spool against their
+    schemas, each attachment against descriptor `k`'s size and sha256) and
+    refuses the entry on any mismatch; the caps apply per part, to decoded
+    sizes."""
 
     def list_entries(self, kind: str) -> Sequence[str]: ...
     def read_entry(self, kind: str, entry_id: str) -> bytes: ...
@@ -198,6 +241,11 @@ EntryKind = Literal["file", "dir", "other"]
 #: the writer's lifetime: a second call for the same (tree, side) returns an
 #: fd to the same inode.
 StageSide = Literal["up", "down", "intake"]
+#: One dependency of a `commit_durable` sentinel: `(dir_fd, name, size,
+#: sha256)`, the sha256 as lowercase hex (`HopFsOps`, DEPENDENCIES).
+Dependency = Tuple[int, str, int, str]
+#: `fsops.UnsafeRead.reason`: exactly one of these (`HopFsOps`, READS).
+UNSAFE_READ_REASONS = ("not_regular", "link_count", "too_large")
 
 
 @runtime_checkable
@@ -208,8 +256,8 @@ class HopFsOps(Protocol):
     `PLUGIN_API`'s major. Every failed barrier RAISES, and the caller's
     dependent step does not run.
 
-    `commit_durable(stage_dirfd, dest_dirfd, name, data, mode)` publishes
-    `data` (the writer's FROZEN bytes, journalled before the call) under
+    `commit_durable(stage_dirfd, dest_dirfd, name, data, mode, *, deps=())`
+    publishes `data` (the writer's FROZEN bytes, journalled before the call) under
     `name` in `dest_dirfd`, by writing a deterministic stage in the
     writer-private `stage_dirfd`, fsyncing it, linking it in, fsyncing the
     destination and unlinking the stage. Equality is byte equality.
@@ -258,14 +306,64 @@ class HopFsOps(Protocol):
         tag from the binding's role and path, never from registration
         order, so recovery in a fresh instance derives the same stage name.
 
+    DEPENDENCIES (`deps`, on a publication's sentinel only). Each
+    `(dir_fd, name, size, sha256)` is an earlier commit of the same
+    publication, in commit order; its directory may differ from the
+    sentinel's but is in the SAME TREE as the destination and never inside
+    a stage directory. A dependency outside that scope raises before
+    anything is staged. For each one the implementation checks:
+
+      * the binding guard: `dir_fd`'s directory is still at its recorded
+        path in its tree, by a fresh `O_NOFOLLOW` walk from the tree root,
+        with the same (`st_dev`, `st_ino`);
+      * the content: through that walk, `name` is a regular file at link
+        count 1 (count 2 is an anomaly here, never NOT_YET: the
+        dependency's own commit already returned), read pinned and bounded
+        to `size + 1` bytes, with exactly `size` bytes whose SHA-256 is
+        `sha256`.
+
+    They are checked BEFORE any stage, compare, recovery or `exists_*`
+    answer, and AGAIN after the link or the compare, before the barrier or
+    the result, on every path, `exists_different` included. A failure RAISES the implementation's
+    dependency anomaly, naming its cause (binding moved, missing, not
+    regular, link count, size, digest); it is never `created` or
+    `exists_same`, and the stage is kept. These are point-in-time
+    observations, not a guarantee through the commit point: `created` and
+    `exists_same` mean the sentinel is physically committed and both
+    observations passed. Whether a publication is complete is for its
+    READER to establish, on the immutable snapshot it consumes.
+
+    `open_private_stage_dir(root_fd)` returns the writer-private stage of a
+    configured PRIVATE root: `<private_root>/.stage/`. `root_fd` must be
+    the private root itself (not a directory inside one, and never a hop
+    tree or intake): anything else raises before anything is created. A
+    missing `.stage/` is created 0700 (`fchmod` after `mkdir`, so the umask
+    cannot widen it); an existing one must be a real directory owned by the
+    calling writer's uid with mode exactly 0700, and is otherwise refused,
+    never repaired. The private root is fsynced before the descriptor is
+    returned, whether this call created `.stage/` or found it. The
+    descriptor is pinned once. `commit_durable` accepts as `stage_dirfd`
+    only a directory THIS instance validated through `open_stage_dir` or
+    `open_private_stage_dir`, identified by `(st_dev, st_ino)` while the
+    instance's pinned stage descriptor holds it, and bound at that stage's
+    canonical path; another descriptor of that same directory at that path,
+    including one reached through `descend_pinned`, is the same stage. A
+    directory this instance never validated, one created in its place, or
+    the validated directory reached at any other path, is refused. The
+    same-tree rule then confines a private stage to its own private tree.
+    `.stage/` is never a destination and must never be swept
+    while the writer runs. An implementation is constructed with its hop
+    root and private roots, which must be pairwise disjoint (none equal to
+    or containing another); otherwise construction raises.
+
     `open_regular_pinned` returns the file's bytes (`bytes`, exactly) once
     it is committed (link count 1), and `self.NOT_YET` for a commit still
     in flight (link count 2), ON A HOP-TREE OR HOST-INTAKE BINDING ONLY:
     both are written only by trusted runtimes (a generation tree's sides,
     and a host intake's `.stage/` publications), so a link count of 2 there
-    is a commit in flight. On any other binding (an agent-writable source),
-    a link count of 2 raises like any other count but 1. Any other link
-    count raises. `NOT_YET` is one
+    is a commit in flight. On any other binding (an agent-writable source,
+    or a writer's private tree), a link count of 2 raises like any other
+    count but 1. Any other link count raises. `NOT_YET` is one
     object per implementation, never a `bytes` instance and identical
     across calls; the two runtimes do not import each other, so there is
     no shared sentinel. Callers dispatch three ways, and the third is a
@@ -282,10 +380,40 @@ class HopFsOps(Protocol):
     Reading anything else as "not yet" would turn a bug (a `None`, a `str`,
     a forgotten return) into a silent retry forever.
 
+    READS: WHAT A REFUSAL IS. `open_regular_pinned` raises `self.UnsafeRead`
+    (an exception class, one per implementation, defined the way `NOT_YET`
+    is) for a deterministic finding about the file, with `.reason` exactly
+    one of `UNSAFE_READ_REASONS`:
+
+      * `"not_regular"`: not a regular file after the `fstat`, or ELOOP or
+        ENXIO from the single-component `O_NOFOLLOW | O_NONBLOCK` open (a
+        symlink gives ELOOP and a socket ENXIO; a FIFO or a device opens,
+        and fails the regular-file check), with the `OSError` kept as
+        `__cause__`;
+      * `"link_count"`: a count other than 1 on a binding without trusted
+        links, or other than 1 or 2 on a generation tree or host intake
+        (including 0: the name unlinked after the open);
+      * `"too_large"`: more than `max_bytes`.
+
+    A missing name raises a raw `FileNotFoundError`, never `UnsafeRead`.
+    Anything else (EACCES, EIO, EMFILE, ...) propagates as itself, and
+    means no verdict. Callers dispatch on `isinstance(e, fsops.UnsafeRead)`
+    and `e.reason` only, never on a class name or module. The reason
+    classifies the error; the CALLER's contract decides whether it is
+    terminal.
+
     THE BARRIER EACH METHOD OWES before it returns (a failed barrier raises):
 
       * `mkdir_and_pin`: fsyncs the parent, whether or not this call created
-        the directory (an earlier creator's fsync may have failed);
+        the directory (an earlier creator's fsync may have failed). Before
+        it returns, the FINAL `fstat` of the descriptor it pins must show a
+        directory owned by the writer's uid, permission bits equal to
+        `mode & 0o777`, no setuid or sticky bit, and a setgid bit equal to
+        the pinned parent's (from `fstat` of the parent descriptor; a
+        requested setgid bit means nothing). A new directory is made with
+        `mode & 0o777`; only if the umask removed bits is it `fchmod`ed to
+        `(its setgid bit) | (mode & 0o777)`. An existing directory is
+        checked the same way and never repaired. A failure raises;
       * `stage_tree`: creates the staging subtree under `staging_name`,
         fsyncs it bottom-up and the parent, and returns its root fd
         UNPUBLISHED. It never renames. The caller commits what must exist
@@ -306,15 +434,18 @@ class HopFsOps(Protocol):
 
     #: This implementation's "committed not yet" result (above).
     NOT_YET: object
-
+    #: This implementation's refusal class for `open_regular_pinned` (READS).
+    UnsafeRead: type
 
     def open_root_nofollow(self, path: str) -> int: ...
     def descend_pinned(self, root_fd: int, rel: str) -> Optional[int]: ...
     def mkdir_and_pin(self, parent_fd: int, name: str, mode: int) -> int: ...
     def stage_tree(self, parent_fd: int, staging_name: str) -> int: ...
     def commit_durable(self, stage_dirfd: int, dest_dirfd: int, name: str,
-                       data: bytes, mode: int) -> CommitResult: ...
+                       data: bytes, mode: int, *,
+                       deps: Sequence[Dependency] = ()) -> CommitResult: ...
     def open_stage_dir(self, tree_fd: int, side: StageSide) -> int: ...
+    def open_private_stage_dir(self, root_fd: int) -> int: ...
     def replace_durable(self, dir_fd: int, name: str, data: bytes, mode: int) -> None: ...
     def rename_noreplace(self, src_fd: int, src: str,
                          dst_fd: int, dst: str) -> RenameResult: ...
@@ -326,13 +457,17 @@ class HopFsOps(Protocol):
     def fsync_dir(self, fd: int) -> None: ...
 
 
-#: `HopFsOps`'s methods, in the contract's order (B §e.2).
+#: `HopFsOps`'s methods, in the contract's order (B §e.2, as amended by E5).
+#: Methods only: its attributes are `HOPFSOPS_ATTRIBUTES`.
 HOPFSOPS_METHODS = (
     "open_root_nofollow", "descend_pinned", "mkdir_and_pin", "stage_tree",
-    "commit_durable", "open_stage_dir", "replace_durable", "rename_noreplace",
+    "commit_durable", "open_stage_dir", "open_private_stage_dir",
+    "replace_durable", "rename_noreplace",
     "open_regular_pinned", "stat_owner_pinned", "remove_pinned",
     "fsync_file", "fsync_dir",
 )
+#: `HopFsOps`'s non-method members.
+HOPFSOPS_ATTRIBUTES = ("NOT_YET", "UnsafeRead")
 
 
 @runtime_checkable
