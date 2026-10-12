@@ -425,8 +425,15 @@ def _refusal_diag(
     attachment, the one that failed. Otherwise the optional member is omitted
     and `detail` names the failing index and its outcome. A verdict is never
     fabricated."""
-    if e.index is None or e.attachment_outcome is None:
+    if e.index is None:
         return None, e.detail
+    if e.attachment_outcome is None:
+        # MALFORMED (a size or digest mismatch, a sidecar that cannot be
+        # opened, is not regular or is linked): §6.1's "two paths, never
+        # conflated" makes it a top-level `rejected`, and its per-attachment
+        # vocabulary has no word for it (`rejected_type` is the policy
+        # verdict for a disallowed type). No array; the index in detail.
+        return None, f"{e.detail} (attachment {e.index}: malformed)"
     if submitted == 1 and e.index == 0:
         return [{"index": 0, "outcome": e.attachment_outcome, "detail": e.detail}], e.detail
     return None, f"{e.detail} (attachment {e.index}: {e.attachment_outcome})"
@@ -2318,8 +2325,12 @@ def _place_one(
     to be replayed with the SAME identity next poll; nothing here is
     terminal, except on a DIRECT record (`ORIGIN_DIRECT`), where a non-held
     failure fails the target as the direct paths always did (the commit
-    writes the notice last, so a raise means no notice was placed). Returns
-    True when the record changed without being written."""
+    writes the notice last, so a raise means no notice was placed). The one
+    raise that does NOT mean that is `PublishedNotDurable`: a file was
+    renamed into place and its directory barrier failed, so the notice may
+    be visible. That target stays `delivering` and is replayed with the same
+    identity, on every record. Returns True when the record changed without
+    being written."""
     path = _pending_path(cfg, name, req_id)
     pin = rec.get("binding")
     if t["state"] in ("held", "ready"):
@@ -2350,7 +2361,8 @@ def _place_one(
         t["reason"] = e.reason              # identity kept: a later poll replays it
         return True
     except Exception as e:  # noqa: BLE001 — one target must not sink the request
-        if rec.get("origin") == ORIGIN_DIRECT:
+        if rec.get("origin") == ORIGIN_DIRECT and not isinstance(
+                e, attachments_mod.PublishedNotDurable):
             logger.warning(
                 "instance %r req %r: delivery to %r failed, continuing with the remaining "
                 "recipients: %s: %s", name, req_id, t["recipient"], type(e).__name__, e)

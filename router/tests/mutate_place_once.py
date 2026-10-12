@@ -1,8 +1,10 @@
 """Single-rule mutants for placing once through the intent record
 (`test_place_once.py`), the refusal's `attachments[]` (`test_attachments_
 outbound.py`, `TestRefusalDiagnosticIsConformant`), the `.control/` listing
-(`test_quarantine_cli.py`) and the launcher umask (`test_docker.py`,
-`EntrypointUmaskTests`), each run against the tests that name it.
+(`test_quarantine_cli.py`), the launcher umask (`test_docker.py`,
+`EntrypointUmaskTests`) and the agent-visible write barriers
+(`test_agent_visible_durability.py`), each run against the tests that name
+it.
 
 Run from the repository root:
 
@@ -28,6 +30,7 @@ A = "router.tests.test_attachments_outbound.TestRefusalDiagnosticIsConformant."
 Q = "router.tests.test_quarantine_cli."
 GP = "router.tests.test_generations_pending.DigestlessAnchorTests."
 U = "router.tests.test_docker.EntrypointUmaskTests."
+D = "router.tests.test_agent_visible_durability."
 OB, QU, EP = "router/outbound.py", "router/quarantine.py", "docker/entrypoint.sh"
 
 
@@ -49,8 +52,8 @@ M = [
   '    if req_digest is not None and _any_held(cfg, [recipient]):\n        # Held or not, through the record',
   both('test_a_peer_route_places_once')),
  ('P4 a direct failure is not terminal', OB,
-  '        if rec.get("origin") == ORIGIN_DIRECT:\n            logger.warning(',
-  '        if False:\n            logger.warning(',
+  '        if rec.get("origin") == ORIGIN_DIRECT and not isinstance(',
+  '        if False and not isinstance(',
   both('test_a_failing_recipient_on_a_direct_path_is_answered_failed')),
  ('P5 a replay mints a fresh identity', OB,
   '    if t["state"] in ("held", "ready"):\n        if t["recipient"] in cfg.instances and t["lid"] is None:',
@@ -77,14 +80,44 @@ M = [
  ('D1 the array written whatever was examined', OB,
   '    if submitted == 1 and e.index == 0:\n',
   '    if True:\n',
-  [A + 'test_a_mismatch_after_the_first_attachment_omits_the_array',
-   A + 'test_a_size_cap_on_the_last_attachment_omits_the_array',
-   A + 'test_a_failure_at_index_zero_of_two_omits_the_array']),
+  [A + 'test_a_size_cap_on_the_last_attachment_omits_the_array',
+   A + 'test_a_cap_on_the_first_of_two_omits_the_array']),
  ('D2 the omitted array leaves no index in detail', OB,
   '    return None, f"{e.detail} (attachment {e.index}: {e.attachment_outcome})"\n',
   '    return None, e.detail\n',
+  [A + 'test_a_size_cap_on_the_last_attachment_omits_the_array',
+   A + 'test_a_cap_on_the_first_of_two_omits_the_array']),
+ ('D3 a malformed refusal leaves no index in detail', OB,
+  '        return None, f"{e.detail} (attachment {e.index}: malformed)"\n',
+  '        return None, e.detail\n',
   [A + 'test_a_mismatch_after_the_first_attachment_omits_the_array',
-   A + 'test_a_size_cap_on_the_last_attachment_omits_the_array']),
+   A + 'test_a_failure_at_index_zero_of_two_omits_the_array',
+   A + 'test_the_only_attachment_malformed_has_no_array']),
+ ('C1 a malformed attachment is called rejected_type', 'router/attachments.py',
+  "            f\"{declared_sha}, computed {digest} over the sidecar bytes)\",\n                index=index, attachment_outcome=None,\n",
+  "            f\"{declared_sha}, computed {digest} over the sidecar bytes)\",\n                index=index, attachment_outcome=\"rejected_type\",\n",
+  [A + 'test_the_only_attachment_malformed_has_no_array',
+   'router.tests.test_attachments_outbound.TestIntegrityMismatch.test_sha_mismatch_whole_request_rejected']),
+ ('B1 no file fsync before the rename', 'router/attachments.py',
+  '            f.flush()\n            os.fsync(f.fileno())\n',
+  '            f.flush()\n',
+  [D + 'BlobBarrierTests.test_file_fsync_then_rename_then_directory_fsync',
+   D + 'BlobBarrierTests.test_a_failed_file_fsync_never_publishes',
+   D + 'PlacementIsDurableTests.test_the_notice_is_synced_before_and_after_its_rename']),
+ ('B2 no directory fsync after the rename', 'router/attachments.py',
+  '    try:\n        os.fsync(dir_fd)\n    except OSError as e:\n',
+  '    try:\n        pass\n    except OSError as e:\n',
+  [D + 'BlobBarrierTests.test_file_fsync_then_rename_then_directory_fsync',
+   D + 'BlobBarrierTests.test_a_failed_directory_fsync_raises_published_not_durable',
+   D + 'PlacementIsDurableTests.test_a_failed_barrier_on_the_notice_directory_leaves_the_request_unanswered']),
+ ('B3 a directory not made durable in its parent', 'router/attachments.py',
+  '        pass\n    os.fsync(parent_fd)\n',
+  '        pass\n',
+  [D + 'BlobBarrierTests.test_a_directory_is_made_durable_in_its_parent_created_or_not']),
+ ('B4 published-not-durable treated as nothing placed', OB,
+  '        if rec.get("origin") == ORIGIN_DIRECT and not isinstance(\n                e, attachments_mod.PublishedNotDurable):\n',
+  '        if rec.get("origin") == ORIGIN_DIRECT:\n',
+  [D + 'PlacementIsDurableTests.test_a_failed_barrier_on_the_notice_directory_leaves_the_request_unanswered']),
  ('Q1 the writer stage is listed', QU,
   '            if entry == STAGE_NAME:\n                continue',
   '            if False:\n                continue',

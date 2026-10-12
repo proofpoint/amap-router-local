@@ -333,9 +333,10 @@ class TestIntegrityMismatch(RouterTestCase):
         write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=[desc])
         stage_outbound_sidecars(self.cfg, "alice", "00000001", [data])
         result = self._reject()
-        self.assertEqual(result["attachments"], [
-            {"index": 0, "outcome": "rejected_type", "detail": result["attachments"][0]["detail"]},
-        ])
+        # Malformed: a top-level rejected with no per-attachment outcome
+        # (§6.1 has no word for it), so no array.
+        self.assertNotIn("attachments", result)
+        self.assertIn("(attachment 0: malformed)", result["detail"])
 
     def test_declared_size_smaller_than_actual_is_rejected(self):
         data = b"a" * 100
@@ -941,7 +942,7 @@ class TestRefusalDiagnosticIsConformant(RouterTestCase):
         self.assertEqual((result["outcome"], result["reason_code"]),
                          ("rejected", "attachment_mismatch"))
         self.assertNotIn("attachments", result)
-        self.assertIn("(attachment 1: rejected_type)", result["detail"])
+        self.assertIn("(attachment 1: malformed)", result["detail"])
 
     def test_a_size_cap_on_the_last_attachment_omits_the_array(self):
         descs = [attachment_descriptor(b"a"), attachment_descriptor(b"b")]
@@ -961,13 +962,34 @@ class TestRefusalDiagnosticIsConformant(RouterTestCase):
         stage_outbound_sidecars(self.cfg, "alice", "00000001", data)
         result = self._result()
         self.assertNotIn("attachments", result, "attachment 1 has no verdict")
-        self.assertIn("(attachment 0: rejected_type)", result["detail"])
+        self.assertIn("(attachment 0: malformed)", result["detail"])
 
-    def test_the_only_attachment_failing_keeps_its_one_entry(self):
+    def test_a_cap_on_the_first_of_two_omits_the_array(self):
+        descs = [attachment_descriptor(b"a"), attachment_descriptor(b"b")]
+        descs[0]["size_bytes"] = self.cfg.attachment_max_bytes + 1
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=descs)
+        result = self._result()
+        self.assertNotIn("attachments", result, "attachment 1 has no verdict")
+        self.assertIn("(attachment 0: too_large)", result["detail"])
+
+    def test_the_only_attachment_over_a_cap_keeps_its_one_entry(self):
+        desc = attachment_descriptor(b"only")
+        desc["size_bytes"] = self.cfg.attachment_max_bytes + 1
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=[desc])
+        result = self._result()
+        self.assertEqual([(a["index"], a["outcome"]) for a in result["attachments"]],
+                         [(0, "too_large")])
+
+    def test_the_only_attachment_malformed_has_no_array(self):
+        """A malformed attachment has no §6.1 per-attachment verdict, so even
+        alone it gets no entry: `rejected_type` is the policy verdict for a
+        disallowed type, never a digest mismatch."""
         desc = attachment_descriptor(b"only")
         desc["sha256"] = "0" * 64
         write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=[desc])
         stage_outbound_sidecars(self.cfg, "alice", "00000001", [b"only"])
         result = self._result()
-        self.assertEqual([(a["index"], a["outcome"]) for a in result["attachments"]],
-                         [(0, "rejected_type")])
+        self.assertEqual((result["outcome"], result["reason_code"]),
+                         ("rejected", "attachment_mismatch"))
+        self.assertNotIn("attachments", result)
+        self.assertIn("(attachment 0: malformed)", result["detail"])

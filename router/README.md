@@ -861,10 +861,15 @@ entry per SUBMITTED attachment, its `index` equal to its array position, 0
 through n-1. Ingest stops at the first failure, so the attachments after it
 have no verdict, and §6.1's vocabulary has no word for "not examined". The
 array is written only when every submitted attachment has a real verdict,
-which on a refusal means exactly one was submitted. Otherwise the optional
-member is omitted and `detail` ends with the failing index and its outcome,
-`(attachment <i>: <outcome>)`. A verdict is never invented for an attachment
-nobody examined.
+which on a refusal means exactly one was submitted and it failed a POLICY
+cap (`too_large`). Otherwise the optional member is omitted and `detail`
+ends with the failing index and its outcome, `(attachment <i>: <outcome>)`.
+A MALFORMED attachment (a size or digest mismatch, a sidecar that cannot be
+opened, is not a regular file, or is linked) has no §6.1 per-attachment
+outcome at all: §6.1 makes it a top-level `rejected`, and `rejected_type` is
+the policy verdict for a disallowed type. It is never given an entry, alone
+or not, and `detail` ends `(attachment <i>: malformed)`. A verdict is never
+invented for an attachment nobody examined.
 
 **TOCTOU.** The sidecar dir is agent-owned and writable while the router
 reads it — the same defect class `reset.py` found and fixed for deletions
@@ -1808,7 +1813,19 @@ the record and answers from it without placing again, instead of minting a
 second notice id. Two things differ from a held record: a delivery failure
 that is not a hold fails that target at once (the commit writes the notice
 last, so a raise means no notice was placed), exactly as the direct paths
-always answered; and the record is removed once the request is answered. An
+always answered; and the record is removed once the request is answered.
+The one raise that does not mean "nothing placed" is a failed barrier AFTER
+a file was renamed into place (`attachments.PublishedNotDurable`): the
+notice may be visible, so that target stays `delivering` and is replayed
+with the same identity, never failed.
+
+**Every agent-visible write is durable.** Sidecars, the message spool and
+the notice are each fsynced before they are renamed into place and their
+directory after, and every directory on the way is made durable in its
+parent; a failed barrier raises. So the commit order (blobs, spool, ledger,
+notice LAST) holds on disk across a power loss, not only across a process
+crash, and the private record can never say "delivered" over a notice the
+disk lost: a power loss lands in the re-presentation residual below. An
 injected backend that cannot take the `preset` and `from_address` keywords is
 called directly, as before, and keeps the old exposure: a failure after its
 placement can place again under a new id.
