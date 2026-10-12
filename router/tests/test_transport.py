@@ -521,7 +521,10 @@ class StartupTests(_PluginDir):
         self.addCleanup(base.tearDown)
         cfg = base.make_config({"alice": []})
         from dataclasses import replace
-        return replace(cfg, transport_plugin=pin)
+        hop = None if pin is None else config_mod.HopConfig(
+            root=str(base.tmp / "hop"), peer_uid=0, version_write=1,
+            caps=tuple(helpers.TEST_HOP_CAPS.items()))
+        return replace(cfg, transport_plugin=pin, hop=hop)
 
     def test_no_plugin_configured_gives_no_transport(self):
         self.assertIsNone(service.start_transport(self._cfg()))
@@ -545,15 +548,24 @@ class StartupTests(_PluginDir):
                 service.start_transport(cfg)
         self.assertEqual(cm.exception.reason, "missing")
 
-    def test_a_valid_plugin_is_refused_until_the_filesystem_port_exists(self):
+    def test_a_valid_plugin_is_activated_with_this_routers_filesystem_port(self):
+        """API (3, 0): a plugin that passes every check is ACTIVATED. The
+        drain receives the plugin-object carrier, never a port: senders are
+        constructed per generation on first use, not here."""
+        from router import fsops
         cfg = self._cfg(config_mod.TransportPluginPin(str(self.path), self.sha))
         with self._trusting_me(), mock.patch.object(service, "logger") as log:
-            with self.assertRaises(transport.PluginRefused) as cm:
-                service.start_transport(cfg)
-        self.assertEqual(cm.exception.reason, "fsops_unavailable")
-        log.info.assert_not_called()  # no success line for a refused plugin
-        self.assertIn(self.sha, cm.exception.detail)
-        self.assertIn(str(self.path), cm.exception.detail)
+            rt = service.start_transport(cfg)
+        self.assertIsInstance(rt, service.HopRuntime)
+        self.assertEqual([f.name for f in __import__("dataclasses").fields(rt)],
+                         ["plugin", "fsops", "hop"])
+        self.assertIsInstance(rt.plugin, transport.LoadedPlugin)
+        self.assertEqual(rt.plugin.sha256, self.sha)
+        self.assertIsInstance(rt.fsops, fsops.FsOps)
+        self.assertIs(rt.hop, cfg.hop)
+        self.assertEqual(rt.plugin.namespace["LOADS"], ["executed"])
+        log.info.assert_called()   # the activation is logged, naming the pin
+        self.assertIn(self.sha, " ".join(map(str, log.info.call_args[0])))
 
     def test_run_forever_refuses_to_start_and_never_polls(self):
         self.path.unlink()

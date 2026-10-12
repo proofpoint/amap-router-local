@@ -1342,6 +1342,12 @@ def _begin_external(
     attachments, whose staging to the transport is not built yet (the
     sidecars sit in the agent-writable outbox; ingest by copy needs them
     staged first)."""
+    if isinstance(transport, hoplink.Held):
+        # This generation's sender is held: nothing is consumed, so the
+        # request is decided on a later poll, once the hold clears.
+        logger.warning("instance %r req %r: held unconsumed, the hop sender is held (%s)",
+                       name, req_id, transport.hold.reason)
+        return HELD
     if transport is None:
         result = _result_doc(
             req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
@@ -1505,6 +1511,8 @@ def _advance_inflight(
     exactly as they are and only counted: nothing here may guess a verdict."""
     settled = errored = 0
     req_ids = inflight_mod.list_records(cfg, name)
+    if isinstance(transport, hoplink.Held):
+        return {"inflight_settled": 0, "inflight_errored": 0}
     if req_ids and transport is None:
         if (name, None) not in _STALE_WARNED:
             _STALE_WARNED.add((name, None))
@@ -3103,8 +3111,10 @@ def drain_instance(
     `_pin_own_root` returns, so it can only act on the verified root."""
     view, fd = _pin_own_root(cfg, name)
     try:
+        current, fenced = hoplink.resolve(transport, view, name)
         return _drain_instance(view, name, deliver_backend=deliver_backend,
-                               cold_policy=cold_policy, transport=transport)
+                               cold_policy=cold_policy, transport=current,
+                               fenced_transport=fenced)
     finally:
         if fd is not None:
             os.close(fd)
@@ -3115,6 +3125,7 @@ def _drain_instance(
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
     cold_policy: Optional[ColdPolicy] = None,
     transport: Optional[inflight_mod.TransportPort] = None,
+    fenced_transport: Any = None,
 ) -> Dict[str, int]:
     """Drain instance `name`'s `outbound/` once. Returns a summary dict for
     logging (mirrors `gate.outbound.drain_outbound`'s shape).
@@ -3170,7 +3181,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # A fenced generation's work first (its own transport ids, its own
     # snapshots); what it still owns at this root is neither first-sighted
     # nor drained by the current generation.
-    fenced_owned = _drain_fenced(cfg, name, transport, deliver_backend=deliver_backend,
+    fenced_owned = _drain_fenced(cfg, name, fenced_transport, deliver_backend=deliver_backend,
                                  cold_policy=cold_policy)
     marker_doc, first_sight = firstsight.record_first_sight(cfg, name, exclude=fenced_owned)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)

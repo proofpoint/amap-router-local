@@ -224,3 +224,228 @@ def build_handover(request: Dict[str, Any], *, from_address: str, version_write:
         "schema": HANDOVER_SCHEMA,
         "settled_through": settled_through,
     })
+
+
+# ---------------------------------------------------------------------------
+# The sender for one generation: its binding pin, its admission
+# confirmation, and the per-process cache.
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402  (kept beside the half that uses it)
+import logging  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Tuple  # noqa: E402
+
+from . import config as config_mod  # noqa: E402
+from . import generations as generations_mod  # noqa: E402
+from . import transport as transport_mod  # noqa: E402
+from .util import atomic_write  # noqa: E402
+
+logger = logging.getLogger("amap_router_local.hoplink")
+
+#: Where a generation's hop state lives, under its private directory.
+TRANSPORT_DIR = "transport"
+PIN_FILE = "hop.json"
+ADMITTED_FILE = "admitted.json"
+
+#: Hold reasons this half reports (per generation unless said otherwise).
+HOLD_BINDING_CHANGED = "hop_binding_changed"
+HOLD_PREDECESSOR_UNRETIRED = "hop_predecessor_unretired"   # the whole instance
+HOLD_SETTINGS_REFUSED = "hop_settings_refused"
+HOLD_IDENTITY_CONFLICT = "hop_identity_conflict"
+HOLD_PLUGIN_VOCABULARY = "hop_plugin_vocabulary"           # the whole instance
+HOLD_CONSTRUCT_FAILED = "hop_construct_failed"             # retried next poll
+
+
+class HopHold(Exception):
+    """No sender for this generation this poll. `reason` is a hold reason;
+    `latched` says whether only an operator act releases it (otherwise the
+    next poll tries again); `scope` is `"gen"` or `"instance"`."""
+
+    def __init__(self, reason: str, detail: str, *, latched: bool, scope: str = "gen"):
+        super().__init__(f"{reason}: {detail}")
+        self.reason, self.detail, self.latched, self.scope = reason, detail, latched, scope
+
+
+def split_gen_key(key: str) -> Tuple[str, str]:
+    """`<logical_id>/gen-<gen>` into `(logical_id, gen)`."""
+    lid, _, rest = key.partition("/")
+    if not (lid and rest.startswith(generations_mod.GEN_PREFIX)):
+        raise ValueError(f"{key!r} is not a generation key")
+    return lid, rest[len(generations_mod.GEN_PREFIX):]
+
+
+def transport_dir(cfg: Any, name: str) -> Path:
+    return config_mod.gen_state_dir(cfg, name) / TRANSPORT_DIR
+
+
+def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def pin_doc(hop: Any, admitted_at: str) -> Dict[str, Any]:
+    return {"hop_root": hop.root, "peer_uid": hop.peer_uid,
+            "version_write": hop.version_write, "admitted_at": admitted_at}
+
+
+def minted_ts(cfg: Any, name: str) -> str:
+    """The generation's `minted_ts` from its durable record: the sender's
+    `admitted_at` (F4), never the clock."""
+    lid, gen = split_gen_key(config_mod.gen_key(cfg, name))
+    doc = generations_mod.read_doc(cfg.state_dir, lid)
+    if doc is None:
+        raise HopHold(HOLD_CONSTRUCT_FAILED, "no generations record", latched=False)
+    entry = next((g for g in doc["gens"] if g["gen"] == gen), None)
+    if entry is None or not isinstance(entry.get("minted_ts"), str):
+        raise HopHold(HOLD_CONSTRUCT_FAILED, f"generation {gen} has no minted_ts",
+                      latched=False)
+    return entry["minted_ts"]
+
+
+def ensure_pin(cfg: Any, name: str) -> Dict[str, Any]:
+    """This generation's binding pin: written durably BEFORE its sender is
+    first constructed, and compared on every later construction. A config
+    that no longer matches it HOLDS this generation (`hop_binding_changed`):
+    a changed root would admit a live generation a second time elsewhere and
+    hand a request over twice."""
+    path = transport_dir(cfg, name) / PIN_FILE
+    want = pin_doc(cfg.hop, minted_ts(cfg, name))
+    have = _read_json_file(path)
+    if have is None:
+        atomic_write(path, canonical(want), durable_root=cfg.state_dir)
+        return want
+    if have != want:
+        raise HopHold(HOLD_BINDING_CHANGED,
+                      f"this generation is pinned to {have}, the config now says {want}",
+                      latched=True)
+    return have
+
+
+def settings_for(cfg: Any, name: str, pin: Dict[str, Any]) -> Dict[str, Any]:
+    """The sender's settings, exactly the plugin's closed list, taken from the
+    PIN (never the current config) and the generation key."""
+    lid, gen = split_gen_key(config_mod.gen_key(cfg, name))
+    return {"hop_root": pin["hop_root"], "logical_id": lid, "generation": gen,
+            "peer_uid": pin["peer_uid"], "version_write": pin["version_write"],
+            "caps": dict(cfg.hop.caps), "admitted_at": pin["admitted_at"], "role": "hop1"}
+
+
+def admitted(cfg: Any, name: str) -> bool:
+    return (transport_dir(cfg, name) / ADMITTED_FILE).is_file()
+
+
+def fenced_admitted(cfg: Any, name: str) -> List[str]:
+    """The fenced predecessors of `name`'s current generation that this
+    router ADMITTED (an `admitted.json` beside their pin)."""
+    lid, current = split_gen_key(config_mod.gen_key(cfg, name))
+    doc = generations_mod.read_doc(cfg.state_dir, lid)
+    out = []
+    for g in (doc or {}).get("gens", []):
+        if g["gen"] != current and (generations_mod.gen_dir(cfg.state_dir, lid, g["gen"])
+                                    / TRANSPORT_DIR / ADMITTED_FILE).is_file():
+            out.append(g["gen"])
+    return out
+
+
+#: The per-process cache: (runtime id, state_dir, logical_id, gen, pin digest)
+#: -> the constructed sender. Filled only after a construction succeeded.
+_SENDERS: Dict[Tuple, Any] = {}
+
+
+def sender_for(runtime: Any, cfg: Any, name: str) -> Any:
+    """`name`'s CURRENT generation's sender: constructed once per (generation,
+    pin) per process, and only after the pin is durable. Its successful
+    construction admitted the tree, so `admitted.json` is then written,
+    before the first request is handed over. Raises `HopHold`."""
+    fenced = fenced_admitted(cfg, name)
+    if fenced:
+        # Retiring a fenced predecessor is the fence step's; until it has
+        # run, no successor is admitted (one live generation, contract §4.1).
+        raise HopHold(HOLD_PREDECESSOR_UNRETIRED,
+                      f"fenced generation(s) {fenced} not yet retired", latched=False,
+                      scope="instance")
+    pin = ensure_pin(cfg, name)
+    lid, gen = split_gen_key(config_mod.gen_key(cfg, name))
+    key = (id(runtime), str(cfg.state_dir), lid, gen,
+           hashlib.sha256(canonical(pin)).hexdigest())
+    port = _SENDERS.get(key)
+    if port is not None:
+        return port
+    try:
+        port = runtime.plugin.make_sender(settings_for(cfg, name, pin), runtime.fsops)
+    except Exception as e:  # noqa: BLE001 -- classified, never swallowed silently
+        raise _construction_hold(e) from e
+    atomic_write(transport_dir(cfg, name) / ADMITTED_FILE,
+                 canonical({"admitted_at": pin["admitted_at"], "hop_root": pin["hop_root"]}),
+                 durable_root=cfg.state_dir)
+    _SENDERS[key] = port
+    return port
+
+
+def _construction_hold(e: BaseException) -> HopHold:
+    """The construction row of the closed exception table."""
+    kind, detail = transport_mod.classify(e)
+    if kind == "reason" and detail == "settings_invalid":
+        return HopHold(HOLD_SETTINGS_REFUSED, str(e), latched=True)
+    if kind == "reason" and detail == "exists_different":
+        return HopHold(HOLD_IDENTITY_CONFLICT, str(e), latched=True)
+    if isinstance(e, transport_mod.SeamRefused):
+        return HopHold(HOLD_PLUGIN_VOCABULARY, str(e), latched=True, scope="instance")
+    return HopHold(f"{HOLD_CONSTRUCT_FAILED}:{detail or kind}", str(e), latched=False)
+
+
+def forget_senders() -> None:
+    """Drop the cache, closing each sender (tests, and a process ending)."""
+    for port in list(_SENDERS.values()):
+        try:
+            port.close()
+        except Exception:  # noqa: BLE001 -- close is cleanup
+            logger.exception("closing a hop sender failed")
+    _SENDERS.clear()
+
+
+class Held:
+    """The drain's transport when this generation's sender is held: a
+    request bound for the external leg stays UNCONSUMED in the outbox (it is
+    neither settled nor put in flight), and in-flight records are left as
+    they are. Never `None`, which the drain reads as "no transport
+    configured" and settles."""
+
+    def __init__(self, hold: HopHold):
+        self.hold = hold
+
+
+def is_runtime(transport: Any) -> bool:
+    """The plugin-object seam's carrier (`service.HopRuntime`), recognised
+    by its three fields; the drain resolves it to a sender per generation."""
+    return all(hasattr(transport, a) for a in ("plugin", "fsops", "hop"))
+
+
+#: This process's latest hold per (state_dir, instance), for status.
+HOLDS: Dict[Tuple[str, str], HopHold] = {}
+
+
+def resolve(transport: Any, cfg: Any, name: str) -> Tuple[Any, Any]:
+    """`(current, fenced)`: the transport the drain uses for `name`'s current
+    generation, and for its fenced generations' work. A runtime resolves to
+    the current generation's sender (or `Held`); fenced generations get none
+    here, since a fenced generation's sender may be constructed only after
+    its tree is retired. Anything else (a test's port, or `None`) is used as
+    given for both."""
+    if not is_runtime(transport):
+        return transport, transport
+    key = (str(cfg.state_dir), name)
+    try:
+        port = sender_for(transport, cfg, name)
+    except HopHold as e:
+        if HOLDS.get(key) is None or HOLDS[key].reason != e.reason:
+            (logger.error if e.latched else logger.warning)(
+                "instance %r: no hop sender this poll (%s): %s", name, e.reason, e.detail)
+        HOLDS[key] = e
+        return Held(e), None
+    HOLDS.pop(key, None)
+    return port, None

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -49,6 +49,19 @@ logger = logging.getLogger("amap_router_local")
 _LOAD = object()
 
 
+@dataclass(frozen=True)
+class HopRuntime:
+    """What `start_transport` hands the drain when a transport plugin is
+    configured: the loaded plugin (or a same-shaped stand-in), this router's
+    filesystem port for the hop tree, and the hop config. Exactly these
+    three fields, in this order: the hop fixture builds one directly. The
+    drain resolves it to one sender per (logical_id, generation)
+    (`router/hoplink.py`)."""
+    plugin: Any
+    fsops: Any
+    hop: Any
+
+
 def _agent_reachable_roots(cfg: RouterConfig) -> List[Path]:
     """Every directory an agent can reach: no plugin may live inside one."""
     roots: List[Path] = []
@@ -59,32 +72,29 @@ def _agent_reachable_roots(cfg: RouterConfig) -> List[Path]:
     return roots
 
 
-def start_transport(cfg: RouterConfig) -> Optional[Any]:
+def start_transport(cfg: RouterConfig) -> Optional["HopRuntime"]:
     """The transport the drain uses, loaded ONCE per process (`run_forever`)
     and never hot-swapped. With no `transport_plugin` configured this is
     `NullTransport`'s sender, `None`, and the drain behaves exactly as it
     did before plugins existed. With one configured, `transport.load_plugin`
     checks the file and raises `PluginRefused` on any failure, which stops
     startup: a configured hand-off with no usable plugin never starts in a
-    degraded mode.
-
-    NOT YET ACTIVATABLE. The filesystem port a plugin's factories receive
-    is not built yet, so a plugin that passes every check is still refused
-    (`fsops_unavailable`) rather than handed `None` for it. Configuring one
-    therefore stops startup until that port exists, which is the intended
-    gate: no transport is used before its durability work is done."""
+    degraded mode. Then this router's filesystem port for the configured
+    hop root is built, its own refusal classes checked
+    (`transport.check_fsops_classes`), and a `HopRuntime` returned. Nothing
+    is constructed against the hop tree yet: each generation's sender is,
+    on first use, by the drain."""
     pin = cfg.transport_plugin
     if pin is None:
         return transport_mod.NullTransport().make_sender({}, None)
     plugin = transport_mod.load_plugin(
         pin.path, pin.sha256, forbidden_roots=_agent_reachable_roots(cfg))
-    # No "loaded" line: success is logged only once a plugin is ACTIVATED,
-    # and none can be yet. The refusal names what was verified instead.
-    raise transport_mod.PluginRefused(
-        "fsops_unavailable",
-        f"{plugin.path} (sha256 {plugin.sha256}, PLUGIN_API {plugin.api}) passed "
-        "every check, but the filesystem port its factories need is not built "
-        "yet; it cannot be activated")
+    from . import fsops as fsops_mod  # local: only a configured plugin needs it
+    fsops = fsops_mod.FsOps(hop_root=cfg.hop.root)
+    transport_mod.check_fsops_classes(fsops)
+    logger.info("transport plugin activated: %s (sha256 %s, PLUGIN_API %s), hop root %s",
+                plugin.path, plugin.sha256, plugin.api, cfg.hop.root)
+    return HopRuntime(plugin=plugin, fsops=fsops, hop=cfg.hop)
 
 
 #: What this process last logged about the registry, so a standing hold is
@@ -392,6 +402,12 @@ def reload_config(config_path, current: RouterConfig) -> RouterConfig:
             "config reload changed transport_plugin — REFUSED and ignored. The "
             "plugin is loaded once at startup and never hot-swapped; changing "
             "it needs a restart, not a reload.")
+        return replace(current, reload_failed=True)
+    if fresh.hop != current.hop:
+        logger.error(
+            "config reload changed hop — REFUSED and ignored. Each generation is "
+            "pinned to the hop binding it was admitted under; changing it needs a "
+            "restart, and a changed root holds the generations pinned to the old one.")
         return replace(current, reload_failed=True)
     return fresh
 
