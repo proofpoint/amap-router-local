@@ -31,6 +31,7 @@ CONTRACT_HOPFSOPS = {
     "remove_pinned": ["dir_fd", "name"],
     "fsync_file": ["fd"],
     "fsync_dir": ["fd"],
+    "list_pinned": ["dir_fd", "limit", "after"],   # E8 (3, 0)
 }
 
 
@@ -59,11 +60,13 @@ class HopFsOpsShapeTests(unittest.TestCase):
         self.assertIn("protocol violation, never a skip", doc)
 
     def test_the_attributes_are_exactly_not_yet_and_unsafe_read(self):
-        """E5: `UnsafeRead` is a member beside `NOT_YET`, not a method, and
-        `HOPFSOPS_METHODS` stays methods only."""
+        """E5: `UnsafeRead` is a member beside `NOT_YET`, not a method; E8
+        adds `ListingTooLarge` the same way. `HOPFSOPS_METHODS` stays methods
+        only."""
         self.assertEqual(tuple(transport.HopFsOps.__annotations__),
                          transport.HOPFSOPS_ATTRIBUTES)
-        self.assertEqual(transport.HOPFSOPS_ATTRIBUTES, ("NOT_YET", "UnsafeRead"))
+        self.assertEqual(transport.HOPFSOPS_ATTRIBUTES,
+                         ("NOT_YET", "UnsafeRead", "ListingTooLarge"))
         self.assertFalse(set(transport.HOPFSOPS_ATTRIBUTES) & set(transport.HOPFSOPS_METHODS))
 
     def test_deps_is_keyword_only_and_empty_by_default(self):
@@ -74,7 +77,11 @@ class HopFsOpsShapeTests(unittest.TestCase):
                          typing.Sequence[transport.Dependency])
 
     def test_the_e5_rules_are_stated(self):
-        self.assertEqual(transport.UNSAFE_READ_REASONS, ("not_regular", "link_count", "too_large"))
+        self.assertEqual(transport.UNSAFE_READ_REASONS,
+                         ("not_regular", "link_count", "too_large", "hardlink", "open_failed"))
+        from router import fsops
+        self.assertLessEqual(set(fsops.UNSAFE_READ_REASONS), set(transport.UNSAFE_READ_REASONS),
+                             "this router's own reasons are a subset of the union")
         doc = " ".join(transport.HopFsOps.__doc__.split())
         for phrase in ("a fresh `O_NOFOLLOW` walk from the tree root",
                        "count 2 is an anomaly here, never NOT_YET",
@@ -205,6 +212,7 @@ class AnnotationsResolveTests(unittest.TestCase):
     def test_the_factory_table_names_every_factory_and_its_port(self):
         self.assertEqual(dict(transport.FACTORY_PORTS), {
             "make_sender": "HopFsOps", "make_intake_reader": "HopFsOps",
+            "make_upstream_marker_store": "HopFsOps",
             "make_signer": "KeyOps", "make_verifier": None,
             "make_hop_receiver": "HopFsOps", "make_intake_writer": "HopFsOps",
             "make_marker_store": "HopFsOps", "make_hop_sender": "HopFsOps",
@@ -230,6 +238,8 @@ class _CompleteFsOps:
     def remove_pinned(self, dir_fd, name): return None
     def fsync_file(self, fd): return None
     def fsync_dir(self, fd): return None
+    ListingTooLarge = type("ListingTooLarge", (Exception,), {})
+    def list_pinned(self, dir_fd, *, limit, after=None): return ([], False)
 
 
 class ConformanceTests(unittest.TestCase):
@@ -281,7 +291,8 @@ class InterfaceOnlyTests(unittest.TestCase):
         import ast
         from pathlib import Path
         tree = ast.parse(Path(transport.__file__).read_text(encoding="utf-8"))
-        ports = {"HopFsOps", "KeyOps", "Signer", "Verifier", "TransportPort", "InboundPort"}
+        ports = {"HopFsOps", "KeyOps", "Signer", "Verifier", "TransportPort", "InboundPort",
+                 "UpstreamMarkers"}
         seen = 0
         for node in tree.body:
             if isinstance(node, ast.ClassDef) and node.name in ports:
@@ -294,7 +305,10 @@ class InterfaceOnlyTests(unittest.TestCase):
                         self.assertEqual(len(body), 1, item.name)
                         self.assertIsInstance(body[0], ast.Expr, item.name)
                         self.assertIs(body[0].value.value, Ellipsis, item.name)
-        self.assertEqual(seen, 14 + 2 + 1 + 1 + 5 + 2)
+        # HopFsOps 15, KeyOps 2, Signer 1, Verifier 1, TransportPort 7,
+        # InboundPort 3, UpstreamMarkers 3 (E8 adds list_pinned, withdraw,
+        # close on each plugin object, and the marker store).
+        self.assertEqual(seen, 15 + 2 + 1 + 1 + 7 + 3 + 3)
 
 
 class PluginApiCoversThePortsTests(unittest.TestCase):

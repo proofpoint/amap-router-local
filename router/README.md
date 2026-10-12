@@ -1131,9 +1131,10 @@ accepts can withdraw it: no transport API has a withdraw operation. The
 record is marked `revocation_unenforceable` (a member of its closed schema,
 so it survives a restart), an ERROR is logged every poll it stays pending,
 and `status` lists it with its age. A result, if one arrives, still settles
-it, because the send may have happened. A `withdraw_request` on the port is
-reported (`withdraw_capable`) and never called: it is a proposal for a
-later plugin API, not an approved part of this one.
+it, because the send may have happened. `withdraw_request` is part of the
+port from API (3, 0) and is reported (`withdraw_capable`), but the in-flight
+table does not call it yet: a withdrawn request needs its own branch in the
+"archived, still no result" row first.
 
 **A failing reload.** A reload that fails, or that `reload_config` refuses
 (a changed `state_dir` or `transport_plugin`), keeps the last good config
@@ -1211,7 +1212,7 @@ fixed `PluginRefused.reason`:
 | `hash_mismatch` | its bytes, read once from the pinned descriptor, do not hash to `sha256` |
 | `exec_failed` | those bytes, the only ones ever executed, fail to run |
 | `api_mismatch` | its `PLUGIN_API` is not `(our major, at least our minor)` |
-| `missing_factory` | it lacks a callable `make_sender` or `make_intake_reader` |
+| `missing_factory` | it lacks a callable `make_sender`, `make_intake_reader` or `make_upstream_marker_store` |
 | `fsops_unavailable` | it passed every check, but the filesystem port its factories need is not built yet |
 
 The last one is deliberate and temporary: until that port exists, any
@@ -1224,11 +1225,42 @@ only: `HopFsOps` (every filesystem operation a plugin may make, on pinned
 descriptors; a plugin makes no filesystem call of its own), `KeyOps` (the
 signing key as bytes; the signer never opens a path), `Signer` and
 `Verifier`, plus the factory signatures (`make_sender`, `make_intake_reader`,
-`make_signer`, `make_verifier`, and the sibling runtime's four).
-`PLUGIN_API`'s major covers all of them, and is `(2, 0)` since contract
-amendment E5: a `(1, x)` plugin is refused here, and a `(2, x)` plugin by a
-`(1, x)` runtime, before any factory is called. The contracts on
-`HopFsOps` worth knowing before implementing it:
+`make_upstream_marker_store`, `make_signer`, `make_verifier`, and the
+sibling runtime's four). `PLUGIN_API`'s major covers all of them, and is
+`(3, 0)` since contract amendment E8: a `(2, x)` plugin is refused here, and
+a `(3, x)` plugin by a `(2, x)` runtime, before any factory is called.
+Nothing at `(2, x)` was ever deployed, so plugin and runtime move together.
+What `(3, 0)` adds:
+
+- `HopFsOps.list_pinned(dir_fd, *, limit, after=None)` pages a pinned
+  directory by name, at most `transport.LIST_LIMIT_MAX` names per call,
+  scanning a fresh open description and stopping with the port's own
+  `ListingTooLarge` past `transport.LIST_SCAN_MAX` names.
+- `InboundPort.list_entries(kind, *, limit, after=None)` pages committed
+  entries by their NAME (a notice's is `notice-<id>.json`, so id order is
+  not listing order), and fills or exhausts, with a one-entry lookahead
+  for `truncated`. A notice bundle is `amap-hop-notice-entry/2`, with a
+  REQUIRED `hop` member (the exact facts bytes). A committed notice whose
+  facts are missing or invalid is listed, and its read raises the port's
+  own `NoticeRefused` (`notice_incomplete`, `notice_invalid`).
+- `make_upstream_marker_store` returns `UpstreamMarkers`: exactly
+  `retire(retired_at)` (`created`, `exists_same`, `exists`, `absent`) and
+  `retired()`, which raises the store's own `GenerationAbsent` for a
+  missing tree and raises whenever it cannot decide, never answering
+  "not retired" on a failed read.
+- `TransportPort.withdraw_request(n)` (`withdrawn`, `too_late`), decided by
+  the rename itself.
+- `close()` on every plugin object; it never closes the `HopFsOps`
+  instance's shared stage descriptors. A factory that raises has released
+  everything it opened.
+- Every exception a plugin object raises on purpose carries `.reason` from
+  `transport.TRANSPORT_REASONS`, and `transport.classify` is the one
+  classifier, in a fixed order: the captured verdict classes, the
+  runtime's own classes, a plugin reason, `OSError`, anything else.
+- PENDING the owner's decision: an optional `make_intake_remover` at
+  `(3, 1)`, a minor addition. Nothing in `(3, 0)` depends on it.
+
+The contracts on `HopFsOps` worth knowing before implementing it:
 
 - `commit_durable` derives its stage name's destination tag from a binding
   the implementation holds, never from a parameter or a bare descriptor

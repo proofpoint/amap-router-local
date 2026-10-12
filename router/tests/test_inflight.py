@@ -65,6 +65,19 @@ class FakeTransport:
             f"transport request {n} rewritten"
         self.pending[n] = data
 
+    def withdraw_request(self, n):
+        """API (3, 0): the in-flight table never calls it yet; a test that
+        does gets the Protocol's vocabulary."""
+        if n in self.results or n in self.archived:
+            return "too_late"
+        if n not in self.pending:
+            raise FileNotFoundError(n)
+        self.archived[n] = self.pending.pop(n)
+        return "withdrawn"
+
+    def close(self):
+        self.closed = True
+
     # -- the downstream runtime ------------------------------------------
 
     def send(self, n, *, outcome="accepted", reason_code="allowlisted",
