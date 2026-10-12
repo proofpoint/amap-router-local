@@ -285,8 +285,9 @@ class InboundPort(Protocol):
     `NoticeRefused` is this object's refusal class for a notice (an
     exception class, like `HopFsOps.UnsafeRead`). `read_entry("notice", id)`
     raises it, with `.reason` one of `NOTICE_REFUSAL_REASONS`, for a
-    COMMITTED notice whose facts file is missing (`notice_incomplete`) or
-    invalid by any codec layer (`notice_invalid`). Such an entry IS listed,
+    COMMITTED notice whose facts, spool or sidecars are missing
+    (`notice_incomplete`) or invalid (`notice_invalid`: the facts by any
+    codec layer, or a malformed descriptor or `content_ref`). Such an entry IS listed,
     never hidden; an uncommitted notice is not listed. The caller captures
     the class once, at construction (`capture_verdict_class`: two-way
     disjoint from `OSError` and the runtime's `UnsafeRead`), and dispatches
@@ -451,14 +452,12 @@ StageSide = Literal["up", "down", "intake"]
 #: One dependency of a `commit_durable` sentinel: `(dir_fd, name, size,
 #: sha256)`, the sha256 as lowercase hex (`HopFsOps`, DEPENDENCIES).
 Dependency = Tuple[int, str, int, str]
-#: `fsops.UnsafeRead.reason`: exactly one of these (`HopFsOps`, READS). The
-#: UNION over the runtimes that implement `HopFsOps`: this router's own
-#: implementation raises the first three (`router/fsops.py`); the sibling
-#: runtime's also raises `hardlink` and `open_failed`. Each implementation's
-#: own set must be a subset of this one (the plugin's conformance suite
-#: checks it), and the classifier never compares these with
-#: `TRANSPORT_REASONS` (module docstring, CLASSIFYING).
-UNSAFE_READ_REASONS = ("not_regular", "link_count", "too_large", "hardlink", "open_failed")
+#: `fsops.UnsafeRead.reason`: exactly one of these (`HopFsOps`, READS), for
+#: every runtime that implements `HopFsOps`. Each implementation's own set
+#: must be a subset (the plugin's conformance suite checks it), and the
+#: classifier never compares these with `TRANSPORT_REASONS` (module
+#: docstring, CLASSIFYING).
+UNSAFE_READ_REASONS = ("not_regular", "link_count", "too_large")
 
 
 @runtime_checkable
@@ -875,26 +874,38 @@ def check_disjoint(cls: Any, bases: Sequence[type]) -> type:
 
 
 def capture_verdict_class(obj: Any, attribute: str, fsops: Any, reason: str) -> type:
-    """The refusal class `obj.<attribute>`, checked ONCE (`check_disjoint`
-    against `OSError` and `fsops.UnsafeRead`) and returned for the caller to
-    keep: later dispatch uses the captured class, never a fresh lookup, so a
-    class swapped onto the object afterwards changes nothing. A missing or
-    non-disjoint class raises `SeamRefused(reason)`."""
+    """The refusal class `obj.<attribute>`, checked ONCE and returned for the
+    caller to keep: later dispatch uses the captured class, never a fresh
+    lookup, so a class swapped onto the object afterwards changes nothing.
+    The check is `check_disjoint` against the COMPLETE set the classifier
+    tells it apart from: `OSError` and both of the runtime's own classes
+    (`fsops.UnsafeRead`, `fsops.ListingTooLarge`), so no runtime exception
+    can ever be read as this verdict, nor this verdict as a runtime one. A
+    missing or non-disjoint class raises `SeamRefused(reason)`."""
     try:
-        return check_disjoint(getattr(obj, attribute), (OSError, fsops.UnsafeRead))
+        bases = (OSError, fsops.UnsafeRead, fsops.ListingTooLarge)
+        return check_disjoint(getattr(obj, attribute), bases)
     except (AttributeError, TypeError) as e:
         raise SeamRefused(reason, f"{attribute}: {e}") from None
 
 
-def check_fsops_classes(fsops: Any) -> Tuple[type, type]:
-    """The runtime's own `(UnsafeRead, ListingTooLarge)`, with
-    `ListingTooLarge` two-way disjoint from `OSError` and `UnsafeRead`."""
+#: The ROLES of the runtime's own classes, as `classify` reports them. The
+#: Protocol fixes the attribute's role, not the implementation class's name,
+#: so a conforming `HopFsOps` may call its class anything.
+RUNTIME_ROLES = ("unsafe_read", "listing_too_large")
+
+
+def check_fsops_classes(fsops: Any) -> Tuple[Tuple[type, str], Tuple[type, str]]:
+    """The runtime's own classes with their roles, `((UnsafeRead,
+    "unsafe_read"), (ListingTooLarge, "listing_too_large"))`, ready for
+    `classify(runtime=...)`; `ListingTooLarge` two-way disjoint from
+    `OSError` and `UnsafeRead`."""
     try:
         unsafe = fsops.UnsafeRead
         too_large = check_disjoint(fsops.ListingTooLarge, (OSError, unsafe))
     except (AttributeError, TypeError) as e:
         raise SeamRefused("fsops_vocabulary", str(e)) from None
-    return unsafe, too_large
+    return (unsafe, "unsafe_read"), (too_large, "listing_too_large")
 
 
 def is_current_bundle_schema(value: Any) -> bool:
@@ -908,16 +919,16 @@ CLASSES = ("verdict", "runtime", "reason", "oserror", "other")
 
 def classify(exc: BaseException, *,
              verdicts: Sequence[Tuple[type, Optional[Sequence[str]]]] = (),
-             runtime: Sequence[type] = ()) -> Tuple[str, Optional[str]]:
+             runtime: Sequence[Tuple[type, str]] = ()) -> Tuple[str, Optional[str]]:
     """What `exc`, raised by a plugin object, IS, as `(kind, detail)`:
 
       * `("verdict", reason)` for an instance of a captured verdict class
         whose `.reason` is in that class's reasons (or any reason, when the
         class has none: `None`); a verdict class with an unknown reason is
         `("other", None)`, never a verdict;
-      * `("runtime", class name)` for an instance of one of the runtime's
-        own classes (`UnsafeRead`, `ListingTooLarge`), whatever its
-        `.reason`;
+      * `("runtime", role)` for an instance of one of the runtime's own
+        classes, `role` from `RUNTIME_ROLES` as `check_fsops_classes` pairs
+        them (never the class's own name), whatever its `.reason`;
       * `("reason", reason)` for a `.reason` in `TRANSPORT_REASONS`;
       * `("oserror", errno name or None)` for an `OSError`;
       * `("other", None)` for anything else."""
@@ -927,9 +938,9 @@ def classify(exc: BaseException, *,
             if reasons is None or reason in reasons:
                 return "verdict", reason
             return "other", None
-    for cls in runtime:
+    for cls, role in runtime:
         if isinstance(exc, cls):
-            return "runtime", cls.__name__
+            return "runtime", role
     reason = getattr(exc, "reason", None)
     if type(reason) is str and reason in TRANSPORT_REASONS:
         return "reason", reason

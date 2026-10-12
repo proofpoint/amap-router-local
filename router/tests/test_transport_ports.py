@@ -77,11 +77,10 @@ class HopFsOpsShapeTests(unittest.TestCase):
                          typing.Sequence[transport.Dependency])
 
     def test_the_e5_rules_are_stated(self):
-        self.assertEqual(transport.UNSAFE_READ_REASONS,
-                         ("not_regular", "link_count", "too_large", "hardlink", "open_failed"))
+        self.assertEqual(transport.UNSAFE_READ_REASONS, ("not_regular", "link_count", "too_large"))
         from router import fsops
         self.assertLessEqual(set(fsops.UNSAFE_READ_REASONS), set(transport.UNSAFE_READ_REASONS),
-                             "this router's own reasons are a subset of the union")
+                             "this router's own reasons are a subset of the Protocol's")
         doc = " ".join(transport.HopFsOps.__doc__.split())
         for phrase in ("a fresh `O_NOFOLLOW` walk from the tree root",
                        "count 2 is an anomaly here, never NOT_YET",

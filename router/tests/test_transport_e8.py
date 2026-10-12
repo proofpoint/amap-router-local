@@ -116,6 +116,7 @@ class ShapeTests(unittest.TestCase):
         for phrase in ("never over the id", "fewer than `limit` entries only when `truncated` is False",
                        "`limit + 1` committed entries", "a BOUND, not an exact count",
                        "propagates UNCHANGED", "IS listed, never hidden", "A `/1` bundle is refused",
+                       "whose facts, spool or sidecars are missing",
                        "REQUIRED and never null"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, ip)
@@ -232,7 +233,8 @@ class DisjointnessTests(unittest.TestCase):
     a verdict and a no-verdict I/O failure, and the outcome depends on the
     order of the `except` clauses."""
 
-    FSOPS = _HasClass(UnsafeRead=UnsafeRead)
+    TOO_LARGE = type("ListingTooLarge", (Exception,), {})
+    FSOPS = _HasClass(UnsafeRead=UnsafeRead, ListingTooLarge=TOO_LARGE)
 
     def refused(self, cls):
         obj = _HasClass(NoticeRefused=cls)
@@ -254,10 +256,25 @@ class DisjointnessTests(unittest.TestCase):
             "an OSError descendant": type("X", (FileNotFoundError,), {}),
             "an UnsafeRead ancestor": FsOpsError,
             "an UnsafeRead descendant": type("X", (UnsafeRead,), {}),
+            "a ListingTooLarge descendant": type("X", (self.TOO_LARGE,), {}),
         }
         for why, cls in cases.items():
             with self.subTest(why=why):
                 self.refused(cls)
+
+    def test_an_ancestor_of_the_runtimes_listing_class_is_refused(self):
+        """The COMPLETE captured set: a verdict class above ListingTooLarge
+        would make `classify` (verdicts first) read a runtime
+        ListingTooLarge as that verdict."""
+        base = type("Base", (Exception,), {})
+        too_large = type("ListingTooLarge", (base,), {})
+        fsops = _HasClass(UnsafeRead=UnsafeRead, ListingTooLarge=too_large)
+        with self.assertRaises(transport.SeamRefused):
+            transport.capture_verdict_class(_HasClass(NoticeRefused=base), "NoticeRefused",
+                                            fsops, "reader_vocabulary")
+        with self.assertRaises(transport.SeamRefused):
+            transport.capture_verdict_class(_HasClass(GenerationAbsent=base), "GenerationAbsent",
+                                            fsops, "marker_vocabulary")
 
     def test_a_missing_attribute_is_refused(self):
         with self.assertRaises(transport.SeamRefused):
@@ -273,7 +290,9 @@ class DisjointnessTests(unittest.TestCase):
     def test_listing_too_large_is_checked_the_same_way(self):
         good = type("ListingTooLarge", (Exception,), {})
         self.assertEqual(transport.check_fsops_classes(
-            _HasClass(UnsafeRead=UnsafeRead, ListingTooLarge=good)), (UnsafeRead, good))
+            _HasClass(UnsafeRead=UnsafeRead, ListingTooLarge=good)),
+            ((UnsafeRead, "unsafe_read"), (good, "listing_too_large")))
+        self.assertEqual(transport.RUNTIME_ROLES, ("unsafe_read", "listing_too_large"))
         for bad in (type("X", (OSError,), {}), type("X", (UnsafeRead,), {}), FsOpsError):
             with self.subTest(bad=bad):
                 with self.assertRaises(transport.SeamRefused) as cm:
@@ -303,7 +322,7 @@ class ClassifyTests(unittest.TestCase):
         self.absent = type("GenerationAbsent", (Exception,), {})
         self.too_large = type("ListingTooLarge", (Exception,), {})
         self.verdicts = ((self.refused, transport.NOTICE_REFUSAL_REASONS), (self.absent, None))
-        self.runtime = (UnsafeRead, self.too_large)
+        self.runtime = ((UnsafeRead, "unsafe_read"), (self.too_large, "listing_too_large"))
 
     def classify(self, e):
         return transport.classify(e, verdicts=self.verdicts, runtime=self.runtime)
@@ -333,8 +352,19 @@ class ClassifyTests(unittest.TestCase):
             Exception.__init__(e, reason)
             e.reason = reason
             with self.subTest(reason=reason):
-                self.assertEqual(self.classify(e), ("runtime", "UnsafeRead"))
-        self.assertEqual(self.classify(self.too_large()), ("runtime", "ListingTooLarge"))
+                self.assertEqual(self.classify(e), ("runtime", "unsafe_read"))
+        self.assertEqual(self.classify(self.too_large()), ("runtime", "listing_too_large"))
+
+    def test_the_runtime_role_never_depends_on_the_class_name(self):
+        """The Protocol fixes the attribute's ROLE; a conforming FsOps may
+        name its class anything, or the same as another role's."""
+        for name in ("HugeDirectory", "ListingTooLarge", "UnsafeRead"):
+            with self.subTest(name=name):
+                cls = type(name, (Exception,), {})
+                fsops = _HasClass(UnsafeRead=UnsafeRead, ListingTooLarge=cls)
+                runtime = transport.check_fsops_classes(fsops)
+                self.assertEqual(transport.classify(cls(), runtime=runtime),
+                                 ("runtime", "listing_too_large"))
 
     def test_a_plugin_oserror_with_a_reason_is_classified_by_its_reason(self):
         self.assertEqual(self.classify(_ReasonedOSError("below_frontier")),
@@ -352,7 +382,8 @@ class ClassifyTests(unittest.TestCase):
     def test_a_class_swapped_after_capture_changes_nothing(self):
         obj = _HasClass(NoticeRefused=self.refused)
         captured = transport.capture_verdict_class(obj, "NoticeRefused",
-                                                   _HasClass(UnsafeRead=UnsafeRead),
+                                                   _HasClass(UnsafeRead=UnsafeRead,
+                                                             ListingTooLarge=self.too_large),
                                                    "reader_vocabulary")
         obj.NoticeRefused = OSError   # the plugin swaps it afterwards
         e = self.refused()

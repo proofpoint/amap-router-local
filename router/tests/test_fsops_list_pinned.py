@@ -73,6 +73,11 @@ class PagingTests(_Dir):
         raw = b"notice-\xff.json"
         fd = os.open(os.fsencode(str(self.dir)) + b"/" + raw, os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(fd)
+        # Some filesystems (macOS-backed virtiofs, for one) store a different
+        # name for a non-UTF-8 byte. There the rule cannot be shown, and a
+        # failure would be the filesystem's, not this code's: skip, by name.
+        if raw not in os.listdir(os.fsencode(str(self.dir))):
+            self.skipTest("this filesystem does not preserve non-UTF-8 name bytes")
         self.touch("notice-ok.json")
         names, _ = self.ls(10)
         self.assertEqual(len(names), 2)
@@ -105,8 +110,9 @@ class ArgumentAndBindingTests(_Dir):
         """The pinned number now names another directory."""
         moved = self.dir.parent / "elsewhere"
         moved.mkdir()
-        fd = self.fs.descend_pinned(self.fs.open_root_nofollow(str(self.root)),
-                                    os.path.relpath(moved, self.root))
+        root_fd = self.fs.open_root_nofollow(str(self.root))
+        self.addCleanup(os.close, root_fd)
+        fd = self.fs.descend_pinned(root_fd, os.path.relpath(moved, self.root))
         os.close(fd)
         replacement = os.open(str(self.dir.parent), os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -211,7 +217,8 @@ class ScanCapTests(_Dir):
             self.assertFalse(issubclass(FsOps.ListingTooLarge, base))
             self.assertFalse(issubclass(base, FsOps.ListingTooLarge))
         self.assertEqual(transport.check_fsops_classes(self.fs),
-                         (FsOps.UnsafeRead, FsOps.ListingTooLarge))
+                         ((FsOps.UnsafeRead, "unsafe_read"),
+                          (FsOps.ListingTooLarge, "listing_too_large")))
         self.assertIsInstance(self.fs, transport.HopFsOps)
 
 

@@ -28,13 +28,21 @@ TR, FS = "router/transport.py", "router/fsops.py"
 M = [
  # -- the classifier and the runtime-side checks (commit 1) ---------------
  ('T1 a plugin .reason classified before the runtime classes', TR,
-  [('    for cls in runtime:\n        if isinstance(exc, cls):\n            return "runtime", cls.__name__\n'
+  [('    for cls, role in runtime:\n        if isinstance(exc, cls):\n            return "runtime", role\n'
     '    reason = getattr(exc, "reason", None)\n'
     '    if type(reason) is str and reason in TRANSPORT_REASONS:\n        return "reason", reason\n',
     '    reason = getattr(exc, "reason", None)\n'
     '    if type(reason) is str and reason in TRANSPORT_REASONS:\n        return "reason", reason\n'
-    '    for cls in runtime:\n        if isinstance(exc, cls):\n            return "runtime", cls.__name__\n')],
+    '    for cls, role in runtime:\n        if isinstance(exc, cls):\n            return "runtime", role\n')],
   None, [E8 + "ClassifyTests.test_the_runtimes_own_classes_win_over_a_colliding_reason"]),
+ ('T11 verdicts not checked against the runtime ListingTooLarge', TR,
+  '        bases = (OSError, fsops.UnsafeRead, fsops.ListingTooLarge)\n',
+  '        bases = (OSError, fsops.UnsafeRead)\n',
+  [E8 + "DisjointnessTests.test_an_ancestor_of_the_runtimes_listing_class_is_refused",
+   E8 + "DisjointnessTests.test_each_forbidden_shape_is_refused"]),
+ ('T12 the runtime role taken from the class name', TR,
+  '            return "runtime", role\n', '            return "runtime", cls.__name__\n',
+  [E8 + "ClassifyTests.test_the_runtime_role_never_depends_on_the_class_name"]),
  ('T2 the descendant half of disjointness removed', TR,
   '        if issubclass(cls, base) or issubclass(base, cls):\n',
   '        if issubclass(base, cls):\n',
@@ -72,6 +80,20 @@ M = [
  ('T10 the runtime stays at (2, 0)', TR,
   'PLUGIN_API: Tuple[int, int] = (3, 0)\n', 'PLUGIN_API: Tuple[int, int] = (2, 0)\n',
   [LD + "test_an_older_major_plugin_is_refused_by_this_major_3_runtime"]),
+ ('T13 OSError classified before a plugin .reason', TR,
+  [('    reason = getattr(exc, "reason", None)\n'
+    '    if type(reason) is str and reason in TRANSPORT_REASONS:\n        return "reason", reason\n'
+    '    if isinstance(exc, OSError):\n',
+    '    reason = getattr(exc, "reason", None)\n'
+    '    if isinstance(exc, OSError):\n'
+    '        return "oserror", errno.errorcode.get(exc.errno) if exc.errno else None\n'
+    '    if type(reason) is str and reason in TRANSPORT_REASONS:\n        return "reason", reason\n'
+    '    if isinstance(exc, OSError):\n')],
+  None, [E8 + "ClassifyTests.test_a_plugin_oserror_with_a_reason_is_classified_by_its_reason"]),
+ ('T14 the fsops vocabulary check skipped', TR,
+  '        too_large = check_disjoint(fsops.ListingTooLarge, (OSError, unsafe))\n',
+  '        too_large = fsops.ListingTooLarge\n',
+  [E8 + "DisjointnessTests.test_listing_too_large_is_checked_the_same_way"]),
  # -- FsOps.list_pinned (commit 2) ------------------------------------------
  ('F1 the scan reads a dup of the pinned descriptor', FS,
   '        fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,\n'
@@ -122,6 +144,22 @@ M = [
   '        finally:\n            os.close(fd)\n        names = sorted(h.name for h in heap)\n',
   '        finally:\n            pass\n        names = sorted(h.name for h in heap)\n',
   [FL + "FreshDescriptionTests.test_the_pinned_descriptor_keeps_its_position_and_closes_nothing_extra"]),
+ ('F12 only names after the cursor counted toward the cap', FS,
+  [('                    visited += 1\n'
+    '                    if visited > transport_mod.LIST_SCAN_MAX:\n'
+    '                        raise ListingTooLarge(\n'
+    '                            f"more than {transport_mod.LIST_SCAN_MAX} names; the scan stopped")\n'
+    '                    name = entry.name\n'
+    '                    if after is not None and name <= after:\n'
+    '                        continue\n',
+    '                    name = entry.name\n'
+    '                    if after is not None and name <= after:\n'
+    '                        continue\n'
+    '                    visited += 1\n'
+    '                    if visited > transport_mod.LIST_SCAN_MAX:\n'
+    '                        raise ListingTooLarge(\n'
+    '                            f"more than {transport_mod.LIST_SCAN_MAX} names; the scan stopped")\n')],
+  None, [FL + "ScanCapTests.test_the_cap_holds_whatever_after_and_limit_are"]),
  ('F11 a scan error read as an empty listing', FS,
   '            with os.scandir(fd) as it:\n',
   '            try:\n                it = os.scandir(fd)\n            except OSError:\n'
