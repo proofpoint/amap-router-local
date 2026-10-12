@@ -172,6 +172,12 @@ class FencedTests(_Pending):
         self.replace_root("alpha")
         self.release_bravo()
         self.poll()
+        # Settled privately in this poll. A fenced generation that tried to
+        # publish into the replaced root fails there, after its anchor, and
+        # leaves its record for the next poll's sweep: so this is checked
+        # after ONE poll, where only the private settlement has removed it.
+        self.assertFalse((old / outbound.PENDING_DIR / "00000001.json").exists(),
+                         "the fenced work did not settle (privately) in one poll")
         self.poll()
         self.assertEqual(self.bodies(), ["old root"])
         self.assertTrue((old / "results" / "00000001.json").is_file())
@@ -253,14 +259,20 @@ class RecipientGenerationTests(_Pending):
         write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
         k = keyed_for_poll(self.cfg)
         self.replace_root("bravo")
-        # Only the up-front check misses the swap (the race): delivery's own
-        # gate then sees it.
-        with mock.patch.object(outbound, "_any_held", lambda cfg, recipients: False):
+        # Only the up-front checks miss the swap (the race): delivery's own
+        # gate then sees it. The intent record checks too (`target_hold` when
+        # it is made, `_hold_reason` before each placement), so all three
+        # are the race's blind spot here.
+        with mock.patch.object(outbound, "_any_held", lambda cfg, recipients: False), \
+                mock.patch.object(outbound, "target_hold", lambda cfg, name: None), \
+                mock.patch.object(outbound, "_hold_reason", lambda cfg, target: None):
             outbound.drain_instance(k, "alpha")
         self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists(),
                          "answered delivery_failed instead of going pending")
         self.assertTrue((self.pending_dir() / "00000001.json").is_file())
         self.poll()
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(),
+                        "never completed after the hold resolved")
         self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
                          "accepted")
         self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
@@ -630,6 +642,11 @@ class DigestlessAnchorTests(_Pending):
         with mock.patch.object(outbound, "_publish_result_and_archive",
                                side_effect=OSError(5, "injected")):
             self.poll()
+        # The failure after the anchor leaves the request's intent record
+        # beside it; the next drain's sweep removes it. Swept here, so the
+        # fenced generation holds the anchor ALONE, which is what this tests:
+        # a record would claim the file without reading it.
+        outbound._sweep_answered_pending(keyed_for_poll(self.cfg), "alpha")
         generations.operator_new(self.cfg, "alpha", "connector reset")
         new = gen_state(self.state_dir, LIDS["alpha"])
         with self.fenced_fault():
@@ -641,6 +658,31 @@ class DigestlessAnchorTests(_Pending):
         self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(), "never completed")
         self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
                          "accepted")
+        self.assertEqual(self.bodies(), ["once"])
+
+    def test_a_fenced_answered_record_is_swept_never_replayed(self):
+        """A failure after the anchor leaves the request's intent record
+        beside it, and here the generation is fenced before any drain sweeps
+        it. The fenced work removes the answered record instead of replaying
+        it, so the verdict is completed only by the guarded completion step:
+        with that step's read faulting, nothing is published this poll."""
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")], body_text="once")
+        with mock.patch.object(outbound, "_publish_result_and_archive",
+                               side_effect=OSError(5, "injected")):
+            self.poll()
+        generations.operator_new(self.cfg, "alpha", "connector reset")
+        old = sorted(p for p in (self.state_dir / LIDS["alpha"]).glob("gen-*")
+                     if p != gen_state(self.state_dir, LIDS["alpha"]))
+        self.assertTrue(any((g / outbound.PENDING_DIR / "00000001.json").is_file() for g in old),
+                        "control: the fenced generation holds the record beside its anchor")
+        with self.fenced_fault():
+            self.poll()
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists(),
+                         "the fenced record was replayed past the guarded completion")
+        self.assertFalse(any((g / outbound.PENDING_DIR / "00000001.json").exists() for g in old),
+                         "the answered record was not swept")
+        self.poll()
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(), "never completed")
         self.assertEqual(self.bodies(), ["once"])
 
     def test_a_transient_fault_under_a_digestless_anchor_publishes_nothing(self):

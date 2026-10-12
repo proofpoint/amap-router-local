@@ -52,8 +52,8 @@ M = [
   '        if False:\n            shutil.rmtree(p, ignore_errors=True)\n',
   [P + 'SnapshotTests.test_the_snapshot_is_written_before_the_record']),
  ('S7 a pending request with no live file is never drained', OB,
-  '        for req_id in sorted(set(_pending_ids(cfg, name)) - listed):\n',
-  '        for req_id in []:\n',
+  '    for req_id in sorted(set(_pending_ids(cfg, name)) - listed):\n',
+  '    for req_id in []:\n',
   [P + 'SnapshotTests.test_a_vanished_live_entry_continues_from_the_snapshot']),
  ('S8 a held reused id is not audited', OB,
   '    if live and not fenced:\n        generations_mod.note_reuse_pending(cfg, name, req_id)\n', '',
@@ -158,8 +158,10 @@ M = [
   '            and False:\n',
   [P + 'RecipientGenerationTests.test_a_begun_placement_holds_when_the_recipient_generation_changes']),
  ('R3 a mid-pass hold fails the recipient', OB,
-  '            held_now.append(r)    # nothing placed for it: it goes pending, below\n',
-  '            failed.append(r)\n',
+  # Every default-backend placement goes through the record (ORIGIN_DIRECT),
+  # so the hold that arrives mid-pass is the record's.
+  '            t.update(state="held", reason=e.reason, notice_id=None, ts=None,\n                     recipient_gen=None)\n',
+  '            t.update(state="failed", error="held", reason=None)\n',
   [P + 'RecipientGenerationTests.test_a_root_swapped_mid_pass_goes_pending_not_failed']),
 ]
 

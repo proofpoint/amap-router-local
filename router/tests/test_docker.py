@@ -167,6 +167,34 @@ class WhatTheEntrypointMayRunTests(unittest.TestCase):
                 msg="reset is destructive and evidence-destroying; keep it on the host")
 
 
+class EntrypointUmaskTests(unittest.TestCase):
+    """Every router mode starts under umask 0027, whatever the container
+    runtime handed over. RUN, not read: the real entrypoint is executed with
+    a stand-in `python3` first on PATH that reports the umask it inherited,
+    starting from a permissive 0000, so an entrypoint that left the umask
+    alone reports 0000."""
+
+    def _umask_seen_by(self, mode: str) -> str:
+        with TemporaryDirectory() as tmp:
+            stub = Path(tmp, "python3")
+            stub.write_text("#!/bin/sh\numask\n")
+            stub.chmod(0o755)
+            cfg = Path(tmp, "router.json")
+            cfg.write_text("{}")
+            env = {**os.environ, "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+                   "ROUTER_CONFIG": str(cfg)}
+            out = subprocess.run(
+                ["sh", "-c", 'umask 0000; exec bash "$0" "$1"',
+                 str(_REPO / "docker" / "entrypoint.sh"), mode],
+                env=env, capture_output=True, text=True, timeout=30, check=True)
+            return out.stdout.strip()
+
+    def test_every_router_mode_runs_under_0027(self):
+        for mode in ("run", "once", "peers", "status"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self._umask_seen_by(mode), "0027")
+
+
 class MountDerivationTests(unittest.TestCase):
     """run.sh computes mounts from the config rather than taking a hand-written
     list. A missing instance mount does not crash the router — it starts, looks

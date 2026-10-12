@@ -58,9 +58,35 @@ class DeliveryBackendSeamTest(helpers.RouterTestCase):
         self.assertEqual(args[2], "alice")
         self.assertEqual(args[3], "bob")
         self.assertEqual(args[4]["req_id"], "00000001")
-        self.assertEqual(kwargs, {"attachments": []})
+        # A backend that takes the pre-minted identity is placed through the
+        # request's intent record, exactly as the local `deliver` is: the
+        # identity it is handed is the one the placed notice carries.
+        self.assertEqual(set(kwargs), {"attachments", "preset", "from_address",
+                                       "reply_to_record"})
+        self.assertEqual(kwargs["attachments"], [])
+        self.assertIsNone(kwargs["reply_to_record"])
+        self.assertEqual(kwargs["from_address"], "agent.alice@local")
         # It really delivered — the seam is a substitution, not a stub.
+        (notice,) = list_notices(cfg, "bob")
+        self.assertEqual(notice, f"notice-{kwargs['preset'][0]}.json")
+
+    def test_a_backend_without_the_identity_keywords_is_placed_directly(self):
+        """A backend that cannot take the pre-minted identity is called as it
+        always was, with no keyword it does not declare."""
+        cfg = self._pair()
+        write_request(cfg, "alice", "00000001", to=["agent.bob@local"])
+        calls = []
+
+        def backend(cfg_, state_dir, sender, recipient, request, *, attachments,
+                    reply_to_record=None):
+            calls.append(attachments)
+            return deliver_mod.deliver(cfg_, state_dir, sender, recipient, request,
+                                       attachments=attachments, reply_to_record=reply_to_record)
+
+        outbound.drain_instance(cfg, "alice", deliver_backend=backend)
+        self.assertEqual(calls, [[]])
         self.assertEqual(len(list_notices(cfg, "bob")), 1)
+        self.assertEqual(read_json(result_path(cfg, "alice", "00000001"))["outcome"], "accepted")
 
     def test_backend_message_id_reaches_the_result_document(self):
         cfg = self._pair()

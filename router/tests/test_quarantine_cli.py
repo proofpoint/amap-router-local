@@ -5,9 +5,11 @@ The fixtures here are written in the frozen format by hand, because this
 router has no writer yet: the step that writes items must write exactly
 what these tests read."""
 import contextlib
+import errno
 import io
 import json
 import os
+import unittest
 from unittest import mock
 
 from router import __main__ as cli, generations, quarantine, service
@@ -137,7 +139,7 @@ class FormatTests(_Q):
         target = self.tmp / "elsewhere.json"
         target.write_text(json.dumps(item(self.gen)))
         os.symlink(target, self.qdir / f"{ID1}.json")
-        self.assertIn("without following a link", self.damaged())
+        self.assertIn("a symbolic link, never followed", self.damaged())
         (self.qdir / f"{ID1}.json").unlink()
         os.link(target, self.qdir / f"{ID1}.json")
         self.assertIn("more than one link", self.damaged())
@@ -305,7 +307,7 @@ class ControlTests(_Q):
         self.candidate(ID2, b"x" * (quarantine.CANDIDATE_MAX_BYTES + 1))
         items = {i.id: i.damaged for i in quarantine.list_control(self.control)}
         self.assertEqual(items["not-hex"], "an unexpected name")
-        self.assertIn("without following a link", items[ID1])
+        self.assertEqual(items[ID1], "candidate.json: a symbolic link, never followed")
         self.assertIn("larger than", items[ID2])
 
     def test_a_commit_caught_in_progress_is_in_flight_not_damaged(self):
@@ -317,6 +319,36 @@ class ControlTests(_Q):
         os.link(d / "candidate.json", self.tmp / "third")       # three: damaged
         [i] = quarantine.list_control(self.control)
         self.assertIn("more than one link", i.damaged or "<not damaged>")
+
+    def test_the_writers_stage_is_not_listed(self):
+        (self.control / ".stage").mkdir()
+        self.candidate(ID1)
+        self.assertEqual([i.id for i in quarantine.list_control(self.control)], [ID1])
+        (self.control / ".stagex").mkdir()       # only that exact name
+        items = {i.id: i.damaged for i in quarantine.list_control(self.control)}
+        self.assertEqual(items[".stagex"], "an unexpected name")
+
+    def test_a_directory_without_its_candidate_is_not_yet_an_item(self):
+        d = self.control / ID1
+        d.mkdir()
+        (d / "body").write_bytes(b"leaf written before the sentinel")
+        [i] = quarantine.list_control(self.control)
+        self.assertIsNone(i.damaged)
+        self.assertEqual(quarantine.render_line(i),
+                         f"- control - {ID1} IN FLIGHT (no committed candidate.json yet)")
+        code, out, _ = self.run_cli("show", "-", "control", "-", ID1,
+                                    "--control-dir", str(self.control))
+        self.assertEqual(code, 0)
+        self.assertEqual((json.loads(out)["status"], json.loads(out)["why"]),
+                         ("in_flight", "no committed candidate.json yet"))
+        self.assertNotIn("leaf written", out)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-0 file")
+    def test_an_unreadable_candidate_names_its_own_error(self):
+        d = self.candidate(ID1)
+        (d / "candidate.json").chmod(0)
+        [i] = quarantine.list_control(self.control)
+        self.assertEqual(i.damaged, f"candidate.json: cannot be opened ({os.strerror(errno.EACCES)})")
 
     def test_nothing_is_moved_or_written(self):
         self.candidate(ID1)

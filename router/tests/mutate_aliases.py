@@ -199,8 +199,12 @@ M = [
   '    if False:\n',
   [T + 'PinTests.test_the_schema_is_closed']),
  # -- hold markers ----------------------------------------------------------------
- ('H1 a consumed request keeps its marker', OB,
-  '    aliases_mod.clear_held(cfg, name, req_id)\n    if private:\n', '    if private:\n',
+ # The marker is cleared where a request is consumed: when its record is made
+ # (every local placement goes through one) and when it is answered. Either
+ # call alone clears it, so the mutant removes the clear itself.
+ ('H1 a consumed request keeps its marker', AL,
+  '        os.unlink(_held_path(cfg, name, req_id))\n    except Exception:  # noqa: BLE001 -- absent, or no generation: nothing to clear\n',
+  '        pass\n    except Exception:  # noqa: BLE001 -- absent, or no generation: nothing to clear\n',
   [T + 'HoldMarkerTests.test_the_marker_binds_the_request_and_clears_on_consume']),
  ('H2 a malformed marker gets a made-up age', AL,
   '        except Exception:  # noqa: BLE001\n            age, reason = None, None\n',

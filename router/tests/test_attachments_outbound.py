@@ -911,3 +911,63 @@ def _try_ingest(cfg, name, req_id, descriptors):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRefusalDiagnosticIsConformant(RouterTestCase):
+    """AMAP §6.1: a Result's `attachments[]` has one entry per SUBMITTED
+    attachment, `index` equal to its position. Ingest stops at the first
+    failure, so when attachments go unexamined the optional member is
+    omitted and `detail` names the failing index and outcome; a verdict is
+    never invented for an attachment nobody examined."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.make_config({"alice": ["bob"], "bob": ["alice"]})
+
+    def _result(self):
+        outbound.drain_instance(self.cfg, "alice")
+        result = read_json(result_path(self.cfg, "alice", "00000001"))
+        # The spec's own gate: the schema and the index-binding post-check.
+        self.assertEqual(load_amp_validate().check_document("result-produced.json", result), [])
+        return result
+
+    def test_a_mismatch_after_the_first_attachment_omits_the_array(self):
+        data = [b"zero", b"one", b"two"]
+        descs = [attachment_descriptor(d) for d in data]
+        descs[1]["sha256"] = "0" * 64
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=descs)
+        stage_outbound_sidecars(self.cfg, "alice", "00000001", data)
+        result = self._result()
+        self.assertEqual((result["outcome"], result["reason_code"]),
+                         ("rejected", "attachment_mismatch"))
+        self.assertNotIn("attachments", result)
+        self.assertIn("(attachment 1: rejected_type)", result["detail"])
+
+    def test_a_size_cap_on_the_last_attachment_omits_the_array(self):
+        descs = [attachment_descriptor(b"a"), attachment_descriptor(b"b")]
+        descs[1]["size_bytes"] = self.cfg.attachment_max_bytes + 1
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=descs)
+        result = self._result()
+        self.assertEqual((result["outcome"], result["reason_code"]),
+                         ("queued_for_human", "attachment_too_large"))
+        self.assertNotIn("attachments", result)
+        self.assertIn("(attachment 1: too_large)", result["detail"])
+
+    def test_a_failure_at_index_zero_of_two_omits_the_array(self):
+        data = [b"zero", b"one"]
+        descs = [attachment_descriptor(d) for d in data]
+        descs[0]["sha256"] = "0" * 64
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=descs)
+        stage_outbound_sidecars(self.cfg, "alice", "00000001", data)
+        result = self._result()
+        self.assertNotIn("attachments", result, "attachment 1 has no verdict")
+        self.assertIn("(attachment 0: rejected_type)", result["detail"])
+
+    def test_the_only_attachment_failing_keeps_its_one_entry(self):
+        desc = attachment_descriptor(b"only")
+        desc["sha256"] = "0" * 64
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"], attachments=[desc])
+        stage_outbound_sidecars(self.cfg, "alice", "00000001", [b"only"])
+        result = self._result()
+        self.assertEqual([(a["index"], a["outcome"]) for a in result["attachments"]],
+                         [(0, "rejected_type")])

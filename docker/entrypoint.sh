@@ -23,6 +23,12 @@
 # loud, not silent — but it is a mount bug, and this is where to look for it.
 set -euo pipefail
 
+# Every file and directory the router creates lands without group write or
+# any world access, whatever umask the container runtime handed over: some
+# of its writes (missing parents under state_dir, among them) take their
+# mode from the umask alone. The deploy verifies the live process's umask.
+umask 0027
+
 MODE="${1:-run}"
 shift || true
 

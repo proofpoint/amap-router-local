@@ -412,6 +412,26 @@ def _result_doc(
     return doc
 
 
+def _refusal_diag(
+    e: "attachments_mod.AttachmentIngestError", submitted: int,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """`(attachments, detail)` for an attachment-ingest refusal.
+
+    AMAP §6.1: `attachments[]` carries one entry per SUBMITTED attachment,
+    `index` equal to its array position, 0 through n-1. Ingest stops at the
+    first failure, so the attachments after it have no verdict, and §6.1's
+    vocabulary has no word for "not examined". The array is therefore written
+    only when every submitted attachment has a real verdict: one submitted
+    attachment, the one that failed. Otherwise the optional member is omitted
+    and `detail` names the failing index and its outcome. A verdict is never
+    fabricated."""
+    if e.index is None or e.attachment_outcome is None:
+        return None, e.detail
+    if submitted == 1 and e.index == 0:
+        return [{"index": 0, "outcome": e.attachment_outcome, "detail": e.detail}], e.detail
+    return None, f"{e.detail} (attachment {e.index}: {e.attachment_outcome})"
+
+
 def _attachments_accepted_diag(
     verified: List[attachments_mod.VerifiedAttachment],
 ) -> Optional[List[Dict[str, Any]]]:
@@ -541,11 +561,9 @@ def _drain_one(
             cfg, name, req_id, descriptors
         )
     except attachments_mod.AttachmentIngestError as e:
-        diag = None
-        if e.index is not None and e.attachment_outcome is not None:
-            diag = [{"index": e.index, "outcome": e.attachment_outcome, "detail": e.detail}]
+        diag, detail = _refusal_diag(e, len(descriptors))
         result = _result_doc(
-            req_id, e.outcome, reason_code=e.reason_code, detail=e.detail,
+            req_id, e.outcome, reason_code=e.reason_code, detail=detail,
             attachments=diag,
         )
         if e.outcome == "queued_for_human":
@@ -714,15 +732,17 @@ def _drain_reply(
     # Resolved LATE, per call, never as a def-time default: the default
     # has to be whatever `deliver_mod.deliver` names at the moment of the
     # call, not the function object that existed at import time.
-    if _any_held(cfg, [bound_instance]) and req_digest is not None:
+    held = _any_held(cfg, [bound_instance])
+    if req_digest is not None and (held or _placement_origin(deliver_backend) is not None):
         # The binding resolved now: pinned with the request digest, so a
-        # hold never turns this reply into an unresolved one.
+        # hold never turns this reply into an unresolved one. Unheld, the
+        # record is the placement's intent (`ORIGIN_DIRECT`).
         return _begin_pending(
             cfg, name, req_id, doc, kind="mail", recipients=[bound_instance],
             pin={"in_reply_to": str(in_reply_to), "bound_instance": bound_instance,
                  "record": record, "evaluated_ts": utc_ts(), "window_ok": True},
             req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend,
-            aliases={})
+            aliases={}, origin=None if held else _placement_origin(deliver_backend))
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
     try:
         delivered = backend(
@@ -1018,11 +1038,14 @@ def _drain_peer_route(
     comment in `_drain_reply` for why an unguarded delivery would retry
     forever). Late-resolved so a test can patch `deliver_mod.deliver_peer`."""
     recipient = route.recipient
-    if _any_held(cfg, [recipient]) and req_digest is not None:
+    if req_digest is not None:
+        # Held or not, through the record: unheld, it is the placement's
+        # intent (`ORIGIN_DIRECT`).
         return _begin_pending(
             cfg, name, req_id, doc, kind="peer", recipients=[recipient], pin=pin,
             req_digest=req_digest, attachments=attachments, deliver_backend=None,
-            aliases=aliases)
+            aliases=aliases,
+            origin=None if _any_held(cfg, [recipient]) else ORIGIN_DIRECT)
     try:
         delivered = deliver_mod.deliver_peer(
             cfg, cfg.state_dir, name, recipient, doc,
@@ -1218,12 +1241,16 @@ def _drain_cold(
     # once no matter how any single delivery goes.
     # Under a registry, a held local target makes the whole request PENDING
     # (HELD LOCAL DELIVERY, below): nothing is answered until it resolves,
-    # and the targets that can go now go through the pending record.
-    if _any_held(cfg, recipients) and req_digest is not None:
+    # and the targets that can go now go through the pending record. With
+    # nothing held, the same record is the placement's intent
+    # (`ORIGIN_DIRECT`), so a failure after placement never places twice.
+    if req_digest is not None and (
+            _any_held(cfg, recipients) or _placement_origin(deliver_backend) is not None):
         return _begin_pending(
             cfg, name, req_id, doc, kind="mail", recipients=recipients, pin=None,
             req_digest=req_digest, attachments=attachments, deliver_backend=deliver_backend,
-            aliases=applied)
+            aliases=applied,
+            origin=None if _any_held(cfg, recipients) else _placement_origin(deliver_backend))
 
     # Late resolution, as in `_drain_reply` above — see that comment.
     backend = deliver_backend if deliver_backend is not None else deliver_mod.deliver
@@ -1759,7 +1786,7 @@ def _quarantine_one(
 
 
 # ---------------------------------------------------------------------------
-# HELD LOCAL DELIVERY (registry mode only)
+# HELD LOCAL DELIVERY, and every direct placement's intent record
 #
 # Under a registry, a LOCAL target the poll's report does not resolve is
 # HELD, not failed (`config.target_hold`). AMAP gives a Runtime exactly one,
@@ -1796,7 +1823,10 @@ def _quarantine_one(
 #     answered) and the record is removed.
 #
 # A damaged record fails closed: the request holds and the operator sees it.
-# Nothing here runs without a registry.
+# Holds exist only under a registry. The record itself also carries every
+# DIRECT local placement (`ORIGIN_DIRECT`), with or without one: written
+# before anything is placed, so a failure after placement (the private
+# anchor, say) is answered from it instead of placing a second notice.
 # ---------------------------------------------------------------------------
 
 #: `drain_instance`'s tally for a request left pending this poll.
@@ -1816,7 +1846,16 @@ _PENDING_VERSIONS = (1, 2, 3)
 #: with a non-empty `aliases`. Anything else is damage.
 _PENDING_KEYS_V1 = frozenset({"v", "req_id", "request_sha256", "kind", "sender_lid",
                               "created_ts", "block", "binding", "targets"})
-_PENDING_KEYS_V2 = _PENDING_KEYS_V1 | {"snapshot", "source_gen", "from_address", "aliases"}
+_PENDING_KEYS_V2 = _PENDING_KEYS_V1 | {"snapshot", "source_gen", "from_address", "aliases",
+                                       "origin"}
+#: `origin` on a record made by a DIRECT placement (no target held when it
+#: began): the record is the placement's intent, written before anything is
+#: placed, so a failure after placement (the private anchor, say) replays the
+#: same identity instead of minting a second notice. A non-held delivery
+#: failure is then terminal for that target, as it always was on the direct
+#: paths. Absent: a record made because a target was held, whose failing
+#: targets are replayed every poll.
+ORIGIN_DIRECT = "direct"
 _TARGET_KEYS = frozenset({"recipient", "kind", "lid", "state", "reason", "notice_id", "ts",
                           "message_id", "error", "recipient_gen", "address"})
 _TARGET_STATES = frozenset({"held", "ready", "delivering", "delivered", "failed"})
@@ -1909,6 +1948,8 @@ def _check_pending(doc: Any, req_id: str) -> Dict[str, Any]:
                 raise PendingDamaged("snapshot attachment")
         if not _str_or_none(doc.get("source_gen")) or not _str_or_none(doc.get("from_address")):
             raise PendingDamaged("source_gen/from_address")
+    if "origin" in doc and doc["origin"] != ORIGIN_DIRECT:
+        raise PendingDamaged("origin")
     if doc.get("req_id") != req_id:
         raise PendingDamaged("req_id")
     if not (isinstance(doc.get("request_sha256"), str) and _HEX64.fullmatch(doc["request_sha256"])):
@@ -1940,8 +1981,12 @@ def _check_pending(doc: Any, req_id: str) -> Dict[str, Any]:
         addrs = set()
         for t in targets:
             a = t["address"]
+            # The target's own address in either form `address_for` gives:
+            # `<name>@<fleet_domain>`, or the legacy `agent.<name>@local`
+            # without a fleet domain (a direct record has no registry).
             if not (isinstance(a, str) and a.count("@") == 1
-                    and a.split("@")[0] == t["recipient"] and a.split("@")[1]):
+                    and (a == address_for(t["recipient"])
+                         or (a.split("@")[0] == t["recipient"] and a.split("@")[1]))):
                 raise PendingDamaged("target address")
             addrs.add(a)
         if not set(amap.values()) <= addrs:
@@ -2024,6 +2069,17 @@ def _recipient_gen(cfg: RouterConfig, recipient: str) -> Optional[str]:
     if key is None:
         return None
     return key.partition("/")[2][len(generations_mod.GEN_PREFIX):]
+
+
+def _placement_origin(backend: Optional[Callable[..., Any]]) -> Optional[str]:
+    """`ORIGIN_DIRECT` when a direct placement can go through an intent record:
+    its backend takes the pre-minted identity and the pinned sender. A
+    backend that cannot is placed directly, as before, and a failure after
+    its placement can still re-place (router/README.md)."""
+    if backend is None:
+        return ORIGIN_DIRECT
+    return ORIGIN_DIRECT if _accepts_preset(backend) and _accepts_kw(backend, "from_address") \
+        else None
 
 
 def _any_held(cfg: RouterConfig, recipients: List[str]) -> bool:
@@ -2118,9 +2174,12 @@ def _begin_pending(
     deliver_backend: Optional[deliver_mod.DeliveryBackend],
     settled: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
     aliases: Mapping[str, str],
+    origin: Optional[str] = None,
 ) -> str:
-    """At least one target is held: make the request pending (durably, before
-    anything is placed) and advance whatever can go now. A reply's target is
+    """Make the request pending (durably, before anything is placed) and
+    advance whatever can go now: because a target is held, or (`origin` =
+    `ORIGIN_DIRECT`) as every direct local placement's intent record, so a
+    failure after placement replays the same identity. A reply's target is
     pinned to the logical_id its ledger record names (the identity the task
     came from), else the one the registry knows now. `settled` names targets
     already delivered (with their delivery) or failed (None) by the pass
@@ -2184,6 +2243,8 @@ def _begin_pending(
         "created_ts": utc_ts(), "block": None, "binding": pin, "targets": targets,
         "snapshot": snapshot, "aliases": dict(aliases),
     }
+    if origin is not None:
+        rec["origin"] = origin
     for t in targets:
         t["address"] = address_for(t["recipient"], cfg.fleet_domain)
     if aliases:
@@ -2255,7 +2316,10 @@ def _place_one(
     identity FIRST (on a replay too), then the placement with that identity,
     then `delivered`. A failure after placement began keeps it `delivering`,
     to be replayed with the SAME identity next poll; nothing here is
-    terminal. Returns True when the record changed without being written."""
+    terminal, except on a DIRECT record (`ORIGIN_DIRECT`), where a non-held
+    failure fails the target as the direct paths always did (the commit
+    writes the notice last, so a raise means no notice was placed). Returns
+    True when the record changed without being written."""
     path = _pending_path(cfg, name, req_id)
     pin = rec.get("binding")
     if t["state"] in ("held", "ready"):
@@ -2274,9 +2338,25 @@ def _place_one(
                                   pin["record"] if pin else None, deliver_backend,
                                   from_address=rec.get("from_address"))
     except deliver_mod.RecipientHeld as e:
+        if rec.get("origin") == ORIGIN_DIRECT:
+            # The direct paths always took a hold met during the write as
+            # "nothing placed, goes pending": delivery raises it before the
+            # notice, which is written last. So the target re-enters as held
+            # with no identity, and is placed afresh once it resolves (into
+            # its new generation's root, if that is what changed).
+            t.update(state="held", reason=e.reason, notice_id=None, ts=None,
+                     recipient_gen=None)
+            return True
         t["reason"] = e.reason              # identity kept: a later poll replays it
         return True
     except Exception as e:  # noqa: BLE001 — one target must not sink the request
+        if rec.get("origin") == ORIGIN_DIRECT:
+            logger.warning(
+                "instance %r req %r: delivery to %r failed, continuing with the remaining "
+                "recipients: %s: %s", name, req_id, t["recipient"], type(e).__name__, e)
+            t.update(state="failed", error=type(e).__name__, reason=None)
+            _write_pending(cfg, path, rec)
+            return False
         logger.warning(
             "instance %r req %r: delivery to %r failed: %s: %s — kept, replayed next poll "
             "with the same identity", name, req_id, t["recipient"], type(e).__name__, e)
@@ -2357,6 +2437,12 @@ def _pending_result(
             message_id=None,
             detail=f"delivered to {len(delivered)}; failed for: {', '.join(failed)}",
             attachments=diag)
+    if rec.get("origin") == ORIGIN_DIRECT and (rec["kind"] == "peer" or rec.get("binding")):
+        # The single-target direct paths' own wording (a reply, a peer route).
+        (t,) = rec["targets"]
+        return _result_doc(
+            req_id, "queued_for_human", reason_code=REASON_DELIVERY_FAILED, recipients=[],
+            detail=f"delivery to {t['recipient']!r} failed: {t['error']}")
     return _result_doc(
         req_id, "queued_for_human", reason_code=REASON_DELIVERY_FAILED, recipients=[],
         detail=f"no recipient could be delivered to: {', '.join(failed)}")
@@ -2753,7 +2839,17 @@ def _drain_fenced(
             except Exception:
                 logger.exception("instance %r: error stepping fenced in-flight work — "
                                  "isolated, its files stay claimed", name)
+        # A record whose anchor exists is already answered (an error after the
+        # anchor left it behind): it goes, as in the current generation, and
+        # its verdict is completed by step 3 below, never replayed here.
+        try:
+            _sweep_answered_pending(view, name)
+        except Exception:
+            logger.exception("instance %r: error sweeping fenced pending records — "
+                             "isolated", name)
         for req_id in sorted(_pending_ids(view, name)):
+            if _private_result_path(view, name, req_id).is_file():
+                continue
             try:
                 _drain_pending(view, name, f"req-{req_id}.json", req_id, fenced=True,
                                deliver_backend=deliver_backend, cold_policy=cold_policy)
@@ -3046,8 +3142,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
         inflight_summary = _advance_inflight(cfg, name, transport, outcomes,
                                              cold_policy=cold_policy)
 
-    if cfg.registry_dir is not None:
-        _sweep_answered_pending(cfg, name)
+    _sweep_answered_pending(cfg, name)
     filenames, skipped_symlinks = list_outbound(cfg, name)
 
     drained = resumed = errored = reused = quarantined = held = 0
@@ -3196,8 +3291,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                     reused += 1
                     generations_mod.record_reuse(cfg, name, req_id)
                     outcomes["rejected"] += 1
-            elif (cfg.registry_dir is not None
-                  and _pending_path(cfg, name, req_id).exists()):
+            elif _pending_path(cfg, name, req_id).exists():
                 outcome = _drain_pending(
                     cfg, name, filename, req_id, deliver_backend=deliver_backend,
                     cold_policy=cold_policy,
@@ -3270,24 +3364,23 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
 
     # A pending request whose live file is gone is not in the listing; its
     # record still carries it (from its snapshot, or blocked if version 1).
-    if cfg.registry_dir is not None:
-        listed = {f[len("req-"):-len(".json")] for f in filenames if REQ_NAME_RE.fullmatch(f)}
-        for req_id in sorted(set(_pending_ids(cfg, name)) - listed):
-            if _private_result_path(cfg, name, req_id).is_file():
-                continue
-            try:
-                outcome = _drain_pending(cfg, name, f"req-{req_id}.json", req_id,
-                                         deliver_backend=deliver_backend,
-                                         cold_policy=cold_policy)
-            except Exception:
-                logger.exception("instance %r: error draining pending %r — isolated",
-                                 name, req_id)
-                errored += 1
-                continue
-            if outcome == HELD:
-                held += 1
-            elif outcome in outcomes:
-                outcomes[outcome] += 1
+    listed = {f[len("req-"):-len(".json")] for f in filenames if REQ_NAME_RE.fullmatch(f)}
+    for req_id in sorted(set(_pending_ids(cfg, name)) - listed):
+        if _private_result_path(cfg, name, req_id).is_file():
+            continue
+        try:
+            outcome = _drain_pending(cfg, name, f"req-{req_id}.json", req_id,
+                                     deliver_backend=deliver_backend,
+                                     cold_policy=cold_policy)
+        except Exception:
+            logger.exception("instance %r: error draining pending %r — isolated",
+                             name, req_id)
+            errored += 1
+            continue
+        if outcome == HELD:
+            held += 1
+        elif outcome in outcomes:
+            outcomes[outcome] += 1
 
     return {
         # Surfaced so `status` can say once why a full outbox went quiet.
