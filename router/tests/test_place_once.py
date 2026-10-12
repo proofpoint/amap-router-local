@@ -8,6 +8,7 @@ record (`outbound.ORIGIN_DIRECT`), written before anything is placed, so the
 next poll finds the placement it already made instead of minting a second
 notice id. Each case runs with and without a registry."""
 
+import json
 import logging
 from unittest import mock
 
@@ -80,6 +81,67 @@ class _MailCases:
         self.two_polls_with_one_anchor_failure("bravo")
         self.assertEqual(len(self.notice_ids("alpha")), 1)
 
+
+    # -- after an anchor failure, the request is answered from the record ------
+
+    def request_file(self, sender):
+        return self.cfg.instances[sender].outbox_root / f"req-{REQ}.json"
+
+    def first_poll_loses_the_anchor(self):
+        """One poll whose anchor write fails: the notice is placed, the
+        request unanswered, and its record left with every target done."""
+        write_request(self.cfg, "alpha", REQ, to=[self.addr("bravo")])
+        fail = _RaiseOnce(outbound._write_anchor)
+        with mock.patch.object(outbound, "_write_anchor", fail):
+            self.poll()
+        self.assertEqual(fail.calls, 1, "control: the anchor write was reached and failed")
+        self.assertFalse(result_path(self.cfg, "alpha", REQ).exists())
+        self.assertEqual(outbound._pending_ids(self.keyed(), "alpha"), [REQ],
+                         "control: the record outlived the failed anchor")
+        self.assertEqual(len(self.notice_ids("bravo")), 1)
+
+    def test_a_request_gone_after_an_anchor_failure_is_answered_from_its_record(self):
+        self.first_poll_loses_the_anchor()
+        self.request_file("alpha").unlink()
+        self.poll()
+        self.assertTrue(result_path(self.cfg, "alpha", REQ).exists(),
+                        "a request whose live file vanished was never answered")
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", REQ))["outcome"], "accepted")
+        self.assertEqual(len(self.notice_ids("bravo")), 1)
+
+    def test_a_record_with_any_other_origin_is_damaged_and_holds(self):
+        self.first_poll_loses_the_anchor()
+        path = outbound._pending_path(self.keyed(), "alpha", REQ)
+        for origin in ("held", "Direct", None):
+            with self.subTest(origin=origin):
+                rec = read_json(path)
+                rec["origin"] = origin
+                path.write_text(json.dumps(rec))
+                with self.assertRaises(outbound.PendingDamaged):
+                    outbound._read_pending(path, REQ)
+                self.poll()
+                self.assertFalse(result_path(self.cfg, "alpha", REQ).exists(),
+                                 "a record with a foreign origin was acted on")
+                self.assertTrue(path.is_file())
+                self.assertEqual(len(self.notice_ids("bravo")), 1)
+
+    # -- a failure after the anchor: the record is swept, nothing re-placed ----
+
+    def test_a_failure_after_the_anchor_leaves_no_record_and_places_once(self):
+        write_request(self.cfg, "alpha", REQ, to=[self.addr("bravo")])
+        fail = _RaiseOnce(outbound._publish_result_and_archive)
+        with mock.patch.object(outbound, "_publish_result_and_archive", fail):
+            self.poll()
+            self.assertEqual(fail.calls, 1, "control: the publish was reached and failed")
+            self.assertTrue(outbound._private_result_path(self.keyed(), "alpha", REQ).is_file(),
+                            "control: the anchor was written before the failure")
+            self.assertEqual(outbound._pending_ids(self.keyed(), "alpha"), [REQ],
+                             "control: the record outlived the failure")
+            self.poll()
+        self.assertEqual(outbound._pending_ids(self.keyed(), "alpha"), [],
+                         "an answered request's record was left behind")
+        self.assertTrue(result_path(self.cfg, "alpha", REQ).exists())
+        self.assertEqual(len(self.notice_ids("bravo")), 1)
 
     # -- W2: a crash after placement, before the "delivered" mark -------------
 

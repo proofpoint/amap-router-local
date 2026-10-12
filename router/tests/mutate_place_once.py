@@ -29,6 +29,7 @@ NR, UR = P + "WithoutARegistry.", P + "UnderARegistry."
 A = "router.tests.test_attachments_outbound.TestRefusalDiagnosticIsConformant."
 Q = "router.tests.test_quarantine_cli."
 GP = "router.tests.test_generations_pending.DigestlessAnchorTests."
+RG = "router.tests.test_generations_pending.RecipientGenerationTests."
 U = "router.tests.test_docker.EntrypointUmaskTests."
 D = "router.tests.test_agent_visible_durability."
 OB, QU, EP = "router/outbound.py", "router/quarantine.py", "docker/entrypoint.sh"
@@ -131,6 +132,30 @@ M = [
   '        if False:\n',
   [Q + 'ControlTests.test_damaged_entries',
    Q + 'FormatTests.test_links_and_non_regular_entries']),
+ ('V1 the vanished-request loop runs only under a registry', OB,
+  '    for req_id in sorted(set(_pending_ids(cfg, name)) - listed):\n',
+  '    for req_id in (sorted(set(_pending_ids(cfg, name)) - listed)\n'
+  '                   if cfg.registry_dir is not None else []):\n',
+  [NR + 'test_a_request_gone_after_an_anchor_failure_is_answered_from_its_record']),
+ ('V2 the answered sweep runs only under a registry', OB,
+  '    _sweep_answered_pending(cfg, name)\n    filenames, skipped_symlinks = list_outbound(cfg, name)\n',
+  '    if cfg.registry_dir is not None:\n        _sweep_answered_pending(cfg, name)\n'
+  '    filenames, skipped_symlinks = list_outbound(cfg, name)\n',
+  [NR + 'test_a_failure_after_the_anchor_leaves_no_record_and_places_once']),
+ ('V3 a mid-pass hold fails the recipient on the preset-less path', OB,
+  '            if req_digest is None or cfg.registry_dir is None:\n                failed.append(r)\n'
+  '                continue\n            held_now.append(r)    # nothing placed',
+  '            if True:\n                failed.append(r)\n'
+  '                continue\n            held_now.append(r)    # nothing placed',
+  [RG + 'test_a_root_swapped_mid_pass_on_a_preset_less_backend_goes_pending']),
+ ("V4 a record's origin is not validated", OB,
+  '    if "origin" in doc and doc["origin"] != ORIGIN_DIRECT:\n',
+  '    if False:\n',
+  both('test_a_record_with_any_other_origin_is_damaged_and_holds')),
+ ('P9 a peer route places without an intent record', OB,
+  '    if req_digest is not None:\n        # Held or not, through the record',
+  '    if False:\n        # Held or not, through the record',
+  both('test_a_peer_route_places_once')),
  ('Q4 every open error says "without following a link"', QU,
   '        raise Damaged(f"cannot be opened ({os.strerror(e.errno)})") from None\n',
   '        raise Damaged(f"cannot be opened without following a link ({os.strerror(e.errno)})") from None\n',

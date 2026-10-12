@@ -12,7 +12,7 @@ import shutil
 import sys
 from unittest import mock
 
-from router import generations, outbound, registry, service
+from router import deliver as deliver_mod, generations, outbound, registry, service
 from router.status import StatusTracker
 from router.tests.helpers import (
     attachment_descriptor, stage_outbound_sidecars, gen_state, keyed_for_poll, list_notices, read_json, result_path, write_request,
@@ -277,6 +277,33 @@ class RecipientGenerationTests(_Pending):
                          "accepted")
         self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
 
+
+    def test_a_root_swapped_mid_pass_on_a_preset_less_backend_goes_pending(self):
+        """The same race through a backend that takes no pre-minted identity,
+        which places directly, without an intent record: its held recipient
+        goes pending too, never delivery_failed."""
+        calls = []
+
+        def preset_less(cfg, state_dir, sender, recipient, doc, attachments=None):
+            calls.append(recipient)
+            return deliver_mod.deliver(cfg, state_dir, sender, recipient, doc,
+                                       attachments=attachments)
+
+        self.assertIsNone(outbound._placement_origin(preset_less),
+                          "control: this backend takes no preset")
+        write_request(self.cfg, "alpha", "00000001", to=[addr("bravo")])
+        k = keyed_for_poll(self.cfg)
+        self.replace_root("bravo")
+        with mock.patch.object(outbound, "_any_held", lambda cfg, recipients: False):
+            outbound.drain_instance(k, "alpha", deliver_backend=preset_less)
+        self.assertEqual(calls, ["bravo"], "control: the backend reached the write")
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists(),
+                         "answered delivery_failed instead of going pending")
+        self.assertTrue((self.pending_dir() / "00000001.json").is_file())
+        self.poll()
+        self.assertEqual(read_json(result_path(self.cfg, "alpha", "00000001"))["outcome"],
+                         "accepted")
+        self.assertEqual(len(list_notices(self.cfg, "bravo")), 1)
 
 class PinnedListingTests(_Pending):
     """The listing and first sight reach the outbox as the reads do."""
