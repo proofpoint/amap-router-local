@@ -349,7 +349,8 @@ class RevocationTests(_Case):
             self.drain(narrow)
         revoked = [m for m in logs.output if "REVOKED" in m]
         self.assertEqual(len(revoked), 2, "logged on every poll it stays pending")
-        self.assertIn("no way to withdraw it", revoked[0])
+        # Every (3, 0) port offers withdraw_request; the table never calls it.
+        self.assertIn("approved at (3,0); not yet called by the in-flight table", revoked[0])
         self.assertIn("REVOKED since", revoked[1], "a marked record is not re-decided")
         since = self.record(cfg)["revocation_unenforceable"]
         self.assertIsInstance(since, str)
@@ -389,16 +390,23 @@ class RevocationTests(_Case):
         self.assertNotIn("revocation_unenforceable", self.record(cfg))
 
     def test_a_withdraw_request_on_the_port_is_never_called(self):
-        """The capability is reported, never depended on."""
+        """API (3, 0) makes `withdraw_request` part of every port, so the
+        capability is reported True; the in-flight table still never calls
+        it, and says so."""
         calls = []
         self.port.withdraw_request = lambda n: calls.append(n)
         cfg = self.handed()
         with self.assertLogs("amap_router_local.inflight", logging.ERROR) as logs:
             self.drain(self.cfg(alice={"send_to": ["other@example.com"]}))
         self.assertEqual(calls, [])
-        self.assertTrue(any("never called" in m for m in logs.output))
+        self.assertTrue(any("approved at (3,0); not yet called by the in-flight table" in m
+                            for m in logs.output))
         self.assertTrue(inflight.withdraw_capable(self.port))
-        self.assertFalse(inflight.withdraw_capable(FakeTransport()))
+        self.assertTrue(inflight.withdraw_capable(FakeTransport()))
+
+        class Bare:   # a pre-(3, 0) shape, for the False branch
+            pass
+        self.assertFalse(inflight.withdraw_capable(Bare()))
 
     def test_status_lists_it_with_its_age(self):
         cfg = self.handed()
@@ -410,7 +418,7 @@ class RevocationTests(_Case):
         [row] = doc["revocation_unenforceable"]["alice"]
         self.assertEqual(row["req_id"], "00000001")
         self.assertIsInstance(row["age_s"], int)
-        self.assertIs(doc["withdraw_capable"], False)
+        self.assertIs(doc["withdraw_capable"], True)   # every (3, 0) port has it
         from router.status import render
         self.assertIn("alice: req 00000001 REVOKED after hand-over", render(tracker.to_doc()))
 

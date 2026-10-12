@@ -61,6 +61,46 @@ startup (`router/service.py`), and never hot-swapped.
 
 A sibling runtime has its own loader with the same reasons; one attack
 suite covers both.
+
+API 3.0 (AMENDMENT E8). `(3, 0)` adds, for this runtime: `HopFsOps.list_pinned`
+and the `ListingTooLarge` attribute; a paged, fill-or-exhaust
+`InboundPort.list_entries` and the `NoticeRefused` attribute; the
+`amap-hop-notice-entry/2` bundle with its REQUIRED `hop` member; the
+upstream retirement marker store (`make_upstream_marker_store`,
+`UpstreamMarkers`); `TransportPort.withdraw_request`; `close()` on every
+plugin object; and `TRANSPORT_REASONS`.
+
+MIGRATION, (2, 0) -> (3, 0): a `(3, x)` runtime refuses every `(2, x)`
+plugin at load, and a `(2, x)` runtime every `(3, x)` plugin, before any
+factory is called (step 7). Nothing at `(2, x)` was ever deployed (no
+activation existed), so there is no live migration: plugin and runtime move
+together, in one release, readers first (contract §4.4) where a tree exists.
+No tree written under `(2, x)` is read under `(3, x)`.
+
+ORDER IS NEVER TAKEN FROM A LISTING. Listings are sorted by NAME, and an
+entry id's order is not its name's order (a notice's name is
+`notice-<id>.json`): nothing may compare entry ids to page. An outbound
+request's claim order is `int(n)`, never its name, since `n` grows from 8 to
+18 digits and code-point order is wrong across lengths.
+
+CLASSIFYING WHAT A PLUGIN RAISES (`classify`). The plugin is executed, not
+imported, so this runtime holds no class object of the plugin's own
+exceptions, and message text is not a contract. In order:
+
+  1. the captured VERDICT classes (`InboundPort.NoticeRefused`,
+     `UpstreamMarkers.GenerationAbsent`), each with its own reasons;
+  2. the RUNTIME's own classes, from its `HopFsOps` (`UnsafeRead`,
+     `ListingTooLarge`), by class: their `.reason` is never compared with
+     `TRANSPORT_REASONS`;
+  3. a plugin `.reason` in `TRANSPORT_REASONS`;
+  4. `OSError` (after `.reason`, so a plugin exception deriving from it is
+     still classified by its reason);
+  5. anything else, including a missing or unknown `.reason`: no verdict.
+
+PENDING THE OWNER'S DECISION: `make_intake_remover(settings, fsops)` -> an object with exactly
+`remove_entry(kind, entry_id)` and `close()`. If confirmed it arrives as an
+OPTIONAL factory at `(3, 1)`, a minor change under the rule above; it is not
+part of `(3, 0)`, and nothing in `(3, 0)` depends on it.
 """
 
 from __future__ import annotations
@@ -69,11 +109,13 @@ import errno
 import hashlib
 import hmac
 import os
+import re
 import stat
 import types
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import (Any, Callable, Iterable, Literal, Mapping, Optional, Protocol,
+from typing import (Any, Callable, Iterable, List, Literal, Mapping, Optional, Protocol,
                     Sequence, Tuple, Union, runtime_checkable)
 
 #: `(major, minor)`. A plugin must have the same major and at least this
@@ -85,12 +127,15 @@ from typing import (Any, Callable, Iterable, Literal, Mapping, Optional, Protoco
 #: `open_private_stage_dir`, `commit_durable`'s keyword-only `deps` and the
 #: `UnsafeRead` attribute, so a `(1, x)` plugin is refused here and a
 #: `(2, x)` plugin by a `(1, x)` runtime, before any factory is called.
-PLUGIN_API: Tuple[int, int] = (2, 0)
+#: `(3, 0)` is amendment E8 (module docstring, API 3.0).
+PLUGIN_API: Tuple[int, int] = (3, 0)
 
 #: The factories this runtime calls. A plugin may define more; it must
-#: define these. `make_sender(settings, fsops) -> TransportPort` and
-#: `make_intake_reader(settings, fsops) -> InboundPort`.
-REQUIRED_FACTORIES: Tuple[str, ...] = ("make_sender", "make_intake_reader")
+#: define these. `make_sender(settings, fsops) -> TransportPort`,
+#: `make_intake_reader(settings, fsops) -> InboundPort` and
+#: `make_upstream_marker_store(settings, fsops) -> UpstreamMarkers`.
+REQUIRED_FACTORIES: Tuple[str, ...] = (
+    "make_sender", "make_intake_reader", "make_upstream_marker_store")
 
 #: Uids that may own the plugin file and every directory above it.
 TRUSTED_UIDS: Tuple[int, ...] = (0,)
@@ -123,6 +168,7 @@ class PluginRefused(Exception):
         self.detail = detail
 
 
+@runtime_checkable
 class TransportPort(Protocol):
     """The transport, as the in-flight state machine needs it
     (`router/inflight.py`, its module docstring's table). Every method takes
@@ -160,27 +206,104 @@ class TransportPort(Protocol):
     apply to the decoded sizes. `settled_through` is an `n'` below `n` such
     that every request at or below it is settled by this router or was
     allocated and never written; it never decreases, and it is the one
-    member a retry may change."""
+    member a retry may change.
+
+    `withdraw_request(n)` takes a published, UNCLAIMED request back, and is
+    decided by the no-replace rename of `outbound/req-<n>.json` itself,
+    never by a pre-check: the receiver's claim renames the same source, so
+    exactly one side wins. `"withdrawn"`: this call's rename moved it, or
+    the JSON is already in `withdrawn/` (a repeat after a crash completes
+    the `hop.json` and attachment moves; until then `has_archived(n)` is
+    true and `write_request(n)` raises). `"too_late"`: the JSON is in
+    `claimed/` or `processed/`, or `results/<n>.json` exists, checked even
+    while the JSON is still in `outbound/`; the caller waits for the
+    Result. A source gone with none of those, or a destination conflict,
+    RAISES (an anomaly), never either verdict. `FileNotFoundError` in two
+    separate cases: (i) never published; (ii) a request at link count 2
+    (a publication in flight or partial), which is never withdrawn half
+    made, and nothing moves. Allowed on a retired generation, alike.
+
+    `close()` releases exactly the descriptors the object itself obtained
+    from `open_root_nofollow`, `descend_pinned`, `mkdir_and_pin` or
+    `stage_tree`. Stage descriptors from `open_stage_dir` /
+    `open_private_stage_dir` belong to the `HopFsOps` instance and are never
+    closed by a plugin object, which re-requests a stage descriptor rather
+    than retaining it across calls. Idempotent: a second call is a no-op
+    and never raises. After it, every other method raises
+    `ValueError("closed")`, carrying `.reason` `"closed"`, before any
+    `HopFsOps` call. The same holds for `InboundPort` and `UpstreamMarkers`.
+
+    THE FACTORY CLEANUP RULE: a factory that RAISES has released every
+    descriptor it opened, so a caller never holds anything from a failed
+    construction.
+
+    Every exception a plugin object or factory raises deliberately carries
+    `.reason`, one of `TRANSPORT_REASONS`; the caller classifies on it
+    (module docstring, CLASSIFYING)."""
 
     def has_result(self, n: str) -> bool: ...
     def has_pending(self, n: str) -> bool: ...
     def has_archived(self, n: str) -> bool: ...
     def read_result(self, n: str) -> bytes: ...
     def write_request(self, n: str, data: bytes) -> None: ...
+    def withdraw_request(self, n: str) -> WithdrawResult: ...
+    def close(self) -> None: ...
 
 
+@runtime_checkable
 class InboundPort(Protocol):
     """What arrives from the transport for this router to place: notices,
     signed candidates, and entries no live tree could be found for.
-    `kind` is one of `INBOUND_KINDS`. `list_entries(kind)` names the entries
-    ready to read, in arrival order; `read_entry(kind, entry_id)` returns
+    `kind` is one of `INBOUND_KINDS`. `read_entry(kind, entry_id)` returns
     one entry's bytes, which are HOSTILE input to the caller.
     `entry_id`s are opaque to this router and unique within a kind.
 
+    `list_entries(kind, *, limit, after=None) -> (entry_ids, truncated)`
+    pages over the COMMITTED entries of `kind`. The order and the cursor are
+    over each entry's underlying NAME in its directory (`notice-<id>.json`
+    for a notice; the id itself for a candidate or an unresolved entry), in
+    code-point order, never over the id: `after` is an entry id of `kind`
+    (it must pass the kind's grammar, else `ValueError`), and the entries
+    returned are those whose NAME sorts strictly after `after`'s name.
+    `limit` is the caller's keyword (`check_list_args`). It returns fewer
+    than `limit` entries only when `truncated` is False; `truncated` is True
+    iff at least one further committed entry exists after the last one
+    returned. Internally it repeats `HopFsOps.list_pinned`, each call with
+    `limit=LIST_LIMIT_MAX` and `after` = the last NAME it saw (an entry or
+    not), until it holds `limit + 1` committed entries or the directory is
+    exhausted, and returns the first `limit`: the extra one is only the
+    lookahead. Time is O(directory) per inner call, so at most
+    ceil((J + limit + 1) / LIST_LIMIT_MAX) + 1 scans for `J` non-entry names
+    passed (a BOUND, not an exact count), and every scan stops at
+    `LIST_SCAN_MAX` names; memory is O(limit + LIST_LIMIT_MAX). The
+    `HopFsOps` instance's `ListingTooLarge` propagates UNCHANGED: it is the
+    runtime's class, never caught, wrapped or re-raised as anything else.
+    The caller keeps one cursor per (port, kind) and restarts from `None`
+    when `truncated` is False, so every committed entry is returned within
+    ceil(N / limit) + 1 calls, whatever the held set or the junk names.
+
+    `NoticeRefused` is this object's refusal class for a notice (an
+    exception class, like `HopFsOps.UnsafeRead`). `read_entry("notice", id)`
+    raises it, with `.reason` one of `NOTICE_REFUSAL_REASONS`, for a
+    COMMITTED notice whose facts, spool or sidecars are missing
+    (`notice_incomplete`) or invalid (`notice_invalid`: the facts by any
+    codec layer, or a malformed descriptor or `content_ref`). Such an entry IS listed,
+    never hidden; an uncommitted notice is not listed. The caller captures
+    the class once, at construction (`capture_verdict_class`: two-way
+    disjoint from `OSError` and both of the runtime's own classes,
+    `UnsafeRead` and `ListingTooLarge`), and dispatches on the captured
+    class for kind `"notice"` only. An `OSError`, `UnsafeRead` or
+    `ListingTooLarge` raised while reading or listing notices propagates as
+    itself and is never a verdict.
+
     A `"notice"` entry's bytes are the hop inbound bundle, which the hop
     codec's specification defines, not this module: a CLOSED, VERSIONED
-    JSON object with exactly the members `schema`, `notice`, `spool` and
-    `attachments`, in canonical encoding. `attachments` is POSITIONAL, as
+    JSON object, `NOTICE_BUNDLE_SCHEMA`, with exactly the members `schema`,
+    `notice`, `spool`, `attachments` and `hop`, in canonical encoding. `hop`
+    is REQUIRED and never null: the standard base64 (no newlines) of the
+    EXACT bytes of the notice's facts file
+    (`inbound/notice-facts/notice-<id>.json`), at most `HOP_FACTS_MAX`
+    decoded. A `/1` bundle is refused. `attachments` is POSITIONAL, as
     AMAP binds a sidecar to its descriptor's array index: entry `k` belongs
     to the notice's `message.attachments[k]`, and is the standard base64 of
     sidecar `k` if and only if that descriptor carries `content_ref` (which
@@ -191,14 +314,103 @@ class InboundPort(Protocol):
     The caller validates every part (the notice and spool against their
     schemas, each attachment against descriptor `k`'s size and sha256) and
     refuses the entry on any mismatch; the caps apply per part, to decoded
-    sizes."""
+    sizes. `close()` is `TransportPort.close`'s, alike."""
 
-    def list_entries(self, kind: str) -> Sequence[str]: ...
+    #: This object's refusal class for a committed notice (above).
+    NoticeRefused: type
+
+    def list_entries(self, kind: str, *, limit: int,
+                     after: Optional[str] = None) -> Tuple[List[str], bool]: ...
     def read_entry(self, kind: str, entry_id: str) -> bytes: ...
+    def close(self) -> None: ...
 
 
 #: The kinds an `InboundPort` serves.
 INBOUND_KINDS = ("notice", "candidate", "unresolved")
+#: `InboundPort`'s non-method members.
+INBOUNDPORT_ATTRIBUTES = ("NoticeRefused",)
+#: `InboundPort.NoticeRefused.reason`: exactly one of these.
+NOTICE_REFUSAL_REASONS = ("notice_incomplete", "notice_invalid")
+#: The notice bundle's schema at `(3, 0)`. Any other value is refused.
+NOTICE_BUNDLE_SCHEMA = "amap-hop-notice-entry/2"
+#: The decoded cap on a bundle's `hop` member. Equal to the hop codec's
+#: facts `MAX_BYTES`; the plugin is private, so this runtime cannot import
+#: it, and the plugin's conformance suite asserts the two are equal at this
+#: runtime's pin.
+HOP_FACTS_MAX = 64 * 1024
+
+#: `list_pinned` / `list_entries`: the largest `limit` a caller may pass.
+#: A larger one is refused, never clamped.
+LIST_LIMIT_MAX = 1024
+#: `list_pinned` stops after visiting this many names and raises the
+#: `HopFsOps` instance's `ListingTooLarge`.
+LIST_SCAN_MAX = 65536
+
+#: `withdraw_request`'s results.
+WithdrawResult = Literal["withdrawn", "too_late"]
+WITHDRAW_RESULTS = ("withdrawn", "too_late")
+#: `UpstreamMarkers.retire`'s results.
+RetireResult = Literal["created", "exists_same", "exists", "absent"]
+RETIRE_RESULTS = ("created", "exists_same", "exists", "absent")
+
+#: `.reason` on every exception a plugin object or factory raises
+#: deliberately (module docstring, CLASSIFYING). A missing or unknown
+#: `.reason` is "anything else": no verdict.
+TRANSPORT_REASONS = (
+    "request_exists_different", "request_exists_withdrawn", "request_exists_settled",
+    "handover_invalid", "below_frontier",
+    "layout", "owner", "version",
+    "exists_different", "reconcile", "sidecars", "sidecars_orphaned", "heal_state",
+    "protocol_violation", "marker_unreadable",
+    "settings_invalid", "closed",
+)
+
+
+@runtime_checkable
+class UpstreamMarkers(Protocol):
+    """The upstream side's retirement marker for ONE generation tree
+    (`make_upstream_marker_store`, settings exactly the four-key core:
+    `hop_root`, `logical_id`, `generation`, `peer_uid`). Construction calls
+    no `HopFsOps` writer method and never admits (contrast the sender, whose
+    construction admits).
+
+    `retire(retired_at)` writes `up/retired` durably (`commit_durable`
+    through `up/stage`); it is immutable once written. `retired_at` must
+    pass `check_retired_at`, BEFORE any `HopFsOps` call. Results:
+    `"created"`; `"exists_same"`; `"exists"` (retired already at another
+    instant: not an error); `"absent"` ONLY on an owner-checked ENOENT of
+    `<logical_id>/<gen>/` or `<logical_id>/`, creating nothing. A repeat
+    after a crash part-way through (`up/retired` at link count 2) completes
+    the commit and returns `"created"` or `"exists_same"`. Any failed
+    barrier raises.
+
+    `retired()`: `True` for a valid marker; `False` only for an
+    owner-checked ENOENT of `up/retired` in an EXISTING tree whose `up/` is
+    intact. An absent tree raises this object's `GenerationAbsent`, never
+    `False` (`False` means "the tree exists and is not retired"). The caller
+    captures `GenerationAbsent` once, at construction
+    (`capture_verdict_class`: two-way disjoint from `OSError` and both of the
+    runtime's own classes, `UnsafeRead` and `ListingTooLarge`). Every
+    other condition RAISES ("cannot decide", so the caller holds): a wrong
+    owner, not a regular file, a link count of 2 or more, a missing or
+    damaged `up/`, or content other than EXACTLY the canonical
+    `{"retired_at": <utc_ts>}`.
+
+    `close()` is `TransportPort.close`'s, alike."""
+
+    #: This object's refusal class for an absent generation tree (above).
+    GenerationAbsent: type
+
+    def retire(self, retired_at: str) -> RetireResult: ...
+    def retired(self) -> bool: ...
+    def close(self) -> None: ...
+
+
+#: `UpstreamMarkers`'s non-method members.
+UPSTREAM_MARKER_ATTRIBUTES = ("GenerationAbsent",)
+#: The `retired_at` grammar: this router's `utc_ts` form, ASCII digits only
+#: (`\d` would also match non-ASCII digits).
+RETIRED_AT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 
 
 # --------------------------------------------------------------------------
@@ -244,7 +456,11 @@ StageSide = Literal["up", "down", "intake"]
 #: One dependency of a `commit_durable` sentinel: `(dir_fd, name, size,
 #: sha256)`, the sha256 as lowercase hex (`HopFsOps`, DEPENDENCIES).
 Dependency = Tuple[int, str, int, str]
-#: `fsops.UnsafeRead.reason`: exactly one of these (`HopFsOps`, READS).
+#: `fsops.UnsafeRead.reason`: exactly one of these (`HopFsOps`, READS), for
+#: every runtime that implements `HopFsOps`. Each implementation's own set
+#: must be a subset (the plugin's conformance suite checks it), and the
+#: classifier never compares these with `TRANSPORT_REASONS` (module
+#: docstring, CLASSIFYING).
 UNSAFE_READ_REASONS = ("not_regular", "link_count", "too_large")
 
 
@@ -430,12 +646,35 @@ class HopFsOps(Protocol):
       * `remove_pinned`: the directory, even when the name was already
         missing (an earlier remover's fsync may have failed), so the removal
         is durable on return;
-      * `fsync_file`, `fsync_dir`: exactly what they say."""
+      * `fsync_file`, `fsync_dir`: exactly what they say.
+
+    LISTING. `list_pinned(dir_fd, *, limit, after=None) -> (names, truncated)`
+    lists the directory `dir_fd` pins, which must be a descriptor this
+    instance bound (the stale-binding check applies). It returns the `limit`
+    smallest names strictly greater than `after` in code-point order,
+    sorted; `truncated` is True iff more names exist beyond the last one
+    returned. `limit` and `after` are checked first (`check_list_args`).
+    Names are `str` as the kernel's bytes decode with `surrogateescape`, so
+    an undecodable name is returned for the caller's grammar check, never
+    dropped and never raised; `.` and `..` are excluded; names are returned
+    as listed, and validating them (grammar, kind, owner) is the CALLER's.
+    The scan streams a FRESH open description of that directory
+    (`os.open(".", dir_fd=...)`, never a dup, which would share the pinned
+    descriptor's offset), so the pinned descriptor's offset and state are
+    unchanged; memory is O(limit), a bounded heap, never a full listing.
+    The scan visits at most `LIST_SCAN_MAX` names: on visiting one more it
+    stops at once and raises this instance's `ListingTooLarge`, so no scan
+    is longer than that whatever the directory holds. A failure raises; it
+    never returns an empty list for an error."""
 
     #: This implementation's "committed not yet" result (above).
     NOT_YET: object
     #: This implementation's refusal class for `open_regular_pinned` (READS).
     UnsafeRead: type
+    #: This implementation's refusal class for a directory `list_pinned`
+    #: refuses to scan to the end (LISTING). Two-way disjoint from `OSError`
+    #: and `UnsafeRead`.
+    ListingTooLarge: type
 
     def open_root_nofollow(self, path: str) -> int: ...
     def descend_pinned(self, root_fd: int, rel: str) -> Optional[int]: ...
@@ -455,19 +694,21 @@ class HopFsOps(Protocol):
     def remove_pinned(self, dir_fd: int, name: str) -> None: ...
     def fsync_file(self, fd: int) -> None: ...
     def fsync_dir(self, fd: int) -> None: ...
+    def list_pinned(self, dir_fd: int, *, limit: int,
+                    after: Optional[str] = None) -> Tuple[List[str], bool]: ...
 
 
-#: `HopFsOps`'s methods, in the contract's order (B §e.2, as amended by E5).
-#: Methods only: its attributes are `HOPFSOPS_ATTRIBUTES`.
+#: `HopFsOps`'s methods, in the contract's order (B §e.2, as amended by E5
+#: and E8). Methods only: its attributes are `HOPFSOPS_ATTRIBUTES`.
 HOPFSOPS_METHODS = (
     "open_root_nofollow", "descend_pinned", "mkdir_and_pin", "stage_tree",
     "commit_durable", "open_stage_dir", "open_private_stage_dir",
     "replace_durable", "rename_noreplace",
     "open_regular_pinned", "stat_owner_pinned", "remove_pinned",
-    "fsync_file", "fsync_dir",
+    "fsync_file", "fsync_dir", "list_pinned",
 )
 #: `HopFsOps`'s non-method members.
-HOPFSOPS_ATTRIBUTES = ("NOT_YET", "UnsafeRead")
+HOPFSOPS_ATTRIBUTES = ("NOT_YET", "UnsafeRead", "ListingTooLarge")
 
 
 @runtime_checkable
@@ -513,6 +754,7 @@ Settings = Mapping[str, Any]
 # and the one port it needs.
 MakeSender = Callable[[Settings, HopFsOps], TransportPort]
 MakeIntakeReader = Callable[[Settings, HopFsOps], InboundPort]
+MakeUpstreamMarkerStore = Callable[[Settings, HopFsOps], UpstreamMarkers]
 MakeSigner = Callable[[Settings, KeyOps], Signer]
 MakeVerifier = Callable[[Settings], Verifier]
 #: The sibling runtime's factories. What they return is that runtime's
@@ -523,11 +765,12 @@ MakeMarkerStore = Callable[[Settings, HopFsOps], Any]
 MakeHopSender = Callable[[Settings, HopFsOps], Any]
 
 #: Every factory a plugin may define, with the port it receives (None for
-#: settings only). This runtime calls the first four; the sibling runtime
+#: settings only). This runtime calls the first five; the sibling runtime
 #: calls the rest.
 FACTORY_PORTS: Mapping[str, Optional[str]] = {
     "make_sender": "HopFsOps",
     "make_intake_reader": "HopFsOps",
+    "make_upstream_marker_store": "HopFsOps",
     "make_signer": "KeyOps",
     "make_verifier": None,
     "make_hop_receiver": "HopFsOps",
@@ -552,6 +795,10 @@ class NullTransport:
     def make_intake_reader(self, settings: Settings, fsops: Optional[HopFsOps]) -> None:
         return None
 
+    def make_upstream_marker_store(self, settings: Settings,
+                                   fsops: Optional[HopFsOps]) -> None:
+        return None
+
 
 @dataclass(frozen=True)
 class LoadedPlugin:
@@ -571,6 +818,139 @@ class LoadedPlugin:
 
     def make_intake_reader(self, settings: Settings, fsops: HopFsOps) -> InboundPort:
         return self._factory("make_intake_reader")(settings, fsops)
+
+    def make_upstream_marker_store(self, settings: Settings,
+                                   fsops: HopFsOps) -> UpstreamMarkers:
+        return self._factory("make_upstream_marker_store")(settings, fsops)
+
+
+# --------------------------------------------------------------------------
+# This runtime's side of the 3.0 rules: the checks a caller runs on what a
+# plugin hands it, and the one classifier for what a plugin raises.
+# --------------------------------------------------------------------------
+
+#: Why a plugin object's vocabulary was refused at construction.
+SEAM_REFUSAL_REASONS = ("reader_vocabulary", "marker_vocabulary", "fsops_vocabulary")
+
+
+class SeamRefused(Exception):
+    """A plugin object (or a `HopFsOps`) offered a refusal class that breaks
+    the disjointness rule. `reason` is one of `SEAM_REFUSAL_REASONS`. The
+    object is not used and nothing is cached."""
+
+    def __init__(self, reason: str, detail: str):
+        assert reason in SEAM_REFUSAL_REASONS, reason
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+def check_list_args(limit: Any, after: Any) -> None:
+    """`limit` an int (never a bool) with 1 <= limit <= LIST_LIMIT_MAX, and
+    `after` None or a str; anything else is `ValueError`. Refused, never
+    clamped."""
+    if type(limit) is not int or not 1 <= limit <= LIST_LIMIT_MAX:
+        raise ValueError(f"limit must be an int in 1..{LIST_LIMIT_MAX}, not {limit!r}")
+    if after is not None and type(after) is not str:
+        raise ValueError(f"after must be None or a str, not {type(after).__name__}")
+
+
+def check_retired_at(value: Any) -> str:
+    """`value` if it is this router's `utc_ts` form (`RETIRED_AT_RE`, ASCII
+    digits only) and a real instant; else `ValueError`."""
+    if type(value) is not str or not RETIRED_AT_RE.fullmatch(value):
+        raise ValueError(f"retired_at {value!r} is not a utc_ts (YYYY-MM-DDTHH:MM:SSZ)")
+    datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    return value
+
+
+def check_disjoint(cls: Any, bases: Sequence[type]) -> type:
+    """`cls` if it is a proper subclass of `Exception` and, for EACH base,
+    neither a subclass nor a superclass of it (two-way disjoint), so a
+    verdict can never also be an I/O failure, whatever the catch order.
+    Otherwise `TypeError`."""
+    if not (isinstance(cls, type) and issubclass(cls, Exception) and cls is not Exception):
+        raise TypeError(f"{cls!r} is not a proper subclass of Exception")
+    for base in bases:
+        if issubclass(cls, base) or issubclass(base, cls):
+            raise TypeError(f"{cls.__name__} is not disjoint from {base.__name__}")
+    return cls
+
+
+def capture_verdict_class(obj: Any, attribute: str, fsops: Any, reason: str) -> type:
+    """The refusal class `obj.<attribute>`, checked ONCE and returned for the
+    caller to keep: later dispatch uses the captured class, never a fresh
+    lookup, so a class swapped onto the object afterwards changes nothing.
+    The check is `check_disjoint` against the COMPLETE set the classifier
+    tells it apart from: `OSError` and both of the runtime's own classes
+    (`fsops.UnsafeRead`, `fsops.ListingTooLarge`), so no runtime exception
+    can ever be read as this verdict, nor this verdict as a runtime one. A
+    missing or non-disjoint class raises `SeamRefused(reason)`."""
+    try:
+        bases = (OSError, fsops.UnsafeRead, fsops.ListingTooLarge)
+        return check_disjoint(getattr(obj, attribute), bases)
+    except (AttributeError, TypeError) as e:
+        raise SeamRefused(reason, f"{attribute}: {e}") from None
+
+
+#: The ROLES of the runtime's own classes, as `classify` reports them. The
+#: Protocol fixes the attribute's role, not the implementation class's name,
+#: so a conforming `HopFsOps` may call its class anything.
+RUNTIME_ROLES = ("unsafe_read", "listing_too_large")
+
+
+def check_fsops_classes(fsops: Any) -> Tuple[Tuple[type, str], Tuple[type, str]]:
+    """The runtime's own classes with their roles, `((UnsafeRead,
+    "unsafe_read"), (ListingTooLarge, "listing_too_large"))`, ready for
+    `classify(runtime=...)`; `ListingTooLarge` two-way disjoint from
+    `OSError` and `UnsafeRead`."""
+    try:
+        unsafe = fsops.UnsafeRead
+        too_large = check_disjoint(fsops.ListingTooLarge, (OSError, unsafe))
+    except (AttributeError, TypeError) as e:
+        raise SeamRefused("fsops_vocabulary", str(e)) from None
+    return (unsafe, "unsafe_read"), (too_large, "listing_too_large")
+
+
+def is_current_bundle_schema(value: Any) -> bool:
+    """A notice bundle's `schema` is accepted only at `NOTICE_BUNDLE_SCHEMA`."""
+    return value == NOTICE_BUNDLE_SCHEMA
+
+
+#: `classify`'s kinds, in the order it tries them (module docstring).
+CLASSES = ("verdict", "runtime", "reason", "oserror", "other")
+
+
+def classify(exc: BaseException, *,
+             verdicts: Sequence[Tuple[type, Optional[Sequence[str]]]] = (),
+             runtime: Sequence[Tuple[type, str]] = ()) -> Tuple[str, Optional[str]]:
+    """What `exc`, raised by a plugin object, IS, as `(kind, detail)`:
+
+      * `("verdict", reason)` for an instance of a captured verdict class
+        whose `.reason` is in that class's reasons (or any reason, when the
+        class has none: `None`); a verdict class with an unknown reason is
+        `("other", None)`, never a verdict;
+      * `("runtime", role)` for an instance of one of the runtime's own
+        classes, `role` from `RUNTIME_ROLES` as `check_fsops_classes` pairs
+        them (never the class's own name), whatever its `.reason`;
+      * `("reason", reason)` for a `.reason` in `TRANSPORT_REASONS`;
+      * `("oserror", errno name or None)` for an `OSError`;
+      * `("other", None)` for anything else."""
+    for cls, reasons in verdicts:
+        if isinstance(exc, cls):
+            reason = getattr(exc, "reason", None)
+            if reasons is None or reason in reasons:
+                return "verdict", reason
+            return "other", None
+    for cls, role in runtime:
+        if isinstance(exc, cls):
+            return "runtime", role
+    reason = getattr(exc, "reason", None)
+    if type(reason) is str and reason in TRANSPORT_REASONS:
+        return "reason", reason
+    if isinstance(exc, OSError):
+        return "oserror", errno.errorcode.get(exc.errno) if exc.errno else None
+    return "other", None
 
 
 def _is_within(path: Path, root: Path) -> bool:

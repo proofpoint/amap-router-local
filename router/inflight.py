@@ -173,10 +173,11 @@ class Recheck:
 
 
 def withdraw_capable(port: Any) -> bool:
-    """Whether the transport offers `withdraw_request`. No transport this
-    router accepts does: it is a proposal for a later plugin API, not part
-    of `TransportPort`, and this router never calls it. Reported so that a
-    revoked request's log line and `status` say which case they are in."""
+    """Whether the transport offers `withdraw_request`. It is part of
+    `TransportPort` from API (3, 0), but the in-flight table does not call
+    it yet: a withdrawn request needs its own branch in the table's
+    "archived, still no result" row first. Reported so that a revoked
+    request's log line and `status` say which case they are in."""
     return callable(getattr(port, "withdraw_request", None))
 
 
@@ -603,8 +604,8 @@ def _check_revocation(
     """The pending row's re-check (`advance`, THE RE-CHECK). Fail-visible:
     a marked record is logged as an ERROR on every poll it stays pending."""
     capable = withdraw_capable(port)
-    how = ("the transport offers withdraw_request, which is not an approved part "
-           "of the plugin API and is never called" if capable
+    how = ("the transport offers withdraw_request, approved at (3,0); not yet "
+           "called by the in-flight table" if capable
            else "the transport has no way to withdraw it")
     since = record.get("revocation_unenforceable")
     if since is not None:

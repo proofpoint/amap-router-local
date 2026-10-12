@@ -229,11 +229,11 @@ M = [
  # -- PLUGIN_API -----------------------------------------------------------
  ('A1 the major is not compared', 'router/transport.py',
   '    if got[0] != api[0] or got[1] < api[1]:\n', '    if got[1] < api[1]:\n',
-  ['router.tests.test_transport.LoaderTests.test_a_major_1_plugin_is_refused_by_this_major_2_runtime',
-   'router.tests.test_transport.LoaderTests.test_a_major_2_plugin_is_refused_by_a_major_1_runtime']),
- ('A2 the runtime stays at major 1', 'router/transport.py',
-  'PLUGIN_API: Tuple[int, int] = (2, 0)\n', 'PLUGIN_API: Tuple[int, int] = (1, 0)\n',
-  ['router.tests.test_transport.LoaderTests.test_a_major_1_plugin_is_refused_by_this_major_2_runtime']),
+  ['router.tests.test_transport.LoaderTests.test_an_older_major_plugin_is_refused_by_this_major_3_runtime',
+   'router.tests.test_transport.LoaderTests.test_a_major_3_plugin_is_refused_by_an_older_major_runtime']),
+ ('A2 the runtime stays at an older major', 'router/transport.py',
+  'PLUGIN_API: Tuple[int, int] = (3, 0)\n', 'PLUGIN_API: Tuple[int, int] = (2, 0)\n',
+  ['router.tests.test_transport.LoaderTests.test_an_older_major_plugin_is_refused_by_this_major_3_runtime']),
 ]
 
 

@@ -25,7 +25,7 @@ from router.tests.helpers import write_request
 from router.tests.test_inflight import EXT, FakeTransport, _InflightCase
 
 GOOD = b'''
-PLUGIN_API = (2, 0)
+PLUGIN_API = (3, 0)
 LOADS = []
 LOADS.append("executed")
 
@@ -34,6 +34,9 @@ def make_sender(settings, fsops):
 
 def make_intake_reader(settings, fsops):
     return ("reader", settings, fsops)
+
+def make_upstream_marker_store(settings, fsops):
+    return ("markers", settings, fsops)
 '''
 
 ME = (0, os.getuid())
@@ -84,11 +87,12 @@ class LoaderTests(_PluginDir):
     def test_a_valid_plugin_loads(self):
         """The twin every refusal below is measured against."""
         p = self.load()
-        self.assertEqual(p.api, (2, 0))
+        self.assertEqual(p.api, (3, 0))
         self.assertEqual(p.sha256, self.sha)
         self.assertEqual(p.path, str(self.path))
         self.assertEqual(p.make_sender({"k": 1}, "fs")[0], "sender")
         self.assertEqual(p.make_intake_reader({}, "fs")[0], "reader")
+        self.assertEqual(p.make_upstream_marker_store({}, "fs")[0], "markers")
         self.assertEqual(p.namespace["LOADS"], ["executed"])
 
     def test_the_default_trusts_only_root(self):
@@ -111,34 +115,49 @@ class LoaderTests(_PluginDir):
         return marker, (b"\ndef make_sender(settings, fsops):\n"
                         b"    open(%r, 'w').close()\n" % str(marker).encode())
 
-    def test_a_major_1_plugin_is_refused_by_this_major_2_runtime(self):
-        """E5 (`open_private_stage_dir`, `deps`, `UnsafeRead`) made the
-        HopFsOps change a MAJOR one: a plugin written for (1, x) would call
-        a port that differs from the one it was written against."""
-        self.assertEqual(transport.PLUGIN_API, (2, 0))
-        marker, factory = self._calls_marker()
-        self.write(GOOD.replace(b"PLUGIN_API = (2, 0)", b"PLUGIN_API = (1, 9)") + factory)
-        self.refused("api_mismatch")
-        self.assertFalse(marker.exists(), "a factory was called despite the refusal")
+    def test_an_older_major_plugin_is_refused_by_this_major_3_runtime(self):
+        """THE VERSION-SKEW WITNESS (E8). E8 changed the ports (list_pinned,
+        the paged listing, withdraw_request, close, the marker store), a
+        MAJOR change: a plugin written for (2, x), or the (1, x) of E5's
+        time, would call ports that differ from the ones it was written
+        against, so it is refused before any factory runs."""
+        self.assertEqual(transport.PLUGIN_API, (3, 0))
+        for old in (b"(2, 0)", b"(2, 9)", b"(1, 9)"):
+            with self.subTest(api=old):
+                marker, factory = self._calls_marker()
+                self.write(GOOD.replace(b"PLUGIN_API = (3, 0)", b"PLUGIN_API = " + old) + factory)
+                self.refused("api_mismatch")
+                self.assertFalse(marker.exists(), "a factory was called despite the refusal")
 
-    def test_a_major_2_plugin_is_refused_by_a_major_1_runtime(self):
+    def test_a_major_3_plugin_is_refused_by_an_older_major_runtime(self):
         marker, factory = self._calls_marker()
         self.write(GOOD + factory)
-        self.refused("api_mismatch", api=(1, 0))
+        for api in ((2, 0), (1, 0)):
+            with self.subTest(runtime=api):
+                self.refused("api_mismatch", api=api)
         self.assertFalse(marker.exists(), "a factory was called despite the refusal")
 
+    def test_a_newer_major_plugin_is_refused(self):
+        self.write(GOOD.replace(b"PLUGIN_API = (3, 0)", b"PLUGIN_API = (4, 0)"))
+        self.refused("api_mismatch")
+
     def test_an_older_minor_is_refused(self):
-        self.refused("api_mismatch", api=(2, 1))
+        self.refused("api_mismatch", api=(3, 1))
 
     def test_a_newer_minor_is_accepted(self):
-        self.write(GOOD.replace(b"PLUGIN_API = (2, 0)", b"PLUGIN_API = (2, 7)"))
-        self.assertEqual(self.load().api, (2, 7))
+        """(3, 1), for example the optional remover pending a decision,
+        loads under this (3, 0) runtime, which never calls it."""
+        for newer in ((3, 1), (3, 7)):
+            with self.subTest(api=newer):
+                self.write(GOOD.replace(b"PLUGIN_API = (3, 0)",
+                                        b"PLUGIN_API = (%d, %d)" % newer))
+                self.assertEqual(self.load().api, newer)
 
     def test_a_malformed_or_missing_api_is_refused(self):
         for bad in (b"PLUGIN_API = '1.0'", b"PLUGIN_API = (1,)", b"PLUGIN_API = (True, 0)",
-                    b"NOT_THE_API = (2, 0)"):
+                    b"NOT_THE_API = (3, 0)"):
             with self.subTest(bad=bad):
-                self.write(GOOD.replace(b"PLUGIN_API = (2, 0)", bad))
+                self.write(GOOD.replace(b"PLUGIN_API = (3, 0)", bad))
                 self.refused("api_mismatch")
 
     # -- the hash, and which bytes run ----------------------------------
@@ -281,7 +300,7 @@ class LoaderTests(_PluginDir):
     # -- the plugin's own content ---------------------------------------
 
     def test_a_plugin_that_fails_to_run_is_refused(self):
-        self.write(b"PLUGIN_API = (2, 0)\ndef broken(:\n")
+        self.write(b"PLUGIN_API = (3, 0)\ndef broken(:\n")
         self.refused("exec_failed")
         self.write(b"raise RuntimeError('no')\n")
         self.refused("exec_failed")
@@ -292,12 +311,19 @@ class LoaderTests(_PluginDir):
         self.write(GOOD + b"make_sender = 3\n")
         self.refused("missing_factory")
 
+    def test_a_plugin_without_the_marker_store_is_refused_naming_it(self):
+        """E8: the upstream marker store is REQUIRED; a (3, 0) plugin
+        without it is refused, and the refusal names it."""
+        self.write(GOOD.replace(b"def make_upstream_marker_store", b"def make_other"))
+        e = self.refused("missing_factory")
+        self.assertIn("make_upstream_marker_store", str(e))
+
 
 class NoPluginImportTests(unittest.TestCase):
     """The interface module imports no plugin and never imports by name."""
 
     ALLOWED = {"__future__", "errno", "hashlib", "hmac", "os", "stat", "types",
-               "dataclasses", "pathlib", "typing"}
+               "dataclasses", "pathlib", "typing", "re", "datetime"}
 
     def test_transport_imports_only_the_standard_modules_it_needs(self):
         tree = ast.parse(Path(transport.__file__).read_text(encoding="utf-8"))
