@@ -896,6 +896,11 @@ HOP_LEDGER_TRANSPORT = "hop"
 #: The members a hop ledger record must carry to bind a reply. `admission`
 #: is not among them: absent, it is `hoplink.ADMISSION_OPEN`.
 _HOP_BINDING_REQUIRED = tuple(m for m in binding.MAIL_ORIGIN_MEMBERS if m != "admission")
+#: The counterparty classes a bound reply goes to over the hop: a fleet host,
+#: trusted or not (every trusted host is a fleet host). A bound reply is decided
+#: before the trusted-host rule, so a trusted host's counterparty still gets a
+#: bound reply, never the peer path.
+_BOUND_CLASSES = (classify_mod.CLASS_FLEET, classify_mod.CLASS_TRUSTED)
 #: A bound reply to a counterparty this router cannot reach over the hop.
 DETAIL_NO_REPLY_PATH = "no reply path to this counterparty in this deployment"
 
@@ -904,10 +909,10 @@ def _hop_binding(cfg: RouterConfig, name: str, record: Dict[str, Any],
                  now: str) -> Union[Dict[str, Any], str]:
     """The binding a hop ledger record gives a reply from `name`, as the
     record carries it, or why it gives none. It binds ONLY when the record
-    is mail (not the peer tree), carries every member of
+    is mail (`tree` exactly the inbox tree), carries every member of
     `_HOP_BINDING_REQUIRED`, names `name`'s own state key as its agent, and
     `now` is before its `expires_at`. A bare id lookup is never enough."""
-    if record.get("tree") not in (None, deliver_mod.TREE_INBOX):
+    if record.get("tree") != deliver_mod.TREE_INBOX:
         return "the record is not mail"
     missing = [m for m in _HOP_BINDING_REQUIRED if m not in record]
     if missing:
@@ -941,6 +946,31 @@ def _bound_draft(draft: Dict[str, Any], counterparty: str) -> Dict[str, Any]:
     return fixed
 
 
+def _bound_egress(
+    cfg: RouterConfig, name: str, draft: Dict[str, Any], counterparty: str, klass: str,
+    cold_policy: Optional[ColdPolicy],
+) -> Union[ColdRefusal, ExternalRoute]:
+    """Egress for an `open` bound reply, with bound-mail semantics: the one
+    recipient is the counterparty, decided as mail to a fleet host, and the
+    answer is only ever a refusal or a hand-over of exactly that recipient.
+
+    A custom cold policy decides through `_remote_decision`, which accepts
+    nothing but a refusal or an external route naming this recipient: a
+    policy that routes it anywhere else (the peer lane included) is
+    `transport_anomaly`, never sent. Without one, a plain fleet host gets the
+    default rule through the same path. A trusted host is decided by the
+    default fleet-host rule DIRECTLY, never by the cold classification that
+    would make it a peer task: `remote_fleet` cannot name a trusted host, so
+    the default answer is `queued_for_human`/`recipient_not_allowlisted`."""
+    remote = classify_mod.Remote(classify_mod.CLASS_FLEET, (counterparty,), (counterparty,))
+    if klass == classify_mod.CLASS_FLEET or cold_policy is not None:
+        return _remote_decision(cfg, name, draft, remote, cold_policy)
+    d = classify_mod.remote_rule(cfg, name, remote)
+    if isinstance(d, classify_mod.Refuse):
+        return ColdRefusal(d.outcome, d.reason_code, detail=d.detail, hold=d.hold)
+    return ExternalRoute(d.recipients)
+
+
 def _drain_bound_reply(
     cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], in_reply_to: str,
     record: Dict[str, Any], *, req_digest: Optional[str],
@@ -957,8 +987,8 @@ def _drain_bound_reply(
         are discarded (logged as a count, never echoed);
       * while the delivered-domain set differs from `fleet_hosts`
         (`config.delivered_drift`), every bound reply is held unconsumed;
-      * the counterparty must be a fleet host under this router's
-        classifier, or `rejected`/`no_route` with nothing allocated;
+      * the counterparty must be a fleet host, trusted or not, under this
+        router's classifier, or `rejected`/`no_route` with nothing allocated;
       * an `open` admission is decided by egress, as mail is; any other
         admission is permitted by the binding, and egress is not consulted.
 
@@ -990,17 +1020,14 @@ def _drain_bound_reply(
         klass = classify_mod.address_class(cfg, counterparty)[0]
     except classify_mod.Malformed:
         klass = None
-    if klass != classify_mod.CLASS_FLEET:
+    if klass not in _BOUND_CLASSES:
         result = _result_doc(req_id, "rejected", reason_code=classify_mod.REASON_NO_ROUTE,
                              recipients=[], detail=DETAIL_NO_REPLY_PATH)
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
     staged = dict(doc, draft=_bound_draft(draft, counterparty))
     admission = pinned.get("admission", hoplink.ADMISSION_OPEN)
     if admission == hoplink.ADMISSION_OPEN:
-        routed = _remote_decision(
-            cfg, name, staged["draft"],
-            classify_mod.Remote(classify_mod.CLASS_FLEET, (counterparty,), (counterparty,)),
-            cold_policy)
+        routed = _bound_egress(cfg, name, staged["draft"], counterparty, klass, cold_policy)
         if isinstance(routed, ColdRefusal):
             if routed.hold:
                 _write_held_copy(cfg, name, req_id)
@@ -1699,7 +1726,7 @@ def _recheck_bound(
     """`_recheck` for a bound reply. Permitted only while: the delivered-
     domain set agrees with `fleet_hosts`; the ledger record still exists
     with every pinned member unchanged and its agent still `name`'s; the
-    counterparty is still a fleet host; and, for an `open` admission, egress
+    counterparty is still a fleet host, trusted or not; and, for an `open` admission, egress
     still permits it (any other admission is permitted by the binding, and
     egress is not consulted). Expiry is NOT re-evaluated: the reply was
     authorised when begun, and its bytes are frozen. Never a new digest: the
@@ -1722,13 +1749,11 @@ def _recheck_bound(
         klass = classify_mod.address_class(cfg, counterparty)[0]
     except classify_mod.Malformed:
         klass = None
-    if klass != classify_mod.CLASS_FLEET:
+    if klass not in _BOUND_CLASSES:
         return refused(f"route changed from {classify_mod.CLASS_FLEET} to {klass}")
     if pin["bound"]["admission"] == hoplink.ADMISSION_OPEN:
-        routed = _remote_decision(
-            cfg, name, record["request"]["draft"],
-            classify_mod.Remote(classify_mod.CLASS_FLEET, (counterparty,), (counterparty,)),
-            cold_policy)
+        routed = _bound_egress(cfg, name, record["request"]["draft"], counterparty, klass,
+                               cold_policy)
         if isinstance(routed, ColdRefusal):
             return refused(f"now {routed.reason_code}")
     return inflight_mod.Recheck(True, route=classify_mod.CLASS_FLEET)

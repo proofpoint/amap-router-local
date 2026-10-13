@@ -1641,18 +1641,24 @@ without them never resolves as a binding across the external leg.
 record is decided before the trusted-host rule and before any cold
 classification, and handed back over the hop as kind `"bound_reply"`:
 
-- It binds ONLY when the record carries the binding members, its agent is
-  the replying instance's logical_id, and it has not expired. Otherwise
+- It binds ONLY when the record is mail (its `tree` is the inbox tree),
+  carries the binding members, its agent is the replying instance's
+  logical_id, and it has not expired. Otherwise
   `rejected`/`unresolved_reply`. A bare id lookup is never enough.
 - The recipient is the record's `counterparty`. The draft's `to`, `cc` and
   `bcc` are discarded (logged as a count, never echoed).
 - The counterparty must be a fleet host under this router's own classifier
-  (`fleet_hosts`, and not a trusted fleet host); anything else is
+  (`fleet_hosts`, trusted or not: a trusted host's counterparty still gets
+  a bound reply, never the peer path); anything else is
   `rejected`/`no_route`, "no reply path to this counterparty in this
   deployment", with nothing allocated.
 - An `open` admission (also what an absent one means, written explicitly)
-  is decided by egress, as mail is: `queued_for_human`/
-  `recipient_not_allowlisted` when refused. `fleet_hosts` and
+  is decided by egress, as mail to a fleet host is: `remote_fleet`, or a
+  custom cold policy, whose only possible answers are a refusal or a
+  hand-over of the counterparty (anything else, the peer lane included, is
+  `transport_anomaly`). A trusted host is never re-classified as a peer
+  task; `remote_fleet` cannot name one, so by default it is
+  `queued_for_human`/`recipient_not_allowlisted`. `fleet_hosts` and
   `inbound_allowlist` are permitted by the binding, and egress is not
   consulted.
 - The envelope's `bound` is `{bound_address, origin_notice_id, origin_link,
@@ -1665,7 +1671,7 @@ classification, and handed back over the hop as kind `"bound_reply"`:
 - At every publication attempt and every pending poll, the re-check asks
   whether the ledger record is still there with every pinned member
   unchanged, the agent is still this instance's, the counterparty is still a
-  fleet host, and (for `open`) egress still permits it. Expiry is NOT
+  fleet host (trusted or not), and (for `open`) egress still permits it. Expiry is NOT
   re-evaluated after begin. A failure is `queued_for_human`/
   `recipient_not_allowlisted`, never a send and never `rejected`.
 - A bound reply whose handover could exceed the hop's document cap (the
@@ -1682,7 +1688,9 @@ layout for it is not yet frozen. A hash that does not match refuses the
 config. A set that differs from `fleet_hosts` does NOT: an ERROR names the
 two difference counts (never the domains), every bound reply is held
 unconsumed, a bound reply already in flight is refused at publication, and
-mail is unaffected. Absent, nothing changes.
+mail is unaffected. Absent, nothing changes. The file is read when the
+config is loaded, so a change to it takes effect on the next reload or
+restart only.
 
 **A read that decides nothing, again** (the runtime's own refusal class, or
 an OSError from the reader) is kept per journal key with its first sighting

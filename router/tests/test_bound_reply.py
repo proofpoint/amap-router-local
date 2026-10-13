@@ -191,14 +191,62 @@ class BeginTests(_Case):
                          ("rejected", "no_route", outbound.DETAIL_NO_REPLY_PATH))
         self.nothing_allocated(cfg)
 
-    def test_a_trusted_host_counterparty_has_no_route(self):
-        """Only the fleet-host class has a bound-reply path: a trusted host
-        classifies as its own class."""
+    def test_a_trusted_host_counterparty_gets_a_bound_reply(self):
+        """A bound reply is decided before the trusted-host rule: a trusted
+        host's counterparty gets a bound reply over the hop, never the peer
+        path and never no_route."""
         cfg = self.cfg()
         nid = self.ledger(cfg, counterparty=TRUSTED)
         write_request(cfg, "alice", "00000001", to=[TRUSTED], in_reply_to=nid)
         self.drain(cfg)
-        self.assertEqual(self.answered(cfg)["reason_code"], "no_route")
+        env = self.handover()["envelope"]
+        self.assertEqual(env["kind"], "bound_reply")
+        self.assertEqual(env["bound"]["bound_address"], TRUSTED)
+        self.assertEqual(self.handover()["request"]["draft"]["to"], [TRUSTED])
+
+    def test_a_trusted_host_counterparty_with_open_admission_is_decided_by_egress(self):
+        """Egress decides an open admission: with no `remote_fleet` for the
+        trusted host, the default is queued for a human, nothing allocated."""
+        cfg = self.cfg()
+        nid = self.ledger(cfg, counterparty=TRUSTED, admission="open")
+        write_request(cfg, "alice", "00000001", to=[TRUSTED], in_reply_to=nid)
+        self.drain(cfg)
+        r = self.answered(cfg)
+        self.assertEqual((r["outcome"], r["reason_code"]),
+                         ("queued_for_human", "recipient_not_allowlisted"))
+        self.nothing_allocated(cfg)
+
+    def test_a_trusted_host_counterparty_with_open_admission_permitted_by_a_policy(self):
+        """A permitting custom cold policy hands it over, as a bound reply."""
+        cfg = self.cfg()
+        nid = self.ledger(cfg, counterparty=TRUSTED, admission="open")
+        write_request(cfg, "alice", "00000001", to=[TRUSTED], in_reply_to=nid)
+        self.drain(cfg, cold_policy=lambda c, s, d: outbound.ExternalRoute(tuple(d["to"])))
+        env = self.handover()["envelope"]
+        self.assertEqual((env["kind"], env["bound"]["admission"], env["bound"]["bound_address"]),
+                         ("bound_reply", "open", TRUSTED))
+
+    def test_a_policy_routing_a_bound_reply_to_the_peer_lane_is_never_sent(self):
+        """Never peer traffic: a policy answering with the peer lane is a
+        transport anomaly, with nothing allocated and nothing placed."""
+        cfg = self.cfg()
+        nid = self.ledger(cfg, counterparty=TRUSTED, admission="open")
+        write_request(cfg, "alice", "00000001", to=[TRUSTED], in_reply_to=nid)
+        self.drain(cfg, cold_policy=lambda c, s, d: outbound.PeerRoute("bob"))
+        r = self.answered(cfg)
+        self.assertEqual((r["outcome"], r["reason_code"]),
+                         ("queued_for_human", "transport_anomaly"))
+        self.nothing_allocated(cfg)
+        self.assertFalse((self.tmp / "instances" / "bob" / "peer").exists())
+
+    def test_a_record_without_a_tree_is_unresolved(self):
+        """Mail placed from the hop leg always records its tree; a record
+        without one is not taken for mail."""
+        cfg = self.cfg()
+        nid = self.ledger(cfg, drop=("tree",))
+        write_request(cfg, "alice", "00000001", to=[CP], in_reply_to=nid)
+        self.drain(cfg)
+        self.assertEqual(self.answered(cfg)["reason_code"], "unresolved_reply")
         self.nothing_allocated(cfg)
 
     def test_decided_before_the_trusted_host_rule(self):
@@ -348,6 +396,15 @@ class PublicationRecheckTests(_Case):
         self.stage(cfg)
         self.drain(self.cfg(top={"fleet_hosts": [T1, "t2.fleet.example"]}))
         self.refused(cfg, "route changed from fleet_host to internet")
+
+    def test_a_trusted_host_counterparty_stays_publishable(self):
+        cfg = self.cfg()
+        nid = self.ledger(cfg, counterparty=TRUSTED)
+        write_request(cfg, "alice", "00000001", to=[TRUSTED], in_reply_to=nid)
+        self.drain(dataclasses.replace(cfg, reload_failed=True))
+        self.assertEqual(self.port.writes, [])
+        self.drain(cfg)
+        self.assertEqual(self.port.writes, ["00000001"])
 
     def test_expiry_passing_after_begin_still_publishes(self):
         cfg = self.cfg()
