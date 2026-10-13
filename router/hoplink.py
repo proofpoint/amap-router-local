@@ -62,11 +62,40 @@ class Refused(Exception):
         self.outcome, self.reason_code, self.detail = outcome, reason_code, detail
 
 
+#: Why `canonical` refuses a value: the reason vocabulary shared with the
+#: hop plugin's own canonical encoder, so both refuse the same inputs for the
+#: same reason (the projection's shared encoding vectors).
+REFUSE_FLOAT = "float_not_allowed"
+REFUSE_NOT_JSON = "not_json"
+REFUSE_SURROGATE = "unpaired_surrogate"
+CANONICAL_REFUSALS = (REFUSE_FLOAT, REFUSE_NOT_JSON, REFUSE_SURROGATE)
+
+
+class CanonicalRefused(ValueError):
+    """`canonical` refused `value`. `.reason` is one of `CANONICAL_REFUSALS`."""
+
+    def __init__(self, reason: str, detail: str):
+        assert reason in CANONICAL_REFUSALS, reason
+        super().__init__(f"{detail} ({reason})")
+        self.reason = reason
+
+
+def _has_surrogate(s: str) -> bool:
+    return any(0xD800 <= ord(c) <= 0xDFFF for c in s)
+
+
 def _check_integers_only(value: Any, where: str = "$") -> None:
-    if isinstance(value, bool) or value is None or isinstance(value, (str, int)):
+    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return
+    if isinstance(value, str):
+        if _has_surrogate(value):
+            raise CanonicalRefused(REFUSE_SURROGATE, f"{where}: an unpaired surrogate")
         return
     if isinstance(value, float):
-        raise ValueError(f"{where}: a non-integer number is not representable")
+        if value != value or value in (float("inf"), float("-inf")):
+            # NaN and the infinities are not JSON numbers at all.
+            raise CanonicalRefused(REFUSE_NOT_JSON, f"{where}: {value!r} is not a JSON number")
+        raise CanonicalRefused(REFUSE_FLOAT, f"{where}: a non-integer number is not representable")
     if isinstance(value, list):
         for i, v in enumerate(value):
             _check_integers_only(v, f"{where}[{i}]")
@@ -74,23 +103,24 @@ def _check_integers_only(value: Any, where: str = "$") -> None:
     if isinstance(value, dict):
         for k, v in value.items():
             if not isinstance(k, str):
-                raise ValueError(f"{where}: a non-string key")
+                raise CanonicalRefused(REFUSE_NOT_JSON, f"{where}: a non-string key")
+            if _has_surrogate(k):
+                raise CanonicalRefused(REFUSE_SURROGATE, f"{where}: an unpaired surrogate in a key")
             _check_integers_only(v, f"{where}.{k}")
         return
-    raise ValueError(f"{where}: a {type(value).__name__} is not JSON")
+    raise CanonicalRefused(REFUSE_NOT_JSON, f"{where}: a {type(value).__name__} is not JSON")
 
 
 def canonical(value: Any) -> bytes:
-    """`value` in the handover's canonical encoding, or `ValueError` for
-    anything that encoding refuses: a non-integer number, a non-string key,
-    a lone surrogate (it cannot be UTF-8)."""
+    """`value` in the handover's canonical encoding, or `CanonicalRefused`
+    (a `ValueError`, `.reason` one of `CANONICAL_REFUSALS`) for anything that
+    encoding refuses: a non-integer number (`float_not_allowed`); NaN, an
+    infinity, a non-string key or a non-JSON type (`not_json`); a lone
+    surrogate in a string or a key (`unpaired_surrogate`)."""
     _check_integers_only(value)
     text = json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
-    try:
-        return text.encode("utf-8")
-    except UnicodeEncodeError as e:
-        raise ValueError(f"not encodable as UTF-8 ({e.reason})") from None
+    return text.encode("utf-8")
 
 
 def address_octets_problem(address: Any) -> Optional[str]:

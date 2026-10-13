@@ -29,6 +29,34 @@ class CanonicalTests(unittest.TestCase):
                     hoplink.canonical(bad)
 
 
+class RefusalReasonTests(unittest.TestCase):
+    """The refusal vocabulary is the hop plugin's, so the shared encoding
+    vectors bind both encoders to the same reason for the same input."""
+
+    def test_each_input_has_its_reason(self):
+        cases = {
+            hoplink.REFUSE_FLOAT: (1.0, 0.5, -0.0, 1e3, {"a": [{"b": 2.5}]}),
+            hoplink.REFUSE_NOT_JSON: (float("nan"), float("inf"), float("-inf"),
+                                      {1: "k"}, (1, 2), {1, 2}, b"bytes"),
+            hoplink.REFUSE_SURROGATE: ("\ud800", {"x": "a\udfffb"}, {"\ud800": 1}),
+        }
+        for reason, values in cases.items():
+            for v in values:
+                with self.subTest(reason=reason, value=repr(v)):
+                    with self.assertRaises(ValueError) as cm:
+                        hoplink.canonical(v)
+                    self.assertIsInstance(cm.exception, hoplink.CanonicalRefused)
+                    self.assertEqual(cm.exception.reason, reason)
+
+    def test_the_edge_bytes(self):
+        self.assertEqual(hoplink.canonical("\x00\x1f\n\t"), b'"\\u0000\\u001f\\n\\t"')
+        self.assertEqual(hoplink.canonical("\u2028"), '"\u2028"'.encode())
+        self.assertEqual(hoplink.canonical({"\U0001F600": 1, "\uffff": 2}),
+                         '{"\uffff":2,"\U0001F600":1}'.encode())
+        self.assertEqual(hoplink.canonical(2 ** 63), b"9223372036854775808")
+        self.assertEqual(hoplink.canonical([True, False, None, {}, []]), b"[true,false,null,{},[]]")
+
+
 class AddressTests(unittest.TestCase):
 
     def test_octet_boundaries(self):

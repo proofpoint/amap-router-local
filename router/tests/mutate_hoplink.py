@@ -28,10 +28,38 @@ WT = "router.tests.test_hoplink_write_table."
 ST = "router.tests.test_hoplink_status."
 SU = "router.tests.test_transport.StartupTests."
 FP = "router.tests.test_hoplink_failure_paths."
+RD = "router.tests.test_hoplink_readers."
 CF, HL, IF, OB, SV, SS = ("router/config.py", "router/hoplink.py", "router/inflight.py",
                           "router/outbound.py", "router/service.py", "router/status.py")
 
 M = [
+ # -- the intake-reader seam ----------------------------------------------------
+ ('D1 no reader cache', HL,
+  '    reader = _READERS.get(key)\n    if reader is not None:\n        return reader\n',
+  '    reader = None\n',
+  [RD + "ConstructionTests.test_settings_are_exactly_the_core_and_the_reader_is_cached"]),
+ # (No mutant for "the class looked up afresh at construction": at that moment
+ # it is the same value capture_verdict_class returns, so the mutant is
+ # equivalent. Capture matters at dispatch, which uses Reader.notice_refused.)
+ ('D3 a refused reader not closed', HL,
+  '    except transport_mod.SeamRefused as e:\n        _close_quietly(port)\n',
+  '    except transport_mod.SeamRefused as e:\n',
+  [RD + "ConstructionTests.test_a_class_that_is_not_disjoint_latches_the_vocabulary_hold_and_closes_it"]),
+ ('D4 a latched reader hold re-attempted', HL,
+  '    if key in _READER_LATCHED:\n        raise _READER_LATCHED[key]\n', '',
+  [RD + "ConstructionTests.test_settings_invalid_latches"]),
+ ('D5 eviction leaves the reader open', HL,
+  '        _close_quietly(_READERS.pop(k).port)\n', '        _READERS.pop(k)\n',
+  [RD + "EvictionTests.test_eviction_closes_and_the_next_call_rebuilds"]),
+ # -- canonical's refusal reasons (shared with the plugin's encoder) ---------
+ ('E1 NaN and the infinities read as a float', HL,
+  "        if value != value or value in (float(\"inf\"), float(\"-inf\")):\n",
+  "        if False:\n",
+  [EN + "RefusalReasonTests.test_each_input_has_its_reason"]),
+ ('E2 a lone surrogate in a key left to the encoder', HL,
+  "            if _has_surrogate(k):\n                raise CanonicalRefused(REFUSE_SURROGATE, f\"{where}: an unpaired surrogate in a key\")\n",
+  "",
+  [EN + "RefusalReasonTests.test_each_input_has_its_reason"]),
  # -- failure paths: holds, cleanup, the pin guard, mail only ----------------
  ('F1 an undecidable frontier or missing field not latched', IF,
   '    except (FrontierUndecidable, HandoverUnavailable) as e:\n        # Decided BEFORE',
@@ -57,9 +85,11 @@ M = [
   [FP + "ConstructionFailureTests.test_a_latched_construction_hold_is_not_reattempted"]),
  ('F6 construction classified without the runtime classes', HL,
   '    kind, detail = transport_mod.classify(e, runtime=tuple(_RUNTIME_CLASSES))\n'
-  '    if kind == "reason" and detail == "settings_invalid":\n',
+  '    if kind == "reason" and detail == "settings_invalid":\n'
+  '        return HopHold(HOLD_SETTINGS_REFUSED,',
   '    kind, detail = transport_mod.classify(e)\n'
-  '    if kind == "reason" and detail == "settings_invalid":\n',
+  '    if kind == "reason" and detail == "settings_invalid":\n'
+  '        return HopHold(HOLD_SETTINGS_REFUSED,',
   [FP + "ConstructionFailureTests.test_a_runtime_class_with_a_colliding_reason_is_never_latched"]),
  ('F7 a latched hand-over hold consumes new requests', OB,
   '    if transport is not None and hoplink.write_hold(cfg, name) is not None:\n',
@@ -136,12 +166,12 @@ M = [
   '    if port is not None:\n        return port\n', '    if False:\n        return port\n',
   [SE + "SenderTests.test_the_pin_then_the_sender_then_admitted_once_per_process"]),
  ('H11 settings_invalid retried', HL,
-  '    if kind == "reason" and detail == "settings_invalid":\n',
-  '    if kind == "reason" and detail == "never":\n',
+  '    if kind == "reason" and detail == "settings_invalid":\n        return HopHold(HOLD_SETTINGS_REFUSED,',
+  '    if kind == "reason" and detail == "never":\n        return HopHold(HOLD_SETTINGS_REFUSED,',
   [SE + "ConstructionTests.test_the_latched_construction_reasons"]),
  ('H12 a bare ValueError read as a settings refusal', HL,
-  '    if kind == "reason" and detail == "settings_invalid":\n',
-  '    if isinstance(e, ValueError):\n',
+  '    if kind == "reason" and detail == "settings_invalid":\n        return HopHold(HOLD_SETTINGS_REFUSED,',
+  '    if isinstance(e, ValueError):\n        return HopHold(HOLD_SETTINGS_REFUSED,',
   [SE + "ConstructionTests.test_a_bare_value_error_is_never_the_settings_hold"]),
  # -- the write_request row ------------------------------------------------
  ('W1 below_frontier retried', HL,
