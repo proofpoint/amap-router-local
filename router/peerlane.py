@@ -59,9 +59,14 @@ logger = logging.getLogger("amap_router_local.peerlane")
 PROBE = b"amap-rl-signing-key-probe/1"
 #: The statement's cap, in bytes (item 5f).
 STATEMENT_MAX_BYTES = 8192
-#: The minted peer id: 16 random bytes as unpadded base64url (22 characters).
-PEER_ID_BYTES = 16
-PEER_ID_RE = re.compile(r"[A-Za-z0-9_-]{22}\Z")
+#: The minted peer id: 17 random bytes as unpadded base64url (23
+#: characters), never starting with `-`. The peer-origin profile requires a
+#: peer id of at least 128 bits under the notice_id charset, whose first
+#: character cannot be `-`; re-drawing on 16 bytes would leave under 128.
+#: Only ISSUED ids (this router's own mints) match: no 22-character issued
+#: id exists anywhere, since no peer signing has ever run live.
+PEER_ID_BYTES = 17
+PEER_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{22}\Z")
 #: The peer ledger's directory under a logical_id's private state.
 PEER_LEDGER_DIR = "peer-ledger"
 #: The peer ledger record's members, exactly: a closed record, keyed by
@@ -384,8 +389,12 @@ def activate(cfg: RouterConfig, plugin: Any, *, now: Any) -> Delegation:
 # ---------------------------------------------------------------------------
 
 def mint_peer_id() -> str:
-    """A fresh peer id: 128 random bits, unpadded base64url."""
-    return base64.urlsafe_b64encode(secrets.token_bytes(PEER_ID_BYTES)).rstrip(b"=").decode()
+    """A fresh peer id: 17 random bytes, unpadded base64url, re-drawn while
+    it starts with `-` (about 135.98 bits)."""
+    while True:
+        peer_id = base64.urlsafe_b64encode(secrets.token_bytes(PEER_ID_BYTES)).rstrip(b"=").decode()
+        if not peer_id.startswith("-"):
+            return peer_id
 
 
 def normalise_body(body_text: str) -> str:
@@ -430,7 +439,7 @@ def build_statement(*, key_id: str, peer_id: str, from_address: str, to_address:
 
 #: Fixed-length stand-ins, the length of a minted id and a `ts`, so a size
 #: computed before minting is the size of the statement minted after.
-SIZE_ID = "A" * 22
+SIZE_ID = "A" * 23
 SIZE_TS = "0000-00-00T00:00:00Z"
 
 

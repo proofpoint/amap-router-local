@@ -1033,7 +1033,7 @@ class ReactivationTests(_Base):
 class StatementFieldsTests(unittest.TestCase):
 
     def test_exposure_and_sender_since_are_mandatory(self):
-        base = dict(key_id=KEY_ID, peer_id="A" * 22, from_address=f"alice@{FD}",
+        base = dict(key_id=KEY_ID, peer_id=peerlane.SIZE_ID, from_address=f"alice@{FD}",
                     to_address=TRUSTED, ts="2026-10-13T12:00:00Z", subject="", body_text="",
                     attachments=[], sender_exposure=STAMP, sender_since=OLD_ENOUGH)
         peerlane.build_statement(**base)
@@ -1041,6 +1041,67 @@ class StatementFieldsTests(unittest.TestCase):
             with self.subTest(missing=missing):
                 with self.assertRaises(peerlane.StatementRefused):
                     peerlane.build_statement(**dict(base, **{missing: None}))
+
+
+class MintTests(unittest.TestCase):
+    """The peer id is at least 128 bits and spelled under the notice_id
+    charset, so it never starts with `-`: 17 random bytes, unpadded
+    base64url (23 characters), re-drawn while the first is `-`."""
+
+    def test_a_leading_dash_is_redrawn(self):
+        dash = b"\xf8" + b"\x00" * 16          # base64url "-" first
+        plain = b"\x00" * 17
+        self.assertTrue(base64.urlsafe_b64encode(dash).decode().startswith("-"))
+        with mock.patch.object(peerlane.secrets, "token_bytes", side_effect=[dash, plain]) as tb:
+            got = peerlane.mint_peer_id()
+        self.assertEqual(got, base64.urlsafe_b64encode(plain).rstrip(b"=").decode())
+        self.assertEqual([c.args for c in tb.call_args_list], [(17,), (17,)])
+        self.assertEqual(len(got), 23)
+
+    def test_every_mint_matches_the_issued_grammar(self):
+        for _ in range(10000):
+            peer_id = peerlane.mint_peer_id()
+            self.assertEqual(len(peer_id), 23)
+            self.assertIsNotNone(peerlane.PEER_ID_RE.fullmatch(peer_id), peer_id)
+            self.assertNotEqual(peer_id[0], "-")
+
+    def test_the_size_stand_in_is_the_length_of_a_mint(self):
+        self.assertEqual(len(peerlane.SIZE_ID), len(peerlane.mint_peer_id()))
+        self.assertIsNotNone(peerlane.PEER_ID_RE.fullmatch(peerlane.SIZE_ID))
+
+
+class IssuedIdGrammarTests(_Send):
+    """`write_issued` and `read_ledger` accept exactly this router's own
+    mints: 23 characters, never a leading `-`."""
+
+    def record(self, peer_id):
+        return peerlane.issued_record(peer_id=peer_id, logical_id="alice",
+                                      local_address=f"alice@{FD}", remote=TRUSTED,
+                                      generation="0" * 32, expires_at="2026-10-20T00:00:00Z")
+
+    def test_a_real_mint_is_written_and_read_back(self):
+        cfg = self.cfg()
+        peer_id = peerlane.mint_peer_id()
+        try:
+            peerlane.write_issued(cfg, self.record(peer_id))
+        except ValueError as e:
+            self.fail(f"a real mint was refused: {e}")
+        self.assertEqual(peerlane.read_ledger(cfg, "alice", peer_id)["id"], peer_id)
+
+    def test_anything_else_is_refused_and_never_read(self):
+        cfg = self.cfg()
+        good = peerlane.mint_peer_id()
+        for why, peer_id in (("22 characters", good[:22]), ("a leading dash", "-" + good[1:]),
+                             ("24 characters", good + "A"), ("a trailing newline", good + "\n")):
+            with self.subTest(why=why):
+                with self.assertRaises(ValueError):
+                    peerlane.write_issued(cfg, self.record(peer_id))
+                # A well-formed record planted at that id's path: only the
+                # grammar can make read_ledger refuse it.
+                path = peerlane.ledger_path(cfg, "alice", peer_id)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(self.record(peer_id)), encoding="utf-8")
+                self.assertIsNone(peerlane.read_ledger(cfg, "alice", peer_id))
 
 
 class LedgerPathTests(_Send):
