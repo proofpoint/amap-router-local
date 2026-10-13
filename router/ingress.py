@@ -270,6 +270,199 @@ def facts_version(facts: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
+# The facts, re-checked as hostile input: this router's ADDITIONAL strict
+# check, verdict-identical with the plugin's reader over its corpus (design
+# delta v3.4 §4, from the codec owner's answers; member names and grammars
+# only). The reader's CONTEXT layer (hop_contract in the versions read, each
+# transaction's logical_id the tree's) is consumed from its verdict, never
+# repeated here. Every failure is `FactsInvalid`, so notice_invalid.
+# ---------------------------------------------------------------------------
+
+_F_NOTICE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+_F_LINK = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+_F_RULE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}\Z")
+_F_HEX32 = re.compile(r"[0-9a-f]{32}\Z")
+_F_N = re.compile(r"[0-9]{8,18}\Z")
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]"
+_DOT_ATOM = rf"{_ATEXT}+(?:\.{_ATEXT}+)*"
+_F_MSG_ID = re.compile(rf"<{_DOT_ATOM}@{_DOT_ATOM}>\Z")
+_ADDR_SPEC = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[A-Za-z0-9.-]+"
+_F_ADDR = re.compile(_ADDR_SPEC + r"\Z")
+#: The FINAL `<addr-spec>` group at the very end: the greedy prefix makes it
+#: the last one, and the addr-spec alphabet has no angle bracket.
+_F_FINAL_ADDR = re.compile(rf"(?s).*<({_ADDR_SPEC})>\Z")
+_F_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+_F_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+HOP_CONTRACT_MAX = 2 ** 31 - 1
+_STATUS_DETAIL = {0: (0,), 1: (0, 1, 2, 3, 4, 6, 7, 8), 2: range(5), 3: range(6),
+                  4: range(8), 5: range(6), 6: range(6), 7: range(8)}
+#: The enumerated delivery-status codes, each "X.Y.Z" with X in {4, 5}.
+STATUSES = frozenset(f"{x}.{y}.{z}" for x in (4, 5) for y, zs in _STATUS_DETAIL.items()
+                     for z in zs)
+_V1_REQUIRED = {"hop_contract", "notice_id", "notice_class", "ingress", "admission",
+                "admission_link", "admission_rule"}
+_V1_OPTIONAL = {"origin_host", "in_reply_to", "failure"}
+
+
+def _bad(why: str) -> FactsInvalid:
+    return FactsInvalid(why)
+
+
+def _grammar(value: Any, rx: "re.Pattern[str]", what: str, *, maxlen: int = 0) -> None:
+    if not (isinstance(value, str) and rx.fullmatch(value)
+            and (not maxlen or len(value) <= maxlen)):
+        raise _bad(f"{what} does not match its grammar")
+
+
+def _origin_host(value: Any) -> None:
+    if not (isinstance(value, str) and len(value) <= 253):
+        raise _bad("origin_host is not a host name of at most 253 characters")
+    labels = value.split(".")
+    if len(labels) < 2 or not all(_F_LABEL.fullmatch(lab) for lab in labels):
+        raise _bad("origin_host is not lowercase LDH with at least two labels")
+    if value.endswith(".hosts.internal"):
+        raise _bad("origin_host ends in .hosts.internal")
+
+
+def _closed(doc: Any, members: set, what: str) -> Dict[str, Any]:
+    if not isinstance(doc, dict) or set(doc) != members:
+        raise _bad(f"{what} does not have exactly the members {sorted(members)}")
+    return doc
+
+
+def _transaction(t: Any, what: str) -> None:
+    _closed(t, {"link", "logical_id", "generation", "n"}, what)
+    _grammar(t["link"], _F_LINK, f"{what}.link")
+    _grammar(t["logical_id"], _F_HEX32, f"{what}.logical_id")
+    _grammar(t["generation"], _F_HEX32, f"{what}.generation")
+    _grammar(t["n"], _F_N, f"{what}.n")
+
+
+def addr_of(from_value: Any) -> Optional[str]:
+    """P4's addr(from): `from` itself if it FULLY matches the bare addr-spec,
+    else the final `<addr-spec>` group anchored at the very end, else None.
+    No trimming or unfolding."""
+    if not isinstance(from_value, str):
+        return None
+    if _F_ADDR.fullmatch(from_value):
+        return from_value
+    m = _F_FINAL_ADDR.fullmatch(from_value)
+    return m.group(1) if m else None
+
+
+def domain_of(addr: Optional[str]) -> Optional[str]:
+    """P4's domain: ASCII-lowercased after the LAST "@"; no IDNA."""
+    if addr is None or "@" not in addr:
+        return None
+    dom = addr.rsplit("@", 1)[1]
+    return dom.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                                       "abcdefghijklmnopqrstuvwxyz"))
+
+
+def check_facts(parsed: Dict[str, Any]) -> int:
+    """The facts of a parsed bundle, checked whole: the version selector
+    (`facts_version`), canonical bytes, closed members at every level, the
+    grammars and the codec's conditional rules, then the pair rules P1-P4
+    against the notice and, at version 2, P5 against the notice and the
+    spool. Returns the version; raises `FactsInvalid`."""
+    facts, raw = parsed["facts"], parsed["raw"]["facts"]
+    version = facts_version(facts)
+    try:
+        if canonical(facts) != raw:
+            raise _bad("the facts bytes are not canonical")
+    except ValueError:
+        raise _bad("the facts are not canonically encodable") from None
+    allowed = _V1_REQUIRED | _V1_OPTIONAL | ({"facts_version", "attachments"}
+                                            if version == 2 else set())
+    required = _V1_REQUIRED | ({"facts_version", "attachments"} if version == 2 else set())
+    if not (required <= set(facts) <= allowed):
+        raise _bad("the facts do not have exactly their version's members")
+    hc = facts["hop_contract"]
+    if not (type(hc) is int and 1 <= hc <= HOP_CONTRACT_MAX):
+        raise _bad("hop_contract is not an integer from 1 to 2^31-1")
+    _grammar(facts["notice_id"], _F_NOTICE_ID, "notice_id")
+    if facts["notice_class"] not in NOTICE_CLASSES:
+        raise _bad("notice_class is outside its enum")
+    if facts["ingress"] not in INGRESSES:
+        raise _bad("ingress is outside its enum")
+    if facts["admission"] not in ADMISSIONS:
+        raise _bad("admission is outside its enum")
+    _grammar(facts["admission_link"], _F_LINK, "admission_link")
+    _grammar(facts["admission_rule"], _F_RULE, "admission_rule")
+    fleet = facts["admission"] == "fleet_hosts"
+    if ("origin_host" in facts) != fleet:
+        raise _bad("origin_host is present iff admission is fleet_hosts")
+    if fleet:
+        _origin_host(facts["origin_host"])
+    mail = facts["notice_class"] == "mail"
+    if "in_reply_to" in facts:
+        if not mail:
+            raise _bad("in_reply_to is allowed only on mail")
+        irt = _closed(facts["in_reply_to"], {"message_id", "transaction"}, "in_reply_to")
+        _grammar(irt["message_id"], _F_MSG_ID, "in_reply_to.message_id", maxlen=250)
+        _transaction(irt["transaction"], "in_reply_to.transaction")
+    if ("failure" in facts) == mail:
+        raise _bad("failure is required iff notice_class is failure_notice")
+    if not mail:
+        fl = _closed(facts["failure"], {"transaction", "correlated_by", "reports"}, "failure")
+        _transaction(fl["transaction"], "failure.transaction")
+        if fl["correlated_by"] not in ("envid", "message_id"):
+            raise _bad("failure.correlated_by is outside its enum")
+        reports = fl["reports"]
+        if not (isinstance(reports, list) and 1 <= len(reports) <= 100):
+            raise _bad("failure.reports is not 1 to 100 reports")
+        seen = set()
+        for k, rpt in enumerate(reports):
+            _closed(rpt, {"recipient", "action", "status"}, f"failure.reports[{k}]")
+            _grammar(rpt["recipient"], _F_ADDR, f"failure.reports[{k}].recipient", maxlen=254)
+            if rpt["recipient"] in seen:
+                raise _bad("failure.reports has a duplicate recipient")
+            seen.add(rpt["recipient"])
+            if rpt["action"] not in ("failed", "delayed"):
+                raise _bad(f"failure.reports[{k}].action is outside its enum")
+            if rpt["status"] not in STATUSES:
+                raise _bad(f"failure.reports[{k}].status is outside its enum")
+            if rpt["status"][0] != {"failed": "5", "delayed": "4"}[rpt["action"]]:
+                raise _bad(f"failure.reports[{k}]: the status class does not fit the action")
+    # -- the pair rules ---------------------------------------------------
+    notice = parsed["notice"]
+    message = notice.get("message") if isinstance(notice, dict) else None
+    if not isinstance(message, dict):
+        raise _bad("the notice has no message")
+    if facts["notice_id"] != notice.get("notice_id"):
+        raise _bad("P1: the facts' notice_id is not the notice's")
+    nhc = notice.get("hop_contract")
+    if not (type(nhc) is int and nhc == hc):
+        raise _bad("P2: the notice carries no hop_contract equal to the facts'")
+    want = "fleet-remote" if fleet else "unverified"
+    if message.get("provenance") != want:
+        raise _bad(f"P3: the notice's provenance is not {want!r}")
+    if fleet and domain_of(addr_of(message.get("from"))) != facts["origin_host"]:
+        raise _bad("P4: the From domain is undefined or is not origin_host")
+    if version == 2:
+        rows = facts["attachments"]
+        if not isinstance(rows, list):
+            raise _bad("attachments is not a list")
+        for k, row in enumerate(rows):
+            _closed(row, {"source_sha256", "size_bytes"}, f"attachments[{k}]")
+            _grammar(row["source_sha256"], _F_SHA256, f"attachments[{k}].source_sha256")
+            if not (type(row["size_bytes"]) is int and row["size_bytes"] >= 0):
+                raise _bad(f"attachments[{k}].size_bytes is not a non-negative integer")
+        descs = message.get("attachments", [])
+        if len(rows) != len(descs):
+            raise _bad("P5: the facts' row count is not the notice's descriptor count")
+        for k, (row, d) in enumerate(zip(rows, descs)):
+            if row["size_bytes"] != d.get("size_bytes"):
+                raise _bad(f"P5: row {k}'s size_bytes is not descriptor {k}'s")
+            if "sha256" in d and d["sha256"] != row["source_sha256"]:
+                raise _bad(f"P5c: descriptor {k}'s sha256 is not row {k}'s source_sha256")
+        spool_atts = parsed["spool"].get("attachments", [])
+        if len(spool_atts) != len(rows):
+            raise _bad("P5: the spool's attachment count is not the row count")
+    return version
+
+
+# ---------------------------------------------------------------------------
 # The notice bundle, validated as HOSTILE input before anything is kept.
 # ---------------------------------------------------------------------------
 

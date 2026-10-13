@@ -8,9 +8,16 @@ import json
 import unittest
 
 from router import ingress, transport
+from router.hoplink import canonical
 
 NID = "1700000000-42"
 CAP = 1024
+#: Valid version-2 facts for the notice `make` builds: untrusted fleet mail
+#: from fleet-b.example (the From's domain, P4), over link-a.
+FACTS = {"hop_contract": 1, "notice_id": NID, "notice_class": "mail", "ingress": "hub",
+         "admission": "fleet_hosts", "admission_link": "link-a",
+         "admission_rule": "fleet-hosts.v1", "origin_host": "fleet-b.example",
+         "facts_version": 2, "attachments": []}
 
 
 def b64(raw: bytes) -> str:
@@ -18,7 +25,7 @@ def b64(raw: bytes) -> str:
 
 
 def make(*, blobs=(b"hello",), clean=True, notice_extra=None, drop_message_attachments=False,
-         nid=NID):
+         nid=NID, facts_extra=None):
     # `clean` is one flag for every part, or one per part.
     cleans = list(clean) if isinstance(clean, (list, tuple)) else [clean] * len(blobs)
     descs = []
@@ -29,20 +36,24 @@ def make(*, blobs=(b"hello",), clean=True, notice_extra=None, drop_message_attac
             d["sha256"] = hashlib.sha256(blob).hexdigest()
             d["content_ref"] = f"{nid}.attachments/{k}"
         descs.append(d)
-    message = {"id": "42", "from": "a@x.example", "subject": "s", "preview": "b",
-               "mailbox": "inbox", "provenance": "fleet-remote"}
+    message = {"id": "42", "from": "Someone <a@fleet-b.example>", "subject": "s",
+               "preview": "b", "mailbox": "inbox", "provenance": "fleet-remote"}
     if not drop_message_attachments:
         message["attachments"] = descs
     notice = {"contract_version": "2", "kind": "deliver", "notice_id": nid,
-              "ts": "2026-10-13T00:00:00Z", "message": message}
+              "ts": "2026-10-13T00:00:00Z", "hop_contract": 1, "message": message}
     if notice_extra:
         notice.update(notice_extra)
+    rows = [{"source_sha256": hashlib.sha256(b).hexdigest(), "size_bytes": len(b)}
+            for b in blobs] if not drop_message_attachments else []
+    the_facts = dict(FACTS, notice_id=nid, attachments=rows)
+    if facts_extra is not None:
+        the_facts = facts_extra(the_facts)
     bundle = {"schema": transport.NOTICE_BUNDLE_SCHEMA,
               "notice": b64(json.dumps(notice).encode()),
               "spool": b64(json.dumps({"contract_version": "2", "notice_id": nid,
                                        "body_text": "b", "attachments": descs}).encode()),
-              "hop": b64(json.dumps({"notice_id": nid, "facts_version": 2,
-                                     "attachments": []}).encode()),
+              "hop": b64(canonical(the_facts)),
               "attachments": [b64(b) if c else None for b, c in zip(blobs, cleans)]}
     return bundle
 
