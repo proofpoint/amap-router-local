@@ -33,6 +33,7 @@ CF, HL, IF, OB, SV, SS = ("router/config.py", "router/hoplink.py", "router/infli
                           "router/outbound.py", "router/service.py", "router/status.py")
 IG = "router/ingress.py"
 FV = "router.tests.test_ingress_facts_version.FactsVersionTests."
+BT = "router.tests.test_ingress_bundle.BundleTests."
 
 M = [
  # -- the facts version guard (driven directly at the guard unit) -------------
@@ -48,6 +49,59 @@ M = [
  ('G4 version 2 without attachments accepted', IG,
   '        if "attachments" not in facts:\n            raise FactsInvalid("version-2 facts require an attachments member")\n', '',
   [FV + "test_version_2_without_attachments_is_refused"]),
+ # -- the notice bundle, parsed as hostile input --------------------------------
+ ('B1 an older bundle schema accepted', IG,
+  '    if not transport_mod.is_current_bundle_schema(bundle.get("schema")):\n', '    if False:\n',
+  [BT + "test_an_older_bundle_schema"]),
+ ('B2 members not closed', IG,
+  '    if tuple(sorted(bundle)) != BUNDLE_MEMBERS:\n', '    if not set(BUNDLE_MEMBERS) <= set(bundle):\n',
+  [BT + "test_members_are_exactly_five"]),
+ ('B3 non-canonical base64 accepted', IG,
+  '    if _base64.b64encode(raw).decode("ascii") != text:\n', '    if False:\n',
+  [BT + "test_non_canonical_base64_is_refused"]),
+ ('B4 the decoded cap unchecked', IG,
+  '    if len(raw) > cap:\n', '    if False:\n',
+  [BT + "test_base64_is_standard_canonical_and_capped",
+   BT + "test_the_document_cap_is_exact"]),
+ # (No mutant for the encoded-length precheck alone: it only bounds the work
+ # done before the exact decoded-length check, which refuses the same inputs.)
+ ('B5 the facts capped at the document cap', IG,
+  '_b64(bundle["hop"], "hop", transport_mod.HOP_FACTS_MAX)', '_b64(bundle["hop"], "hop", DOC_CAP)',
+  [BT + "test_the_facts_cap"]),
+ ('B6 notice_id not compared with the entry', IG,
+  '    if notice.get("notice_id") != entry_id:\n', '    if False:\n',
+  [BT + "test_the_notice_id_must_be_the_listed_entry"]),
+ ('B7 a non-object message read as no attachments', IG,
+  'message.get("attachments", []) if isinstance(message, dict) else None',
+  'message.get("attachments", []) if isinstance(message, dict) else []',
+  [BT + "test_a_message_or_descriptor_that_is_not_an_object"]),
+ ('B8 an absent member not read as zero attachments', IG,
+  'message.get("attachments", []) if', 'message.get("attachments") if',
+  [BT + "test_zero_attachments_with_the_member_absent"]),
+ ('B9 attachments not positional', IG,
+  '    if not isinstance(atts, list) or len(atts) != len(descs):\n', '    if not isinstance(atts, list):\n',
+  [BT + "test_attachments_are_positional"]),
+ ('B10 bytes accepted without a content_ref', IG,
+  '            if a is not None:\n                raise _invalid(f"attachment {k} present without a content_ref")\n', '',
+  [BT + "test_bytes_without_a_ref_and_a_ref_without_bytes"]),
+ ('B11 content_ref position unchecked', IG,
+  'if ref != f"{entry_id}.attachments/{k}" or d.get', 'if not ref.startswith(f"{entry_id}.attachments/") or d.get',
+  [BT + "test_content_ref_must_name_its_position_on_a_clean_part"]),
+ ('B12 content_ref on a non-clean part accepted', IG,
+  ' or d.get("disposition") != "clean":\n', ':\n',
+  [BT + "test_content_ref_must_name_its_position_on_a_clean_part"]),
+ # (No mutant for "a ref without bytes" alone: `_b64` refuses a non-string,
+ # None included, so removing the explicit check changes only the message.)
+ ('B14 size unchecked', IG,
+  '        if (d.get("size_bytes") != len(blob)\n                or ', '        if (',
+  [BT + "test_size_and_digest_must_match_the_descriptor"]),
+ ('B15 sha256 unchecked', IG,
+  '\n                or d.get("sha256") != hashlib.sha256(blob).hexdigest()):', '):',
+  [BT + "test_size_and_digest_must_match_the_descriptor"]),
+ ('B16 a non-object descriptor read as empty', IG,
+  '        if not isinstance(d, dict):\n            raise _invalid(f"descriptor {k} is not an object")\n',
+  '        if not isinstance(d, dict):\n            d = {}\n',
+  [BT + "test_a_message_or_descriptor_that_is_not_an_object"]),
  # -- the intake-reader seam ----------------------------------------------------
  ('D1 no reader cache', HL,
   '    reader = _READERS.get(key)\n    if reader is not None:\n        return reader\n',

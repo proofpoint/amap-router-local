@@ -31,7 +31,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from . import generations as generations_mod
 from .hoplink import canonical
@@ -255,3 +255,120 @@ def facts_version(facts: Any) -> int:
             raise FactsInvalid("version-2 facts require an attachments member")
         return 2
     raise FactsInvalid(f"facts_version {v!r} is not a version this router reads")
+
+
+# ---------------------------------------------------------------------------
+# The notice bundle, validated as HOSTILE input before anything is kept.
+# ---------------------------------------------------------------------------
+
+import base64 as _base64  # noqa: E402
+import binascii as _binascii  # noqa: E402
+
+from . import transport as transport_mod  # noqa: E402
+
+#: The decoded cap on the notice and on the spool document, each.
+DOC_CAP = 1 << 20
+
+BUNDLE_MEMBERS = ("attachments", "hop", "notice", "schema", "spool")
+
+
+class BundleRefused(Exception):
+    """The bundle is not one this router keeps. `.reason` names why:
+    `bundle_schema` (not the current bundle version) or `bundle_invalid`
+    (anything else about its shape, encoding, caps or digests)."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+
+
+def _invalid(detail: str) -> BundleRefused:
+    return BundleRefused("bundle_invalid", detail)
+
+
+def _b64(text: Any, what: str, cap: int) -> bytes:
+    """Standard base64, no newlines, canonical (it re-encodes to itself), and
+    at most `cap` bytes once decoded."""
+    if not isinstance(text, str):
+        raise _invalid(f"{what}: not a base64 string")
+    if len(text) > 4 * ((cap + 2) // 3):
+        raise _invalid(f"{what}: over its {cap}-byte cap")
+    try:
+        raw = _base64.b64decode(text.encode("ascii"), validate=True)
+    except (_binascii.Error, UnicodeEncodeError):
+        raise _invalid(f"{what}: not standard base64") from None
+    if _base64.b64encode(raw).decode("ascii") != text:
+        raise _invalid(f"{what}: not canonical base64")
+    if len(raw) > cap:
+        raise _invalid(f"{what}: {len(raw)} bytes, over its {cap}-byte cap")
+    return raw
+
+
+def _json_doc(raw: bytes, what: str) -> Dict[str, Any]:
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise _invalid(f"{what}: not a JSON document") from None
+    if not isinstance(doc, dict):
+        raise _invalid(f"{what}: not a JSON object")
+    return doc
+
+
+def parse_bundle(raw: bytes, entry_id: str, *, attachment_cap: int) -> Dict[str, Any]:
+    """The bundle `read_entry` returned for notice `entry_id`, checked as
+    HOSTILE input: exactly the five members; the current schema; each part
+    canonical standard base64 within its cap (the notice and the spool
+    `DOC_CAP`, the facts `transport.HOP_FACTS_MAX`, each attachment
+    `attachment_cap`); the notice's `notice_id` equal to `entry_id`; and the
+    attachments POSITIONAL, entry k present iff descriptor k carries
+    `content_ref == "<notice_id>.attachments/<k>"`, its bytes matching that
+    descriptor's `size_bytes` and `sha256`. Returns the decoded parts and the
+    raw bytes of each (what a snapshot keeps). Raises `BundleRefused`."""
+    try:
+        bundle = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, AttributeError):
+        raise _invalid("the bundle is not a JSON document") from None
+    if not isinstance(bundle, dict):
+        raise _invalid("the bundle is not a JSON object")
+    if not transport_mod.is_current_bundle_schema(bundle.get("schema")):
+        raise BundleRefused("bundle_schema", f"schema {bundle.get('schema')!r}")
+    if tuple(sorted(bundle)) != BUNDLE_MEMBERS:
+        raise _invalid(f"members {sorted(bundle)}, not exactly {list(BUNDLE_MEMBERS)}")
+    notice_raw = _b64(bundle["notice"], "notice", DOC_CAP)
+    spool_raw = _b64(bundle["spool"], "spool", DOC_CAP)
+    facts_raw = _b64(bundle["hop"], "hop", transport_mod.HOP_FACTS_MAX)
+    notice = _json_doc(notice_raw, "notice")
+    spool = _json_doc(spool_raw, "spool")
+    facts = _json_doc(facts_raw, "hop facts")
+    if notice.get("notice_id") != entry_id:
+        raise BundleRefused("entry_id_mismatch",
+                            f"the notice's notice_id is not the listed entry {entry_id!r}")
+    message = notice.get("message")
+    descs = message.get("attachments", []) if isinstance(message, dict) else None
+    if not isinstance(descs, list):
+        raise _invalid("message.attachments is not a list")
+    atts = bundle["attachments"]
+    if not isinstance(atts, list) or len(atts) != len(descs):
+        raise _invalid("attachments are not positional with message.attachments")
+    blobs: List[Optional[bytes]] = []
+    for k, (d, a) in enumerate(zip(descs, atts)):
+        if not isinstance(d, dict):
+            raise _invalid(f"descriptor {k} is not an object")
+        ref = d.get("content_ref")
+        if ref is None:
+            if a is not None:
+                raise _invalid(f"attachment {k} present without a content_ref")
+            blobs.append(None)
+            continue
+        if ref != f"{entry_id}.attachments/{k}" or d.get("disposition") != "clean":
+            raise _invalid(f"descriptor {k}: content_ref {ref!r} on a non-clean or misnamed part")
+        if a is None:
+            raise _invalid(f"attachment {k} absent although its descriptor carries content_ref")
+        blob = _b64(a, f"attachment {k}", attachment_cap)
+        if (d.get("size_bytes") != len(blob)
+                or d.get("sha256") != hashlib.sha256(blob).hexdigest()):
+            raise _invalid(f"attachment {k}: size or sha256 differs from its descriptor")
+        blobs.append(blob)
+    return {"notice": notice, "spool": spool, "facts": facts,
+            "raw": {"notice": notice_raw, "spool": spool_raw, "facts": facts_raw},
+            "attachments": blobs}
