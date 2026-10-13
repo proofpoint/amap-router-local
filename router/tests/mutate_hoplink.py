@@ -209,6 +209,11 @@ M = [
   '            os.fchmod(fd, 0o600)\n            view = memoryview(fresh)\n',
   '            os.fchmod(fd, 0o644)\n            view = memoryview(fresh)\n',
   [QW + "test_the_written_item_is_in_the_frozen_format_and_private"]),
+ ('Q6 notice_invalid dropped from the cause vocabulary', "router/quarantine.py",
+  'CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND, CAUSE_NOTICE_INVALID)',
+  'CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND)',
+  [QW + "test_a_first_sight_notice_invalid_item_is_in_the_frozen_format",
+   "router.tests.test_quarantine_cli.FormatTests.test_the_vocabulary_is_closed"]),
  # (No mutant for the explicit cause check: `check_item` refuses the same
  # value before anything is written, so removing it changes only the message.
  # None for the temporary file's directory either: it matters only after a

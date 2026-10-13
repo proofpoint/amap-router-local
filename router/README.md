@@ -1412,8 +1412,10 @@ holds open.
 
 Cross-host inbound that is not placed is held in the generation it arrived
 for, at `state_dir/<logical_id>/gen-<g>/ingress-quarantine/<id>.json`. This
-router FREEZES the item format and inspects it read-only; the writer and
-the expiry sweep are a later step's, which must write exactly this format.
+router FREEZES the item format and inspects it read-only (`quarantine`); the
+writer is `ingress.write_quarantine_item`, which checks each item against
+those rules before writing it, one item per journal key, create-if-absent.
+The expiry sweep is still a later step's.
 
 An item has exactly `schema` (`amap-router-local.ingress-quarantine/1`),
 `id` (32 hex, the filename stem), `generation` (32 hex, the directory's),

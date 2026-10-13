@@ -108,6 +108,18 @@ class WriterTests(unittest.TestCase):
                                           "policy", digests=DIGESTS, now=TS)
         self.assertFalse(self.qdir.exists() and os.listdir(self.qdir))
 
+    def test_a_first_sight_notice_invalid_item_is_in_the_frozen_format(self):
+        # E17: the cause is in the vocabulary, and the evidence carries the
+        # refusal's reason and nothing read from the refused bytes.
+        self.assertEqual(self.write(cause=quarantine.CAUSE_NOTICE_INVALID, digests=None,
+                                    extra_evidence={"refusal": "notice_invalid"}), "created")
+        doc = json.loads(self.path.read_bytes())
+        quarantine.check_item(doc, item_id=self.path.stem, generation=GEN,
+                              now=quarantine._now(None))
+        self.assertEqual(doc["causes"], ["notice_invalid"])
+        self.assertEqual(sorted(doc["evidence"]),
+                         ["entry_id", "journal_key", "kind", "link", "refusal"])
+
     def test_a_long_attachment_list_keeps_count_and_aggregate(self):
         many = dict(DIGESTS, attachments=["f" * 64] * 20)
         self.write(digests=many)
