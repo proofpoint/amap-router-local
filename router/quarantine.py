@@ -99,8 +99,9 @@ SOURCES = (SOURCE_INGRESS, SOURCE_CONTROL)
 #: This router's own cause for cold trusted-host traffic. The profile's §5
 #: causes are added beside it once published (module docstring).
 CAUSE_COLD_FLEET_MAIL = "cold_fleet_mail"
-#: An entry that arrived for a fenced or retired generation (the ingress
-#: journal's late-inbound rule): held in that generation, never placed.
+#: Contract amendment E16: an inbound entry attributed to a generation that is
+#: no longer current when this router FIRST observes it (its own observation,
+#: never the writer's timing) is quarantined to that generation, never placed.
 CAUSE_LATE_INBOUND = "late_inbound"
 CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND)
 
