@@ -2105,6 +2105,49 @@ GONE = object()
 _CURSORS: Dict[tuple, Optional[str]] = {}
 HELD_LISTING_TOO_LARGE = "hop_listing_too_large"
 
+# THE LISTING PROXY (RL-SEND v3.9 item 2 and v3.10, fixed text): a status
+# WARN, labelled a proxy, CUMULATIVE over one complete cursor traversal per
+# reader. Each page adds its entry count; on the page that completes the
+# traversal (`truncated` False) a total at or above a quarter of
+# `LIST_SCAN_MAX` sets (or keeps) `listing_entries_high` with that count,
+# and anything less clears it; the count then restarts. It restarts WITHOUT
+# evaluating when the traversal is restarted or invalidated (a new reader
+# object, a `ListingTooLarge` hold, a process restart: it lives in memory).
+# A truncated page alone never sets or clears it. The ListingTooLarge hold
+# itself is exact and unaffected.
+LISTING_PROXY_THRESHOLD = transport_mod.LIST_SCAN_MAX // 4
+LISTING_PROXY_LABEL = ("proxy: committed entries, not directory names; junk and per-notice "
+                       "extra names are not counted")
+#: key -> entries counted so far in the current traversal.
+_CYCLE: Dict[tuple, int] = {}
+#: key -> the count of the last complete traversal at or above the threshold.
+LISTING_ENTRIES_HIGH: Dict[tuple, int] = {}
+#: key -> the id of the reader port the cursor belongs to.
+_CURSOR_PORT: Dict[tuple, int] = {}
+
+
+def listing_proxy(key: tuple, entries: int, truncated: bool) -> Optional[int]:
+    """Fold one page into the traversal's count. Returns the WARN's count
+    when a completing page sets or keeps it, else None."""
+    threshold = LISTING_PROXY_THRESHOLD
+    _CYCLE[key] = _CYCLE.get(key, 0) + entries
+    if truncated:
+        return None
+    total, _CYCLE[key] = _CYCLE[key], 0
+    if total >= threshold:
+        LISTING_ENTRIES_HIGH[key] = total
+        return total
+    LISTING_ENTRIES_HIGH.pop(key, None)
+    return None
+
+
+def reset_traversal(key: tuple) -> None:
+    """The traversal restarted or became invalid: forget the cursor and the
+    count without evaluating (the WARN, if set, stands until a complete
+    traversal clears it)."""
+    _CURSORS.pop(key, None)
+    _CYCLE.pop(key, None)
+
 
 #: (state_dir, logical_id, gen) -> why inbound is latched off for the process.
 _LINK_LATCHED: Dict[tuple, str] = {}
@@ -2123,15 +2166,23 @@ def pump_generation(pump: Pump, *, listing_too_large: Any = (),
     pump.now = now or _utcnow()
     pump.recover()
     key = (str(pump.state_dir), pump.logical_id, pump.gen)
+    if _CURSOR_PORT.get(key) != id(pump.reader.port):
+        reset_traversal(key)         # a new reader object: the cursor is not its
+        _CURSOR_PORT[key] = id(pump.reader.port)
     try:
         ids, truncated = pump.reader.port.list_entries("notice", limit=limit,
                                                          after=_CURSORS.get(key))
     except listing_too_large:
+        reset_traversal(key)
         pump.count(HELD_LISTING_TOO_LARGE)
         logger.error("ingress %s gen %s: listing too large; held this pump",
                      pump.logical_id, pump.gen)
         return pump.counts
     _CURSORS[key] = ids[-1] if (truncated and ids) else None
+    high = listing_proxy(key, len(ids), truncated)
+    if high is not None:
+        logger.warning("ingress %s gen %s: listing_entries_high %d (%s)",
+                       pump.logical_id, pump.gen, high, LISTING_PROXY_LABEL)
     for entry_id in ids:
         try:
             what = pump.dispatch(entry_id)
@@ -2342,7 +2393,10 @@ def status_doc(cfg: Any, last_pump: Optional[Dict[str, Dict[str, int]]] = None
             latched = _LINK_LATCHED.get((str(state_dir), lid, gen))
             if latched:
                 entry["inbound_latched"] = latched
+            high = LISTING_ENTRIES_HIGH.get((str(state_dir), lid, gen))
+            if high is not None:
+                entry["listing_entries_high"] = {"count": high, "label": LISTING_PROXY_LABEL}
             if any(entry[k] for k in ("states", "quarantine", "snapshots", "damaged")) \
-                    or entry["link_pinned"] or latched:
+                    or entry["link_pinned"] or latched or high is not None:
                 out["generations"][f"{lid}/{gen}"] = entry
     return out

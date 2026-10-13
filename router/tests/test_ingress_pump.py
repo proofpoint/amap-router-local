@@ -211,6 +211,35 @@ class DispatchTests(_Pump):
                 self.assertEqual(self.state(E1), (ingress.HELD, reason))
                 self.assertEqual(self.notices(), [])
 
+    def test_the_listing_proxy_spans_pumps_and_a_too_large_hold_restarts_it(self):
+        from unittest import mock
+        self.addCleanup(ingress.LISTING_ENTRIES_HIGH.clear)
+        self.addCleanup(ingress._CYCLE.clear)
+        for e in (E1, E2, E3):
+            self.port.entries[e] = "notice_incomplete"
+        key = (str(self.state_dir), self.lid, self.gen)
+        with mock.patch.object(ingress, "LISTING_PROXY_THRESHOLD", 3):
+            self.pump(limit=2)                        # 2, truncated
+            self.assertNotIn(key, ingress.LISTING_ENTRIES_HIGH)
+            self.pump(limit=2)                        # +1, completes: 3
+            self.assertEqual(ingress.LISTING_ENTRIES_HIGH[key], 3)
+            doc = ingress.status_doc(self.keyed)
+            self.assertEqual(doc["generations"][f"{self.lid}/{self.gen}"]
+                             ["listing_entries_high"]["count"], 3)
+        ingress.LISTING_ENTRIES_HIGH.clear()
+        with mock.patch.object(ingress, "LISTING_PROXY_THRESHOLD", 4):
+            self.pump(limit=2)                        # 2, truncated
+            self.port.too_large = True
+            self.pump(limit=2)                        # the hold: count restarts
+            self.port.too_large = False
+            self.port.reads.clear()
+            self.pump(limit=2)                        # 2, truncated
+            self.assertEqual(self.port.reads, [E1, E2],
+                             "the traversal resumed instead of restarting after the hold")
+            self.pump(limit=2)                        # +1, completes: 3 < 4
+            self.assertNotIn(key, ingress.LISTING_ENTRIES_HIGH,
+                             "pages before the hold were counted")
+
     def test_a_listing_too_large_holds_and_reads_nothing(self):
         self.port.entries[E1] = entry(E1)
         self.port.too_large = True
