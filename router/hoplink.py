@@ -449,14 +449,109 @@ def _construction_hold(e: BaseException) -> HopHold:
 
 
 def forget_senders() -> None:
-    """Drop the cache, closing each sender (tests, and a process ending)."""
-    for port in list(_SENDERS.values()):
+    """Drop the caches, closing each sender and reader (tests, and a process
+    ending)."""
+    for port in list(_SENDERS.values()) + [r.port for r in _READERS.values()]:
         try:
             port.close()
         except Exception:  # noqa: BLE001 -- close is cleanup
-            logger.exception("closing a hop sender failed")
+            logger.exception("closing a hop object failed")
     _SENDERS.clear()
     _LATCHED.clear()
+    _READERS.clear()
+    _READER_LATCHED.clear()
+
+
+# ---------------------------------------------------------------------------
+# Intake readers: one per (logical_id, generation), current or fenced.
+# Reading never admits, so a fenced generation's tree may be read; its
+# entries are late (contract amendment E16).
+# ---------------------------------------------------------------------------
+
+HOLD_READER_CONSTRUCT_FAILED = "hop_reader_construct_failed"   # retried next poll
+HOLD_READER_SETTINGS_REFUSED = "hop_reader_settings_refused"
+HOLD_READER_VOCABULARY = "hop_reader_vocabulary"               # the whole instance
+
+
+class Reader:
+    """A constructed intake reader and its refusal class, captured ONCE at
+    construction (`transport.capture_verdict_class`): later dispatch uses
+    `notice_refused`, never a fresh attribute lookup."""
+
+    def __init__(self, port: Any, notice_refused: type):
+        self.port, self.notice_refused = port, notice_refused
+
+
+#: (runtime id, state_dir, logical_id, gen) -> Reader. Filled only after a
+#: construction and its class capture both succeeded.
+_READERS: Dict[Tuple, Reader] = {}
+#: Latched reader construction holds, by the same key.
+_READER_LATCHED: Dict[Tuple, "HopHold"] = {}
+
+
+def reader_settings(cfg: Any, logical_id: str, gen: str) -> Dict[str, Any]:
+    """A tree reader's settings: exactly the four-key core."""
+    return {"hop_root": cfg.hop.root, "logical_id": logical_id, "generation": gen,
+            "peer_uid": cfg.hop.peer_uid}
+
+
+def reader_for(runtime: Any, cfg: Any, logical_id: str, gen: str) -> Reader:
+    """The intake reader for generation `gen` of `logical_id`, constructed
+    once per process. Raises `HopHold`, and ONLY `HopHold`: settings and
+    vocabulary refusals latch; anything else is retried next poll."""
+    key = (id(runtime), str(cfg.state_dir), logical_id, gen)
+    reader = _READERS.get(key)
+    if reader is not None:
+        return reader
+    if key in _READER_LATCHED:
+        raise _READER_LATCHED[key]
+    try:
+        port = runtime.plugin.make_intake_reader(reader_settings(cfg, logical_id, gen),
+                                                 runtime.fsops)
+    except Exception as e:  # noqa: BLE001 -- classified, never escaped
+        hold = _reader_construction_hold(e)
+        if hold.latched:
+            _READER_LATCHED[key] = hold
+        raise hold from e
+    try:
+        refused = transport_mod.capture_verdict_class(port, "NoticeRefused", runtime.fsops,
+                                                      "reader_vocabulary")
+    except transport_mod.SeamRefused as e:
+        _close_quietly(port)
+        hold = HopHold(HOLD_READER_VOCABULARY, str(e), latched=True, scope="instance")
+        _READER_LATCHED[key] = hold
+        raise hold from e
+    reader = Reader(port, refused)
+    _READERS[key] = reader
+    return reader
+
+
+def _reader_construction_hold(e: BaseException) -> HopHold:
+    kind, detail = transport_mod.classify(e, runtime=tuple(_RUNTIME_CLASSES))
+    if kind == "reason" and detail == "settings_invalid":
+        return HopHold(HOLD_READER_SETTINGS_REFUSED, str(e), latched=True)
+    if isinstance(e, transport_mod.SeamRefused):
+        return HopHold(HOLD_READER_VOCABULARY, str(e), latched=True, scope="instance")
+    return HopHold(f"{HOLD_READER_CONSTRUCT_FAILED}:{detail or kind}", str(e), latched=False)
+
+
+def evict_readers(cfg: Any, logical_id: str, gen: Optional[str] = None) -> int:
+    """Close and drop the cached readers of `logical_id` (one generation, or
+    all): a cached reader pins its tree, so a fence must not leave it
+    reading the old directory. Returns how many were evicted."""
+    state = str(cfg.state_dir)
+    keys = [k for k in _READERS if k[1] == state and k[2] == logical_id
+            and (gen is None or k[3] == gen)]
+    for k in keys:
+        _close_quietly(_READERS.pop(k).port)
+    return len(keys)
+
+
+def _close_quietly(port: Any) -> None:
+    try:
+        port.close()
+    except Exception:  # noqa: BLE001 -- close is cleanup
+        logger.exception("closing a hop object failed")
 
 
 class Held:
