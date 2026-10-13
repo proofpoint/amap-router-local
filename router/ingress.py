@@ -38,6 +38,7 @@ import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import aliases as aliases_mod
 from . import attachments as attachments_mod
 from . import binding as binding_mod
 from . import classify as classify_mod
@@ -1603,4 +1604,53 @@ def pinned_link(state_dir: Path, logical_id: str, gen: str,
     if pin["link"] != configured:
         return None, HELD_LINK_CHANGED
     return pin["link"], None
+
+
+# ---------------------------------------------------------------------------
+# The plain-mail RECIPIENT binding (design delta v3.5 B3): a notice read from
+# L's tree is for L only if one of its named recipients resolves to L. Plain
+# mail carries no transaction, so without this only the tree would bind it.
+# ---------------------------------------------------------------------------
+
+HELD_NOT_THIS_IDENTITY = "recipient_not_this_identity"
+
+
+def named_addresses(spool: Dict[str, Any]) -> List[str]:
+    """The spool's `to` and `cc`, each split on "," into elements, each
+    element stripped of surrounding whitespace and read by P4's `addr` rule.
+    An element with no address is skipped."""
+    out: List[str] = []
+    for member in ("to", "cc"):
+        value = spool.get(member)
+        if not isinstance(value, str):
+            continue
+        for element in value.split(","):
+            addr = addr_of(element.strip())
+            if addr is not None:
+                out.append(addr)
+    return out
+
+
+def addressed_to(cfg: Any, report: Any, logical_id: str,
+                 spool: Dict[str, Any]) -> Optional[bool]:
+    """True when a named recipient resolves to `logical_id`, by name
+    (`<name>@<fleet_domain>` for a configured name whose registry identity it
+    is) or through an alias ACTIVE this poll whose target name's identity it
+    is; False when none does; None when the registry report is not `ok`
+    (no decision: the transient hold)."""
+    if getattr(report, "state", None) != "ok":
+        return None
+    known = dict(report.known or {})
+    table = {a.old: a for a in (getattr(cfg, "aliases", None) or ())}
+    view = getattr(cfg, "alias_view", None)
+    for addr in named_addresses(spool):
+        name = config_mod.instance_for(addr, cfg.fleet_domain, known=cfg.instances)
+        if name is not None and known.get(name) == logical_id:
+            return True
+        k = aliases_mod.match_key(addr)
+        a = table.get(k) if k else None
+        d = view.decisions.get(a.old) if (a is not None and view is not None) else None
+        if d is not None and d.status == aliases_mod.ACTIVE and known.get(d.target) == logical_id:
+            return True
+    return False
 

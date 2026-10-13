@@ -41,6 +41,7 @@ PL = "router.tests.test_ingress_place."
 KC = "router.tests.test_ingress_classify.ClassifyTests."
 FC = "router.tests.test_ingress_facts_check.FactsCheckTests."
 LK = "router.tests.test_ingress_link_pin.LinkPinTests."
+RC = "router.tests.test_ingress_recipient.RecipientTests."
 
 M = [
  # -- the inbound reader's link (config) ----------------------------------------
@@ -65,6 +66,25 @@ M = [
  # (No mutant for replace-instead-of-link on the pin write: that path runs only
  # while no pin exists, so either writes the same; a differing pin never
  # reaches it, which L3 pins.)
+ # -- the plain-mail recipient binding ------------------------------------------
+ ('R1 any fleet name taken as L', IG,
+  '        if name is not None and known.get(name) == logical_id:\n',
+  '        if name is not None:\n',
+  [RC + "test_mail_addressed_only_to_another_agent_is_not_for_l"]),
+ ('R2 an alias taken whatever its decision', IG,
+  '        if d is not None and d.status == aliases_mod.ACTIVE and known.get(d.target) == logical_id:\n',
+  '        if a is not None:\n',
+  [RC + "test_an_inactive_or_undecided_alias_is_not_l"]),
+ ('R3 an active alias of anyone taken as L', IG,
+  ' and d.status == aliases_mod.ACTIVE and known.get(d.target) == logical_id:\n',
+  ' and d.status == aliases_mod.ACTIVE:\n',
+  [RC + "test_an_active_alias_of_another_identity_is_not_l"]),
+ ('R4 decided without a valid registry reading', IG,
+  '    if getattr(report, "state", None) != "ok":\n        return None\n', '',
+  [RC + "test_no_valid_registry_reading_is_no_decision"]),
+ ('R5 list elements not stripped', IG,
+  '            addr = addr_of(element.strip())\n', '            addr = addr_of(element)\n',
+  [RC + "test_l_among_others_in_to_or_cc"]),
  # -- the facts version guard (driven directly at the guard unit) -------------
  ('G1 facts_version unchecked (presence selects version 2)', IG,
   '    if type(v) is int and v == 2:\n', '    if True:\n',
