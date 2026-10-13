@@ -138,6 +138,9 @@ TRANSPORT_STATE_DIR = "transport"
 COUNTER_FILE = "next_req_id"
 
 REASON_TRANSPORT_ANOMALY = "transport_anomaly"
+#: `classify.REASON_NO_ROUTE`, named here so this module keeps its imports.
+REASON_NO_ROUTE = "no_route"
+DETAIL_FENCED_UNHANDED = "generation fenced before hand-over; nothing was sent"
 DETAIL_PREFIX = "transport: "
 
 #: Age past which a record counts as stale in `summarize`. Reporting only:
@@ -570,6 +573,7 @@ def advance(
     anchor: Optional[Path] = None,
     recheck: Optional[Callable[[Dict[str, Any]], Recheck]] = None,
     publish_blocked: bool = False,
+    fenced_retired: bool = False,
 ) -> str:
     """One step for one record (module docstring's table). `settle(verdict,
     digest)` writes the agent's one result; `already_settled` says the
@@ -595,7 +599,95 @@ def advance(
     transport this router accepts, so the record is marked
     `revocation_unenforceable` and an ERROR is logged every poll; a result,
     if one arrives, still settles it as usual, because the send may have
-    happened."""
+    happened.
+
+    `fenced_retired`: the record's generation is fenced and its hop tree is
+    retired. A record never handed over is then settled `rejected`/
+    `no_route` and never handed over: there is never a FIRST hand-over into
+    a retired tree. A handed-over record carries on as before (a no-op
+    retry, or completing a partial one).
+
+    PROBES. Under the hop, any exception from `has_result`, `has_pending`,
+    `has_archived` or `read_result` is a RETRY that never settles: the
+    record, its transport id and its HANDED marker are kept, no Result is
+    written, and status shows `hop_probe_failed:<reason or class>`. A
+    result that reads fine but fails validation is still a verdict on
+    readable bytes (`transport_anomaly`)."""
+    try:
+        state = _advance(cfg, name, req_id, record, port, settle=settle,
+                         already_settled=already_settled, anchor=anchor, recheck=recheck,
+                         publish_blocked=publish_blocked, fenced_retired=fenced_retired)
+        if _is_hop(cfg) and "transport_req_id" in record:
+            hoplink.clear_retry(cfg, name, n=record["transport_req_id"], prefix=PROBE_FAILED)
+        return state
+    except ProbeFailed as failed:
+        e = failed.raised
+        if not _is_hop(cfg):
+            raise e from None
+        status = probe_status(e)
+        age = hoplink.note_retry(cfg, name, status, f"{type(e).__name__}: {e}",
+                                 record["transport_req_id"])
+        quiet = age < STALE_AFTER_S
+        (logger.warning if quiet else logger.error)(
+            "instance %r req %r: a transport probe failed (%s, for %ds): %s; nothing is "
+            "settled, retried next poll", name, req_id, status, age, e)
+        return BLOCKED
+
+
+class ProbeFailed(Exception):
+    """A transport probe raised (`advance`, PROBES); `raised` is what."""
+
+    def __init__(self, raised: BaseException):
+        super().__init__(repr(raised))
+        self.raised = raised
+
+
+PROBE_FAILED = "hop_probe_failed"
+
+
+def probe_status(exc: BaseException) -> str:
+    """`hop_probe_failed:<reason or class>`."""
+    why = getattr(exc, "reason", None)
+    return f"{PROBE_FAILED}:{why if type(why) is str and why else type(exc).__name__}"
+
+
+class _Probed:
+    """The port, with each probe's exception wrapped in `ProbeFailed`."""
+
+    def __init__(self, port: TransportPort):
+        self._port = port
+
+    def _call(self, method: str, n: str) -> Any:
+        try:
+            return getattr(self._port, method)(n)
+        except Exception as e:  # noqa: BLE001 -- a probe never settles (advance, PROBES)
+            raise ProbeFailed(e) from e
+
+    def has_result(self, n: str) -> bool:
+        return self._call("has_result", n)
+
+    def has_pending(self, n: str) -> bool:
+        return self._call("has_pending", n)
+
+    def has_archived(self, n: str) -> bool:
+        return self._call("has_archived", n)
+
+    def read_result(self, n: str) -> bytes:
+        return self._call("read_result", n)
+
+
+def _advance(
+    cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
+    port: TransportPort,
+    *, settle: Callable[[Dict[str, Any], Optional[str]], Any],
+    already_settled: bool,
+    anchor: Optional[Path],
+    recheck: Optional[Callable[[Dict[str, Any]], Recheck]],
+    publish_blocked: bool,
+    fenced_retired: bool,
+) -> str:
+    writer = port
+    port = _Probed(port)
     path = record_path(cfg, name, req_id)
     handed = handed_path(cfg, name, req_id)
     if already_settled:
@@ -630,6 +722,12 @@ def advance(
                     record.get("digest"))
             _effect("unlink", _cleanup, path, handed)
             return SETTLED
+        if fenced_retired:
+            _effect("settle", settle, {
+                "outcome": "rejected", "reason_code": REASON_NO_ROUTE,
+                "detail": DETAIL_FENCED_UNHANDED, "recipients": []}, record.get("digest"))
+            _effect("unlink", _cleanup, path, handed)
+            return SETTLED
 
     def from_result() -> str:
         verdict = verdict_from_result(port.read_result(n), n, record)
@@ -641,7 +739,7 @@ def advance(
         return from_result()
     if port.has_pending(n):
         if recheck is not None:
-            _check_revocation(cfg, name, req_id, record, port, recheck,
+            _check_revocation(cfg, name, req_id, record, writer, recheck,
                               enact=not publish_blocked)
         return PENDING
     if port.has_archived(n):
@@ -694,7 +792,7 @@ def advance(
     _effect("handed", atomic_write, handed, n.encode("ascii"),
             durable_root=cfg.state_dir)
     try:
-        _effect("transport", port.write_request, n, data)
+        _effect("transport", writer.write_request, n, data)
     except Exception as e:  # noqa: BLE001 -- the closed table decides
         latched = hoplink.latch_for_write(e)
         if latched is not None:

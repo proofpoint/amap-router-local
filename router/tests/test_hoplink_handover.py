@@ -185,9 +185,10 @@ class BeginRefusalTests(_InflightCase):
         write_request(self.cfg, "alice", "00000001", to=["l" * 65 + "@example.com"])
         self.drain()
         r = read_json(result_path(self.cfg, "alice", "00000001"))
-        # The classifier may already refuse it as malformed; either way it is
-        # refused before anything is allocated.
-        self.assertEqual(r["outcome"], "rejected")
+        # The classifier answers first (the address grammar); begin's own
+        # octet check is the same bound (BeginCheckTests).
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "malformed_request"))
+        self.assertIn("address grammar", r["detail"])
         self.assertEqual(self.port.writes, [])
         self.assertFalse(inflight.counter_path(self.cfg, "alice").exists())
 
@@ -202,6 +203,29 @@ class BeginRefusalTests(_InflightCase):
                          ("queued_for_human", outbound.REASON_TRANSPORT_ANOMALY))
         self.assertEqual(self.port.writes, [])
         self.assertFalse(inflight.counter_path(self.cfg, "alice").exists())
+
+    def test_the_from_address_octet_bounds_at_begin(self):
+        """The same bounds as at load, through the drain: the whole address
+        at 254 octets and the local part at 64 go; 255 and 65 are refused
+        before anything is allocated."""
+        dom254 = "b" * 63 + "." + "c" * 63 + "." + "d" * 61        # 64 + 1 + 189 = 254
+        cases = [("a" * 64 + "@" + dom254, True), ("a" * 64 + "@" + dom254 + "e", False),
+                 ("l" * 64 + "@x.org", True), ("l" * 65 + "@x.org", False)]
+        for address, goes in cases:
+            with self.subTest(octets=len(address), goes=goes):
+                self.tearDown()
+                self.setUp()
+                write_request(self.cfg, "alice", "00000001", to=[EXT])
+                with mock.patch.object(outbound, "address_for", return_value=address):
+                    self.drain()
+                if goes:
+                    self.assertEqual(self.port.writes, ["00000001"])
+                    continue
+                self.assertEqual(self.port.writes, [])
+                r = read_json(result_path(self.cfg, "alice", "00000001"))
+                self.assertEqual((r["outcome"], r["reason_code"]),
+                                 ("queued_for_human", outbound.REASON_TRANSPORT_ANOMALY))
+                self.assertFalse(inflight.counter_path(self.cfg, "alice").exists())
 
     def test_the_record_pins_the_address_at_begin(self):
         write_request(self.cfg, "alice", "00000001", to=[EXT])

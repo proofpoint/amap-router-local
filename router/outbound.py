@@ -1415,7 +1415,7 @@ def _begin_external(
 def _advance_one(
     cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
     transport: inflight_mod.TransportPort, *, fenced: bool = False,
-    cold_policy: Optional[ColdPolicy] = None,
+    cold_policy: Optional[ColdPolicy] = None, fenced_retired: bool = False,
 ) -> str:
     """`inflight.advance` with `_finish` as the settle step.
 
@@ -1448,7 +1448,7 @@ def _advance_one(
         cfg, name, req_id, record, transport, settle=settle,
         already_settled=anchor.is_file(), anchor=anchor,
         recheck=lambda rec: _recheck(cfg, name, rec, transport, cold_policy),
-        publish_blocked=cfg.reload_failed,
+        publish_blocked=cfg.reload_failed, fenced_retired=fenced_retired,
     )
 
 
@@ -1518,12 +1518,14 @@ _STALE_WARNED: set = set()
 def _advance_inflight(
     cfg: RouterConfig, name: str, transport: Optional[inflight_mod.TransportPort],
     outcomes: Dict[str, int], *, fenced: bool = False,
-    cold_policy: Optional[ColdPolicy] = None,
+    cold_policy: Optional[ColdPolicy] = None, fenced_retired: bool = False,
 ) -> Dict[str, int]:
     """One step for every in-flight record of `name`, isolated per record.
     Runs BEFORE the outbox listing, so a request settled here is seen by the
     listing as already answered. Without a transport, records are left
-    exactly as they are and only counted: nothing here may guess a verdict."""
+    exactly as they are and only counted: nothing here may guess a verdict.
+    `fenced_retired`: `name`'s generation is fenced and its hop tree retired,
+    so a record never handed over is never handed over now."""
     settled = errored = 0
     req_ids = inflight_mod.list_records(cfg, name)
     if isinstance(transport, hoplink.Held):
@@ -1542,7 +1544,7 @@ def _advance_inflight(
                 if record is None:
                     continue
                 state = _advance_one(cfg, name, req_id, record, transport, fenced=fenced,
-                                     cold_policy=cold_policy)
+                                     cold_policy=cold_policy, fenced_retired=fenced_retired)
             except Exception:
                 logger.exception(
                     "instance %r: error advancing in-flight request %r — isolated, "
@@ -2894,12 +2896,20 @@ def _drain_fenced(
         #    error below never shrinks the claim.
         if same_root:
             owned |= _fenced_claims(cfg, view, name)
-        # 2. The work, each record isolated: an error keeps its claim.
+        # 2. The work, each record isolated: an error keeps its claim. Under
+        #    the hop each fenced generation has its own sender, constructed
+        #    only once its tree is retired (`hoplink.FencedSenders`), and
+        #    closed once its in-flight set is empty.
         if transport is not None:
+            retired_hop = isinstance(transport, hoplink.FencedSenders)
             try:
                 if inflight_mod.list_records(view, name):
-                    _advance_inflight(view, name, transport, {}, fenced=True,
-                                      cold_policy=cold_policy)
+                    port = transport.for_view(view, name) if retired_hop else transport
+                    _advance_inflight(view, name, port, {}, fenced=True,
+                                      cold_policy=cold_policy,
+                                      fenced_retired=retired_hop)
+                if retired_hop and not inflight_mod.list_records(view, name):
+                    hoplink.evict_drained(view, name)
             except Exception:
                 logger.exception("instance %r: error stepping fenced in-flight work — "
                                  "isolated, its files stay claimed", name)

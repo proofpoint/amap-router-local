@@ -4,6 +4,7 @@ quietly only while a routine retry is young, and kept out of the drained
 summary line. Driven through the real drain under a registry."""
 from __future__ import annotations
 
+import json
 import logging
 
 from router import config as config_mod
@@ -178,6 +179,22 @@ class HoldStatusTests(_Status):
         held = self.section(k)["instances"].get("alpha", {}).get("write_hold", {})
         self.assertEqual((held.get("reason"), held.get("transport_req_id")),
                          ("hop_handover_invalid", "00000002"))
+        self.assertIn("router generation new <name> --reason <text>", held.get("hint", ""),
+                      "a latched hold's status does not name its exit")
+        self.assertIn("left for disposal", held["hint"])
+
+    def test_a_binding_change_names_its_exit(self):
+        write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
+        k, _ = self.drain()
+        pin_path = hoplink.transport_dir(k, "alpha") / hoplink.PIN_FILE
+        pin = json.loads(pin_path.read_text())
+        pin["peer_uid"] = 7
+        pin_path.write_text(json.dumps(pin))
+        hoplink.forget_senders()
+        k, _ = self.drain()
+        hold = self.section(k)["instances"]["alpha"]["sender_hold"]
+        self.assertEqual(hold["reason"], "hop_binding_changed")
+        self.assertIn("fixed for the life of state_dir", hold.get("hint", ""))
 
     def test_a_quiet_instance_has_no_entry_and_the_senders_are_counted(self):
         write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])

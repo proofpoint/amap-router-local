@@ -54,6 +54,15 @@ LAST_INGRESS: Dict[str, Dict[str, int]] = {}
 #: `run_once`'s default: load the configured plugin for this one call.
 _LOAD = object()
 
+#: TEST-ONLY, and `None` in production (nothing in this package assigns it):
+#: a callable the hop fence step calls with "fence_recorded" (the new
+#: generation's record is durable, no predecessor retired yet) and
+#: "retired_written" (every pinned predecessor retired, the successor not yet
+#: admitted). The hop fixture stops a poll there by raising; what it raises
+#: leaves the poll as `hoplink.FenceStopped` (its `.raised`), which no
+#: isolation belt swallows.
+FENCE_STOP_AT: Optional[Any] = None
+
 
 @dataclass(frozen=True)
 class HopRuntime:
@@ -69,13 +78,10 @@ class HopRuntime:
 
 
 def _agent_reachable_roots(cfg: RouterConfig) -> List[Path]:
-    """Every directory an agent can reach: no plugin may live inside one."""
-    roots: List[Path] = []
-    for inst in cfg.instances.values():
-        for p in (inst.root, inst.inbox_root, inst.outbox_root, inst.peer_root):
-            if p is not None:
-                roots.append(p)
-    return roots
+    """Every directory an agent can reach: no plugin may live inside one.
+    The same list `config.load` checks `hop.root` against."""
+    from .config import agent_reachable_roots
+    return agent_reachable_roots(cfg.instances)
 
 
 def start_transport(cfg: RouterConfig) -> Optional["HopRuntime"]:

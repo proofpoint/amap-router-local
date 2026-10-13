@@ -778,7 +778,8 @@ def _fresh_entry(cfg: Any, name: str, dry_run: bool) -> Tuple[Any, Any]:
     return report, report.resolved[name]
 
 
-def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> Dict[str, Any]:
+def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False,
+                 lost: Optional[Any] = None) -> Dict[str, Any]:
     """`router generation new <name> --reason <text>`: fence `name`'s current
     generation and begin the next, for what the router cannot see (a
     same-root connector counter reset). In `reset`'s order: validate, take
@@ -790,7 +791,16 @@ def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> 
     pre-generation layout (adopt or fence it); no current generation (the
     next poll begins the first); an unfinished migration; a successor
     counter that cannot be carried; an empty reason. Allowed with the root
-    unreadable: it fences."""
+    unreadable: it fences.
+
+    `lost` (`hoplink.LostAcks`, when a transport is configured): the verb
+    is also the audited exit from a lost hop tree. Under the lock, BEFORE
+    anything is written, it finds the lost set itself (`lost.find`, never
+    from status); a set it cannot decide refuses the verb with nothing
+    changed. Only AFTER the new generation and its audit line are durable
+    does it acknowledge each lost generation (`lost.ack`). A failure there
+    leaves the new generation and no acknowledgement: running the verb
+    again recovers (one more never-admitted generation is harmless)."""
     if cfg.registry_dir is None:
         raise OperatorRefused("generations exist only under a registry (registry_dir)")
     if name not in cfg.instances:
@@ -820,7 +830,16 @@ def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> 
         plan = {"name": name, "logical_id": lid, "fences": cur["gen"],
                 "transport_counter": start, "root": root, "reason": reason.strip()}
         if dry_run:
+            if lost is not None:
+                plan["lost_candidates"] = lost.candidates(lid, doc)
             return dict(plan, dry_run=True)
+        lost_gens: List[str] = []
+        if lost is not None:
+            try:
+                lost_gens = lost.find(lid, doc)
+            except Exception as e:  # noqa: BLE001 -- never guessed: refuse, nothing changed
+                raise OperatorRefused(
+                    f"the lost hop trees cannot be decided, so nothing was changed: {e}") from None
         try:
             plan["generation"] = begin(cfg.state_dir, name, lid, binding_of(entry), root,
                                        REASON_OPERATOR, note=reason.strip(),
@@ -828,6 +847,16 @@ def operator_new(cfg: Any, name: str, reason: str, *, dry_run: bool = False) -> 
         except AuditCommitFailed as e:
             raise OperatorRefused(
                 f"the audit line could not be written, so nothing was changed: {e}") from None
+        if lost_gens:
+            try:
+                lost.ack(lid, lost_gens, reason.strip(),
+                         f"{EVENT_GENERATION_MINTED}:{plan['generation']}")
+            except Exception as e:  # noqa: BLE001 -- after the commit: re-run to recover
+                raise OperatorRefused(
+                    f"generation {plan['generation']} began and was audited, but acknowledging "
+                    f"the lost hop tree(s) {lost_gens} failed ({type(e).__name__}: {e}); run "
+                    "this verb again to recover") from None
+            plan["lost_acknowledged"] = lost_gens
         return plan
     finally:
         if lk is not None:

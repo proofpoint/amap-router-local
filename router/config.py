@@ -577,6 +577,11 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 #: `hop.caps`'s members, exactly.
 HOP_CAPS = ("document", "request", "attachment", "total")
+#: The least `hop.caps.attachment` loads: the hop codec's per-sidecar cap.
+#: The peer may commit an inbound sidecar of up to that size, and a smaller
+#: cap here would refuse it on every read, an entry held for ever; refusing
+#: the config turns that into a startup refusal.
+HOP_ATTACHMENT_CAP_MIN = 1 << 20
 #: The largest `hop.version_write`: the envelope's `hop_contract` is a JSON
 #: integer 1..2^31-1, and a larger one would load here and then have every
 #: handover refused.
@@ -615,8 +620,21 @@ def _positive_int(value, what: str, *, minimum: int = 1,
     return value
 
 
+def agent_reachable_roots(instances: Mapping[str, Any]) -> List[Path]:
+    """Every directory an agent can reach, per instance: its root and the
+    trees derived from it. The ONE list both the plugin loader (no plugin
+    inside one) and `hop.root`'s overlap check (no hop tree inside one, nor
+    one inside it) use, so the two cannot drift."""
+    roots: List[Path] = []
+    for inst in instances.values():
+        for p in (inst.root, inst.inbox_root, inst.outbox_root, inst.peer_root):
+            if p is not None:
+                roots.append(p)
+    return roots
+
+
 def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
-         state_dir: Path, intake_dir: Optional[Path], roots,
+         state_dir: Path, intake_dir: Optional[Path], instances,
          attachment_caps: Tuple[int, int, int]) -> Optional[HopConfig]:
     if "hop" not in top:
         if transport_plugin is not None:
@@ -651,8 +669,9 @@ def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
     others = [("config.state_dir", state_dir), ("config.registry_dir", registry_dir)]
     if intake_dir is not None:
         others.append(("config.intake_dir", intake_dir))
-    for name, (_mode, root_key, iroot) in roots.items():
-        others.append((f"config.instances.{name}.{root_key}", iroot))
+    for name in sorted(instances):
+        for iroot in agent_reachable_roots({name: instances[name]}):
+            others.append((f"config.instances.{name}'s agent-reachable directory", iroot))
     for what, other in others:
         if _is_within(rp, other) or _is_within(other, rp):
             raise ConfigError(
@@ -668,6 +687,11 @@ def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
         root=root, peer_uid=peer_uid, version_write=version_write,
         caps=tuple((k, _positive_int(caps[k], f"config.hop.caps.{k}")) for k in HOP_CAPS),
         link=link)
+    if hop.cap("attachment") < HOP_ATTACHMENT_CAP_MIN:
+        raise ConfigError(
+            f"config.hop.caps.attachment: {hop.cap('attachment')} is below "
+            f"{HOP_ATTACHMENT_CAP_MIN}, the hop's per-sidecar cap: an inbound sidecar the "
+            "peer may commit would be refused on every read")
     from .hoplink import document_floor  # local: hoplink is a leaf, kept out of load order
     count_cap, file_cap, total_cap = attachment_caps
     floor = document_floor(
@@ -1641,7 +1665,7 @@ def load_obj(
                 "state_dir/<logical_id>/, so such a name cannot be told from an "
                 "identity's state; rename the instance")
     hop = _hop(top, transport_plugin=transport_plugin, registry_dir=registry_dir,
-               state_dir=state_dir, intake_dir=intake_dir, roots=roots,
+               state_dir=state_dir, intake_dir=intake_dir, instances=instances,
                attachment_caps=(attachment_max_count, attachment_max_bytes,
                                 attachment_max_total_bytes))
     if hop is not None:
@@ -1657,6 +1681,7 @@ def load_obj(
                     f"config.instances.{name}: its address "
                     f"{address_for(name, fleet_domain)!r} cannot be a handover's "
                     f"from_address ({why})")
+
 
     trusted, fleet_hosts, egress, per_instance = _classification(
         top, fleet_domain, classify_raw)

@@ -567,7 +567,12 @@ def main(argv=None) -> int:
     if args.command == "generation":
         try:
             if args.gen_command == "new":
-                plan = operator_new(cfg, args.name, args.reason, dry_run=args.dry_run)
+                lost = None
+                if cfg.transport_plugin is not None:
+                    from . import hoplink, service
+                    lost = hoplink.LostAcks(cfg, service.start_transport)
+                plan = operator_new(cfg, args.name, args.reason, dry_run=args.dry_run,
+                                    lost=lost)
             else:
                 plan = operator_migrate(cfg, args.name, args.gen_command, args.reason,
                                         dry_run=args.dry_run,

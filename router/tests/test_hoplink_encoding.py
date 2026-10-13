@@ -11,6 +11,7 @@ import unittest
 
 from router import config as config_mod
 from router import hoplink
+from router import transport as transport_mod
 from router.config import ConfigError
 from router.tests import helpers
 
@@ -219,6 +220,78 @@ class ConfigFloorTests(helpers.RouterTestCase):
         with self.assertRaises(ConfigError) as cm:
             config_mod.load_obj(self.doc(floor - 1))
         self.assertIn("config.hop.caps.document", str(cm.exception))
+
+
+def _worst_sizes(n, f, t):
+    """Attachment sizes whose canonical array is longest (brute force):
+    at most `n` files, each at most `f` bytes, together at most `t`."""
+    best, best_len = (), -1
+    for sizes in itertools.product(range(f + 1), repeat=n):
+        if sum(sizes) > t:
+            continue
+        arr = [base64.b64encode(b"x" * s).decode() for s in sizes]
+        length = len(hoplink.canonical(arr))
+        if length > best_len:
+            best, best_len = sizes, length
+    return best
+
+
+class ComposedFloorTests(helpers.RouterTestCase):
+    """The floor, BUILT and loaded, at each shape of the attachment term:
+    the total unreachable by the count cap; unreachable by the per-file cap;
+    reachable; and fewer total bytes than slots. Each worst case is
+    constructed to the byte, and the config at exactly the floor loads while
+    one less is refused."""
+
+    CASES = {
+        "count_bound": (1, 10, 12),          # N=1, F < T
+        "per_file_bound": (2, 5, 12),        # N*F < T
+        "reachable": (2, 10, 12),            # N*F >= T
+        "total_below_count": (3, 1, 2),      # T < N: zero-byte slots carry syntax only
+        "residues": (3, 7, 11),              # F, T and min(T, kF) at residues 1, 2, 2
+    }
+
+    def config(self, n, f, t, document):
+        root = self.tmp / "alice"
+        root.mkdir(exist_ok=True)
+        doc = helpers.with_hop({
+            "state_dir": str(self.state_dir),
+            "instances": {"alice": {"namespace": str(root)}},
+            "attachment_max_count": n, "attachment_max_bytes": f,
+            "attachment_max_total_bytes": t,
+            "transport_plugin": {"path": "/opt/p.py", "sha256": "a" * 64}}, self.tmp)
+        doc["hop"]["caps"] = {"document": document, "request": 4096,
+                              "attachment": 1 << 20, "total": 1 << 20}
+        return doc
+
+    def test_each_shape_is_exact_built_and_at_load(self):
+        request_cap, v = 4096, 1
+        base = _req()
+        pad = request_cap - 1 - len(hoplink.canonical(dict(base, pad="")))
+        request = dict(base, pad="p" * pad)
+        for label, (n, f, t) in self.CASES.items():
+            with self.subTest(shape=label):
+                floor = hoplink.document_floor(request_cap=request_cap, count_cap=n,
+                                               file_cap=f, total_cap=t, version_write=v)
+                atts = [base64.b64encode(b"x" * s).decode() for s in _worst_sizes(n, f, t)]
+                doc = hoplink.build_handover(
+                    request, from_address="a" * 252 + "@b", version_write=v, attachments=atts,
+                    settled_through=10 ** 18 - 1)
+                self.assertEqual(len(doc), floor, "the floor is not the built worst case")
+                config_mod.load_obj(self.config(n, f, t, floor))
+                with self.assertRaises(ConfigError) as cm:
+                    config_mod.load_obj(self.config(n, f, t, floor - 1))
+                self.assertIn("config.hop.caps.document", str(cm.exception))
+
+
+class ReasonTableCompletenessTests(unittest.TestCase):
+
+    def test_the_write_tables_partition_the_transport_reasons(self):
+        latched, retry = set(hoplink.LATCHED_WRITE_REASONS), set(hoplink.RETRY_WRITE_REASONS)
+        other = set(hoplink.NOT_WRITE_REASONS)
+        self.assertEqual(latched | retry | other, set(transport_mod.TRANSPORT_REASONS))
+        self.assertEqual(latched & retry, set())
+        self.assertEqual((latched | retry) & other, set())
 
 
 if __name__ == "__main__":
