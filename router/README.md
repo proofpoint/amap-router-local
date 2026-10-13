@@ -1418,8 +1418,10 @@ the expiry sweep are a later step's, which must write exactly this format.
 An item has exactly `schema` (`amap-router-local.ingress-quarantine/1`),
 `id` (32 hex, the filename stem), `generation` (32 hex, the directory's),
 `arrival_ts`, `causes` (non-empty, no duplicates, from a closed
-vocabulary: `cold_fleet_mail` and `late_inbound` (an entry for a fenced or
-retired generation, held there) today; the peer-origin profile's §5 causes
+vocabulary: `cold_fleet_mail`, `late_inbound` (an entry for a fenced or
+retired generation, held there) and `notice_invalid` (an entry the
+transport's reader refused as invalid on first sight, contract amendment
+E17) today; the peer-origin profile's §5 causes
 are added once the revision defining them is published) and
 `evidence` (at most 32 members; keys 1-64 printable ASCII; values strings of
 at most 1024 characters or integers, never booleans, of magnitude below

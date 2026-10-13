@@ -22,11 +22,13 @@ THE ITEM, a JSON object with exactly these members:
      "causes": ["<cause>", ...],          # non-empty, no duplicates, CAUSES
      "evidence": {"<key>": <value>, ...}} # see below
 
-`causes` is drawn from a CLOSED vocabulary. Today it holds two causes:
-`cold_fleet_mail`, for cold traffic from a trusted fleet host, and
+`causes` is drawn from a CLOSED vocabulary. Today it holds three causes:
+`cold_fleet_mail`, for cold traffic from a trusted fleet host;
 `late_inbound`, for an entry that arrived for a generation that is no longer
 current (fenced or retired) and is held in THAT generation, never placed
-into a later one. The
+into a later one; and `notice_invalid`, for an entry the transport's reader
+refused as invalid on this router's first sight of it (its evidence carries
+the refusal's reason and nothing read from the refused bytes). The
 peer-origin profile's §5 causes join it when the profile revision that
 defines them is published: until then they are not this public
 repository's to copy, and an item naming one is DAMAGED. The writer refuses
@@ -104,7 +106,13 @@ CAUSE_COLD_FLEET_MAIL = "cold_fleet_mail"
 #: no longer current when this router FIRST observes it (its own observation,
 #: never the writer's timing) is quarantined to that generation, never placed.
 CAUSE_LATE_INBOUND = "late_inbound"
-CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND)
+#: Contract amendment E17: an entry the transport's reader refuses as
+#: `notice_invalid` on this router's FIRST sight of it (no journal record for
+#: its key) is quarantined, one item per key, then removed upstream. Named
+#: after the transport's own refusal reason (`transport.NOTICE_REFUSAL_REASONS`),
+#: so it adds no wire vocabulary.
+CAUSE_NOTICE_INVALID = "notice_invalid"
+CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND, CAUSE_NOTICE_INVALID)
 
 ITEM_MAX_BYTES = 64 * 1024
 CANDIDATE_MAX_BYTES = 1024 * 1024

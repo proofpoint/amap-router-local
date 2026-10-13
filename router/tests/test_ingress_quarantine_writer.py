@@ -105,7 +105,7 @@ class WriterTests(unittest.TestCase):
     def test_a_cause_outside_the_vocabulary_is_refused_before_writing(self):
         with self.assertRaises(ValueError):
             ingress.write_quarantine_item(self.state, LID, GEN, "notice", LINK, NID,
-                                          "notice_invalid", digests=DIGESTS, now=TS)
+                                          "policy", digests=DIGESTS, now=TS)
         self.assertFalse(self.qdir.exists() and os.listdir(self.qdir))
 
     def test_a_long_attachment_list_keeps_count_and_aggregate(self):

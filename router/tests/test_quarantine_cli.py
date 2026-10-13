@@ -182,9 +182,12 @@ class FormatTests(_Q):
         self.assertEqual(quarantine.list_ingress(self.state_dir, "f" * 32, "x", days=14), [])
 
     def test_the_vocabulary_is_closed(self):
-        """Two causes today; anything else, including a §5 cause name not yet
-        published to this repository, is outside it."""
-        self.assertEqual(quarantine.CAUSES, ("cold_fleet_mail", "late_inbound"))
+        """Three causes today; anything else, including a §5 cause name not
+        yet published to this repository, is outside it."""
+        self.assertEqual(quarantine.CAUSES, ("cold_fleet_mail", "late_inbound",
+                                             "notice_invalid"))
+        self.put_item(causes=["notice_invalid"])
+        self.assertIsNone(self.one().damaged, "notice_invalid is in the vocabulary (E17)")
         self.put_item(causes=["cold_fleet_mail"])
         self.assertIsNone(self.one().damaged)
         self.put_item(causes=["late_inbound"])
