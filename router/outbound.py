@@ -608,7 +608,7 @@ def _drain_one(
         return _drain_reply(
             cfg, name, req_id, doc, reply_key,
             req_digest=req_digest, attachments=verified_attachments,
-            deliver_backend=deliver_backend,
+            deliver_backend=deliver_backend, transport=transport, cold_policy=cold_policy,
         )
 
     return _drain_cold(
@@ -625,6 +625,8 @@ def _drain_reply(
     *, req_digest: Optional[str],
     attachments: Optional[List[attachments_mod.VerifiedAttachment]] = None,
     deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
+    transport: Optional[inflight_mod.TransportPort] = None,
+    cold_policy: Optional[ColdPolicy] = None,
 ) -> str:
     """Reply routing: recipient set is EXACTLY the bound instance, resolved
     from the router's own ledger. `draft.to`/`draft.cc` are discarded
@@ -635,8 +637,9 @@ def _drain_reply(
     Unresolvable -> `rejected`/`unresolved_reply` (fail closed). A record
     with no fleet sender that passes `_external_binding`'s three-part test
     goes to `_drain_external_reply` instead; one that fails it (a router
-    DSN, or anything short of all three) is unresolved as before. Returns
-    the governing `outcome` string."""
+    DSN, or anything short of all three) is unresolved as before. A record
+    of mail placed from the hop leg goes to `_drain_bound_reply`, and never
+    to the SMTP branch. Returns the governing `outcome` string."""
     record = binding.read_ledger_record(cfg.state_dir, name, str(in_reply_to),
                                         state_key=state_key(cfg, name))
     bound_instance = None
@@ -644,6 +647,14 @@ def _drain_reply(
         from_instance = record.get("from_instance")
         if isinstance(from_instance, str) and from_instance:
             bound_instance = from_instance
+        elif record.get("transport") == HOP_LEDGER_TRANSPORT:
+            # Mail placed from the hop leg: a bound reply over the hop, and
+            # only under `_hop_binding`'s test.
+            return _drain_bound_reply(
+                cfg, name, req_id, doc, in_reply_to, record,
+                req_digest=req_digest, attachments=attachments,
+                transport=transport, cold_policy=cold_policy,
+            )
         else:
             # A record with no fleet sender binds OUTSIDE only under the
             # three-part test below; a router-authored DSN record (also
@@ -878,6 +889,149 @@ def _drain_external_reply(
         attachments=_attachments_accepted_diag(attachments or []),
     )
     return _finish(cfg, name, req_id, result, req_digest=req_digest)
+
+
+#: The ledger `transport` of mail placed from the hop leg (`ingress.prepare`).
+HOP_LEDGER_TRANSPORT = "hop"
+#: The members a hop ledger record must carry to bind a reply. `admission`
+#: is not among them: absent, it is `hoplink.ADMISSION_OPEN`.
+_HOP_BINDING_REQUIRED = tuple(m for m in binding.MAIL_ORIGIN_MEMBERS if m != "admission")
+#: A bound reply to a counterparty this router cannot reach over the hop.
+DETAIL_NO_REPLY_PATH = "no reply path to this counterparty in this deployment"
+
+
+def _hop_binding(cfg: RouterConfig, name: str, record: Dict[str, Any],
+                 now: str) -> Union[Dict[str, Any], str]:
+    """The binding a hop ledger record gives a reply from `name`, as the
+    record carries it, or why it gives none. It binds ONLY when the record
+    is mail (not the peer tree), carries every member of
+    `_HOP_BINDING_REQUIRED`, names `name`'s own state key as its agent, and
+    `now` is before its `expires_at`. A bare id lookup is never enough."""
+    if record.get("tree") not in (None, deliver_mod.TREE_INBOX):
+        return "the record is not mail"
+    missing = [m for m in _HOP_BINDING_REQUIRED if m not in record]
+    if missing:
+        return f"the record carries no reply binding (missing {missing})"
+    if record["agent"] != state_key(cfg, name):
+        return "the record binds another agent"
+    expires, at = parse_utc_ts(record["expires_at"]), parse_utc_ts(now)
+    if expires is None or at is None:
+        return "the record's expires_at cannot be read"
+    if not at < expires:
+        return "the reply binding has expired"
+    return {m: record[m] for m in binding.MAIL_ORIGIN_MEMBERS if m in record}
+
+
+def _bound_policy_digest(cfg: RouterConfig, name: str, admission: str,
+                         pinned: Dict[str, Any]) -> str:
+    """The policy digest a bound reply is begun and handed over under: the
+    sender's mail policy for an `open` admission, which egress decides;
+    otherwise that policy with the pinned binding added, which permits it."""
+    if admission == hoplink.ADMISSION_OPEN:
+        return classify_mod.policy_digest(cfg, name)
+    return classify_mod.digest_of(dict(classify_mod.policy_object(cfg, name),
+                                       binding=pinned))
+
+
+def _bound_draft(draft: Dict[str, Any], counterparty: str) -> Dict[str, Any]:
+    """`draft` addressed to `counterparty` alone: `to`, `cc` and `bcc` are
+    the agent's and are replaced, never consulted."""
+    fixed = {k: v for k, v in draft.items() if k not in ("to", "cc", "bcc")}
+    fixed["to"] = [counterparty]
+    return fixed
+
+
+def _drain_bound_reply(
+    cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], in_reply_to: str,
+    record: Dict[str, Any], *, req_digest: Optional[str],
+    attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    transport: Optional[inflight_mod.TransportPort], cold_policy: Optional[ColdPolicy],
+) -> str:
+    """A reply to mail placed from the hop leg, handed back over the hop as a
+    bound reply. Decided here, before the trusted-host rule and before any
+    cold classification:
+
+      * the binding must resolve (`_hop_binding`), or `rejected`/
+        `unresolved_reply`;
+      * the recipient is the binding's counterparty; `draft.to`/`cc`/`bcc`
+        are discarded (logged as a count, never echoed);
+      * while the delivered-domain set differs from `fleet_hosts`
+        (`config.delivered_drift`), every bound reply is held unconsumed;
+      * the counterparty must be a fleet host under this router's
+        classifier, or `rejected`/`no_route` with nothing allocated;
+      * an `open` admission is decided by egress, as mail is; any other
+        admission is permitted by the binding, and egress is not consulted.
+
+    The binding, and the `bound` object built from it, are pinned in the
+    in-flight record at begin (`inflight.begin`'s `bound_reply`)."""
+    pinned = _hop_binding(cfg, name, record, utc_ts())
+    if isinstance(pinned, str):
+        result = _result_doc(
+            req_id, "rejected", reason_code=REASON_UNRESOLVED_REPLY,
+            detail=f"in_reply_to {in_reply_to!r} does not resolve to a reply binding "
+                   f"for {name!r}: {pinned}")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    counterparty = pinned["counterparty"]
+    draft = doc.get("draft") if isinstance(doc.get("draft"), dict) else {}
+    supplied = [a for k in ("to", "cc", "bcc") for a in (draft.get(k) or [])]
+    others = [a for a in supplied if _canonical_or_none(a) != counterparty]
+    if others:
+        logger.warning(
+            "bound reply from instance %r (req_id=%r, in_reply_to=%r) addressed %d "
+            "recipient(s) other than its counterparty; draft.to/cc/bcc discarded, bound "
+            "to the ledger record's counterparty", name, req_id, in_reply_to, len(others))
+    if cfg.delivered_drift is not None:
+        logger.error(
+            "instance %r req %r: bound reply held unconsumed: the delivered-domain set "
+            "differs from config.fleet_hosts (%d delivered but not a fleet host, %d fleet "
+            "hosts not delivered)", name, req_id, *cfg.delivered_drift)
+        return HELD
+    try:
+        klass = classify_mod.address_class(cfg, counterparty)[0]
+    except classify_mod.Malformed:
+        klass = None
+    if klass != classify_mod.CLASS_FLEET:
+        result = _result_doc(req_id, "rejected", reason_code=classify_mod.REASON_NO_ROUTE,
+                             recipients=[], detail=DETAIL_NO_REPLY_PATH)
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    staged = dict(doc, draft=_bound_draft(draft, counterparty))
+    admission = pinned.get("admission", hoplink.ADMISSION_OPEN)
+    if admission == hoplink.ADMISSION_OPEN:
+        routed = _remote_decision(
+            cfg, name, staged["draft"],
+            classify_mod.Remote(classify_mod.CLASS_FLEET, (counterparty,), (counterparty,)),
+            cold_policy)
+        if isinstance(routed, ColdRefusal):
+            if routed.hold:
+                _write_held_copy(cfg, name, req_id)
+            result = _result_doc(req_id, routed.outcome, reason_code=routed.reason_code,
+                                 recipients=[], detail=routed.detail)
+            return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    digest = _bound_policy_digest(cfg, name, admission, pinned)
+    bound = {
+        "bound_address": counterparty,
+        "origin_notice_id": pinned["origin_notice_id"],
+        "origin_link": pinned["origin_link"],
+        "origin_generation": pinned["origin_generation"],
+        "participants": {"agent": pinned["agent"], "counterparty": counterparty},
+        "admission": admission,
+        "admission_link": pinned["admission_link"],
+        "admission_rule": pinned["admission_rule"],
+        "policy_digest": digest,
+    }
+    why = hoplink.bound_problem(bound)
+    if why is not None:
+        result = _result_doc(
+            req_id, "rejected", reason_code=REASON_UNRESOLVED_REPLY,
+            detail=f"in_reply_to {in_reply_to!r}: the reply binding cannot make a bound "
+                   f"reply ({why})")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    return _begin_external(
+        cfg, name, req_id, staged, ExternalRoute((counterparty,)),
+        req_digest=req_digest, attachments=attachments, transport=transport,
+        klass=classify_mod.CLASS_FLEET, cold_policy=cold_policy,
+        bound_reply={"notice_id": in_reply_to, "binding": pinned, "bound": bound},
+    )
 
 
 @dataclass(frozen=True)
@@ -1334,6 +1488,7 @@ def _begin_external(
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     transport: Optional[inflight_mod.TransportPort],
     klass: Optional[str] = None, cold_policy: Optional[ColdPolicy] = None,
+    bound_reply: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Put a request in flight and take its first step (which writes the
     transport request). No transport configured settles at once,
@@ -1342,7 +1497,10 @@ def _begin_external(
     (the smaller of the hop's and this router's) before anything is
     allocated, then snapshotted into this router's private state by
     `inflight.begin`, so every hand-over carries exactly the bytes ingest
-    verified, whatever later happens to the agent's own sidecars."""
+    verified, whatever later happens to the agent's own sidecars.
+    `bound_reply` (`_drain_bound_reply`) makes the hand-over a bound reply,
+    begun under its own policy digest, and refuses one whose handover could
+    exceed the hop's document cap."""
     if isinstance(transport, hoplink.Held):
         # This generation's sender is held: nothing is consumed, so the
         # request is decided on a later poll, once the hold clears.
@@ -1409,11 +1567,27 @@ def _begin_external(
         result = _result_doc(req_id, e.outcome, reason_code=e.reason_code,
                              recipients=[], detail=e.detail)
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    if bound_reply is not None and cfg.hop is not None:
+        # The document floor (`hoplink.document_floor`) is sized for a mail
+        # envelope; a bound reply's is larger, so its fit is checked here.
+        size = hoplink.handover_len_max(
+            probe, from_address=from_address, version_write=cfg.hop.version_write,
+            attachment_sizes=[a.size_bytes for a in attachments or []],
+            kind=hoplink.BOUND_REPLY_KIND, bound=bound_reply["bound"])
+        if size > cfg.hop.cap("document"):
+            result = _result_doc(
+                req_id, "rejected", reason_code=hoplink.REASON_MALFORMED_REQUEST,
+                recipients=[], detail=f"the bound reply's handover can be {size} bytes; it "
+                                      f"exceeds the hop document cap "
+                                      f"({cfg.hop.cap('document')})")
+            return _finish(cfg, name, req_id, result, req_digest=req_digest)
     record = inflight_mod.begin(
         cfg, name, req_id, digest=req_digest, request_doc=doc,
         recipients=list(route.recipients),
-        policy_digest=classify_mod.policy_digest(cfg, name), route=klass,
-        from_address=from_address, attachments=attachments or None,
+        policy_digest=(bound_reply["bound"]["policy_digest"] if bound_reply is not None
+                       else classify_mod.policy_digest(cfg, name)),
+        route=klass, from_address=from_address, attachments=attachments or None,
+        bound_reply=bound_reply,
     )
     _advance_one(cfg, name, req_id, record, transport, cold_policy=cold_policy)
     return INFLIGHT
@@ -1483,6 +1657,8 @@ def _recheck(
             "detail": f"policy changed before publication: {why}", "recipients": []},
             why=why)
 
+    if "bound_reply" in record:
+        return _recheck_bound(cfg, name, record, cold_policy, refused)
     draft = record.get("request", {}).get("draft")
     if not isinstance(draft, dict):
         return refused("the staged request has no draft")
@@ -1514,6 +1690,48 @@ def _recheck(
         return refused("the permitted recipient set changed")
     return inflight_mod.Recheck(True, policy_digest=classify_mod.policy_digest(cfg, name),
                                 route=decided.klass)
+
+
+def _recheck_bound(
+    cfg: RouterConfig, name: str, record: Dict[str, Any], cold_policy: Optional[ColdPolicy],
+    refused: Callable[[str], inflight_mod.Recheck],
+) -> inflight_mod.Recheck:
+    """`_recheck` for a bound reply. Permitted only while: the delivered-
+    domain set agrees with `fleet_hosts`; the ledger record still exists
+    with every pinned member unchanged and its agent still `name`'s; the
+    counterparty is still a fleet host; and, for an `open` admission, egress
+    still permits it (any other admission is permitted by the binding, and
+    egress is not consulted). Expiry is NOT re-evaluated: the reply was
+    authorised when begun, and its bytes are frozen. Never a new digest: the
+    `bound` handed over is the pinned one."""
+    pin = record["bound_reply"]
+    pinned = pin["binding"]
+    counterparty = pin["bound"]["bound_address"]
+    if cfg.delivered_drift is not None:
+        return refused("the delivered-domain set differs from fleet_hosts")
+    now = binding.read_ledger_record(cfg.state_dir, name, pin["notice_id"],
+                                     state_key=state_key(cfg, name))
+    if now is None:
+        return refused("binding no longer resolves: its ledger record is gone")
+    if any(now.get(m) != pinned.get(m) for m in binding.MAIL_ORIGIN_MEMBERS) \
+            or now.get("transport") != HOP_LEDGER_TRANSPORT:
+        return refused("binding no longer resolves: its ledger record changed")
+    if pinned.get("agent") != state_key(cfg, name):
+        return refused("binding no longer resolves: it binds another agent")
+    try:
+        klass = classify_mod.address_class(cfg, counterparty)[0]
+    except classify_mod.Malformed:
+        klass = None
+    if klass != classify_mod.CLASS_FLEET:
+        return refused(f"route changed from {classify_mod.CLASS_FLEET} to {klass}")
+    if pin["bound"]["admission"] == hoplink.ADMISSION_OPEN:
+        routed = _remote_decision(
+            cfg, name, record["request"]["draft"],
+            classify_mod.Remote(classify_mod.CLASS_FLEET, (counterparty,), (counterparty,)),
+            cold_policy)
+        if isinstance(routed, ColdRefusal):
+            return refused(f"now {routed.reason_code}")
+    return inflight_mod.Recheck(True, route=classify_mod.CLASS_FLEET)
 
 
 #: What this process has already warned about, so a 5-second poll does not

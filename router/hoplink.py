@@ -36,6 +36,9 @@ HANDOVER_SCHEMA = "amap-hop-handover/1"
 #: signed kinds; a request of any other class is refused `no_route` at
 #: begin (`outbound._begin_external`), before anything is allocated.
 MAIL_KIND = "mail"
+#: The envelope kind of a reply bound to a placed hop mail (`bound`, below):
+#: begun only from this router's own ledger record of that mail.
+BOUND_REPLY_KIND = "bound_reply"
 #: The most raw `to` + `cc` (+ `bcc`) entries one request may name,
 #: duplicates counted (`too_many_recipients`).
 MAX_RECIPIENTS = 100
@@ -243,18 +246,92 @@ def document_floor(*, request_cap: int, count_cap: int, file_cap: int, total_cap
 
 
 def build_handover(request: Dict[str, Any], *, from_address: str, version_write: int,
-                   attachments: Iterable[str], settled_through: int) -> bytes:
+                   attachments: Iterable[str], settled_through: int,
+                   kind: str = MAIL_KIND, bound: Optional[Dict[str, Any]] = None) -> bytes:
     """The handover document's canonical bytes. `attachments` are standard
-    base64 strings in descriptor order. `ValueError` for anything the
-    encoding refuses."""
+    base64 strings in descriptor order. `kind` is `MAIL_KIND`, with no
+    `bound`, or `BOUND_REPLY_KIND`, whose envelope carries `bound` (which
+    must pass `bound_problem`). `ValueError` for anything the encoding
+    refuses, or for any other combination."""
+    envelope: Dict[str, Any] = {"from_address": from_address, "hop_contract": version_write,
+                                "kind": kind}
+    if kind == BOUND_REPLY_KIND:
+        why = bound_problem(bound)
+        if why is not None:
+            raise ValueError(f"bound: {why}")
+        envelope["bound"] = bound
+    elif kind != MAIL_KIND or bound is not None:
+        raise ValueError(f"kind {kind!r} with bound {'present' if bound else 'absent'}")
     return canonical({
         "attachments": list(attachments),
-        "envelope": {"from_address": from_address, "hop_contract": version_write,
-                     "kind": MAIL_KIND},
+        "envelope": envelope,
         "request": request,
         "schema": HANDOVER_SCHEMA,
         "settled_through": settled_through,
     })
+
+
+# The bound reply's `bound` object: its members and the hop codec's grammar
+# for each, applied with `fullmatch`. `bound_address` and the counterparty
+# are addresses (`from_address_problem`), and equal exactly.
+BOUND_MEMBERS = ("bound_address", "origin_notice_id", "origin_link", "origin_generation",
+                 "participants", "admission", "admission_link", "admission_rule",
+                 "policy_digest")
+ORIGIN_NOTICE_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+LINK_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+HEX32_RE = re.compile(r"[0-9a-f]{32}\Z")
+ADMISSION_RULE_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}\Z")
+POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+#: `admission`'s values. An absent admission is `ADMISSION_OPEN`, and is
+#: always written explicitly.
+ADMISSION_OPEN = "open"
+ADMISSIONS = (ADMISSION_OPEN, "fleet_hosts", "inbound_allowlist")
+
+
+def bound_problem(bound: Any) -> Optional[str]:
+    """Why `bound` is not a bound reply's `bound` object, or None."""
+    if not isinstance(bound, dict) or set(bound) != set(BOUND_MEMBERS):
+        return f"not an object with exactly {list(BOUND_MEMBERS)}"
+    parts = bound["participants"]
+    if not isinstance(parts, dict) or set(parts) != {"agent", "counterparty"}:
+        return "participants is not {agent, counterparty}"
+    for key, value, pattern in (
+            ("origin_notice_id", bound["origin_notice_id"], ORIGIN_NOTICE_ID_RE),
+            ("origin_link", bound["origin_link"], LINK_RE),
+            ("origin_generation", bound["origin_generation"], HEX32_RE),
+            ("participants.agent", parts["agent"], HEX32_RE),
+            ("admission_link", bound["admission_link"], LINK_RE),
+            ("admission_rule", bound["admission_rule"], ADMISSION_RULE_RE),
+            ("policy_digest", bound["policy_digest"], POLICY_DIGEST_RE)):
+        if not (isinstance(value, str) and pattern.fullmatch(value)):
+            return f"{key} is outside its grammar"
+    if bound["admission"] not in ADMISSIONS:
+        return "admission is outside its enum"
+    for key, value in (("bound_address", bound["bound_address"]),
+                       ("participants.counterparty", parts["counterparty"])):
+        why = from_address_problem(value)
+        if why is not None:
+            return f"{key}: {why}"
+    if bound["bound_address"] != parts["counterparty"]:
+        return "bound_address is not participants.counterparty exactly"
+    return None
+
+
+def handover_len_max(request: Dict[str, Any], *, from_address: str, version_write: int,
+                     attachment_sizes: Iterable[int], kind: str = MAIL_KIND,
+                     bound: Optional[Dict[str, Any]] = None) -> int:
+    """The largest the handover for `request` can be: the transport id and
+    `settled_through` at their most digits, and each attachment as the
+    standard base64 of its size. Computed, not built: no attachment bytes
+    are read."""
+    sizes = list(attachment_sizes)
+    probe = dict(request, req_id="9" * TRANSPORT_ID_MAX_DIGITS)
+    skeleton = build_handover(probe, from_address=from_address, version_write=version_write,
+                              attachments=(), settled_through=10 ** TRANSPORT_ID_MAX_DIGITS - 1,
+                              kind=kind, bound=bound)
+    if not sizes:
+        return len(skeleton)
+    return len(skeleton) + sum(4 * math.ceil(n / 3) + 2 for n in sizes) + len(sizes) - 1
 
 
 # ---------------------------------------------------------------------------

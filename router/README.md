@@ -713,8 +713,10 @@ view.
 - `mail_reply_window_seconds` (default 604800, at most 7776000, i.e. 90
   days) — how long after an inbound hop mail is placed its recipient may
   reply to it as a bound reply. Fixed into the mail's ledger record when the
-  entry is prepared, so a later change never moves a recorded binding. The
-  default is PROVISIONAL, pending the owner's confirmation.
+  entry is prepared, so a later change never moves a recorded binding.
+- `delivered_domains_file` — optional, an absolute path: the set of domains
+  the downstream hub delivers to, as the deployment renders it. Below,
+  "Bound replies over the hop".
 - `intake_dir` — the cross-host intake spool's parent; `provision` creates
   `<intake_dir>/<instance>/`, `docker/derive-mounts.py` mounts it. Nothing
   reads it until an email router exists.
@@ -1012,13 +1014,13 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `rejected` | `attachment_mismatch` | An attachment descriptor and its sidecar bytes disagree, or the sidecar dir's shape is wrong: sha/size mismatch, missing/extra ordinal, non-ordinal entry name, symlinked/hardlinked/non-regular sidecar, dir present with no attachments declared (or vice versa) — see "Attachment transport" below |
 | `rejected` | `recipient_unknown` | Cold send: an address at this router's own domain names no instance (classification step 3); or, with no transport plugin, any cross-host address (step 4); or a trusted-host peer task that passed every check, because this router cannot yet sign a cross-host peer statement (item 5e) |
 | `rejected` | `mixed_recipient_classes` | Cold send: `to` ∪ `cc` spans more than one class (local, trusted fleet host, other fleet host, internet). One request, one class |
-| `rejected` | `no_route` | Cold send to the internet, and this host has no `egress`. Decided before `send_to` |
+| `rejected` | `no_route` | Cold send to the internet, and this host has no `egress`. Decided before `send_to`. Also a bound reply whose counterparty is not a fleet host: "no reply path to this counterparty in this deployment", with nothing allocated |
 | `rejected` | `fleet_mail_disabled` | Cold send to a trusted fleet host that cannot be a peer task: more than one recipient, or any `cc` |
 | `rejected` | `peer_denied` | Trusted fleet host: the sender's `task_deny` removes the edge (an exact address or `@domain`) |
 | `rejected` | `peer_quarantined` | Trusted fleet host: the sender's registry `first_registered_ts` is under 24 h old, in the future, or absent ("sender age unknown") |
 | `rejected` | `exposure_unavailable` | Trusted fleet host: the `sender_exposure` assessment returned nothing or failed; a cross-host peer task never goes without it |
 | `rejected` | `peer_statement_too_large` | Trusted fleet host: the signed statement would exceed 8192 bytes. Reachable only once a signer exists (item 5e decides first today) |
-| `rejected` | `unresolved_reply` | Reply: `in_reply_to` doesn't resolve to a ledger record for this sender |
+| `rejected` | `unresolved_reply` | Reply: `in_reply_to` doesn't resolve to a ledger record for this sender; or, for a bound reply, the record binds another agent, has expired, lacks its binding members, or cannot make a valid `bound` |
 | `rejected` | `self_send` | Recipient resolves to the sender's own instance |
 | `rejected` | `req_id_reused` | The filename's `req_id` was already anchored to a DIFFERENT request (agent deleted its own `outbound/{results,processed}` and resubmitted under a reused id) — refused rather than replaying the stale verdict |
 | `rejected` | `quarantined_pre_approval` | The filename was already present in the outbox at the moment this router FIRST SAW the instance — staged-request quarantine, never delivered; resubmit under a fresh `req_id`. (The code keeps its old spelling: it is on the wire, and `approve` was retired after it shipped.) |
@@ -1341,8 +1343,7 @@ codec's link grammar (`[a-z0-9][a-z0-9-]{0,62}`): it keys the ingress
 journal and is what admission compares the facts' `admission_link` with.
 Without it inbound is DISABLED (nothing is listed, read or placed; the
 outbound leg is unaffected). It is rendered by the host adapter from the
-fleet policy that names the downstream runtime's link. PROVISIONAL, pending
-the owner's confirmation. A reload that changes `hop` is refused, like one
+fleet policy that names the downstream runtime's link. A reload that changes `hop` is refused, like one
 that changes the plugin. Every instance's address must be able to serve as a
 handover's `from_address` (at most 254 octets, a local part of at most 64,
 the bare addr-spec pattern): one that cannot is refused at load, by the
@@ -1495,10 +1496,10 @@ changes `settled_through` and nothing else.
   burns a transport id; the burned id is harmless and the snapshot is
   swept.
 
-**Mail only.** The hand-over carries kind `"mail"`, so a request the
-classifier did not put in a cold mail class (`fleet_host`, `internet`) is
-refused `rejected`/`no_route` before anything is allocated, never handed
-over as mail.
+**Mail, or a bound reply.** A cold hand-over carries kind `"mail"`, so a
+request the classifier did not put in a cold mail class (`fleet_host`,
+`internet`) is refused `rejected`/`no_route` before anything is allocated,
+never handed over as mail. The one other kind is `"bound_reply"`, below.
 
 **Refused at begin**, before a transport id is allocated: more than 100
 raw recipients across `to`, `cc` and `bcc` (`too_many_recipients`, with
@@ -1634,8 +1635,54 @@ from (`origin_notice_id`, `origin_link`, `origin_logical_id`,
 `origin_generation`), how it was admitted (`admission`, `admission_link`,
 `admission_rule`, never backfilled), `received_at` and `expires_at` (fixed
 when the entry is prepared, from `mail_reply_window_seconds`). A record
-without them never resolves as a binding across the external leg. (Sending a
-bound reply over the leg is a later change.)
+without them never resolves as a binding across the external leg.
+
+**Bound replies over the hop.** A reply whose `in_reply_to` names such a
+record is decided before the trusted-host rule and before any cold
+classification, and handed back over the hop as kind `"bound_reply"`:
+
+- It binds ONLY when the record carries the binding members, its agent is
+  the replying instance's logical_id, and it has not expired. Otherwise
+  `rejected`/`unresolved_reply`. A bare id lookup is never enough.
+- The recipient is the record's `counterparty`. The draft's `to`, `cc` and
+  `bcc` are discarded (logged as a count, never echoed).
+- The counterparty must be a fleet host under this router's own classifier
+  (`fleet_hosts`, and not a trusted fleet host); anything else is
+  `rejected`/`no_route`, "no reply path to this counterparty in this
+  deployment", with nothing allocated.
+- An `open` admission (also what an absent one means, written explicitly)
+  is decided by egress, as mail is: `queued_for_human`/
+  `recipient_not_allowlisted` when refused. `fleet_hosts` and
+  `inbound_allowlist` are permitted by the binding, and egress is not
+  consulted.
+- The envelope's `bound` is `{bound_address, origin_notice_id, origin_link,
+  origin_generation, participants: {agent, counterparty}, admission,
+  admission_link, admission_rule, policy_digest}`, with `bound_address`
+  equal to the counterparty exactly. `policy_digest` is the sender's mail
+  policy digest for `open`, and for the other two that policy with the
+  binding added. The binding and the `bound` are PINNED in the in-flight
+  record at begin, and every hand-over carries the record's, byte for byte.
+- At every publication attempt and every pending poll, the re-check asks
+  whether the ledger record is still there with every pinned member
+  unchanged, the agent is still this instance's, the counterparty is still a
+  fleet host, and (for `open`) egress still permits it. Expiry is NOT
+  re-evaluated after begin. A failure is `queued_for_human`/
+  `recipient_not_allowlisted`, never a send and never `rejected`.
+- A bound reply whose handover could exceed the hop's document cap (the
+  config-time floor is sized for a mail envelope) is `rejected`/
+  `malformed_request` before anything is allocated.
+
+`delivered_domains_file`, when set, is read at load: no symlink, a regular
+file owned by root or this process and not writable by group or others,
+outside every agent-reachable root, at most 1 MiB. Its shape is
+`{"delivered_domains": [...], "sha256": ..., "attestation": {...}}`, where
+`sha256` is the hex digest of the domains lowercased, sorted, each followed
+by a newline, and `attestation` is not read. PROVISIONAL: the deployment's
+layout for it is not yet frozen. A hash that does not match refuses the
+config. A set that differs from `fleet_hosts` does NOT: an ERROR names the
+two difference counts (never the domains), every bound reply is held
+unconsumed, a bound reply already in flight is refused at publication, and
+mail is unaffected. Absent, nothing changes.
 
 **A read that decides nothing, again** (the runtime's own refusal class, or
 an OSError from the reader) is kept per journal key with its first sighting
