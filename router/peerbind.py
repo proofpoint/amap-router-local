@@ -640,14 +640,14 @@ def _link_once(dirfd: int, name: str, data: bytes, *, stage_prefix: str) -> str:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                  0o600, dir_fd=dirfd)
     try:
-        os.fchmod(fd, 0o600)
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    try:
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.link(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
     except FileExistsError:
         os.unlink(tmp, dir_fd=dirfd)
@@ -660,6 +660,15 @@ def _link_once(dirfd: int, name: str, data: bytes, *, stage_prefix: str) -> str:
             os.close(efd)
         os.fsync(dirfd)
         return "exists_same"
+    except Exception:
+        # A synchronous failure before the link leaves the namespace as it
+        # was. (A crash leaves the temp; the next writer's stage cleanup and
+        # `reopen_decision` remove it.)
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
     os.unlink(tmp, dir_fd=dirfd)
     os.fsync(dirfd)
     return "created"

@@ -878,14 +878,46 @@ class FileFsyncTests(_Chain):
                                        preset=PRESET, cfg=self.cfg, state_dir=self.state_dir)
         return rec, snap
 
+    def state(self):
+        return sorted((str(p.relative_to(self.state_dir)),
+                       p.read_bytes() if p.is_file() else None)
+                      for p in self.state_dir.rglob("*"))
+
     def test_the_temp_is_fsynced_before_its_link(self):
         rec, _snap = self.record()
+        before = self.state()
         with self.failing_file_fsync():
             with self.assertRaises(OSError):
                 peerbind.commit_decision(self.state_dir, self.record_dir, rec,
                                          record_id=RECORD_ID)
         self.assertFalse((self.state_dir / self.record_dir / peerbind.DECISION_FILE).exists(),
                          "nothing is linked before the temp is durable")
+        self.assertEqual(self.state(), before, "the state namespace is byte-identical")
+
+    def kinds(self):
+        """A spy recording each fsync as "file" or "dir", in order."""
+        real, seen = os.fsync, []
+
+        def fsync(fd):
+            import stat as st
+            seen.append("dir" if st.S_ISDIR(os.fstat(fd).st_mode) else "file")
+            return real(fd)
+        return seen, mock.patch.object(peerbind.os, "fsync", fsync)
+
+    def test_the_file_is_fsynced_before_its_directory(self):
+        rec, _snap = self.record()
+        seen, spy = self.kinds()
+        with spy:
+            peerbind.commit_decision(self.state_dir, self.record_dir, rec, record_id=RECORD_ID)
+        self.assertEqual(seen, ["file", "dir"], "commit: the temp, then the directory")
+        seen, spy = self.kinds()
+        with spy:
+            peerbind.reopen_decision(self.state_dir, self.record_dir, record_id=RECORD_ID)
+        self.assertEqual(seen, ["file", "dir"], "reopen: the record, then the directory")
+        seen, spy = self.kinds()
+        with spy:
+            peerbind.ensure_decision_key(self.state_dir)
+        self.assertEqual(seen, ["file", "dir"], "the present key, then the directory")
 
     def test_reopen_fsyncs_the_record(self):
         rec, _snap = self.record()

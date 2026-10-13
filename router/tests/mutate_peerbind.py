@@ -24,6 +24,11 @@ EQUIVALENT under one rule, recorded and NOT run:
     its digest (R12), and a statement with the recorded digest carries the
     recorded key_id.
 
+  * commit's directory fsync moved before the temp's: the temp's fsync
+    precedes its link and the directory fsync follows the link and the
+    unlink, so the order is fixed by the steps themselves (the order witness
+    pins it as ["file", "dir"]).
+
 NOT EXPRESSIBLE as a single-rule mutant, recorded here:
   * "the declared media_type consulted for a disposition":
     `deliver.signed_dispositions` takes only the sizes, so no one-line edit
@@ -284,7 +289,7 @@ M = [
   '    os.close(fd)\n    return data',
   [T + 'DecisionKeyTests.test_the_present_key_path_makes_the_key_durable_first']),
  ('K2 fchmod dropped', PB,
-  '        os.fchmod(fd, 0o600)\n',
+  '            os.fchmod(fd, 0o600)\n',
   '',
   [T + 'DecisionKeyTests.test_created_once_0600_even_under_a_restrictive_umask']),
  ('K3 a conflicting creator fatal', PB,
@@ -392,8 +397,8 @@ M = [
   '',
   [T + 'ResumeBindingTests.test_a_snapshot_with_another_attachment']),
  ('F1 the staged temp not fsynced before its link', PB,
-  '        os.fsync(fd)\n    finally:\n        os.close(fd)\n    try:\n        os.link(',
-  '    finally:\n        os.close(fd)\n    try:\n        os.link(',
+  '            os.fsync(fd)\n        finally:\n            os.close(fd)\n        os.link(',
+  '        finally:\n            os.close(fd)\n        os.link(',
   [T + 'FileFsyncTests.test_the_temp_is_fsynced_before_its_link']),
  ('F2 reopen not fsyncing the record', PB,
   '        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n        os.fsync(dirfd)\n        _parse_record(data, key, record_id)',
@@ -427,6 +432,18 @@ M = [
   '    def __reduce_ex__(self, protocol):\n        raise TypeError("a PersistedDecision is not persisted")\n',
   '',
   [T + 'DecidedValueTests.test_a_receipt_is_not_picklable_and_copies_are_identical']),
+ ('F4 reopen fsyncing the directory before the record', PB,
+  '        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n        os.fsync(dirfd)\n        _parse_record(data, key, record_id)',
+  '        os.fsync(dirfd)\n        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n        _parse_record(data, key, record_id)',
+  [T + 'FileFsyncTests.test_the_file_is_fsynced_before_its_directory']),
+ ("F5 the present key's directory fsynced before the key", PB,
+  '    try:\n        os.fsync(fd)\n    finally:\n        os.close(fd)\n    os.fsync(dirfd)\n    return data',
+  '    os.fsync(dirfd)\n    try:\n        os.fsync(fd)\n    finally:\n        os.close(fd)\n    return data',
+  [T + 'FileFsyncTests.test_the_file_is_fsynced_before_its_directory']),
+ ('F6 a pre-link failure leaving its stage temp', PB,
+  '        try:\n            os.unlink(tmp, dir_fd=dirfd)\n        except OSError:\n            pass\n        raise\n',
+  '        raise\n',
+  [T + 'FileFsyncTests.test_the_temp_is_fsynced_before_its_link']),
 ]
 
 
