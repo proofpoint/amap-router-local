@@ -1348,6 +1348,15 @@ handover's `from_address` (at most 254 octets, a local part of at most 64,
 the bare addr-spec pattern): one that cannot is refused at load, by the
 same check begin runs.
 
+**Who creates what under `root`.** `root` itself is the deployment's
+(this router's uid, the downstream runtime's group, 2750), and so are the
+downstream runtime's own host intakes beside the identities (`.unresolved/`,
+`.control/`). Everything else is created by this router, through the
+plugin, when a generation is admitted: `<root>/<logical_id>/`, each
+generation tree, and the upstream `inbound/` parents (2770, setgid). The
+deployment must not pre-create or chown `<root>/<logical_id>/` or anything
+under it: the plugin's owner checks refuse a tree this router did not make.
+
 **One sender per generation.** The drain asks for the current
 generation's sender on first use. Before the first construction this router
 writes the generation's binding pin, `transport/hop.json` (the root,
@@ -2208,6 +2217,18 @@ disk lost: a power loss lands in the re-presentation residual below. An
 injected backend that cannot take the `preset` and `from_address` keywords is
 called directly, as before, and keeps the old exposure: a failure after its
 placement can place again under a new id.
+
+The outbox Result follows the same rule. It is written through the same
+barriers, and one whose directory barrier failed (`PublishedNotDurable`) is
+visible but not yet durable, so the request is NOT archived: the next
+listing finds its private result and re-publishes the Result from it
+(nothing is delivered or handed over again), and only then archives it. The
+archive rename is followed by a barrier on `processed/` and then on the
+outbox; the rename has happened by then, so a failure of either is logged
+and not retried, and the private result stays the authority. A
+`req_id_reused` refusal has no private result of its own: after a failed
+barrier it is issued again on the next listing (the same bytes), and its
+status count can include the repeat.
 
 A crash after the notice write but before the "delivered" mark replays with
 the SAME id. If the agent consumed the notice in that window, it reappears

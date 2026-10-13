@@ -444,18 +444,18 @@ class UpstreamMarkers(Protocol):
     no `HopFsOps` writer method and never admits (contrast the sender, whose
     construction admits).
 
-    `retire(retired_at)` writes `up/retired` durably (`commit_durable`
+    `retire(retired_at)` writes `up/retired.json` durably (`commit_durable`
     through `up/stage`); it is immutable once written. `retired_at` must
     pass `check_retired_at`, BEFORE any `HopFsOps` call. Results:
     `"created"`; `"exists_same"`; `"exists"` (retired already at another
     instant: not an error); `"absent"` ONLY on an owner-checked ENOENT of
     `<logical_id>/<gen>/` or `<logical_id>/`, creating nothing. A repeat
-    after a crash part-way through (`up/retired` at link count 2) completes
+    after a crash part-way through (`up/retired.json` at link count 2) completes
     the commit and returns `"created"` or `"exists_same"`. Any failed
     barrier raises.
 
     `retired()`: `True` for a valid marker; `False` only for an
-    owner-checked ENOENT of `up/retired` in an EXISTING tree whose `up/` is
+    owner-checked ENOENT of `up/retired.json` in an EXISTING tree whose `up/` is
     intact. An absent tree raises this object's `GenerationAbsent`, never
     `False` (`False` means "the tree exists and is not retired"). The caller
     captures `GenerationAbsent` once, at construction
