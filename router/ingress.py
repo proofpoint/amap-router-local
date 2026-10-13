@@ -317,6 +317,113 @@ def _json_doc(raw: bytes, what: str) -> Dict[str, Any]:
     return doc
 
 
+# The AMAP document checks for the bundle's notice (`deliver-notice`) and
+# spool (`inbound-message`): each schema's required members and types,
+# hand-rolled because the package is stdlib-only, and proven against the
+# spec's golden fixtures in the tests (`test_ingress_documents`). Both
+# documents are OPEN (§7's tolerance rule): an unknown member is accepted.
+_NOTICE_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+_SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
+_CONTENT_REF_RE = re.compile(r"[A-Za-z0-9_.-]+\.attachments/(0|[1-9][0-9]*)\Z")
+DISPOSITIONS = ("clean", "stripped", "quarantined", "unscanned")
+
+
+def _str(v: Any, *, nonempty: bool = False) -> bool:
+    return isinstance(v, str) and (not nonempty or bool(v))
+
+
+def _check_descriptors(descs: Any, notice_id: str, what: str) -> None:
+    if not isinstance(descs, list):
+        raise _invalid(f"{what}.attachments is not a list")
+    for k, d in enumerate(descs):
+        w = f"{what}.attachments[{k}]"
+        if not isinstance(d, dict):
+            raise _invalid(f"{w} is not an object")
+        if not (_str(d.get("filename"), nonempty=True)
+                and _str(d.get("media_type"), nonempty=True)):
+            raise _invalid(f"{w}: filename and media_type must be non-empty strings")
+        size = d.get("size_bytes")
+        if not (type(size) is int and size >= 0):
+            raise _invalid(f"{w}: size_bytes is not a non-negative integer")
+        if d.get("disposition") not in DISPOSITIONS:
+            raise _invalid(f"{w}: disposition is not one of {list(DISPOSITIONS)}")
+        if "sha256" in d and not (_str(d["sha256"]) and _SHA256_RE.fullmatch(d["sha256"])):
+            raise _invalid(f"{w}: sha256 is not 64 lowercase hex")
+        if "content_ref" in d:
+            ref = d["content_ref"]
+            if not (_str(ref) and _CONTENT_REF_RE.fullmatch(ref)):
+                raise _invalid(f"{w}: content_ref is not <id>.attachments/<index>")
+            # The post-check the schema cannot state: the grant names THIS
+            # notice and THIS position.
+            if ref != f"{notice_id}.attachments/{k}":
+                raise _invalid(f"{w}: content_ref does not name this notice and position")
+        if ("content_ref" in d or "sha256" in d) and d["disposition"] != "clean":
+            raise _invalid(f"{w}: content_ref or sha256 on a non-clean descriptor")
+
+
+def _check_notice_id(doc: Dict[str, Any], what: str) -> str:
+    nid = doc.get("notice_id")
+    if not (_str(nid) and _NOTICE_ID_RE.fullmatch(nid)):
+        raise _invalid(f"{what}: notice_id is not in the notice id grammar")
+    return nid
+
+
+def check_notice_doc(doc: Any) -> None:
+    """`deliver-notice`, as a hostile document: raises `BundleRefused`
+    (`bundle_invalid`) on the first rule it breaks."""
+    if not isinstance(doc, dict):
+        raise _invalid("the notice is not an object")
+    if doc.get("contract_version") != "2":
+        raise _invalid("the notice's contract_version is not \"2\"")
+    nid = _check_notice_id(doc, "the notice")
+    if not _str(doc.get("ts"), nonempty=True):
+        raise _invalid("the notice's ts is not a non-empty string")
+    if doc.get("kind") != "deliver":
+        raise _invalid("the notice's kind is not \"deliver\"")
+    m = doc.get("message")
+    if not isinstance(m, dict):
+        raise _invalid("the notice's message is not an object")
+    for member in ("id", "from", "mailbox"):
+        if not _str(m.get(member), nonempty=True):
+            raise _invalid(f"message.{member} is not a non-empty string")
+    for member in ("subject", "preview"):
+        if not _str(m.get(member)):
+            raise _invalid(f"message.{member} is not a string")
+    for member in ("task_id",):
+        if member in m and not _str(m[member], nonempty=True):
+            raise _invalid(f"message.{member} is not a non-empty string")
+    for member in ("thread_id", "in_reply_to", "sender_standing", "provenance"):
+        if member in m and not _str(m[member]):
+            raise _invalid(f"message.{member} is not a string")
+    if "references" in m and not (isinstance(m["references"], list)
+                                  and all(_str(r) for r in m["references"])):
+        raise _invalid("message.references is not a list of strings")
+    if "verdict" in m:
+        v = m["verdict"]
+        if not (isinstance(v, dict) and all(_str(v[k]) for k in ("auth", "screen", "entitlement")
+                                            if k in v)):
+            raise _invalid("message.verdict is not an object of strings")
+    if "attachments" in m:
+        _check_descriptors(m["attachments"], nid, "message")
+
+
+def check_message_doc(doc: Any) -> None:
+    """`inbound-message` (the spool), as a hostile document: raises
+    `BundleRefused` (`bundle_invalid`) on the first rule it breaks."""
+    if not isinstance(doc, dict):
+        raise _invalid("the spool is not an object")
+    if doc.get("contract_version") != "2":
+        raise _invalid("the spool's contract_version is not \"2\"")
+    nid = _check_notice_id(doc, "the spool")
+    if not _str(doc.get("body_text")):
+        raise _invalid("the spool's body_text is not a string")
+    for member in ("id", "date", "from", "to", "cc", "subject"):
+        if member in doc and not _str(doc[member]):
+            raise _invalid(f"the spool's {member} is not a string")
+    if "attachments" in doc:
+        _check_descriptors(doc["attachments"], nid, "the spool")
+
+
 def parse_bundle(raw: bytes, entry_id: str, *, attachment_cap: int) -> Dict[str, Any]:
     """The bundle `read_entry` returned for notice `entry_id`, checked as
     HOSTILE input: exactly the five members; the current schema; each part
@@ -343,28 +450,26 @@ def parse_bundle(raw: bytes, entry_id: str, *, attachment_cap: int) -> Dict[str,
     notice = _json_doc(notice_raw, "notice")
     spool = _json_doc(spool_raw, "spool")
     facts = _json_doc(facts_raw, "hop facts")
-    if notice.get("notice_id") != entry_id:
+    check_notice_doc(notice)
+    check_message_doc(spool)
+    if notice.get("notice_id") != entry_id or spool.get("notice_id") != entry_id:
         raise BundleRefused("entry_id_mismatch",
-                            f"the notice's notice_id is not the listed entry {entry_id!r}")
-    message = notice.get("message")
-    descs = message.get("attachments", []) if isinstance(message, dict) else None
-    if not isinstance(descs, list):
-        raise _invalid("message.attachments is not a list")
+                            f"the notice's or the spool's notice_id is not the listed "
+                            f"entry {entry_id!r}")
+    # `check_notice_doc` has established the descriptors' shapes, and that a
+    # `content_ref` sits only on a clean descriptor and names this notice and
+    # its own position; what is left is the bytes beside them.
+    descs = notice["message"].get("attachments", [])
     atts = bundle["attachments"]
     if not isinstance(atts, list) or len(atts) != len(descs):
         raise _invalid("attachments are not positional with message.attachments")
     blobs: List[Optional[bytes]] = []
     for k, (d, a) in enumerate(zip(descs, atts)):
-        if not isinstance(d, dict):
-            raise _invalid(f"descriptor {k} is not an object")
-        ref = d.get("content_ref")
-        if ref is None:
+        if "content_ref" not in d:
             if a is not None:
                 raise _invalid(f"attachment {k} present without a content_ref")
             blobs.append(None)
             continue
-        if ref != f"{entry_id}.attachments/{k}" or d.get("disposition") != "clean":
-            raise _invalid(f"descriptor {k}: content_ref {ref!r} on a non-clean or misnamed part")
         if a is None:
             raise _invalid(f"attachment {k} absent although its descriptor carries content_ref")
         blob = _b64(a, f"attachment {k}", attachment_cap)

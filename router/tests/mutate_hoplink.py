@@ -36,6 +36,7 @@ FV = "router.tests.test_ingress_facts_version.FactsVersionTests."
 BT = "router.tests.test_ingress_bundle.BundleTests."
 SN = "router.tests.test_ingress_snapshot."
 QW = "router.tests.test_ingress_quarantine_writer.WriterTests."
+DF = "router.tests.test_ingress_documents.FixtureTests.test_invalid_fixtures_are_refused"
 
 M = [
  # -- the facts version guard (driven directly at the guard unit) -------------
@@ -71,14 +72,10 @@ M = [
   '_b64(bundle["hop"], "hop", transport_mod.HOP_FACTS_MAX)', '_b64(bundle["hop"], "hop", DOC_CAP)',
   [BT + "test_the_facts_cap"]),
  ('B6 notice_id not compared with the entry', IG,
-  '    if notice.get("notice_id") != entry_id:\n', '    if False:\n',
+  'if notice.get("notice_id") != entry_id or spool', 'if spool',
   [BT + "test_the_notice_id_must_be_the_listed_entry"]),
- ('B7 a non-object message read as no attachments', IG,
-  'message.get("attachments", []) if isinstance(message, dict) else None',
-  'message.get("attachments", []) if isinstance(message, dict) else []',
-  [BT + "test_a_message_or_descriptor_that_is_not_an_object"]),
  ('B8 an absent member not read as zero attachments', IG,
-  'message.get("attachments", []) if', 'message.get("attachments") if',
+  'notice["message"].get("attachments", [])', 'notice["message"].get("attachments")',
   [BT + "test_zero_attachments_with_the_member_absent"]),
  ('B9 attachments not positional', IG,
   '    if not isinstance(atts, list) or len(atts) != len(descs):\n', '    if not isinstance(atts, list):\n',
@@ -86,12 +83,9 @@ M = [
  ('B10 bytes accepted without a content_ref', IG,
   '            if a is not None:\n                raise _invalid(f"attachment {k} present without a content_ref")\n', '',
   [BT + "test_bytes_without_a_ref_and_a_ref_without_bytes"]),
- ('B11 content_ref position unchecked', IG,
-  'if ref != f"{entry_id}.attachments/{k}" or d.get', 'if not ref.startswith(f"{entry_id}.attachments/") or d.get',
-  [BT + "test_content_ref_must_name_its_position_on_a_clean_part"]),
- ('B12 content_ref on a non-clean part accepted', IG,
-  ' or d.get("disposition") != "clean":\n', ':\n',
-  [BT + "test_content_ref_must_name_its_position_on_a_clean_part"]),
+ # (B7, B11, B12 and B16 are gone: `check_notice_doc` now enforces the
+ # message and descriptor shapes and the content_ref rules before this point,
+ # and its M-mutants carry them.)
  # (No mutant for "a ref without bytes" alone: `_b64` refuses a non-string,
  # None included, so removing the explicit check changes only the message.)
  ('B14 size unchecked', IG,
@@ -100,10 +94,30 @@ M = [
  ('B15 sha256 unchecked', IG,
   '\n                or d.get("sha256") != hashlib.sha256(blob).hexdigest()):', '):',
   [BT + "test_size_and_digest_must_match_the_descriptor"]),
- ('B16 a non-object descriptor read as empty', IG,
-  '        if not isinstance(d, dict):\n            raise _invalid(f"descriptor {k} is not an object")\n',
-  '        if not isinstance(d, dict):\n            d = {}\n',
-  [BT + "test_a_message_or_descriptor_that_is_not_an_object"]),
+ # -- the AMAP document checks, each pinned by an invalid golden fixture --------
+ ('M1 the notice kind unchecked', IG,
+  '    if doc.get("kind") != "deliver":\n', '    if False:\n', [DF]),
+ ('M2 the notice id grammar unchecked', IG,
+  '    if not (_str(nid) and _NOTICE_ID_RE.fullmatch(nid)):\n', '    if not _str(nid):\n', [DF]),
+ ('M3 content_ref position unchecked', IG,
+  '            if ref != f"{notice_id}.attachments/{k}":\n', '            if False:\n', [DF]),
+ ('M4 a grant on a non-clean descriptor', IG,
+  '        if ("content_ref" in d or "sha256" in d) and d["disposition"] != "clean":\n',
+  '        if False:\n', [DF]),
+ ('M5 any disposition accepted', IG,
+  '        if d.get("disposition") not in DISPOSITIONS:\n', '        if False:\n', [DF]),
+ ('M6 preview not required', IG,
+  '    for member in ("subject", "preview"):\n', '    for member in ("subject",):\n', [DF]),
+ ('M7 the spool body not required', IG,
+  '    if not _str(doc.get("body_text")):\n', '    if False:\n', [DF]),
+ ('M8 the notice version unchecked', IG,
+  '        raise _invalid("the notice\'s contract_version is not \\"2\\"")\n', '        pass\n', [DF]),
+ # (No mutant for the content_ref grammar alone: the positional post-check
+ # requires equality with "<notice_id>.attachments/<k>", whose notice_id has
+ # passed the grammar, so it refuses everything the grammar does.)
+ ('M10 the spool notice id not compared', IG,
+  ' or spool.get("notice_id") != entry_id:\n', ':\n',
+  [BT + "test_the_spool_notice_id_must_be_the_listed_entry_too"]),
  # -- snapshots: kept durably, verified fail-closed ------------------------------
  ('N1 the snapshot directory left at the umask', IG,
   '    os.mkdir(path, 0o700)\n    os.chmod(path, 0o700)\n', '    os.mkdir(path)\n',

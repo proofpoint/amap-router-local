@@ -26,15 +26,18 @@ def make(*, blobs=(b"hello",), clean=True, notice_extra=None, drop_message_attac
             d["sha256"] = hashlib.sha256(blob).hexdigest()
             d["content_ref"] = f"{NID}.attachments/{k}"
         descs.append(d)
-    message = {"id": "42", "from": "a@x.example", "subject": "s"}
+    message = {"id": "42", "from": "a@x.example", "subject": "s", "preview": "b",
+               "mailbox": "inbox", "provenance": "fleet-remote"}
     if not drop_message_attachments:
         message["attachments"] = descs
-    notice = {"contract_version": "2", "kind": "notice", "notice_id": NID, "message": message}
+    notice = {"contract_version": "2", "kind": "deliver", "notice_id": NID,
+              "ts": "2026-10-13T00:00:00Z", "message": message}
     if notice_extra:
         notice.update(notice_extra)
     bundle = {"schema": transport.NOTICE_BUNDLE_SCHEMA,
               "notice": b64(json.dumps(notice).encode()),
-              "spool": b64(json.dumps({"notice_id": NID, "body_text": "b"}).encode()),
+              "spool": b64(json.dumps({"contract_version": "2", "notice_id": NID,
+                                       "body_text": "b", "attachments": descs}).encode()),
               "hop": b64(json.dumps({"notice_id": NID, "facts_version": 2,
                                      "attachments": []}).encode()),
               "attachments": [b64(b) if clean else None for b in blobs]}
@@ -54,6 +57,8 @@ class BundleTests(unittest.TestCase):
                                         entry_id, attachment_cap=CAP)
         except ingress.BundleRefused as e:
             self.fail(f"refused: {e.reason}: {e}")
+        except Exception as e:  # noqa: BLE001
+            self.fail(f"raised {e!r}")
 
     def refused(self, bundle, reason="bundle_invalid", entry_id=NID):
         with self.assertRaises(Exception) as cm:
@@ -111,14 +116,16 @@ class BundleTests(unittest.TestCase):
         self.refused(b)
 
     def test_the_document_cap_is_exact(self):
+        def padded(member, size):
+            b = make()
+            doc = base64.b64decode(b[member])
+            b[member] = b64(doc[:-1] + b" " * (size - len(doc)) + b"}")
+            return b
+
         for member in ("notice", "spool"):
             with self.subTest(member=member):
-                b = make()
-                b[member] = b64(b"{" + b" " * (ingress.DOC_CAP - 1) + b"}")
-                self.refused(b)
-        b = make()
-        b["spool"] = b64(b"{" + b" " * (ingress.DOC_CAP - 2) + b"}")
-        self.assertIn("spool", self.parse(b))
+                self.refused(padded(member, ingress.DOC_CAP + 1))
+        self.assertIn("spool", self.parse(padded("spool", ingress.DOC_CAP)))
 
     def test_a_message_or_descriptor_that_is_not_an_object(self):
         # Zero attachments, so the positional check has nothing to refuse.
@@ -139,6 +146,19 @@ class BundleTests(unittest.TestCase):
 
     def test_the_notice_id_must_be_the_listed_entry(self):
         self.refused(make(), "entry_id_mismatch", entry_id="1700000000-43")
+        # The notice's alone differing, the spool's still the listed entry.
+        b = make(blobs=())
+        notice = json.loads(base64.b64decode(b["notice"]))
+        notice["notice_id"] = "1700000000-43"
+        b["notice"] = b64(json.dumps(notice).encode())
+        self.refused(b, "entry_id_mismatch")
+
+    def test_the_spool_notice_id_must_be_the_listed_entry_too(self):
+        b = make(blobs=())
+        spool = json.loads(base64.b64decode(b["spool"]))
+        spool["notice_id"] = "1700000000-43"
+        b["spool"] = b64(json.dumps(spool).encode())
+        self.refused(b, "entry_id_mismatch")
 
     def test_attachments_are_positional(self):
         b = make(blobs=(b"a", b"b"))
