@@ -72,6 +72,17 @@ class StateMachineTests(_J):
             self.write(s)
         self.assertEqual(self.read()["state"], ingress.QUARANTINED_COMPLETE)
 
+    def test_the_suppressed_path_moves_forward_and_its_tombstone_is_re_listed(self):
+        for s in (ingress.SUPPRESSED_WAITING_REMOVE, ingress.SUPPRESSED_COMPLETE,
+                  ingress.SUPPRESSED_WAITING_REMOVE, ingress.SUPPRESSED_COMPLETE):
+            self.write(s)
+        self.assertEqual(self.read()["state"], ingress.SUPPRESSED_COMPLETE)
+        self.assertIn(ingress.SUPPRESSED_COMPLETE, ingress.TOMBSTONES)
+        self.assertIn(ingress.SUPPRESSED_WAITING_REMOVE, ingress.DUPLICATE_STATES)
+        self.assertIn(ingress.SUPPRESSED_COMPLETE, ingress.DUPLICATE_STATES)
+        self.write(ingress.HELD, "held-then-suppressed")
+        self.write(ingress.SUPPRESSED_WAITING_REMOVE, "held-then-suppressed")
+
     def test_a_new_record_starts_only_in_an_initial_state(self):
         for s in ingress.STATES:
             with self.subTest(state=s):
@@ -102,6 +113,9 @@ class StateMachineTests(_J):
             ingress.DUPLICATE_DIFFERENT_HELD: [ingress.QUARANTINED, ingress.QUARANTINED_WAITING_REMOVE,
                                                ingress.QUARANTINED_COMPLETE,
                                                ingress.DUPLICATE_DIFFERENT_HELD],
+            ingress.SUPPRESSED_WAITING_REMOVE: [ingress.SUPPRESSED_WAITING_REMOVE],
+            ingress.SUPPRESSED_COMPLETE: [ingress.SUPPRESSED_WAITING_REMOVE,
+                                          ingress.SUPPRESSED_COMPLETE],
         }
         self.assertEqual(set(reach), set(ingress.STATES))
         refused = 0
@@ -123,8 +137,7 @@ class StateMachineTests(_J):
     def test_every_allowed_edge_is_walkable(self):
         """Every edge in the table, from a record brought to its source state
         by a shortest forward path, is accepted and lands in its target."""
-        paths = {ingress.HELD: [ingress.HELD], ingress.PREPARED: [ingress.PREPARED],
-                 ingress.QUARANTINED: [ingress.QUARANTINED]}
+        paths = {s: [s] for s in ingress.INITIAL}
         frontier = list(paths)
         while frontier:
             src = frontier.pop(0)

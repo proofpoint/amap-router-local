@@ -79,6 +79,10 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
   - `peer_reply_window_seconds` (default 604800) — how long after a peer
     notice its recipient may reply along the REVERSE edge without a
     declared edge of its own (`router/outbound.py`).
+  - `mail_reply_window_seconds` (default 604800, at most 7776000) — how long
+    after an inbound hop mail is placed its recipient may reply to it as a
+    bound reply (`router/ingress.py`'s mail binding, fixed when the entry is
+    prepared, so a later change never moves a recorded binding).
   - `intake_dir` — the parent of the cross-host intake spool
     (`<intake_dir>/<instance>/`, created by `provision`). Same containment
     rules as `state_dir`. Nothing in this repo reads it yet: it exists so the
@@ -212,6 +216,7 @@ _TOP_KEYS = {
     "attachment_max_bytes", "attachment_max_count", "attachment_max_total_bytes",
     "fleet_domain", "intake_dir",
     "sender_exposure_window_seconds", "peer_reply_window_seconds",
+    "mail_reply_window_seconds",
     "task_graph", "mail_graph",
     "instances_dir", "selected_json",
     "peer_senders", "peers",
@@ -329,6 +334,12 @@ ROUTER_LOCAL_PART = "amap.router"
 SENDER_EXPOSURE_WINDOW_SECONDS_DEFAULT = 86400
 #: reverse-edge reply window (seconds) — see `router/outbound.py`.
 PEER_REPLY_WINDOW_SECONDS_DEFAULT = 604800
+#: The mail-reply binding window (seconds): a placed inbound hop mail may be
+#: replied to as a bound reply until its recorded `expires_at`. PROVISIONAL
+#: (the owner confirms the default); bounded, so no binding is practically
+#: permanent.
+MAIL_REPLY_WINDOW_SECONDS_DEFAULT = 604800
+MAIL_REPLY_WINDOW_SECONDS_MAX = 90 * 86400
 
 #: Name of the peer tree under a handoff-mode instance's declared root.
 PEER_TREE = "peer"
@@ -503,6 +514,7 @@ class RouterConfig:
     intake_dir: Optional[Path] = None
     sender_exposure_window_seconds: int = SENDER_EXPOSURE_WINDOW_SECONDS_DEFAULT
     peer_reply_window_seconds: int = PEER_REPLY_WINDOW_SECONDS_DEFAULT
+    mail_reply_window_seconds: int = MAIL_REPLY_WINDOW_SECONDS_DEFAULT
     #: Present only under discovery. An authored `instances` object cannot
     #: produce one: everything it could report is an error there.
     discovery: Optional[DiscoveryReport] = None
@@ -1328,6 +1340,13 @@ def load_obj(
     peer_reply_window_seconds = _positive_int(
         "peer_reply_window_seconds", PEER_REPLY_WINDOW_SECONDS_DEFAULT
     )
+    mail_reply_window_seconds = _positive_int(
+        "mail_reply_window_seconds", MAIL_REPLY_WINDOW_SECONDS_DEFAULT
+    )
+    if mail_reply_window_seconds > MAIL_REPLY_WINDOW_SECONDS_MAX:
+        raise ConfigError(
+            f"config.mail_reply_window_seconds: at most {MAIL_REPLY_WINDOW_SECONDS_MAX} "
+            f"(90 days), got {mail_reply_window_seconds}")
 
     # Pass 1: shape + name + root (mode/root_key/root), per instance (peers
     # resolved in pass 2 so an unknown-peer error can name the actual set
@@ -1701,6 +1720,7 @@ def load_obj(
         fleet_domain=fleet_domain, intake_dir=intake_dir,
         sender_exposure_window_seconds=sender_exposure_window_seconds,
         peer_reply_window_seconds=peer_reply_window_seconds,
+        mail_reply_window_seconds=mail_reply_window_seconds,
         discovery=(replace(discovery, inert_edges=inert)
                    if discovery is not None else None),
         selected_json=selected_json,

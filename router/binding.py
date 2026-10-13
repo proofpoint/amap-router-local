@@ -66,7 +66,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .config import ALLOW_ANY, RouterConfig
 
@@ -103,6 +103,7 @@ def record_delivery(
     transport: str,
     tree: Optional[str] = None,
     authored_by: Optional[str] = None,
+    mail_origin: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Build the ledger record bytes for one delivered notice. Writing them
     to disk (atomically, BEFORE the notice itself) is `deliver.py`'s job —
@@ -118,7 +119,14 @@ def record_delivery(
 
     `tree` and `authored_by` are written only when given (module docstring:
     absent `tree` reads as mail; absent `authored_by` reads as agent-
-    authored)."""
+    authored).
+
+    `mail_origin`, for a mail placed from the external leg: EXACTLY the
+    members in `MAIL_ORIGIN_MEMBERS` (the agent's logical_id, the canonical
+    counterparty, where the mail came from, how it was admitted, and when
+    the binding expires), merged into the record. A record without them
+    never resolves as a reply binding across the external leg: nothing is
+    backfilled."""
     record = {
         "notice_id": notice_id,
         "from_instance": from_instance,
@@ -133,7 +141,19 @@ def record_delivery(
         record["tree"] = tree
     if authored_by is not None:
         record["authored_by"] = authored_by
+    if mail_origin is not None:
+        if set(mail_origin) != set(MAIL_ORIGIN_MEMBERS):
+            raise ValueError(f"mail_origin needs exactly {list(MAIL_ORIGIN_MEMBERS)}, "
+                             f"got {sorted(mail_origin)}")
+        record.update(mail_origin)
     return json.dumps(record, sort_keys=True).encode("utf-8")
+
+
+#: A reply binding across the external leg: the members a ledger record
+#: carries for a mail placed from it (`record_delivery`'s `mail_origin`).
+MAIL_ORIGIN_MEMBERS = ("agent", "counterparty", "origin_notice_id", "origin_link",
+                       "origin_logical_id", "origin_generation", "admission",
+                       "admission_link", "admission_rule", "received_at", "expires_at")
 
 
 def read_ledger_record(

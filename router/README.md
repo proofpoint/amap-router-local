@@ -386,7 +386,7 @@ python3 -m router --config C reset {NAME [NAME...]|--all} [--yes|--dry-run]
                                                                       # wipe NAME's (or every instance's) mailbox contents + router-private
                                                                       # state together; returns the instance(s) to NEVER SEEN — see "Resetting an
                                                                       # instance" above
-python3 -m router --config C quarantine list [NAME] [--control-dir DIR]
+python3 -m router --config C quarantine list [NAME] [--control-dir DIR]   # --control-dir only WITHOUT `hop`
 python3 -m router --config C quarantine show NAME SOURCE GEN ID [--control-dir DIR]
                                                                       # read-only inspection of the ingress quarantine — see
                                                                       # "The ingress quarantine" below
@@ -710,6 +710,11 @@ view.
   (`recipient_not_allowlisted`), loudly, on `status`.
 - `sender_exposure_window_seconds` (default 86400) and
   `peer_reply_window_seconds` (default 604800) — below.
+- `mail_reply_window_seconds` (default 604800, at most 7776000, i.e. 90
+  days) — how long after an inbound hop mail is placed its recipient may
+  reply to it as a bound reply. Fixed into the mail's ledger record when the
+  entry is prepared, so a later change never moves a recorded binding. The
+  default is PROVISIONAL, pending the owner's confirmation.
 - `intake_dir` — the cross-host intake spool's parent; `provision` creates
   `<intake_dir>/<instance>/`, `docker/derive-mounts.py` mounts it. Nothing
   reads it until an email router exists.
@@ -1517,9 +1522,65 @@ nobody, as for a Bcc'd or list-delivered recipient or a truncated header,
 never refuses); the admission order; then snapshot, `prepared` and
 placement.
 
-**Untrusted fleet mail is the only class this router places, and that set
-is EMPTY in every deployment today.** Everything else is held for the unit
-that owns it, or quarantined (`cold_fleet_mail` for a trusted host).
+**The admission order.** The INTEGRITY rows come first, for every class: a
+`fleet_hosts` admission over another ingress (`admission_inconsistent`, not
+reachable while the codec's ingress enum is `hub`) and an `admission_link`
+that is not this reader's link (`admission_link_mismatch`). Then the two
+classes that pre-empt the COLD rows, and only those: a failure report, and a
+reply. Then the cold rows: `open` admission held `admission_not_placeable`,
+a trusted fleet host quarantined `cold_fleet_mail`, an unknown host held
+`unknown_host`. Untrusted fleet mail is placed.
+
+**Failure reports and replies are believed only against this router's own
+records.** The downstream runtime correlates each to one of this router's
+outbound transactions; it counts only when this router's own record
+agrees: the same identity, one of its generations (fenced ones included:
+authorising a reply survives a rebind; delivering pending work does not, so
+an entry read through a fenced tree is still `late_inbound`), the link that
+generation is PINNED to, and a transaction this router SENT (a settled
+anchor, or an in-flight record that was handed over; a record never handed
+over matches nothing). Addresses compare in one canonical form (the domain
+lowercased, the local part exact).
+- A FAILURE REPORT whose every reported recipient is one this router sent
+  to places ONE notice, authored by this router alone (from
+  `amap.router@<fleet_domain>`, ledgered `authored_by: "router"` so a reply
+  to it fails closed; no text from the report, the failed message or what
+  the downstream runtime wrote), listing per recipient the RECORDED address,
+  the action and the status code with a local description, plus the
+  agent's req_id and the transport id, threaded to the sent message's
+  Message-ID. It lists only the (transaction, recipient, action) pairs not
+  announced before: each pair is RESERVED durably
+  (`state_dir/<logical_id>/failure-seen/`) before anything is prepared, and
+  a report with nothing new is `suppressed_waiting_remove`, removed upstream
+  like any other entry, then `suppressed_complete` (a tombstone). A
+  reservation counts as announced while its owner can still place or may
+  have placed (including `placing_ambiguous`: at most once); it is released
+  when its owner was quarantined, ended terminally without ever placing, or
+  is gone; an owner that cannot be read decides nothing that pump
+  (`failure_reservations_undecided` in the last pump's counts). Reservations
+  are swept with the tombstones, past the same `ingress_dedup_horizon_days`.
+  A report that does not match is held `failure_unmatched` and re-checked
+  from its snapshot every pump, since this router's record of the send may
+  land after the report.
+- A REPLY whose sender is one this router sent to, and whose correlated
+  Message-ID is the one it recorded, is placed threaded to that send. One
+  that does not match is classified exactly as mail without the
+  correlation: never widened.
+
+**Every placed hop mail carries a reply binding** in its ledger record: the
+recipient's logical_id, the canonical sender (`counterparty`), where it came
+from (`origin_notice_id`, `origin_link`, `origin_logical_id`,
+`origin_generation`), how it was admitted (`admission`, `admission_link`,
+`admission_rule`, never backfilled), `received_at` and `expires_at` (fixed
+when the entry is prepared, from `mail_reply_window_seconds`). A record
+without them never resolves as a binding across the external leg. (Sending a
+bound reply over the leg is a later change.)
+
+**A read that decides nothing, again** (the runtime's own refusal class, or
+an OSError from the reader) is kept per journal key with its first sighting:
+a WARNING while young, an ERROR once it has persisted an hour, and counted
+in status (`read_refusals`: a count, the oldest age and the reasons; the
+upstream entry id is in the log only, never in status).
 
 **The guarantee: AT MOST ONCE per upstream entry id.** At most one
 agent-visible notice is ever placed for an entry id. Placement writes the
@@ -1557,15 +1618,15 @@ placed once more, visibly, in the duplicate direction.
 
 **Holds.** A re-read hold (`notice_incomplete`, `bundle_schema`,
 `entry_id_mismatch`, `bundle_invalid`) takes no snapshot and is read again
-every pump. A snapshot hold (the admission holds and
-`recipient_not_this_identity`) is re-evaluated from what was READ and
-never re-read. The TERMINAL holds are never re-evaluated by a pump:
+every pump. A snapshot hold (the admission holds,
+`recipient_not_this_identity` and `failure_unmatched`) is re-evaluated from
+what was READ and never re-read. The TERMINAL holds are never re-evaluated by a pump:
 `placing_ambiguous`, `placing_survivor_mismatch`, `exists_different`,
 `snapshot_invalid:<what>`, `quarantine_item_conflict`,
 `duplicate_different_held`, and `notice_invalid` on an entry that already
 had a record. The operator verbs that release them are OWED by the first
 unit that adds ingress verbs; they must also cover
-`recipient_not_this_identity`, and the verb that releases
+`recipient_not_this_identity` and `failure_unmatched`, and the verb that releases
 `placing_ambiguous` MUST warn that releasing is AT-LEAST-ONCE: it may
 deliver a notice the agent already consumed.
 
@@ -1602,10 +1663,18 @@ router quarantine show NAME SOURCE GEN ID  one item as escaped JSON
 ```
 
 SOURCE is `ingress` or `control`. `.control/` entries (candidates another
-runtime writes) are listed with `--control-dir`, keyed `- control - ID`
-with ID the candidate's 32-hex directory name, METADATA ONLY (the
-`candidate.json` size, sha256 and mtime) until the inbound step freezes their
-format; their path is not configured yet. A `candidate.json` caught
+runtime writes) are listed from `<hop.root>/.control/` whenever `hop` is
+configured (no key of its own, so it can never disagree with the hop root;
+`--control-dir` names it only for a router WITHOUT `hop`, and is refused
+beside it), keyed `- control - ID` with ID the candidate's 32-hex directory
+name, METADATA ONLY (the `candidate.json` size, sha256 and mtime) until the
+inbound step freezes their format. They are the downstream runtime's
+(2750, its own): this router lists and reads them and never removes one. An
+entry older than `ingress_quarantine_days` is REPORTED `expired`; that is
+this router's report threshold, and the downstream runtime, which owns the
+sweep, never removes an entry sooner. The ingress status counts them
+(`control`: items, expired, in flight, damaged, the oldest age and the
+threshold). A `candidate.json` caught
 mid-commit (exactly two links) is listed IN FLIGHT, not DAMAGED. Its writer
 commits `candidate.json` LAST, so a directory without one is not yet an item:
 listed IN FLIGHT ("no committed candidate.json yet"), and nothing in it is

@@ -526,7 +526,7 @@ PROCESS_STATE: Dict[str, Tuple[str, ...]] = {
                 "_REMOVER_LATCHED", "HOLDS", "_STORES", "_STORE_LATCHED", "_RETIRED",
                 "FENCE_HOLDS", "_RUNTIME_CLASSES", "RETRIES"),
     "ingress": ("_CURSORS", "_CYCLE", "LISTING_ENTRIES_HIGH", "_CURSOR_PORT", "_LINK_LATCHED",
-                "REMOVER_STATE", "_LINK_UNSET_LOGGED", "_LAST_CURRENT"),
+                "REMOVER_STATE", "_LINK_UNSET_LOGGED", "_LAST_CURRENT", "READ_REFUSALS"),
     "outbound": ("_STALE_WARNED",),
     "service": ("LAST_INGRESS", "_REGISTRY_LOGGED"),
     "aliases": ("LAST_TOMBSTONE_ERRORS",),

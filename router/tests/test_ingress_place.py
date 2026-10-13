@@ -282,3 +282,59 @@ class RecoveryTests(_Placement):
 
 
 del _Fleet
+
+
+class FailureNoticeRecoveryTests(RecoveryTests):
+    """Every recovery row again, for a ROUTER-AUTHORED failure notice: its
+    final parts recorded at `prepared` and rebuilt from what was recorded, so
+    the table applies unchanged and at most one notice is ever observed."""
+
+    def prepared(self, blobs=(), clean=True):
+        parsed = ingress.parse_bundle(enc(make(blobs=(), nid=EID,
+                                               drop_message_attachments=True)), EID,
+                                      attachment_cap=CAP)
+        composed = {"req_id": "00000007", "n": "00000001",
+                    "pairs": [{"recipient": "r@example.org", "action": "failed",
+                               "status": "5.1.1"}],
+                    "in_reply_to": "<sent-1@fleet.example>",
+                    "from_address": "amap.router@example.invalid",
+                    "to_address": "bravo@example.invalid"}
+        rec = ingress.prepare_failure(self.keyed, self.state_dir, self.lid, self.gen, LINK,
+                                      EID, parsed, recipient="bravo", composed=composed)
+        self.assertEqual(rec["state"], ingress.PREPARED)
+        self.assertEqual(rec["final"]["attachments"], [])
+        return rec
+
+    # A failure notice has no attachments: these two rows are re-pointed at
+    # the parts it does have.
+
+    def test_row_1_every_expected_part_is_required(self):
+        for part in ("spool", "ledger"):
+            with self.subTest(part=part):
+                self.tearDown()
+                self.setUp()
+                self.crash_at("published")
+                nid = self.nid()
+                path = {"spool": self.tree() / "messages" / f"notice-{nid}.json",
+                        "ledger": self.ledger()}[part]
+                path.unlink()
+                self.assertEqual(self.recover(), ingress.HELD)
+                self.assertEqual(self.state(), (ingress.HELD, ingress.HELD_SURVIVOR_MISMATCH))
+
+    def test_row_1_a_corrupt_survivor_holds(self):
+        self.crash_at("published")
+        spool = self.tree() / "messages" / f"notice-{self.nid()}.json"
+        spool.write_bytes(spool.read_bytes() + b" ")
+        self.assertEqual(self.recover(), ingress.HELD)
+        self.assertEqual(self.state(), (ingress.HELD, ingress.HELD_SURVIVOR_MISMATCH))
+
+
+class LedgerBindingRecoveryTests(_Placement):
+
+    def test_the_prepared_ledger_carries_the_binding_and_rebuilds_equal(self):
+        rec = self.prepared()
+        ledger = json.loads(rec["ledger"])
+        self.assertEqual(ledger["counterparty"], "a@fleet-b.example")
+        parts, why = ingress._rebuild(self.state_dir, self.lid, self.gen, LINK, EID, rec, CAP)
+        self.assertIsNone(why)
+        self.assertEqual(parts["ledger"], rec["ledger"].encode("utf-8"))
