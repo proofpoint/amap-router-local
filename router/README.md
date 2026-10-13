@@ -1351,7 +1351,8 @@ same check begin runs.
 **Who creates what under `root`.** `root` itself is the deployment's
 (this router's uid, the downstream runtime's group, 2750), and so are the
 downstream runtime's own host intakes beside the identities (`.unresolved/`,
-`.control/`). Everything else under `<root>/<logical_id>/` is the
+`.control/`). `.runtime/` holds the downstream runtime's own generation
+trees; this router never creates it. Everything under `<root>/<logical_id>/` is the
 plugin's, created when a generation is admitted or first seen. This router,
 admitting a generation, creates `<root>/<logical_id>/`, the generation tree
 with its `up/`, and the upstream directories: `outbound/` and `inbound/` with
@@ -2229,10 +2230,23 @@ listing finds its private result and re-publishes the Result from it
 (nothing is delivered or handed over again), and only then archives it. The
 archive rename is followed by a barrier on `processed/` and then on the
 outbox; the rename has happened by then, so a failure of either is logged
-and not retried, and the private result stays the authority. A
-`req_id_reused` refusal has no private result of its own: after a failed
-barrier it is issued again on the next listing (the same bytes), and its
-status count can include the repeat.
+and not retried, and the private result stays the authority.
+
+Residuals of that rule:
+- A barrier that keeps failing keeps the request unarchived: its Result is
+  re-published (the same bytes, from the private result) and a WARNING
+  logged on every poll until the barrier succeeds.
+- While the request is unarchived, the agent can still replace the file
+  under that req_id. The next listing then refuses the new file as
+  `req_id_reused`, and that refusal overwrites the visible Result; the
+  original verdict survives only in the private result.
+- A `req_id_reused` refusal has no private result of its own. After a
+  failed barrier it is issued again on the next listing: the same outcome
+  and reason with a new `ts`, so different bytes. Its status count can
+  include the repeat.
+- A Result write that fails BEFORE its rename (nothing was published) is
+  logged and the request is archived anyway, with no Result in the outbox:
+  the private result is the answer, as it was before this rule.
 
 A crash after the notice write but before the "delivered" mark replays with
 the SAME id. If the agent consumed the notice in that window, it reappears

@@ -140,9 +140,6 @@ class PlacementIsDurableTests(RouterTestCase):
         self.assertEqual(len(list_notices(self.cfg, "bob")), 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class _FailOnce:
     """A `_Recorder.fail` predicate: true for the FIRST fsync of `target` only."""
@@ -212,6 +209,25 @@ class ResultPublicationIsDurableTests(RouterTestCase):
         self.assertTrue((self.outbox / "processed" / "req-00000001.json").exists())
         self.assertTrue((self.outbox / "results" / "00000001.json").exists())
 
+    def test_a_failed_outbox_barrier_after_the_archive_is_logged(self):
+        archive = ("rename", str(self.outbox / "processed" / "req-00000001.json"))
+        rec = _Recorder()
+        fired = []
+
+        def fail(t):
+            # only the outbox barrier AFTER the archive rename (the outbox is
+            # also synced earlier, when results/ is made)
+            if t == ("dir", str(self.outbox)) and archive in rec.events and not fired:
+                fired.append(t)
+                return True
+            return False
+        rec.fail = fail
+        with self.assertLogs("amap_router_local", level="WARNING") as cm:
+            self.drain(rec)
+        self.assertEqual(len(fired), 1, "control: the outbox barrier after the archive was injected")
+        self.assertTrue(any("the outbox was not made durable" in r.getMessage() for r in cm.records))
+        self.assertTrue((self.outbox / "processed" / "req-00000001.json").exists())
+
 
 @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "needs /proc/self/fd")
 class ExternalLegResultIsDurableTests(RouterTestCase):
@@ -253,3 +269,6 @@ class ExternalLegResultIsDurableTests(RouterTestCase):
         self.assertEqual(self.port.writes, ["00000001"], "handed over again")
         doc = json.loads((self.outbox / "results" / "00000001.json").read_text())
         self.assertEqual(doc["outcome"], "accepted")
+
+if __name__ == "__main__":
+    unittest.main()
