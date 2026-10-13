@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from router import hoplink, ingress
 from router.tests.ingress_double import DoubleReader, ListingTooLarge
-from router.tests.test_ingress_pump import E1, HORIZON, LATER, LINK, _Pump, entry
+from router.tests.test_ingress_pump import E1, HORIZON, LINK, _Pump, entry, later
 
 
 class _UnsafeRead(Exception):
@@ -118,7 +118,7 @@ class RemoverPassTests(_Pump):
         self.pump_with()
         del self.port.entries[e2]
         remover = RecordingRemover(raises=_Reasoned("closed"))
-        counts, pump = self.pump_with(remover, now=LATER)
+        counts, pump = self.pump_with(remover, now=later())
         self.assertEqual(remover.calls, [("notice", E1)], "the closed remover was called again")
         self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
         self.assertEqual(self.state(e2), (ingress.PUBLISHED_WAITING_REMOVE, None),
@@ -128,13 +128,13 @@ class RemoverPassTests(_Pump):
     def test_a_held_remover_leaves_entries_waiting_even_gone_past_the_horizon(self):
         self.placed()
         del self.port.entries[E1]
-        self.pump_with(hold="hop_settings_refused", now=LATER)
+        self.pump_with(hold="hop_settings_refused", now=later())
         self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
 
     def test_without_a_remover_the_interim_rule_still_applies(self):
         self.placed()
         del self.port.entries[E1]
-        self.pump_with(now=LATER)
+        self.pump_with(now=later())
         self.assertEqual(self.state(E1), (ingress.COMPLETE, None))
 
     def test_an_entry_never_journaled_is_never_passed_to_the_remover(self):
