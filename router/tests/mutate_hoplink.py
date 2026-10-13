@@ -20,6 +20,14 @@ EQUIVALENT mutants, recorded here and NOT run (each reachable by no input):
     directory from `state_dir` down, the generation directory included
     (`util._mkdir_durable`), before the record exists, so no power loss can
     leave a durable record without that entry.
+  * a signed peer task's 8192-byte check moved after allocation in
+    `outbound._begin_peer`: EQUIVALENT under one rule. Item 5f
+    (`classify._trusted`) measures the same statement EXACTLY, with
+    fixed-length stand-ins for the id and `ts`, and refuses it before
+    `_begin_peer` runs, so no request over 8192 bytes reaches allocation.
+    The two checks are covered separately: PS17 here (the bound in
+    `_begin_peer`) and TH14/TH15 in `mutate_classify.py` (the bound in item
+    5f).
   * begin applying the hop's per-file or total cap ALONE, where this
     router's cap is the smaller: ingest has already refused anything over
     this router's caps before begin runs. The reverse (this router's cap
@@ -1568,6 +1576,65 @@ M = [
  ('PS40 the peer codec built with the crypto settings', PLM,
   '        codec = caps.make_peer_codec({})\n', '        codec = caps.make_peer_codec(dict(dc.crypto_settings()))\n',
   [PT + "ActivationTests.test_the_factories_are_called_with_exactly_their_declared_arguments"]),
+ ('PS41 reload catches only a refusal (an activation fault escapes)', SV,
+  '        except Exception:  # noqa: BLE001 -- NEVER RAISES (docstring): a fault refuses the reload\n',
+  '        except ArithmeticError:  # noqa: BLE001 -- NEVER RAISES (docstring): a fault refuses the reload\n',
+  [PT + "ReloadNeverRaisesTests.test_an_unclassified_activation_fault_refuses_the_reload"]),
+ ('PS42 a seed read error escapes as OSError', PLM,
+  '        except OSError as e:\n            raise DelegationRefused("signing_key_path", f"{path}: {e.strerror}") from None\n    finally:\n        os.close(kfd)\n',
+  '        except ArithmeticError as e:\n            raise DelegationRefused("signing_key_path", f"{path}: {e.strerror}") from None\n    finally:\n        os.close(kfd)\n',
+  [PT + "ReloadNeverRaisesTests.test_an_io_error_reading_the_seed_is_a_refusal"]),
+ ('PS43 the peer ledger keyed by generation', PLM,
+  '    return Path(cfg.state_dir) / logical_id / PEER_LEDGER_DIR / f"{peer_id}.json"\n',
+  '    return Path(cfg.state_dir) / logical_id / "gen-current" / PEER_LEDGER_DIR / f"{peer_id}.json"\n',
+  [PT + "LedgerPathTests.test_the_ledger_is_keyed_by_logical_id_not_generation"]),
+ ('PS44 the key path spelling checked after containment', CF,
+  [('    why = _normal_form_problem(sk["path"])\n    if why is not None:\n        raise ConfigError(f"{where}.signing_key.path: {why}")\n', ''),
+   ('    from . import classify as classify_mod  # local: classify imports this module\n    runtimes = raw["runtimes"]\n',
+    '    why = _normal_form_problem(sk["path"])\n    if why is not None:\n        raise ConfigError(f"{where}.signing_key.path: {why}")\n    from . import classify as classify_mod  # local: classify imports this module\n    runtimes = raw["runtimes"]\n')],
+  None, [PT + "DelegationConfigTests.test_a_non_normal_path_is_refused_for_its_spelling_first"]),
+ ('PS45 an unchanged delegation reactivated every poll', SV,
+  '    if current is not None and fingerprint is not None and current.fingerprint == fingerprint:\n',
+  '    if False:\n',
+  [PT + "ReactivationTests.test_an_unchanged_delegation_is_not_reactivated"]),
+ ('PS46 a changed seed file not reactivated', PLM,
+  '    return (dc, id(plugin), st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, st.st_mode,\n            st.st_uid, st.st_nlink)\n',
+  '    return (dc, id(plugin))\n',
+  [PT + "ReactivationTests.test_a_changed_seed_file_is_reactivated"]),
+ ('PS47 a statement without exposure or sender_since built', PLM,
+  '    if sender_exposure is None or sender_since is None:\n', '    if False:\n',
+  [PT + "StatementFieldsTests.test_exposure_and_sender_since_are_mandatory"]),
+ ('PS48 an inactive delegation latches the generation', IF,
+  '        raise HandoverDeferred("delegation is not active")\n',
+  '        raise HandoverUnavailable("delegation is not active")\n',
+  [PT + "DeferredHandoverTests.test_an_inactive_delegation_defers_and_never_latches"]),
+ ('PS49 any make_peer_codec failure a refusal (exact class lost)', PLM,
+  '        if type(e) is caps.errors["ConfigError"]:\n'
+  '            raise DelegationRefused("codec", f"make_peer_codec({{}}) refused: {e}") from None\n'
+  '        raise   # a bug: never mistaken for a refusal\n',
+  '        raise DelegationRefused("codec", f"make_peer_codec({{}}) refused: {e}") from None\n',
+  [PT + "CodecFactoryErrorTests.test_any_other_class_propagates"]),
+ ('PS50 a subclass of ConfigError a refusal', PLM,
+  '        if type(e) is caps.errors["ConfigError"]:\n',
+  '        if isinstance(e, caps.errors["ConfigError"]):\n',
+  [PT + "CodecFactoryErrorTests.test_any_other_class_propagates"]),
+ ('PS51 the plugin ConfigError from the codec factory escapes', PLM,
+  '        if type(e) is caps.errors["ConfigError"]:\n',
+  '        if False:\n',
+  [PT + "CodecFactoryErrorTests.test_the_plugins_config_error_is_a_codec_refusal"]),
+ ('PS52 a startup activation fault swallowed as a refusal', SV,
+  '    delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))\n',
+  '    try:\n'
+  '        delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))\n'
+  '    except Exception as e:\n'
+  '        raise peerlane.DelegationRefused("codec", str(e)) from None\n',
+  [PT + "CodecFactoryErrorTests.test_at_startup_it_propagates"]),
+ ('PS53 a reload activation fault refused without its traceback', SV,
+  '            logger.exception(\n'
+  '                "config reload REFUSED: delegation activation FAILED unexpectedly',
+  '            logger.error(\n'
+  '                "config reload REFUSED: delegation activation FAILED unexpectedly',
+  [PT + "CodecFactoryErrorTests.test_at_reload_it_is_logged_and_the_last_good_stays"]),
 ]
 
 

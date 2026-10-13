@@ -141,6 +141,13 @@ class DelegationConfigTests(helpers.RouterTestCase):
                 sk = {"path": bad, "key_id": KEY_ID, "public_key": "ab" * 32}
                 self.refused(self.doc(signing_key=sk), "signing_key.path")
 
+    def test_a_non_normal_path_is_refused_for_its_spelling_first(self):
+        """The spelling check runs BEFORE containment: a path that would be
+        "inside" a forbidden root only by its `..` is refused as not normal."""
+        bad = str(self.state_dir) + "/x/../../keys/seed"
+        sk = {"path": bad, "key_id": KEY_ID, "public_key": "ab" * 32}
+        self.refused(self.doc(signing_key=sk), "a '.' or '..' component")
+
     def test_the_key_path_stays_outside_every_forbidden_root_by_components(self):
         doc = self.doc()
         inside = {"path": str(self.state_dir / "seed"), "key_id": KEY_ID,
@@ -874,3 +881,193 @@ class TombstoneBytesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Reload never raises; re-activation only on change; the remaining guards
+# ---------------------------------------------------------------------------
+
+import errno as _errno  # noqa: E402
+
+from router import service  # noqa: E402
+
+
+class ReloadNeverRaisesTests(_Base):
+    """`service.reload_config` NEVER raises: an unclassified fault in
+    delegation activation, or an I/O error reading the seed, refuses the
+    reload and keeps the last good config and delegation."""
+
+    def reload(self, current, fresh):
+        runtime = types.SimpleNamespace(plugin=self.plugin)
+        with mock.patch.object(service, "load", return_value=fresh):
+            try:
+                return service.reload_config("cfg.json", current, runtime=runtime)
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"reload_config raised {type(e).__name__}: {e}")
+
+    def test_an_unclassified_activation_fault_refuses_the_reload(self):
+        current = self.cfg()
+        kept = self.activate(current)
+        fresh = self.cfg(partition_verified="new-evidence")
+        with mock.patch.object(peerlane, "activate", side_effect=TypeError("a bug")):
+            got = self.reload(current, fresh)
+        self.assertTrue(got.reload_failed)
+        self.assertEqual(got.delegation, current.delegation)
+        self.assertIs(peerlane.current(current), kept, "the last good delegation stays")
+        service._RELOAD_FAILURE.clear()
+
+    def test_an_io_error_reading_the_seed_is_a_refusal(self):
+        current = self.cfg()
+        self.activate(current)
+        fresh = self.cfg(partition_verified="new-evidence")
+        real_read = os.read
+
+        def eio(fd, n):
+            if n == peerlane.SEED_BYTES + 1:
+                raise OSError(_errno.EIO, "Input/output error")
+            return real_read(fd, n)
+        with mock.patch.object(peerlane.os, "read", eio):
+            try:
+                peerlane.activate(fresh, self.plugin, now=NOW)
+            except peerlane.DelegationRefused as e:
+                self.assertEqual(e.reason, "signing_key_path")
+            except OSError as e:
+                self.fail(f"the seed read's OSError escaped: {e}")
+            else:
+                self.fail("activation succeeded over an unreadable seed")
+            got = self.reload(current, fresh)
+        self.assertTrue(got.reload_failed)
+        service._RELOAD_FAILURE.clear()
+
+
+class CodecFactoryErrorTests(_Base):
+    """`make_peer_codec({})` failing: only the plugin's own `ConfigError`,
+    by EXACT type, is a refusal. Anything else, a subclass included, is a
+    bug and propagates out of `activate`: at startup that stops the router
+    loudly; at reload `reload_config` logs it with its traceback and keeps
+    the last good config and delegation."""
+
+    def plugin_raising(self, exc):
+        ns = si.namespace(calls=self.calls)
+
+        def make_peer_codec(settings):
+            raise exc
+        ns["make_peer_codec"] = make_peer_codec
+        return si.Plugin(ns)
+
+    def test_the_plugins_config_error_is_a_codec_refusal(self):
+        try:
+            peerlane.activate(self.cfg(), self.plugin_raising(si.ConfigError("no")), now=NOW)
+        except peerlane.DelegationRefused as e:
+            self.assertEqual(e.reason, "codec")
+        except Exception as e:  # noqa: BLE001
+            self.fail(f"the plugin's ConfigError escaped as {type(e).__name__}: {e}")
+        else:
+            self.fail("activation succeeded")
+
+    def test_any_other_class_propagates(self):
+        class Sub(si.ConfigError):
+            pass
+        for exc in (RuntimeError("a bug"), Sub("a look-alike"), ValueError("built-in")):
+            with self.subTest(exc=type(exc).__name__):
+                try:
+                    peerlane.activate(self.cfg(), self.plugin_raising(exc), now=NOW)
+                except peerlane.DelegationRefused as e:
+                    self.fail(f"{type(exc).__name__} became a refusal: {e}")
+                except Exception as e:  # noqa: BLE001
+                    self.assertIs(e, exc)
+                else:
+                    self.fail("activation succeeded")
+
+    def test_at_startup_it_propagates(self):
+        bug = RuntimeError("a bug")
+        runtime = types.SimpleNamespace(plugin=self.plugin_raising(bug))
+        try:
+            service.activate_delegation(self.cfg(), runtime)
+        except Exception as e:  # noqa: BLE001
+            self.assertIs(e, bug, f"startup turned the bug into {type(e).__name__}: {e}")
+        else:
+            self.fail("startup activation succeeded")
+
+    def test_at_reload_it_is_logged_and_the_last_good_stays(self):
+        current = self.cfg()
+        kept = self.activate(current)
+        fresh = self.cfg(partition_verified="new-evidence")
+        runtime = types.SimpleNamespace(plugin=self.plugin_raising(RuntimeError("a bug")))
+        with mock.patch.object(service, "load", return_value=fresh), \
+                self.assertLogs(service.logger, "ERROR") as logs:
+            try:
+                got = service.reload_config("cfg.json", current, runtime=runtime)
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"reload_config raised {type(e).__name__}: {e}")
+        self.assertTrue(got.reload_failed)
+        self.assertIs(peerlane.current(current), kept, "the last good delegation stays")
+        self.assertEqual(service._RELOAD_FAILURE[str(self.state_dir)]["error"],
+                         "delegation activation failed unexpectedly")
+        self.assertTrue(any(r.exc_info and r.exc_info[0] is RuntimeError for r in logs.records),
+                        "logged with its traceback")
+        service._RELOAD_FAILURE.clear()
+
+
+class ReactivationTests(_Base):
+
+    def test_an_unchanged_delegation_is_not_reactivated(self):
+        cfg = self.cfg()
+        runtime = types.SimpleNamespace(plugin=self.plugin)
+        service.activate_delegation(cfg, runtime)
+        service.activate_delegation(cfg, runtime)
+        self.assertEqual([c for c, _ in self.calls].count("make_signer"), 1)
+
+    def test_a_changed_seed_file_is_reactivated(self):
+        cfg = self.cfg()
+        runtime = types.SimpleNamespace(plugin=self.plugin)
+        service.activate_delegation(cfg, runtime)
+        os.chmod(self.seed_path, 0o600)
+        try:
+            with self.assertRaises(peerlane.DelegationRefused):
+                service.activate_delegation(cfg, runtime)
+        finally:
+            os.chmod(self.seed_path, 0o400)
+
+
+class StatementFieldsTests(unittest.TestCase):
+
+    def test_exposure_and_sender_since_are_mandatory(self):
+        base = dict(key_id=KEY_ID, peer_id="A" * 22, from_address=f"alice@{FD}",
+                    to_address=TRUSTED, ts="2026-10-13T12:00:00Z", subject="", body_text="",
+                    attachments=[], sender_exposure=STAMP, sender_since=OLD_ENOUGH)
+        peerlane.build_statement(**base)
+        for missing in ("sender_exposure", "sender_since"):
+            with self.subTest(missing=missing):
+                with self.assertRaises(peerlane.StatementRefused):
+                    peerlane.build_statement(**dict(base, **{missing: None}))
+
+
+class LedgerPathTests(_Send):
+
+    def test_the_ledger_is_keyed_by_logical_id_not_generation(self):
+        cfg = self.cfg()
+        self.activate(cfg)
+        write_request(cfg, "alice", "00000001", to=[TRUSTED])
+        self.drain(cfg)
+        pid = inflight.read_record(cfg, "alice", "00000001")["peer"]["id"]
+        self.assertTrue((self.state_dir / "alice" / "peer-ledger" / f"{pid}.json").is_file())
+
+
+class DeferredHandoverTests(_Send):
+
+    def test_an_inactive_delegation_defers_and_never_latches(self):
+        cfg = self.cfg()
+        self.activate(cfg)
+        write_request(cfg, "alice", "00000001", to=[TRUSTED])
+        self.drain(dataclasses.replace(cfg, reload_failed=True))
+        record = inflight.read_record(cfg, "alice", "00000001")
+        peerlane.forget_all()
+        try:
+            inflight.transport_request_bytes(cfg, "alice", record, req_id="00000001")
+        except inflight.HandoverDeferred:
+            pass
+        except inflight.HandoverUnavailable as e:
+            self.fail(f"an inactive delegation latched the generation: {e}")
+        else:
+            self.fail("handed over with no active delegation")

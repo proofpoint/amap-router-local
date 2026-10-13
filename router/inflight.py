@@ -805,6 +805,13 @@ class FrontierUndecidable(Exception):
     over for this generation this poll."""
 
 
+class HandoverDeferred(Exception):
+    """A signed kind's record cannot be handed over THIS poll (delegation is
+    not active): nothing is published and nothing is latched; the next poll
+    tries again. The re-check settles such a record first, so this is a
+    guard, never a route."""
+
+
 class HandoverUnavailable(Exception):
     """A record that lacks what a handover needs (it predates `from_address`
     being pinned), never handed over; nothing is filled in from the current
@@ -919,7 +926,7 @@ def _check_peer_header(cfg: RouterConfig, pin: Dict[str, Any]) -> None:
     from . import peerlane   # local: peerlane imports this module's neighbours
     delegation = peerlane.active(cfg)
     if delegation is None:
-        raise HandoverUnavailable("delegation is not active")
+        raise HandoverDeferred("delegation is not active")
     try:
         kind, k, statement, signature = delegation.codec.check1(
             [(peerlane.STATEMENT_FIELD, pin["statement_header"])])
@@ -1262,6 +1269,10 @@ def _advance(
         return BLOCKED
     try:
         data = transport_request_bytes(cfg, name, record, req_id=req_id)
+    except HandoverDeferred as e:
+        logger.error("instance %r req %r: NOT handed over this poll: %s; retried next poll",
+                     name, req_id, e)
+        return BLOCKED
     except SnapshotDamaged as e:
         # This router's own state damage, decided BEFORE the handed marker
         # is written for this attempt. Handed over before: the request may

@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import dataclasses
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -414,8 +415,16 @@ def activate_delegation(cfg: RouterConfig, runtime: Any) -> None:
     if plugin is None:
         raise peerlane.DelegationRefused("no_plugin", "delegation needs the loaded transport "
                                                       "plugin")
+    fingerprint = peerlane.fingerprint(cfg, plugin)
+    current = peerlane.current(cfg)
+    if current is not None and fingerprint is not None and current.fingerprint == fingerprint:
+        # Nothing activation depends on has changed (the delegation config,
+        # the plugin, the seed file's identity, mode and size): keep it, with
+        # no seed read, no backend self-test and no probe on every poll.
+        peerlane.install(cfg, current)
+        return
     delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))
-    peerlane.install(cfg, delegation)
+    peerlane.install(cfg, dataclasses.replace(delegation, fingerprint=fingerprint))
     logger.info("delegation activated: signing key %s, %d peer runtime(s)",
                 cfg.delegation.signing_key_id, len(cfg.delegation.runtimes))
 
@@ -501,6 +510,11 @@ def reload_config(config_path, current: RouterConfig, runtime: Any = None) -> Ro
                 "the last good config; a key removed in the refused config is NOT applied "
                 "until a reload succeeds", e)
             return _refuse_reload(current, "delegation could not be activated")
+        except Exception:  # noqa: BLE001 -- NEVER RAISES (docstring): a fault refuses the reload
+            logger.exception(
+                "config reload REFUSED: delegation activation FAILED unexpectedly — "
+                "continuing on the last good config and the last good delegation")
+            return _refuse_reload(current, "delegation activation failed unexpectedly")
     _RELOAD_FAILURE.pop(str(current.state_dir), None)
     return fresh
 

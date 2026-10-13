@@ -111,6 +111,9 @@ class Delegation:
     key_table: Any
     reasons: frozenset
     key_config_reasons: frozenset
+    #: What activation depended on (`fingerprint`), set by the caller that
+    #: installs it; None when unknown.
+    fingerprint: Any = None
 
     @property
     def key_id(self) -> str:
@@ -127,6 +130,28 @@ def active(cfg: RouterConfig) -> Optional[Delegation]:
     if getattr(cfg, "delegation", None) is None:
         return None
     return _ACTIVE.get(str(cfg.state_dir))
+
+
+def current(cfg: RouterConfig) -> Optional[Delegation]:
+    """The delegation installed for `cfg`'s state_dir, whatever `cfg`
+    itself configures (a reload compares against it)."""
+    return _ACTIVE.get(str(cfg.state_dir))
+
+
+def fingerprint(cfg: RouterConfig, plugin: Any) -> Optional[Tuple[Any, ...]]:
+    """What activating `cfg`'s delegation depends on, cheaply: the
+    delegation config, the plugin object, and the seed file's device, inode,
+    mtime, size, mode, owner and links (lstat, never following a link).
+    None when the seed cannot be stat'ed: then activation runs, and refuses.
+    A change to a directory ABOVE the seed is not seen here; it is seen at
+    the next activation, which a change to any of these triggers."""
+    dc = cfg.delegation
+    try:
+        st = os.lstat(dc.signing_key_path)
+    except OSError:
+        return None
+    return (dc, id(plugin), st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, st.st_mode,
+            st.st_uid, st.st_nlink)
 
 
 def install(cfg: RouterConfig, delegation: Optional[Delegation]) -> None:
@@ -196,7 +221,10 @@ def read_seed(path: str, forbidden_roots: Iterable[str]) -> bytes:
     finally:
         os.close(fd)
     try:
-        st = os.fstat(kfd)
+        try:
+            st = os.fstat(kfd)
+        except OSError as e:
+            raise DelegationRefused("signing_key_path", f"{path}: {e.strerror}") from None
         if not stat.S_ISREG(st.st_mode):
             raise DelegationRefused("signing_key_path", f"{path} is not a regular file")
         if st.st_nlink != 1:
@@ -207,7 +235,10 @@ def read_seed(path: str, forbidden_roots: Iterable[str]) -> bytes:
             raise DelegationRefused("signing_key_path",
                                     f"{path} has mode {oct(stat.S_IMODE(st.st_mode))}; 0400 "
                                     "required")
-        data = os.read(kfd, SEED_BYTES + 1)
+        try:
+            data = os.read(kfd, SEED_BYTES + 1)
+        except OSError as e:
+            raise DelegationRefused("signing_key_path", f"{path}: {e.strerror}") from None
     finally:
         os.close(kfd)
     if len(data) != SEED_BYTES:
@@ -274,9 +305,10 @@ def activate(cfg: RouterConfig, plugin: Any, *, now: Any) -> Delegation:
         raise DelegationRefused(e.reason, e.detail) from None
     try:
         codec = caps.make_peer_codec({})
-    except Exception as e:  # noqa: BLE001 -- any failure refuses
-        raise DelegationRefused("codec", f"make_peer_codec({{}}) raised {type(e).__name__}") \
-            from None
+    except Exception as e:  # noqa: BLE001 -- classified exactly
+        if type(e) is caps.errors["ConfigError"]:
+            raise DelegationRefused("codec", f"make_peer_codec({{}}) refused: {e}") from None
+        raise   # a bug: never mistaken for a refusal
     for m in _CODEC_METHODS:
         if not callable(getattr(codec, m, None)):
             raise DelegationRefused("codec", f"the peer codec has no callable {m!r}")
@@ -370,7 +402,10 @@ def build_statement(*, key_id: str, peer_id: str, from_address: str, to_address:
     """The statement's exact bytes, `v: 1`, closed, canonical. `attachments`
     are the draft's descriptors in order (`sha256`, `size_bytes`,
     `filename`, `media_type`). `StatementRefused` for anything the encoding
-    refuses."""
+    refuses, and for a missing `sender_exposure` or `sender_since`: both are
+    mandatory on a cross-host peer task (items 5c and 5d refuse first)."""
+    if sender_exposure is None or sender_since is None:
+        raise StatementRefused("sender_exposure and sender_since are mandatory")
     try:
         body = normalise_body(body_text).encode("utf-8")
     except UnicodeEncodeError:
@@ -385,10 +420,8 @@ def build_statement(*, key_id: str, peer_id: str, from_address: str, to_address:
     }
     if in_reply_to is not None:
         doc["in_reply_to"] = in_reply_to
-    if sender_exposure is not None:
-        doc["sender_exposure"] = dict(sender_exposure)
-    if sender_since is not None:
-        doc["sender_since"] = sender_since
+    doc["sender_exposure"] = dict(sender_exposure)
+    doc["sender_since"] = sender_since
     try:
         return hoplink.canonical(doc)
     except hoplink.CanonicalRefused as e:

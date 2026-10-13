@@ -1588,10 +1588,15 @@ configured; then item 5e is on.
 **Activation**, at startup and at every reload (`peerlane.activate`):
 1. the plugin's delegation capabilities (`transport.check_delegation`);
 2. the peer codec (`make_peer_codec({})`), whose published reason sets become
-   this router's vocabulary;
+   this router's vocabulary. Only the plugin's own `ConfigError`, by exact
+   type, refuses here; any other exception from the factory is a bug and
+   propagates;
 3. the seed, read by walking from `/` with no symlink followed: every
    directory owned by root or this process and writable by group or others
-   only when sticky, none of them a forbidden root (by device and inode);
+   only when sticky (as for the plugin file: in a sticky directory others
+   cannot rename or remove an entry they do not own, and every entry on the
+   walk is checked to be root's or this process's), none of them a forbidden
+   root (by device and inode);
    the file this process's, mode 0400, one link, exactly 32 bytes. Its bytes
    go to the plugin's signer and nowhere else;
 4. the peer table through the codec's key gate (a duplicate `key_id` across
@@ -1602,7 +1607,13 @@ configured; then item 5e is on.
 6. a sign/verify PROBE over a fixed message: the configured `public_key` must
    verify the seed's signature, or `signing_key_mismatch`.
 
-A failure stops startup, or refuses the reload: the last good config and
+Activation is repeated only when something it depends on changes (the
+`delegation` config, the plugin, or the seed file's identity, mode or size),
+so an unchanged config costs no seed read, self-test or probe per poll. A
+failure stops startup, or refuses the reload. An unexpected fault (a bug,
+which propagates out of activation) stops startup loudly; at a reload it is
+logged with its traceback and refuses the reload, so a reload never takes the
+router down. On a refused reload the last good config and
 delegation stay in force, `reload_failed` is set, and `status.json`'s
 `classification.config_reload_failure` says since when and why. While a
 reload is refused, a key REMOVED in the refused config is not applied; a key
