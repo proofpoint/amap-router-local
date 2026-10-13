@@ -334,7 +334,8 @@ class SealTests(_Chain):
                 self.assertNotEqual(value, getattr(auth, part), "the swap must change the part")
                 with self.assertRaises(TypeError):
                     dataclasses.replace(auth, **{part: value})
-        with self.assertRaises(TypeError):
+        # TypeError on 3.10+, ValueError on 3.9: either way, refused.
+        with self.assertRaises((TypeError, ValueError)):
             dataclasses.replace(auth, payload={})
 
     def test_not_picklable_and_copies_are_identical(self):
@@ -453,9 +454,14 @@ class PersistenceTests(_Chain):
         auth, snap = self.fresh()
         rec, rcp = self.decide(auth)
         path = self.state_dir / self.record_dir / peerbind.DECISION_FILE
+        # Hold the original open, so the filesystem cannot hand its inode
+        # number straight back to the replacement (ext4 reuses a freed one).
+        held = os.open(path, os.O_RDONLY)
+        self.addCleanup(os.close, held)
         path.unlink()
         path.write_bytes(rec)                     # same bytes, a new inode
         os.chmod(path, 0o600)
+        self.assertNotEqual(os.stat(path).st_ino, os.fstat(held).st_ino)
         with self.assertRaises(peerbind.RecoveryCorrupt) as cm:
             peerbind.resume(rcp, snap, state_dir=self.state_dir)
         self.assertEqual(cm.exception.reason, "replaced")
