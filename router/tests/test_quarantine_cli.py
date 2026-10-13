@@ -187,7 +187,7 @@ class FormatTests(_Q):
         self.assertEqual(quarantine.CAUSES, ("cold_fleet_mail", "late_inbound",
                                              "notice_invalid"))
         self.put_item(causes=["notice_invalid"])
-        self.assertIsNone(self.one().damaged, "notice_invalid is in the vocabulary (E17)")
+        self.assertIsNone(self.one().damaged, "notice_invalid is in the vocabulary")
         self.put_item(causes=["cold_fleet_mail"])
         self.assertIsNone(self.one().damaged)
         self.put_item(causes=["late_inbound"])

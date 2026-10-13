@@ -109,7 +109,7 @@ class WriterTests(unittest.TestCase):
         self.assertFalse(self.qdir.exists() and os.listdir(self.qdir))
 
     def test_a_first_sight_notice_invalid_item_is_in_the_frozen_format(self):
-        # E17: the evidence is EXACTLY the entry id, the journal key,
+        # The evidence is EXACTLY the entry id, the journal key,
         # the attributed generation, arrived_at and the literal closed code;
         # no digests, no detail.
         self.assertEqual(self.write(cause=quarantine.CAUSE_NOTICE_INVALID, digests=None),

@@ -1435,13 +1435,16 @@ entries again). To change the link, begin a new generation.
 listed id the key lookup BEFORE any read (a placed or quarantined key is a
 duplicate, compared whole-bundle with its snapshot and never placed or
 quarantined again); the read (`notice_incomplete` held;
-`notice_invalid` on first sight QUARANTINED, contract amendment E17); the
+`notice_invalid` on first sight QUARANTINED); the
 bundle and the facts checked as hostile input (this router's own check is
 additional to the reader's and verdict-identical with it); a generation
-no longer current gets `late_inbound` (E16); the recipient binding (a
-named recipient must resolve to this identity, by name or through an
-active alias, else `recipient_not_this_identity`); the admission order;
-then snapshot, `prepared` and placement.
+no longer current gets `late_inbound`; the recipient cross-check (the
+tree binds the entry to this identity, and mail whose named To/Cc
+recipients resolve only to ANOTHER identity, by name or through an active
+alias, is held `recipient_not_this_identity`; an address resolving to
+nobody, as for a Bcc'd or list-delivered recipient or a truncated header,
+never refuses); the admission order; then snapshot, `prepared` and
+placement.
 
 **Untrusted fleet mail is the only class this router places, and that set
 is EMPTY in every deployment today.** Everything else is held for the unit
@@ -1498,15 +1501,17 @@ for, at `state_dir/<logical_id>/gen-<g>/ingress-quarantine/<id>.json`. This
 router FREEZES the item format and inspects it read-only (`quarantine`); the
 writer is `ingress.write_quarantine_item`, which checks each item against
 those rules before writing it, one item per journal key, create-if-absent.
-The expiry sweep is still a later step's.
+The expiry sweep is `ingress.sweep_quarantine`: after each generation's
+inbound pass it removes the well-formed items older than
+`ingress_quarantine_days`, logging each sweep that removed any, and keeps a
+damaged item for the operator.
 
 An item has exactly `schema` (`amap-router-local.ingress-quarantine/1`),
 `id` (32 hex, the filename stem), `generation` (32 hex, the directory's),
 `arrival_ts`, `causes` (non-empty, no duplicates, from a closed
 vocabulary: `cold_fleet_mail`, `late_inbound` (an entry for a fenced or
 retired generation, held there) and `notice_invalid` (an entry the
-transport's reader refused as invalid on first sight, contract amendment
-E17) today; the peer-origin profile's §5 causes
+transport's reader refused as invalid on first sight) today; the peer-origin profile's §5 causes
 are added once the revision defining them is published) and
 `evidence` (at most 32 members; keys 1-64 printable ASCII; values strings of
 at most 1024 characters or integers, never booleans, of magnitude below

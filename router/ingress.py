@@ -17,8 +17,10 @@ THE RECORD, a JSON object:
      "state": <STATE>, "reason": <str or null>,
      "first_seen_ts": <utc_ts>, "state_ts": <utc_ts>, ...state members}
 
-Transitions only ever move FORWARD (`TRANSITIONS`). A write that would move a
-record backwards, or across states the table does not join, raises
+Transitions move FORWARD (`TRANSITIONS`), with two deliberate exceptions: a
+tombstone (`complete`, `quarantined_complete`) moves back to its
+`*_waiting_remove` state when its entry is re-published and must be removed
+again. A write across states the table does not join raises
 `JournalError` and writes nothing: the table is the state machine, and no
 caller re-derives it. Every write is durable on return (`atomic_write` with
 the state directory as its durable root).
@@ -1001,11 +1003,11 @@ def write_quarantine_item(state_dir: Path, logical_id: str, gen: str, kind: str,
     if cause not in quarantine_mod.CAUSES:
         raise ValueError(f"{cause!r} is not in the closed cause vocabulary")
     if cause == quarantine_mod.CAUSE_NOTICE_INVALID and (digests is not None or extra_evidence):
-        raise ValueError("a notice_invalid item records identifiers only (E17)")
+        raise ValueError("a notice_invalid item records identifiers only")
 
     def evidence_at(ts: str) -> Dict[str, Any]:
         if cause == quarantine_mod.CAUSE_NOTICE_INVALID:
-            # E17: EXACTLY the listed entry id, the journal key, the
+            # EXACTLY the listed entry id, the journal key, the
             # attributed generation, arrived_at and the literal closed code;
             # nothing from or about the refused bytes.
             return {"entry_id": entry_id, "journal_key": key, "generation": gen,
@@ -1616,9 +1618,9 @@ def pinned_link(state_dir: Path, logical_id: str, gen: str,
 
 
 # ---------------------------------------------------------------------------
-# The plain-mail RECIPIENT binding: a notice read from
-# L's tree is for L only if one of its named recipients resolves to L. Plain
-# mail carries no transaction, so without this only the tree would bind it.
+# The plain-mail RECIPIENT cross-check: the tree binds a notice to L, and mail
+# whose named recipients resolve only to ANOTHER identity is never placed for
+# L. Plain mail carries no transaction, so this is its only cross-check.
 # ---------------------------------------------------------------------------
 
 HELD_NOT_THIS_IDENTITY = "recipient_not_this_identity"
@@ -1642,34 +1644,49 @@ def named_addresses(spool: Dict[str, Any]) -> List[str]:
 
 def addressed_to(cfg: Any, report: Any, logical_id: str,
                  spool: Dict[str, Any]) -> Optional[bool]:
-    """True when a named recipient resolves to `logical_id`, by name
-    (`<name>@<fleet_domain>` for a configured name whose registry identity it
-    is) or through an alias ACTIVE this poll whose target name's identity it
-    is; False when none does; None when the registry report is not `ok`
-    (no decision: the transient hold).
+    """A NEGATIVE cross-check, never a positive requirement: False (hold)
+    only when the named recipients resolve to ANOTHER identity and none to
+    `logical_id`; True otherwise, the tree binding the entry; None when the
+    registry report is not `ok` (no decision: the transient hold).
 
-    THE CASE RULE, each half from the resolver it reuses: by name, the
-    domain and the local part both match case-insensitively
-    (`config.instance_for` against the configured names); through an alias,
-    the local part matches EXACTLY and the domain case-insensitively
-    (`aliases.match_key`, the alias table's own rule). A former name with no
-    active alias resolves to nobody."""
+    The spool's `to`/`cc` are the message's raw header text, possibly
+    truncated, while the tree the entry was read from was chosen upstream by
+    the hub's trusted delivery address. So a Bcc'd recipient, one reached
+    through a list or an alias, or one named past the truncation is named in
+    neither, and is still this identity's: only an address that positively
+    names someone else can refuse the entry.
+
+    An address resolves by name (`<name>@<fleet_domain>` for a configured
+    name, to that name's registry identity) or through an alias ACTIVE this
+    poll (to its target name's identity). THE CASE RULE, each half from the
+    resolver it reuses: by name, the domain and the local part both match
+    case-insensitively (`config.instance_for` against the configured names);
+    through an alias, the local part matches EXACTLY and the domain
+    case-insensitively (`aliases.match_key`). An address that resolves to
+    nobody (outside the fleet, an unconfigured name, an inactive alias)
+    neither binds nor refuses."""
     if getattr(report, "state", None) != "ok":
         return None
     known = dict(report.known or {})
     table = {a.old: a for a in (getattr(cfg, "aliases", None) or ())}
     view = getattr(cfg, "alias_view", None)
+    elsewhere = False
     for addr in named_addresses(spool):
+        lid = None
         name = config_mod.instance_for(addr, cfg.fleet_domain, known=cfg.instances)
-        if name is not None and known.get(name) == logical_id:
+        if name is not None:
+            lid = known.get(name)
+        else:
+            k = aliases_mod.match_key(addr)
+            a = table.get(k) if k else None
+            d = view.decisions.get(a.old) if (a is not None and view is not None) else None
+            if d is not None and d.status == aliases_mod.ACTIVE:
+                lid = known.get(d.target)
+        if lid == logical_id:
             return True
-        k = aliases_mod.match_key(addr)
-        a = table.get(k) if k else None
-        d = view.decisions.get(a.old) if (a is not None and view is not None) else None
-        if d is not None and d.status == aliases_mod.ACTIVE and known.get(d.target) == logical_id:
-            return True
-    return False
-
+        if lid is not None:
+            elsewhere = True
+    return not elsewhere
 
 # ---------------------------------------------------------------------------
 # THE PUMP: one dispatch order, per (identity, generation), under the drain
@@ -1684,12 +1701,12 @@ def addressed_to(cfg: Any, report: Any, logical_id: str,
 #      key goes to its row (terminal: skipped; snapshot kept: re-evaluated
 #      from the snapshot; otherwise re-read).
 #   3. read_entry: the reader's refusal class gives notice_incomplete (held)
-#      or notice_invalid (first sight: quarantined, E17); a runtime class or
+#      or notice_invalid (first sight: quarantined); a runtime class or
 #      OSError gives no decision this pump.
 #   4-5. the bundle (`parse_bundle`): bundle_schema, entry_id_mismatch,
 #      bundle_invalid, each held, no snapshot.
 #   6. the facts version (`facts_version`): notice_invalid.
-#   7. LATE (E16): the generation is not current -> late_inbound.
+#   7. LATE: the generation is not current -> late_inbound.
 #   8. the recipient: the registry names this identity's instance, or no
 #      decision (a transient hold, no snapshot).
 #   9-10. `classify_facts`.
@@ -1702,15 +1719,19 @@ def addressed_to(cfg: Any, report: Any, logical_id: str,
 #: A record held for one of these is never re-evaluated by a pump: only an
 #: operator verb releases it.
 TERMINAL_REASON_PREFIXES = ("snapshot_invalid:",)
-TERMINAL_REASONS = TERMINAL_HOLDS + (QuarantineConflict.reason, HELD_EXISTS_DIFFERENT)
+HELD_NOTICE_INCOMPLETE = "notice_incomplete"
+#: Held `notice_invalid` is written only for an entry that ALREADY had a
+#: record (a first sight is quarantined instead), so it is terminal: a later
+#: valid read never places it.
+HELD_NOTICE_INVALID = "notice_invalid"
+TERMINAL_REASONS = TERMINAL_HOLDS + (QuarantineConflict.reason, HELD_EXISTS_DIFFERENT,
+                                     HELD_NOTICE_INVALID)
 #: Holds that keep the snapshot and are re-evaluated FROM it, never re-read.
 SNAPSHOT_HOLDS = (HELD_FAILURE_NOTICE, HELD_BOUND_REPLY, HELD_NOT_PLACEABLE,
                   HELD_INCONSISTENT, HELD_LINK_MISMATCH, HELD_UNKNOWN_HOST,
                   HELD_NOT_THIS_IDENTITY)
 DUPLICATE_STATES = (PUBLISHED_WAITING_REMOVE, COMPLETE, QUARANTINED_WAITING_REMOVE,
                     QUARANTINED_COMPLETE)
-HELD_NOTICE_INCOMPLETE = "notice_incomplete"
-HELD_NOTICE_INVALID = "notice_invalid"
 
 
 def is_terminal(reason: Optional[str]) -> bool:
@@ -1729,7 +1750,7 @@ class Pump:
                  proven_unknown: bool = False):
         self.cfg, self.reader, self.report = cfg, reader, report
         # Proven unknown: the registry was read, valid, and the identity is absent or
-        # retired. Every generation of it is then non-current (E16).
+        # retired. Every generation of it is then non-current.
         self.proven_unknown = proven_unknown
         self.logical_id, self.gen, self.link = logical_id, gen, link
         self.recipient, self.unresolved = recipient, unresolved
@@ -1755,19 +1776,26 @@ class Pump:
     def recover(self) -> None:
         records = journal_records(self.state_dir, self.logical_id, self.gen, "notice")
         for entry_id, rec in sorted(records.items()):
-            st = rec["state"]
-            if st == PLACING:
-                self.count("recovered_placing")
-                recover_placing(self.cfg, self.state_dir, self.logical_id, self.gen,
-                                self.link, entry_id, attachment_cap=self.attachment_cap)
-            elif st == PREPARED:
-                self.count("recovered_prepared")
-                place(self.cfg, self.state_dir, self.logical_id, self.gen, self.link,
-                      entry_id, attachment_cap=self.attachment_cap)
-            elif st == PUBLISHED:
-                self.jw(entry_id, PUBLISHED_WAITING_REMOVE)
-            elif st == QUARANTINED:
-                self.jw(entry_id, QUARANTINED_WAITING_REMOVE)
+            try:
+                self._recover_one(entry_id, rec["state"])
+            except Exception:  # noqa: BLE001 -- one entry never blocks the rest
+                logger.exception("ingress %s gen %s: recovery of an entry failed; left as it "
+                                 "is, the next entry proceeds", self.logical_id, self.gen)
+                self.count("entry_errored")
+
+    def _recover_one(self, entry_id: str, st: str) -> None:
+        if st == PLACING:
+            self.count("recovered_placing")
+            recover_placing(self.cfg, self.state_dir, self.logical_id, self.gen,
+                            self.link, entry_id, attachment_cap=self.attachment_cap)
+        elif st == PREPARED:
+            self.count("recovered_prepared")
+            place(self.cfg, self.state_dir, self.logical_id, self.gen, self.link,
+                  entry_id, attachment_cap=self.attachment_cap)
+        elif st == PUBLISHED:
+            self.jw(entry_id, PUBLISHED_WAITING_REMOVE)
+        elif st == QUARANTINED:
+            self.jw(entry_id, QUARANTINED_WAITING_REMOVE)
 
     # -- 2. onward, one listed entry ---------------------------------------
 
@@ -1843,7 +1871,7 @@ class Pump:
 
     def quarantine_refused(self, entry_id: str, rec: Optional[Dict[str, Any]]) -> str:
         """notice_invalid. On FIRST sight (no record for the key) it is
-        quarantined, E17: the evidence is the refusal's reason, nothing read
+        quarantined: the evidence is the refusal's reason, nothing read
         from the refused bytes. A key that already has a record (re-read
         holds) is held instead: its first sight was not invalid."""
         if rec is not None:
@@ -1929,7 +1957,7 @@ class Pump:
 
     def from_snapshot(self, entry_id: str, rec: Dict[str, Any]) -> Optional[str]:
         """A snapshot-kept hold, re-evaluated from what was READ, never
-        re-read: the late check first (E16 takes precedence), then the
+        re-read: the late check first (lateness takes precedence), then the
         order again."""
         try:
             kept = verify_snapshot(self.state_dir, self.logical_id, self.gen, "notice",
@@ -2193,6 +2221,10 @@ def pump_generation(pump: Pump, *, listing_too_large: Any = (),
             logger.exception("ingress %s gen %s: a damaged journal record",
                              pump.logical_id, pump.gen)
             what = "journal_damaged"
+        except Exception:  # noqa: BLE001 -- one entry never blocks the rest
+            logger.exception("ingress %s gen %s: an entry failed; left as it is, the next "
+                             "entry proceeds", pump.logical_id, pump.gen)
+            what = "entry_errored"
         pump.count(what or "undecided")
     advance_removal(pump, pump.now, horizon_s)
     swept = sweep_quarantine(pump.state_dir, pump.logical_id, pump.gen,
@@ -2224,7 +2256,9 @@ def identities(cfg: Any, report: Any) -> List[Dict[str, Any]]:
         out.append({"logical_id": lid, "recipient": name if name in (report.resolved or {})
                     else None, "unresolved": (report.held or {}).get(name),
                     "proven_unknown": False})
-    active = {e.logical_id for e in report.all_entries if e.state == "active"}
+    states: Dict[str, set] = {}
+    for e in report.all_entries:
+        states.setdefault(e.logical_id, set()).add(e.state)
     try:
         names = sorted(os.listdir(cfg.state_dir))
     except FileNotFoundError:
@@ -2234,11 +2268,30 @@ def identities(cfg: Any, report: Any) -> List[Dict[str, Any]]:
             continue
         if not generations_mod.gen_file(Path(cfg.state_dir), lid).exists():
             continue
-        proven = report.state == "ok" and lid not in active
+        proven = report.state == "ok" and _proven_unknown(
+            states.get(lid, set()), Path(cfg.state_dir), lid)
         out.append({"logical_id": lid, "recipient": None,
                     "unresolved": None if proven else "identity_unresolved",
                     "proven_unknown": proven})
     return out
+
+
+def _proven_unknown(registry_states: set, state_dir: Path, logical_id: str) -> bool:
+    """With a valid registry reading: the identity is ABSENT from it, or it
+    is RETIRED there and this router records no live generation for it.
+    Retired with a live generation (mid-retirement), or any other state, is
+    not proven: the caller treats it as transient."""
+    if not registry_states:
+        return True
+    if registry_states != {"retired"}:
+        return False
+    try:
+        doc = generations_mod.read_doc(state_dir, logical_id)
+    except generations_mod.GenerationHeld:
+        return False
+    if doc is None:
+        return True
+    return not any(g.get("fenced_ts") is None for g in doc["gens"])
 
 
 def pump_link(cfg: Any, logical_id: str, gen: str) -> Optional[str]:
@@ -2257,6 +2310,8 @@ def pump_link(cfg: Any, logical_id: str, gen: str) -> Optional[str]:
     return link
 
 
+#: The state_dirs whose "inbound disabled, no hop.link" ERROR was logged.
+_LINK_UNSET_LOGGED: set = set()
 #: (state_dir, logical_id) -> the generation the last pass saw as current.
 _LAST_CURRENT: Dict[tuple, str] = {}
 
@@ -2271,7 +2326,14 @@ def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
     summary."""
     from . import hoplink as hoplink_mod   # local: hoplink imports this module's peers
     out: Dict[str, Dict[str, int]] = {}
-    if cfg.hop is None or cfg.hop.link is None:
+    if cfg.hop is None:
+        return out
+    if cfg.hop.link is None:
+        # Inbound is OFF without the link: ONE ERROR per process, and
+        # nothing is constructed, listed, read or placed.
+        if str(cfg.state_dir) not in _LINK_UNSET_LOGGED:
+            _LINK_UNSET_LOGGED.add(str(cfg.state_dir))
+            logger.error("ingress: inbound is disabled: config.hop.link is not set")
         return out
     fsops = runtime.fsops
     runtime_classes = tuple(c for c in (getattr(fsops, "UnsafeRead", None),) if c)

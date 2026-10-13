@@ -139,6 +139,18 @@ class DispatchTests(_Pump):
         self.assertEqual(self.state(E1), (ingress.HELD, "notice_invalid"))
         self.assertEqual(self.items(), [])
 
+    def test_that_hold_is_terminal_a_later_valid_read_never_places_it(self):
+        self.port.entries[E1] = "notice_incomplete"
+        self.pump()
+        self.port.entries[E1] = "notice_invalid"
+        self.pump()
+        self.port.entries[E1] = entry(E1)
+        self.port.reads.clear()
+        self.pump()
+        self.assertEqual(self.port.reads, [], "a terminal hold was read again")
+        self.assertEqual(self.state(E1), (ingress.HELD, "notice_invalid"))
+        self.assertEqual(self.notices(), [])
+
     def test_a_trusted_host_is_quarantined_cold(self):
         self.port.entries[E1] = entry(E1, facts_extra=lambda f: dict(
             f, origin_host="fleet-a.example"),
@@ -198,6 +210,47 @@ class DispatchTests(_Pump):
         self.assertEqual(len(self.notices()), 2)
         self.pump(limit=2)
         self.assertEqual(len(self.notices()), 3)
+
+    def test_one_failing_entry_never_blocks_the_rest(self):
+        from unittest import mock
+        self.port.entries[E1] = entry(E1)
+        self.port.entries[E2] = entry(E2)
+        real = ingress.Pump.dispatch
+
+        def boom(pump, eid):
+            if eid == E1:
+                raise KeyError("an instance removed mid-flight")
+            return real(pump, eid)
+
+        with mock.patch.object(ingress.Pump, "dispatch", boom):
+            try:
+                counts = self.pump()
+            except KeyError as e:
+                self.fail(f"one entry's failure escaped the pass: {e!r}")
+        self.assertEqual(counts.get("entry_errored"), 1)
+        self.assertEqual(self.state(E2), (ingress.PUBLISHED_WAITING_REMOVE, None))
+
+    def test_one_failing_recovery_never_blocks_the_rest(self):
+        from unittest import mock
+        for e in (E1, E2):
+            parsed = ingress.parse_bundle(entry(e), e, attachment_cap=CAP)
+            ingress.prepare(self.keyed, self.state_dir, self.lid, self.gen, LINK, e, parsed,
+                            recipient="bravo")
+        real = ingress.place
+
+        def boom(cfg, state_dir, lid, gen, link, eid, **kw):
+            if eid == E1:
+                raise KeyError("an instance removed mid-flight")
+            return real(cfg, state_dir, lid, gen, link, eid, **kw)
+
+        with mock.patch.object(ingress, "place", boom):
+            try:
+                counts = self.pump()
+            except KeyError as e:
+                self.fail(f"one recovery's failure escaped the pass: {e!r}")
+        self.assertEqual(counts.get("entry_errored"), 1)
+        self.assertEqual(self.state(E1), (ingress.PREPARED, None))
+        self.assertEqual(self.state(E2), (ingress.PUBLISHED_WAITING_REMOVE, None))
 
     def test_a_terminal_hold_is_never_read_or_moved(self):
         for reason in (ingress.HELD_PLACING_AMBIGUOUS, "snapshot_invalid:hash"):
@@ -418,9 +471,18 @@ class PumpAllTests(_Pump):
         self.assertEqual(len(self.plugin.made), n, "evicted again without a new fence")
 
     def test_without_hop_link_nothing_is_listed_read_or_constructed(self):
+        self.addCleanup(ingress._LINK_UNSET_LOGGED.clear)
+        ingress._LINK_UNSET_LOGGED.clear()
         self.port.entries[E1] = entry(E1)
-        self.assertEqual(ingress.pump_all(self.with_link(None), self.rt, self.report), {})
+        with self.assertLogs("amap_router_local.ingress", "ERROR") as logs:
+            for _ in range(2):                       # two polls
+                self.assertEqual(ingress.pump_all(self.with_link(None), self.rt,
+                                                  self.report), {})
+        self.assertEqual(len(logs.output), 1, "the ERROR is once per process")
+        self.assertIn("hop.link", logs.output[0])
         self.assertEqual((self.port.lists, self.port.reads, self.plugin.made), (0, [], []))
+        self.assertEqual(self.snapshots(), [])
+        self.assertEqual(self.notices(), [])
 
     def test_run_once_runs_the_pass_after_the_drains_and_keeps_it_out_of_the_summary(self):
         from unittest import mock
@@ -468,6 +530,39 @@ class StatusTests(_Pump):
         for eid in (E1, E2, E3, "1700000000-9"):
             self.assertNotIn(eid, text)
         self.assertNotIn("fleet-b.example", text)
+
+
+class IdentitiesTests(_Pump):
+    """Proven unknown, decided only from a valid registry reading: ABSENT, or
+    retired with no live generation. Mid-retirement and every other reading
+    are transient (no decision, no quarantine)."""
+
+    def ident(self, state="ok", entries=()):
+        report = SimpleNamespace(state=state, known={}, resolved={}, held={},
+                                 all_entries=tuple(entries))
+        (row,) = [r for r in ingress.identities(SimpleNamespace(
+            instances={}, state_dir=self.state_dir), report) if r["logical_id"] == self.lid]
+        return row
+
+    def test_absent_from_a_valid_registry_is_proven_unknown(self):
+        row = self.ident()
+        self.assertEqual((row["proven_unknown"], row["unresolved"]), (True, None))
+
+    def test_mid_retirement_is_transient(self):
+        # Retired in the registry while this router still records a live
+        # (current, unfenced) generation for it.
+        row = self.ident(entries=[SimpleNamespace(logical_id=self.lid, state="retired")])
+        self.assertEqual((row["proven_unknown"], row["unresolved"]),
+                         (False, "identity_unresolved"))
+
+    def test_active_under_another_name_is_transient(self):
+        row = self.ident(entries=[SimpleNamespace(logical_id=self.lid, state="active")])
+        self.assertFalse(row["proven_unknown"])
+
+    def test_no_valid_registry_reading_is_transient(self):
+        for state in ("unavailable", "rolled_back"):
+            with self.subTest(state=state):
+                self.assertFalse(self.ident(state=state)["proven_unknown"])
 
 
 class LateTests(_Pump):

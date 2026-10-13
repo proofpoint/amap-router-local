@@ -4,7 +4,8 @@ read-only inspection (`router quarantine list|show`).
 OWNERSHIP IS SPLIT, deliberately. This module FREEZES the format and READS
 it. The WRITER (cross-host inbound held in a generation's quarantine) is
 `ingress.write_quarantine_item`, which checks every item against this
-module's rules before writing it; the expiry SWEEP is still a later step's.
+module's rules before writing it, and the expiry SWEEP is
+`ingress.sweep_quarantine`, run after each generation's inbound pass.
 Nothing here creates, moves or deletes anything.
 
 WHERE: `state_dir/<logical_id>/gen-<g>/ingress-quarantine/<id>.json`, one
@@ -102,13 +103,15 @@ SOURCES = (SOURCE_INGRESS, SOURCE_CONTROL)
 #: This router's own cause for cold trusted-host traffic. The profile's §5
 #: causes are added beside it once published (module docstring).
 CAUSE_COLD_FLEET_MAIL = "cold_fleet_mail"
-#: Contract amendment E16: an inbound entry attributed to a generation that is
+#: An inbound entry attributed to a generation that is
 #: no longer current when this router FIRST observes it (its own observation,
 #: never the writer's timing) is quarantined to that generation, never placed.
 CAUSE_LATE_INBOUND = "late_inbound"
-#: Contract amendment E17: an entry the transport's reader refuses as
-#: `notice_invalid` on this router's FIRST sight of it (no journal record for
-#: its key) is quarantined, one item per key, then removed upstream. Named
+#: An entry the transport's reader refuses as `notice_invalid` on this
+#: router's FIRST sight of it (no journal record for its key, a tombstone
+#: included) is quarantined, one item per key, then removed upstream through
+#: the plugin's remover when one is offered, else retained under the interim
+#: rule until the dedup horizon has passed and the reader reports it gone. Named
 #: after the transport's own refusal reason (`transport.NOTICE_REFUSAL_REASONS`),
 #: so it adds no wire vocabulary.
 CAUSE_NOTICE_INVALID = "notice_invalid"

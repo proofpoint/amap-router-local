@@ -495,7 +495,7 @@ def forget_senders() -> None:
 # ---------------------------------------------------------------------------
 # Intake readers: one per (logical_id, generation), current or fenced.
 # Reading never admits, so a fenced generation's tree may be read; its
-# entries are late (contract amendment E16).
+# entries are late.
 # ---------------------------------------------------------------------------
 
 HOLD_READER_CONSTRUCT_FAILED = "hop_reader_construct_failed"   # retried next poll
