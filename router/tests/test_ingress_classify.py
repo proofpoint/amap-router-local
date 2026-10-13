@@ -1,4 +1,4 @@
-"""The §7.2 order and A5 admission over the facts: first match wins, one
+"""The §7.2 order and admission over the facts: first match wins, one
 outcome per facts document, and a value outside the enums is notice_invalid,
 never a row. Untrusted fleet mail is the only placeable class."""
 from __future__ import annotations

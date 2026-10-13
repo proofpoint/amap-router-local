@@ -1,4 +1,4 @@
-"""The listing_entries_high proxy (RL-SEND v3.9 item 2, v3.10): cumulative
+"""The listing_entries_high proxy (its text fixed by the transport design): cumulative
 over one complete cursor traversal, evaluated only on the completing page,
 reset without evaluating when the traversal restarts. The numbers are the
 real ones: 16,384 is a quarter of LIST_SCAN_MAX, over 17 pages of 1024."""

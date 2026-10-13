@@ -597,7 +597,7 @@ class HopConfig:
     peer_uid: int
     version_write: int
     caps: Tuple[Tuple[str, int], ...]
-    #: The inbound reader's link (PROVISIONAL, design delta v3.4 §2): the
+    #: The inbound reader's link (PROVISIONAL, pending the owner's confirmation): the
     #: journal key's `link` and admission's comparand. Absent, inbound is
     #: disabled; the outbound leg does not read it.
     link: Optional[str] = None

@@ -11,7 +11,7 @@ so neither reads as a gap:
 
   * version-1 facts CARRYING `attachments` are refused here at the
     version guard and there at the version-1 closed schema: the same
-    verdict, no difference (Opus N1, as corrected).
+    verdict, no difference.
   * a spool that is not JSON or not an object, and a present null
     `attachments` on the notice or the spool, are refused here at the
     BUNDLE layer (`bundle_invalid`, a re-read hold) where the plugin's
@@ -129,7 +129,7 @@ class FactsCheckTests(unittest.TestCase):
                 self.bad(parsed(facts=lambda f, v=v: f.update(hop_contract=v),
                                 notice=lambda n, v=v: n.update(hop_contract=v)))
         # True beside the notice's integer 1: only the type check refuses it
-        # (P2 compares equal, True == 1).
+        # (the hop_contract pair rule compares equal, True == 1).
         self.bad(parsed(facts=lambda f: f.update(hop_contract=True)))
 
     def test_grammars(self):
@@ -192,16 +192,16 @@ class FactsCheckTests(unittest.TestCase):
 
     # -- the pair rules ----------------------------------------------------
 
-    def test_p1_notice_id(self):
+    def test_pair_notice_id(self):
         self.bad(parsed(facts=lambda f: f.update(notice_id="1700000000-43")))
 
-    def test_p2_hop_contract(self):
+    def test_pair_hop_contract(self):
         self.bad(parsed(notice=lambda n: n.pop("hop_contract")))
         self.bad(parsed(notice=lambda n: n.update(hop_contract=2)))
         self.bad(parsed(notice=lambda n: n.update(hop_contract=True),
                         facts=lambda f: f.update(hop_contract=1)))
 
-    def test_p3_provenance(self):
+    def test_pair_provenance(self):
         for prov in (None, "internal", "external", "unverified"):
             with self.subTest(prov=prov):
                 self.bad(parsed(notice=lambda n, p=prov: (
@@ -209,7 +209,7 @@ class FactsCheckTests(unittest.TestCase):
                     else n["message"].update(provenance=p))))
         self.bad(parsed(facts=openly))   # fleet-remote under open
 
-    def test_p4_from_domain(self):
+    def test_pair_from_domain(self):
         for frm in ("a@other.example", "a@fleet-b.example ", "<a@fleet-b.example> x",
                     "nobody"):
             with self.subTest(frm=frm):
@@ -218,11 +218,11 @@ class FactsCheckTests(unittest.TestCase):
             with self.subTest(frm=frm):
                 self.ok(parsed(notice=lambda n, v=frm: n["message"].update(**{"from": v})))
 
-    def test_p4_reads_only_the_last_at(self):
+    def test_the_from_domain_reads_only_the_last_at(self):
         self.assertEqual(ingress.domain_of("a@b@Fleet.Example"), "fleet.example")
         self.assertIsNone(ingress.domain_of(ingress.addr_of("x <a@b>y")))
 
-    def test_p5_alignment_at_version_2(self):
+    def test_attachment_alignment_at_version_2(self):
         self.bad(parsed(facts=lambda f: f["attachments"].append(
             {"source_sha256": "c" * 64, "size_bytes": 1})))
         # An extra row the SPOOL agrees with: only the notice count refuses it.
@@ -243,7 +243,7 @@ class FactsCheckTests(unittest.TestCase):
         p = parsed()
         p["spool"]["attachments"] = None
         self.bad(p)
-        # P5c only where the descriptor carries sha256: a stripped part is
+        # The digest is aligned only where the descriptor carries sha256: a stripped part is
         # aligned by size alone.
         self.ok(parsed(clean=False, facts=lambda f: f["attachments"][0].update(
             source_sha256="c" * 64)))

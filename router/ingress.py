@@ -278,7 +278,7 @@ def facts_version(facts: Any) -> int:
 # ---------------------------------------------------------------------------
 # The facts, re-checked as hostile input: this router's ADDITIONAL strict
 # check, verdict-identical with the plugin's reader over its corpus (design
-# delta v3.4 §4, from the codec owner's answers; member names and grammars
+# from the codec owner's answers; member names and grammars
 # only). The reader's CONTEXT layer (hop_contract in the versions read, each
 # transaction's logical_id the tree's) is consumed from its verdict, never
 # repeated here. Every failure is `FactsInvalid`, so notice_invalid.
@@ -345,7 +345,7 @@ def _transaction(t: Any, what: str) -> None:
 
 
 def addr_of(from_value: Any) -> Optional[str]:
-    """P4's addr(from): `from` itself if it FULLY matches the bare addr-spec,
+    """The From rule's addr(from): `from` itself if it FULLY matches the bare addr-spec,
     else the final `<addr-spec>` group anchored at the very end, else None.
     No trimming or unfolding."""
     if not isinstance(from_value, str):
@@ -357,7 +357,7 @@ def addr_of(from_value: Any) -> Optional[str]:
 
 
 def domain_of(addr: Optional[str]) -> Optional[str]:
-    """P4's domain: ASCII-lowercased after the LAST "@"; no IDNA."""
+    """The From rule's domain: ASCII-lowercased after the LAST "@"; no IDNA."""
     if addr is None or "@" not in addr:
         return None
     dom = addr.rsplit("@", 1)[1]
@@ -368,9 +368,10 @@ def domain_of(addr: Optional[str]) -> Optional[str]:
 def check_facts(parsed: Dict[str, Any]) -> int:
     """The facts of a parsed bundle, checked whole: the version selector
     (`facts_version`), canonical bytes, closed members at every level, the
-    grammars and the codec's conditional rules, then the pair rules P1-P4
-    against the notice and, at version 2, P5 against the notice and the
-    spool. Returns the version; raises `FactsInvalid`."""
+    grammars and the codec's conditional rules, then the pair rules
+    against the notice (notice id, hop_contract, provenance, the From
+    domain) and, at version 2, the attachment alignment against the notice
+    and the spool. Returns the version; raises `FactsInvalid`."""
     facts, raw = parsed["facts"], parsed["raw"]["facts"]
     version = facts_version(facts)
     try:
@@ -436,15 +437,15 @@ def check_facts(parsed: Dict[str, Any]) -> int:
     if not isinstance(message, dict):
         raise _bad("the notice has no message")
     if facts["notice_id"] != notice.get("notice_id"):
-        raise _bad("P1: the facts' notice_id is not the notice's")
+        raise _bad("pair rule: the facts' notice_id is not the notice's")
     nhc = notice.get("hop_contract")
     if not (type(nhc) is int and nhc == hc):
-        raise _bad("P2: the notice carries no hop_contract equal to the facts'")
+        raise _bad("pair rule: the notice carries no hop_contract equal to the facts'")
     want = "fleet-remote" if fleet else "unverified"
     if message.get("provenance") != want:
-        raise _bad(f"P3: the notice's provenance is not {want!r}")
+        raise _bad(f"pair rule: the notice's provenance is not {want!r}")
     if fleet and domain_of(addr_of(message.get("from"))) != facts["origin_host"]:
-        raise _bad("P4: the From domain is undefined or is not origin_host")
+        raise _bad("pair rule: the From domain is undefined or is not origin_host")
     if version == 2:
         rows = facts["attachments"]
         if not isinstance(rows, list):
@@ -458,16 +459,16 @@ def check_facts(parsed: Dict[str, Any]) -> int:
         spool_atts = parsed["spool"].get("attachments", []) if isinstance(
             parsed["spool"], dict) else None
         if not isinstance(descs, list) or not isinstance(spool_atts, list):
-            raise _bad("P5: a present attachments member is not a list")
+            raise _bad("alignment: a present attachments member is not a list")
         if len(rows) != len(descs):
-            raise _bad("P5: the facts' row count is not the notice's descriptor count")
+            raise _bad("alignment: the facts' row count is not the notice's descriptor count")
         for k, (row, d) in enumerate(zip(rows, descs)):
             if row["size_bytes"] != d.get("size_bytes"):
-                raise _bad(f"P5: row {k}'s size_bytes is not descriptor {k}'s")
+                raise _bad(f"alignment: row {k}'s size_bytes is not descriptor {k}'s")
             if "sha256" in d and d["sha256"] != row["source_sha256"]:
-                raise _bad(f"P5c: descriptor {k}'s sha256 is not row {k}'s source_sha256")
+                raise _bad(f"alignment: descriptor {k}'s sha256 is not row {k}'s source_sha256")
         if len(spool_atts) != len(rows):
-            raise _bad("P5: the spool's attachment count is not the row count")
+            raise _bad("alignment: the spool's attachment count is not the row count")
     return version
 
 
@@ -1433,17 +1434,17 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
 
 
 # ---------------------------------------------------------------------------
-# The §7.2 order and A5 admission, on the FACTS only (provenance is never an
+# The §7.2 order and admission, on the FACTS only (provenance is never an
 # input). FIRST MATCH WINS; one outcome per facts document:
 #
-#   1  notice_class is not "mail"           -> held (failure notice, RL-07b)
-#   2  in_reply_to present                  -> held (bound reply, RL-07b)
+#   1  notice_class is not "mail"           -> held (failure notice, a later unit's)
+#   2  in_reply_to present                  -> held (bound reply, a later unit's)
 #   3  admission "open"                     -> held admission_not_placeable
 #   4  fleet_hosts, ingress not "hub"       -> held admission_inconsistent
 #   5  admission_link is not this link      -> held admission_link_mismatch
 #   6  origin_host a trusted fleet host     -> quarantined cold_fleet_mail
 #   7  origin_host not a fleet host         -> held unknown_host
-#   8  otherwise (D12, untrusted fleet mail)-> PLACE
+#   8  otherwise (untrusted fleet mail)     -> PLACE
 #
 # Untrusted fleet mail (row 8) is the ONLY placeable class, and that set is
 # empty in every deployment today. A value outside the codec's enums is
@@ -1451,7 +1452,7 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
 #
 # Row 3 is "open" alone: the codec's admission enum is exactly
 # {"open", "fleet_hosts"} (its owner's answer), so "inbound_allowlist" is
-# notice_invalid here as in the plugin's reader (design delta v3.4).
+# notice_invalid here as in the plugin's reader.
 # ---------------------------------------------------------------------------
 
 PLACE = "place"
@@ -1518,7 +1519,7 @@ def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fle
 
 
 # ---------------------------------------------------------------------------
-# The inbound link, PINNED per generation (design delta v3.5 B1). The link is
+# The inbound link, PINNED per generation. The link is
 # inside every journal key, so a config edit must never re-key: the first
 # inbound use writes the pin, every later pump compares, and a difference
 # latches that generation's inbound off. Changing the link means fencing a
@@ -1615,7 +1616,7 @@ def pinned_link(state_dir: Path, logical_id: str, gen: str,
 
 
 # ---------------------------------------------------------------------------
-# The plain-mail RECIPIENT binding (design delta v3.5 B3): a notice read from
+# The plain-mail RECIPIENT binding: a notice read from
 # L's tree is for L only if one of its named recipients resolves to L. Plain
 # mail carries no transaction, so without this only the tree would bind it.
 # ---------------------------------------------------------------------------
@@ -1625,7 +1626,7 @@ HELD_NOT_THIS_IDENTITY = "recipient_not_this_identity"
 
 def named_addresses(spool: Dict[str, Any]) -> List[str]:
     """The spool's `to` and `cc`, each split on "," into elements, each
-    element stripped of surrounding whitespace and read by P4's `addr` rule.
+    element stripped of surrounding whitespace and read by the From rule's `addr`.
     An element with no address is skipped."""
     out: List[str] = []
     for member in ("to", "cc"):
@@ -1727,7 +1728,7 @@ class Pump:
                  attachment_cap: int, runtime_classes: tuple = (),
                  proven_unknown: bool = False):
         self.cfg, self.reader, self.report = cfg, reader, report
-        # A4: the registry was read, valid, and the identity is absent or
+        # Proven unknown: the registry was read, valid, and the identity is absent or
         # retired. Every generation of it is then non-current (E16).
         self.proven_unknown = proven_unknown
         self.logical_id, self.gen, self.link = logical_id, gen, link
@@ -2000,9 +2001,9 @@ def _digests_of(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Removal and the dedup horizon (v2 §4, §8; RL-E8b's interim rule).
+# Removal and the dedup horizon, under the remover's interim rule.
 #
-# THE REMOVER is RL-E8b's optional capability, and this router has no
+# THE REMOVER is the plugin's optional capability, and this router has no
 # plugin that offers it yet: `remover` is NOT_OFFERED, and the interim rule
 # is the live path. A `*_waiting_remove` record becomes its tombstone only
 # when BOTH the horizon has passed since it began waiting AND `read_entry`
@@ -2105,7 +2106,7 @@ GONE = object()
 _CURSORS: Dict[tuple, Optional[str]] = {}
 HELD_LISTING_TOO_LARGE = "hop_listing_too_large"
 
-# THE LISTING PROXY (RL-SEND v3.9 item 2 and v3.10, fixed text): a status
+# THE LISTING PROXY (its text is fixed by the transport design): a status
 # WARN, labelled a proxy, CUMULATIVE over one complete cursor traversal per
 # reader. Each page adds its entry count; on the page that completes the
 # traversal (`truncated` False) a total at or above a quarter of
@@ -2283,7 +2284,7 @@ def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
             continue
         if doc is None:
             continue
-        # EVICTION ON FENCE (v3 §13): a cached reader pins its tree's
+        # EVICTION ON FENCE: a cached reader pins its tree's
         # descriptor, so the generation this process last saw as current is
         # evicted once when another becomes current; the next pass
         # constructs a fresh reader for it (a fenced tree is still read).

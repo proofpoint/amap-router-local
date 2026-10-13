@@ -13,7 +13,7 @@ from router.hoplink import canonical
 NID = "1700000000-42"
 CAP = 1024
 #: Valid version-2 facts for the notice `make` builds: untrusted fleet mail
-#: from fleet-b.example (the From's domain, P4), over link-a.
+#: from fleet-b.example (the From's domain), over link-a.
 FACTS = {"hop_contract": 1, "notice_id": NID, "notice_class": "mail", "ingress": "hub",
          "admission": "fleet_hosts", "admission_link": "link-a",
          "admission_rule": "fleet-hosts.v1", "origin_host": "fleet-b.example",

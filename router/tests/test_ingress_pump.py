@@ -249,7 +249,7 @@ class DispatchTests(_Pump):
 
 
 class RemovalTests(_Pump):
-    """RL-E8b's interim rule (the remover not offered): a waiting record
+    """The remover's interim rule (the remover not offered): a waiting record
     becomes its tombstone only when the horizon has passed AND the entry is
     gone upstream; a tombstone is kept at least the horizon."""
 
