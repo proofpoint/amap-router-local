@@ -212,7 +212,8 @@ class FsOpsCheckFailureTests(_Runtime):
         except Exception as e:  # noqa: BLE001 -- a wrong outcome is a FAILURE
             self.fail(f"the check's failure escaped the drain: {e!r}")
         hold = self.hold(k)
-        self.assertEqual((hold.reason, hold.latched), ("hop_construct_failed:RuntimeError", False))
+        self.assertEqual((hold.reason, hold.latched, hold.scope),
+                         ("hop_construct_failed:RuntimeError", False, "instance"))
         self.assertEqual(self.plugin.calls, [], "a sender was built past a failed check")
 
 

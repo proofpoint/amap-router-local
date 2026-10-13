@@ -267,6 +267,7 @@ import logging  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Tuple  # noqa: E402
 
+from . import audit as audit_mod  # noqa: E402
 from . import config as config_mod  # noqa: E402
 from . import generations as generations_mod  # noqa: E402
 from . import transport as transport_mod  # noqa: E402
@@ -302,6 +303,14 @@ class HopHold(Exception):
         super().__init__(f"{reason}: {detail}")
         self.reason, self.detail, self.latched, self.scope = reason, detail, latched, scope
         self.since, self.since_ts = _clock(), utc_ts()
+
+    def fresh(self) -> "HopHold":
+        """The same hold as a new exception, its first sighting kept: a
+        cached hold is raised again on every poll, and re-raising ONE object
+        grows its traceback (and the frames it pins) without bound."""
+        copy = HopHold(self.reason, self.detail, latched=self.latched, scope=self.scope)
+        copy.since, copy.since_ts = self.since, self.since_ts
+        return copy
 
 
 def split_gen_key(key: str) -> Tuple[str, str]:
@@ -437,7 +446,7 @@ def _sender_for(runtime: Any, cfg: Any, name: str) -> Any:
         # (one live generation, contract §4.1). Its own hold says why.
         held = FENCE_HOLDS.get((str(cfg.state_dir), name))
         if held is not None:
-            raise held
+            raise held.fresh()
         raise HopHold(HOLD_PREDECESSOR_UNRETIRED,
                       f"fenced generation(s) {unretired} not yet retired", latched=False,
                       scope="instance")
@@ -447,7 +456,7 @@ def _sender_for(runtime: Any, cfg: Any, name: str) -> Any:
     if port is not None:
         return port
     if key in _LATCHED:
-        raise _LATCHED[key]
+        raise _LATCHED[key].fresh()
     try:
         port = runtime.plugin.make_sender(settings_for(cfg, name, pin), runtime.fsops)
     except Exception as e:  # noqa: BLE001 -- classified, never swallowed silently
@@ -524,13 +533,22 @@ PROCESS_STATE: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def reset_process_state() -> None:
+def reset_process_state(*runtimes: Any) -> None:
     """What a process end forgets, forgotten now: every hop object closed
-    and dropped (`forget_senders`), then every container in `PROCESS_STATE`
-    emptied in place. Durable state is untouched. A module not yet imported
-    has nothing to forget. For the hop fixture's restart and for tests."""
+    and dropped (`forget_senders`); then each given runtime's filesystem port
+    closed (`FsOps.close`: its pinned stage descriptors and its bindings),
+    so the runtime is spent and the caller builds a new one
+    (`service.start_transport`, or a `HopRuntime` over a new FsOps); then
+    every container in `PROCESS_STATE` emptied in place. Durable state is
+    untouched. A module not yet imported has nothing to forget. The plugin
+    module itself is NOT reloaded: its own module state, if any, is the
+    plugin's. For the hop fixture's restart and for tests."""
     import sys
     forget_senders()
+    for runtime in runtimes:
+        close = getattr(getattr(runtime, "fsops", None), "close", None)
+        if close is not None:
+            close()
     for module, names in PROCESS_STATE.items():
         mod = sys.modules.get(f"{__package__}.{module}")
         if mod is None:
@@ -581,7 +599,7 @@ def reader_for(runtime: Any, cfg: Any, logical_id: str, gen: str) -> Reader:
     if reader is not None:
         return reader
     if key in _READER_LATCHED:
-        raise _READER_LATCHED[key]
+        raise _READER_LATCHED[key].fresh()
     try:
         port = runtime.plugin.make_intake_reader(reader_settings(cfg, logical_id, gen),
                                                  runtime.fsops)
@@ -645,7 +663,7 @@ def remover_for(runtime: Any, cfg: Any, logical_id: str, gen: str) -> Optional[A
     if remover is not None:
         return remover
     if key in _REMOVER_LATCHED:
-        raise _REMOVER_LATCHED[key]
+        raise _REMOVER_LATCHED[key].fresh()
     try:
         remover = runtime.plugin.make_intake_remover(
             reader_settings(cfg, logical_id, gen), runtime.fsops)
@@ -745,7 +763,7 @@ def resolve(transport: Any, cfg: Any, name: str) -> Tuple[Any, Any]:
                               scope="instance") from e
             except Exception as e:  # noqa: BLE001 -- never escapes the drain
                 raise HopHold(f"{HOLD_CONSTRUCT_FAILED}:{type(e).__name__}", str(e),
-                              latched=False) from e
+                              latched=False, scope="instance") from e
         fence_step(transport, cfg, name)
         port = sender_for(transport, cfg, name)
     except HopHold as e:
@@ -793,7 +811,8 @@ TREE_LOST_HINT = (
     "tree and moves the instance on; its in-flight records are left for disposal (§5.4). If "
     "the verb refuses with layout/marker_unreadable, the tree is present but damaged: it is "
     "NOT lost; repair it or dispose of its records (§5.4). A crash during the verb is "
-    "recovered by running it again.")
+    "recovered by running it again, and so is a lost tree that was the CURRENT "
+    "generation when the verb ran (the verb acknowledges fenced generations only).")
 
 #: (runtime id, state_dir, logical_id, gen, pin digest) -> the constructed
 #: upstream marker store, while its retirement is not yet confirmed.
@@ -872,15 +891,21 @@ def fence_step(runtime: Any, cfg: Any, name: str) -> None:
         FENCE_HOLDS.pop(hkey, None)
         return
     _stop_at("fence_recorded")
+    # EVERY pending predecessor is attempted, each poll: one that holds
+    # never stops a newer one being retired (a fenced generation's requests
+    # stay claimable until its tree is retired). The oldest hold is kept.
+    kept: Optional[HopHold] = None
     for entry, pin in pending:
         try:
             hold = _retire_one(runtime, cfg, name, lid, entry, pin)
         except Exception as e:  # noqa: BLE001 -- never escapes the drain
             hold = HopHold(f"{HOLD_RETIRE_FAILED}:{type(e).__name__}", str(e),
                            latched=False, scope="instance")
-        if hold is not None:
-            _fence_hold(cfg, name, hold)
-            return
+        if hold is not None and kept is None:
+            kept = hold
+    if kept is not None:
+        _fence_hold(cfg, name, kept)
+        return
     FENCE_HOLDS.pop(hkey, None)
     _stop_at("retired_written")
 
@@ -926,7 +951,7 @@ def _store_for(runtime: Any, cfg: Any, lid: str, gen: str, pin: Dict[str, Any],
     if store is not None:
         return store
     if key in _STORE_LATCHED:
-        raise _STORE_LATCHED[key]
+        raise _STORE_LATCHED[key].fresh()
     if pin.get("hop_root") != runtime.hop.root:
         # One FsOps has exactly one hop root: a generation pinned to another
         # can never be retired through it.
@@ -970,6 +995,8 @@ def _retire_one(runtime: Any, cfg: Any, name: str, lid: str, entry: Dict[str, An
             logger.warning("instance %r: generation %s was already retired at another "
                            "instant (not an error)", name, gen)
         logger.info("instance %r: generation %s retired (%s)", name, gen, result)
+        if result != "exists_same":
+            _audit_retired(runtime, cfg, name, lid, gen, result, entry["fenced_ts"])
         _RETIRED[key] = "retired"
         _close_store(key)
         return None
@@ -986,6 +1013,32 @@ def _retire_one(runtime: Any, cfg: Any, name: str, lid: str, entry: Dict[str, An
     return HopHold(f"{HOLD_RETIRE_FAILED}:protocol",
                    f"generation {gen}: retire returned {result!r}", latched=False,
                    scope="instance")
+
+
+def recorded_value_unreadable(runtime: Any) -> str:
+    """What an "exists" line says in place of the marker's own retired_at:
+    the loaded API offers no read of it (`UpstreamMarkers` has `retire` and
+    a boolean `retired`)."""
+    api = getattr(runtime.plugin, "api", None)
+    where = f"PLUGIN_API {tuple(api)}" if api is not None else "the plugin"
+    return f"not readable through {where}"
+
+
+def _audit_retired(runtime: Any, cfg: Any, name: str, lid: str, gen: str, result: str,
+                   attempted: str) -> None:
+    """One AUDIT line for a retirement this router made ("created") or found
+    ("exists"). A failure to write it is an ERROR and never undoes or holds
+    the retirement: the retire has happened and cannot be taken back."""
+    fields: Dict[str, Any] = {"gen": gen, "result": result, "retired_at_attempted": attempted}
+    if result == "exists":
+        fields.update(recorded_retired_at=None,
+                      recorded_value=recorded_value_unreadable(runtime))
+    try:
+        audit_mod.append(cfg.state_dir, name, audit_mod.EVENT_GENERATION_RETIRED,
+                         state_key=lid, **fields)
+    except Exception:  # noqa: BLE001 -- the retirement stands; its line is reported
+        logger.exception("instance %r: generation %s retired (%s) but its audit line "
+                         "could not be written", name, gen, result)
 
 
 def _close_store(key: Tuple) -> None:
@@ -1035,7 +1088,7 @@ def fenced_sender_for(runtime: Any, view: Any, name: str) -> Any:
         return _SENDERS[key]
     latched = _LATCHED.get(key)
     if latched is not None:
-        raise latched
+        raise latched.fresh()
     try:
         port = runtime.plugin.make_sender(settings_for(view, name, pin), runtime.fsops)
     except Exception as e:  # noqa: BLE001 -- classified, never swallowed silently

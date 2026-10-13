@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import ast
 import importlib
+import os
 import pathlib
 import pkgutil
 import unittest
+from types import SimpleNamespace
 
 import router
+from router import fsops as fsops_mod
 from router import hoplink
+from router.tests.test_fsops import GEN, LID, _HopCase
 
 #: Module-level containers that are constants (read-only tables), never
 #: process state. A new container lands in one list or the other.
@@ -109,6 +113,35 @@ class ResetTests(unittest.TestCase):
                               container, "replaced rather than emptied in place")
         for obj in (sender, store):
             self.assertIn(obj, closed, "a hop object was dropped without being closed")
+
+
+class FsOpsResetTests(_HopCase):
+    """A real FsOps: the reset closes the runtime's port, so its pinned stage
+    descriptor is released and a new port validates the stage again."""
+
+    def test_the_reset_closes_the_port_and_a_new_one_revalidates(self):
+        def fds():
+            return len(os.listdir("/proc/self/fd"))
+        baseline = fds()
+        ops = fsops_mod.FsOps(hop_root=self.hop, private_roots=[self.priv])
+        root = ops.open_root_nofollow(str(self.hop))
+        tree = ops.descend_pinned(root, f"{LID}/{GEN}")
+        ops.open_stage_dir(tree, "up")
+        for fd in (tree, root):                   # a plugin object's own, closed by it
+            os.close(fd)
+        self.assertEqual(fds(), baseline + 1, "control: the port pins one stage descriptor")
+        stage = self.hop / LID / GEN / "up" / "stage"
+        os.chmod(stage, 0o750)                    # no longer a valid stage
+        self.addCleanup(hoplink.reset_process_state)
+        hoplink.reset_process_state(SimpleNamespace(fsops=ops))
+        self.assertEqual(fds(), baseline, "the port's stage descriptor outlived the reset")
+        with self.assertRaises(fsops_mod.BindingError):
+            ops.open_root_nofollow(str(self.hop))  # a closed port binds nothing
+        fresh = fsops_mod.FsOps(hop_root=self.hop, private_roots=[self.priv])
+        tree = fresh.descend_pinned(fresh.open_root_nofollow(str(self.hop)), f"{LID}/{GEN}")
+        with self.assertRaises(fsops_mod.FsOpsError):
+            fresh.open_stage_dir(tree, "up")       # validated again, and refused
+        fresh.close()
 
 
 def _tree(name):

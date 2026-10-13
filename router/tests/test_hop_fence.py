@@ -22,6 +22,9 @@ import json
 import os
 from unittest import mock
 
+import logging
+
+from router import audit as audit_mod
 from router import config as config_mod
 from router import generations, hoplink, inflight, outbound, service
 from router.tests.helpers import keyed_for_poll, read_json, result_path, write_request
@@ -41,6 +44,7 @@ class OrderPlugin(StandInPlugin):
     def __init__(self, log):
         super().__init__()
         self.log = log
+        self.raises_for = {}     # generation -> what its store's retire raises
 
     def make_sender(self, settings, fsops):
         self.log.append(("admit", settings["generation"]))
@@ -48,6 +52,8 @@ class OrderPlugin(StandInPlugin):
 
     def make_upstream_marker_store(self, settings, fsops):
         store = super().make_upstream_marker_store(settings, fsops)
+        if settings["generation"] in self.raises_for:
+            store.raises = self.raises_for[settings["generation"]]
         log, retire = self.log, store.retire
 
         def logged(retired_at):
@@ -475,6 +481,165 @@ class FencedSenderUnitTests(_Fence):
         self.drain()
         got = hoplink.FencedSenders(self.rt).for_view(self.view_of(g1), "alpha")
         self.assertNotIsInstance(got, hoplink.Held)
+
+
+class CurrentHoldTests(_Fence):
+
+    def test_a_current_generations_own_hold_leaves_the_retired_predecessor_flowing(self):
+        """The CURRENT generation held for itself (a changed binding, scope
+        "gen"): a retired predecessor's handed request still settles."""
+        self.admitted_g1()
+        g1_port = self.plugin.ports[0]
+        self.fence()
+        k, _ = self.drain()                       # G1 retired, G2 admitted
+        pin_path = hoplink.transport_dir(k, "alpha") / hoplink.PIN_FILE
+        pin = json.loads(pin_path.read_text())
+        pin["peer_uid"] = 7
+        pin_path.write_text(json.dumps(pin))
+        hoplink.evict_sender(k, "alpha")          # G2's sender only
+        g1_port.send_all()
+        k, _ = self.drain()
+        self.assertEqual((self.held(k).reason, self.held(k).scope), ("hop_binding_changed", "gen"))
+        self.assertTrue(result_path(self.cfg, "alpha", "00000001").exists(),
+                        "the predecessor's work stopped for the current generation's own hold")
+
+
+class EveryPredecessorTests(_Fence):
+
+    def two_pinned_predecessors(self):
+        """G1 and G2 both pinned and fenced, G3 current, and a restart so
+        neither is retired in this process yet."""
+        g1 = self.admitted_g1()
+        self.fence()
+        k, _ = self.drain()                       # G1 retired, G2 admitted (pinned)
+        g2 = self.gen(k)
+        self.assertIsNotNone(hoplink.read_pin(k, "alpha"))
+        self.put(alpha={"binding_seq": 10})       # fences G2
+        self.restart()
+        return g1, g2
+
+    def test_a_held_predecessor_never_stops_a_newer_one_being_retired(self):
+        g1, g2 = self.two_pinned_predecessors()
+        self.plugin.raises_for[g1] = OSError(5, "EIO")
+        mark = len(self.log)
+        with mock.patch.object(service, "FENCE_STOP_AT", lambda p: self.log.append(("hook", p))):
+            k, _ = self.drain()
+        g3 = self.gen(k)
+        retired = [e[1] for e in self.log[mark:] if e[0] == "retire"]
+        self.assertIn(g2, retired, "the newer predecessor was not retired that poll")
+        hold = self.held(k)
+        self.assertEqual(hold.reason, "hop_retire_failed:EIO")
+        self.assertIn(g1, hold.detail, "the kept hold is not the oldest predecessor's")
+        self.assertNotIn(("admit", g3), self.log[mark:], "admitted over a held predecessor")
+        self.assertNotIn(("hook", "retired_written"), self.log[mark:])
+
+    def test_with_both_held_the_oldest_hold_is_kept(self):
+        g1, g2 = self.two_pinned_predecessors()
+        self.plugin.raises_for[g1] = OSError(5, "EIO")
+        self.plugin.raises_for[g2] = _Reasoned("marker_unreadable")
+        mark = len(self.log)
+        k, _ = self.drain()
+        self.assertIn(g2, [e[1] for e in self.log[mark:] if e[0] == "retire"],
+                      "the newer predecessor was not attempted")
+        self.assertEqual(self.held(k).reason, "hop_retire_failed:EIO",
+                         "the kept hold is not the oldest predecessor's")
+
+
+class RetireAuditTests(_Fence):
+
+    def lines(self):
+        return [d for d in audit_mod.read_events(self.state_dir, "alpha", state_key=self.lid())
+                if d.get("event") == audit_mod.EVENT_GENERATION_RETIRED]
+
+    def plant_fenced_ts(self, gen, ts):
+        keyed_for_poll(self.cfg)                  # the pre-pass writes the fence record
+        path = generations.gen_file(self.state_dir, self.lid())
+        doc = json.loads(path.read_text())
+        for g in doc["gens"]:
+            if g["gen"] == gen:
+                g["fenced_ts"] = ts
+        path.write_text(json.dumps(doc))
+
+    def one_line(self):
+        lines = self.lines()
+        self.assertEqual(len(lines), 1, f"not exactly one generation_retired line: {lines}")
+        return lines[0]
+
+    def test_created_is_one_audit_line_at_the_fence_time(self):
+        g1 = self.admitted_g1()
+        self.fence()
+        self.plant_fenced_ts(g1, "2001-02-03T04:05:06Z")
+        self.drain()
+        line = self.one_line()
+        self.assertEqual((line["gen"], line["result"], line["retired_at_attempted"]),
+                         (g1, "created", "2001-02-03T04:05:06Z"))
+        self.assertNotIn("recorded_retired_at", line)
+
+    def test_exists_says_the_recorded_value_cannot_be_read(self):
+        g1 = self.admitted_g1()
+        self.plugin.api = (3, 1)
+        self.fence()
+        self.plugin.store_result = "exists"
+        self.drain()
+        line = self.one_line()
+        self.assertEqual((line["gen"], line["result"], line["retired_at_attempted"]),
+                         (g1, "exists", self.fenced_ts(g1)))
+        self.assertIn("recorded_retired_at", line)
+        self.assertIsNone(line["recorded_retired_at"],
+                          "a value presented as the marker's own, which was never read")
+        self.assertEqual(line["recorded_value"], "not readable through PLUGIN_API (3, 1)")
+
+    def test_a_replay_writes_no_line(self):
+        self.admitted_g1()
+        self.fence()
+        self.drain()
+        self.restart()
+        self.plugin.store_result = "exists_same"
+        self.drain()
+        self.assertEqual(len(self.lines()), 1, "the replay after a restart was audited")
+
+    def test_a_failed_audit_line_never_undoes_the_retirement(self):
+        self.admitted_g1()
+        self.fence()
+        log = logging.getLogger("amap_router_local")
+        log.disabled = False
+        self.addCleanup(setattr, log, "disabled", True)
+        with mock.patch.object(audit_mod, "append", side_effect=OSError(28, "full")):
+            with self.assertLogs("amap_router_local.hoplink", level="ERROR"):
+                k, _ = self.drain()
+        self.assertIsNone(self.hold(k), "a failed audit line held the successor")
+        self.assertIn(("admit", self.gen(k)), self.log)
+
+
+class FreshHoldTests(_Fence):
+
+    def test_a_fresh_copy_keeps_the_first_sighting(self):
+        hold = hoplink.HopHold("hop_x", "d", latched=True, scope="instance")
+        hold.since, hold.since_ts = 12.5, "2001-02-03T04:05:06Z"
+        copy = hold.fresh()
+        self.assertIsNot(copy, hold)
+        self.assertEqual((copy.reason, copy.detail, copy.latched, copy.scope, copy.since,
+                          copy.since_ts),
+                         ("hop_x", "d", True, "instance", 12.5, "2001-02-03T04:05:06Z"))
+
+    def test_a_cached_hold_is_raised_fresh_its_traceback_never_grows(self):
+        self.admitted_g1()
+        self.fence()
+        self.plugin.store_fail = _Reasoned("settings_invalid")
+        self.drain()
+        [cached] = list(hoplink._STORE_LATCHED.values())
+
+        def depth(e):
+            n, tb = 0, e.__traceback__
+            while tb is not None:
+                n, tb = n + 1, tb.tb_next
+            return n
+        first = depth(cached)
+        for _ in range(5):
+            k, _ = self.drain()
+        self.assertEqual(depth(cached), first, "the cached hold's traceback grew")
+        self.assertEqual(self.held(k).reason, "hop_settings_refused")
+        self.assertIsNot(self.held(k), cached)
 
 
 class ProcessResetTests(_Fence):

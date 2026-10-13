@@ -79,7 +79,8 @@ class RetryStatusTests(_Status):
         port = self.first_poll_with(_Reasoned("version"))
         (k, summary), records = self.logs(self.drain)
         self.assertEqual([r.levelname for r in records], ["WARNING"])
-        retry = self.section(k)["instances"]["alpha"]["retry"]
+        retry = self.section(k)["instances"].get("alpha", {}).get("retry")
+        self.assertIsNotNone(retry, "the retry is not in status")
         self.assertEqual((retry["status"], retry["transport_req_id"], retry["age_s"]),
                          ("hop_version_unavailable", "00000002", 0))
         self.assertEqual(summary.get("inflight_errored", 0), 0, "a named retry is not an error")
@@ -87,7 +88,8 @@ class RetryStatusTests(_Status):
         port.raise_on_write = _Reasoned("version")
         (k, _), records = self.logs(self.drain)
         self.assertEqual([r.levelname for r in records], ["ERROR"], "stale: loud")
-        retry = self.section(k)["instances"]["alpha"]["retry"]
+        retry = self.section(k)["instances"].get("alpha", {}).get("retry")
+        self.assertIsNotNone(retry, "the retry is not in status")
         self.assertEqual(retry["age_s"], inflight.STALE_AFTER_S, "the first sighting is kept")
         k, _ = self.drain()                              # it goes
         self.assertEqual(port.writes, ["00000001", "00000002"])

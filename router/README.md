@@ -1366,11 +1366,20 @@ admit the current generation by constructing its sender. Each poll, under
 the drain lock and before any construction, every pinned predecessor not
 yet retired in this process is retired through the plugin's upstream marker
 store, built from that generation's pin, at that generation's `fenced_ts`
-(never the clock). A start that finds one unretired retires it first, so
-recovery is the same code. The pin, not `admitted.json`, decides what may
+(never the clock). EVERY such predecessor is attempted each poll: one that
+holds never stops a newer one being retired, and the oldest hold is the one
+kept. A start that finds one unretired retires it first, so recovery is the
+same code. The pin, not `admitted.json`, decides what may
 exist: a construction can admit the tree and then fail before confirming
 it. `created`, `exists_same` and `exists` mean retired, and the store is
-then closed. `absent` means there was nothing to retire unless
+then closed. `created` and `exists` each write one AUDIT line,
+`generation_retired`, with the attempted `retired_at`. For `exists` the
+marker's own value cannot be read through the plugin (`UpstreamMarkers` has
+`retire` and a boolean `retired`), and the line says so
+(`recorded_retired_at: null`, `recorded_value: "not readable through
+PLUGIN_API (3, 1)"`). A replay after a restart (`exists_same`) writes none.
+A failure to write the line is an ERROR and never undoes or holds the
+retirement, which has already happened. `absent` means there was nothing to retire unless
 `admitted.json` says the tree was admitted, in which case the tree is lost:
 the whole instance holds `hop_tree_lost` and no successor is admitted until
 `router generation new` acknowledges it (below). Any exception holds the
@@ -1462,6 +1471,13 @@ fail-closed, and `router generation new` releases it. While a sender is held, or
 are latched, an external request stays in the outbox, unconsumed: it is
 decided once the hold clears or `router generation new` moves the instance
 on, never stranded in the held generation.
+
+**A process end, modelled** (`hoplink.reset_process_state(*runtimes)`, for
+the hop fixture's restart and for tests): every hop object is closed, each
+given runtime's filesystem port is closed (`FsOps.close`: its pinned stage
+descriptors and its bindings, so a new port validates the stages again), and
+every per-process container in the package is emptied. The runtime is then
+spent: build a new one. The plugin module is not reloaded.
 
 **`status.json`** carries a `hop` section, never the drained summary line:
 per instance the sender hold, the latched hand-over hold and the current
