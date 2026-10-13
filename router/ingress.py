@@ -797,11 +797,21 @@ def write_quarantine_item(state_dir: Path, logical_id: str, gen: str, kind: str,
     item_id = quarantine_item_id(key)
     if cause not in quarantine_mod.CAUSES:
         raise ValueError(f"{cause!r} is not in the closed cause vocabulary")
-    evidence = _evidence(kind, link, entry_id, key, digests, dict(extra_evidence or {}))
+    if cause == quarantine_mod.CAUSE_NOTICE_INVALID and (digests is not None or extra_evidence):
+        raise ValueError("a notice_invalid item records identifiers only (E17)")
+
+    def evidence_at(ts: str) -> Dict[str, Any]:
+        if cause == quarantine_mod.CAUSE_NOTICE_INVALID:
+            # E17: EXACTLY the listed entry id, the journal key, the
+            # attributed generation, arrived_at and the literal closed code;
+            # nothing from or about the refused bytes.
+            return {"entry_id": entry_id, "journal_key": key, "generation": gen,
+                    "arrived_at": ts, "refusal": quarantine_mod.CAUSE_NOTICE_INVALID}
+        return _evidence(kind, link, entry_id, key, digests, dict(extra_evidence or {}))
 
     def build(ts: str) -> Dict[str, Any]:
         doc = {"schema": quarantine_mod.SCHEMA, "id": item_id, "generation": gen,
-               "arrival_ts": ts, "causes": [cause], "evidence": evidence}
+               "arrival_ts": ts, "causes": [cause], "evidence": evidence_at(ts)}
         try:
             quarantine_mod.check_item(doc, item_id=item_id, generation=gen,
                                       now=quarantine_mod._now(ts))
@@ -968,10 +978,14 @@ def _verified(notice: Dict[str, Any], blobs: List[Optional[bytes]]
 
 
 def prepare(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: str,
-            entry_id: str, parsed: Dict[str, Any], *, recipient: str) -> Dict[str, Any]:
-    """Snapshot `parsed`, mint the target identity once, and journal
-    `prepared` with the final parts' digests and the ledger bytes."""
-    digests = take_snapshot(state_dir, logical_id, gen, "notice", link, entry_id, parsed)
+            entry_id: str, parsed: Dict[str, Any], *, recipient: str,
+            digests: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Snapshot `parsed` (unless `digests` names the snapshot already kept
+    and verified for it, a held entry now placeable), mint the target
+    identity once, and journal `prepared` with the final parts' digests and
+    the ledger bytes."""
+    if digests is None:
+        digests = take_snapshot(state_dir, logical_id, gen, "notice", link, entry_id, parsed)
     notice_id, ts = mint_notice_id(), utc_ts()
     spool, notice = final_documents(parsed["raw"]["notice"], parsed["raw"]["spool"],
                                     notice_id, ts)
@@ -1222,7 +1236,7 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
 #
 #   1  notice_class is not "mail"           -> held (failure notice, RL-07b)
 #   2  in_reply_to present                  -> held (bound reply, RL-07b)
-#   3  admission "inbound_allowlist"/"open" -> held admission_not_placeable
+#   3  admission "open"                     -> held admission_not_placeable
 #   4  fleet_hosts, ingress not "hub"       -> held admission_inconsistent
 #   5  admission_link is not this link      -> held admission_link_mismatch
 #   6  origin_host a trusted fleet host     -> quarantined cold_fleet_mail
@@ -1233,10 +1247,9 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
 # empty in every deployment today. A value outside the codec's enums is
 # `FactsInvalid` (notice_invalid), never a row.
 #
-# PENDING (recorded, not resolved here): whether "inbound_allowlist" is in
-# the frozen codec's admission enum is a question put to the codec's owner.
-# If it is not, row 3 is "open" alone and "inbound_allowlist" is
-# notice_invalid, identical to the plugin's reader.
+# Row 3 is "open" alone: the codec's admission enum is exactly
+# {"open", "fleet_hosts"} (its owner's answer), so "inbound_allowlist" is
+# notice_invalid here as in the plugin's reader (design delta v3.4).
 # ---------------------------------------------------------------------------
 
 PLACE = "place"
@@ -1251,7 +1264,9 @@ HELD_LINK_MISMATCH = "admission_link_mismatch"
 HELD_UNKNOWN_HOST = "unknown_host"
 
 NOTICE_CLASSES = ("mail", "failure_notice")
-ADMISSIONS = ("inbound_allowlist", "fleet_hosts", "open")
+#: Exactly the frozen codec's enum: "inbound_allowlist" is refused there at
+#: the schema layer, and so here (notice_invalid, verdict-identical).
+ADMISSIONS = ("fleet_hosts", "open")
 INGRESSES = ("hub",)
 
 
@@ -1284,7 +1299,7 @@ def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fle
         return HOLD, HELD_FAILURE_NOTICE
     if "in_reply_to" in facts:
         return HOLD, HELD_BOUND_REPLY
-    if admission in ("inbound_allowlist", "open"):
+    if admission == "open":
         return HOLD, HELD_NOT_PLACEABLE
     # Row 4 is unreachable while the codec's ingress enum is {"hub"}: any
     # other value is refused above as notice_invalid, as the plugin's reader
@@ -1298,3 +1313,4 @@ def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fle
     if origin not in fleet_hosts:
         return HOLD, HELD_UNKNOWN_HOST
     return PLACE, None
+

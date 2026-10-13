@@ -94,6 +94,7 @@ class ClassifyTests(unittest.TestCase):
 
     def test_values_outside_the_enums_are_invalid(self):
         for doc in (facts(notice_class="other"), facts(admission="other"),
+                    facts(admission="inbound_allowlist", origin_host=None),
                     facts(ingress="internet"), facts(ingress=None),
                     facts(admission_link=""), facts(admission_rule=None),
                     facts(origin_host="Fleet-B.example"), facts(origin_host=None),

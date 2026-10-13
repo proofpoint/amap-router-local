@@ -214,6 +214,12 @@ M = [
   'CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND)',
   [QW + "test_a_first_sight_notice_invalid_item_is_in_the_frozen_format",
    "router.tests.test_quarantine_cli.FormatTests.test_the_vocabulary_is_closed"]),
+ ('Q7 a notice_invalid item taking digests', IG,
+  '    if cause == quarantine_mod.CAUSE_NOTICE_INVALID and (digests is not None or extra_evidence):\n', '    if False:\n',
+  [QW + "test_a_notice_invalid_item_refuses_anything_from_the_bytes"]),
+ ('Q8 a notice_invalid item with the general evidence', IG,
+  '        if cause == quarantine_mod.CAUSE_NOTICE_INVALID:\n            # E17', '        if False:\n            # E17',
+  [QW + "test_a_first_sight_notice_invalid_item_is_in_the_frozen_format"]),
  # (No mutant for the explicit cause check: `check_item` refuses the same
  # value before anything is written, so removing it changes only the message.
  # None for the temporary file's directory either: it matters only after a
@@ -272,7 +278,7 @@ M = [
   '    if "in_reply_to" in facts:\n        return HOLD, HELD_BOUND_REPLY\n', '',
   [KC + "test_a_bound_reply_from_a_trusted_host_is_row_2"]),
  ('K4 open admission not held', IG,
-  '    if admission in ("inbound_allowlist", "open"):\n        return HOLD, HELD_NOT_PLACEABLE\n', '',
+  '    if admission == "open":\n        return HOLD, HELD_NOT_PLACEABLE\n', '',
   [KC + "test_row_3_open_admission_is_not_placeable"]),
  ('K5 an unknown host placed', IG,
   '    if origin not in fleet_hosts:\n        return HOLD, HELD_UNKNOWN_HOST\n', '',
@@ -286,6 +292,9 @@ M = [
  ('K8 any ingress value read', IG,
   '    if ingress_v not in INGRESSES:\n', '    if False:\n',
   [KC + "test_non_hub_ingress_is_invalid_while_the_enum_is_hub_only"]),
+ ('K9 inbound_allowlist read as an admission', IG,
+  'ADMISSIONS = ("fleet_hosts", "open")', 'ADMISSIONS = ("inbound_allowlist", "fleet_hosts", "open")',
+  [KC + "test_values_outside_the_enums_are_invalid"]),
  # (No mutant for row 4 alone: it is unreachable while the ingress enum is
  # {"hub"}, so removing it is equivalent; K8 is what pins the enum.)
  # -- the intake-reader seam ----------------------------------------------------

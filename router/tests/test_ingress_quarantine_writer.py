@@ -109,16 +109,31 @@ class WriterTests(unittest.TestCase):
         self.assertFalse(self.qdir.exists() and os.listdir(self.qdir))
 
     def test_a_first_sight_notice_invalid_item_is_in_the_frozen_format(self):
-        # E17: the cause is in the vocabulary, and the evidence carries the
-        # refusal's reason and nothing read from the refused bytes.
-        self.assertEqual(self.write(cause=quarantine.CAUSE_NOTICE_INVALID, digests=None,
-                                    extra_evidence={"refusal": "notice_invalid"}), "created")
+        # E17 rev 3: the evidence is EXACTLY the entry id, the journal key,
+        # the attributed generation, arrived_at and the literal closed code;
+        # no digests, no detail.
+        self.assertEqual(self.write(cause=quarantine.CAUSE_NOTICE_INVALID, digests=None),
+                         "created")
         doc = json.loads(self.path.read_bytes())
         quarantine.check_item(doc, item_id=self.path.stem, generation=GEN,
                               now=quarantine._now(None))
         self.assertEqual(doc["causes"], ["notice_invalid"])
-        self.assertEqual(sorted(doc["evidence"]),
-                         ["entry_id", "journal_key", "kind", "link", "refusal"])
+        self.assertEqual(doc["evidence"], {"entry_id": NID, "journal_key": self.key,
+                                           "generation": GEN, "arrived_at": TS,
+                                           "refusal": "notice_invalid"})
+        (got,) = self.items()
+        self.assertIsNone(got["digests"])
+        # Re-presented later: adopted, the arrival (and so arrived_at) unmoved.
+        self.assertEqual(self.write(cause=quarantine.CAUSE_NOTICE_INVALID, digests=None,
+                                    now="2026-10-13T01:00:00Z"), "adopted")
+
+    def test_a_notice_invalid_item_refuses_anything_from_the_bytes(self):
+        for kw in ({"digests": DIGESTS}, {"digests": None, "extra_evidence": {"x": "y"}}):
+            with self.subTest(kw=kw):
+                with self.assertRaises(ValueError):
+                    ingress.write_quarantine_item(self.state, LID, GEN, "notice", LINK, NID,
+                                                  quarantine.CAUSE_NOTICE_INVALID, now=TS, **kw)
+        self.assertFalse(self.qdir.exists() and os.listdir(self.qdir))
 
     def test_a_long_attachment_list_keeps_count_and_aggregate(self):
         many = dict(DIGESTS, attachments=["f" * 64] * 20)
@@ -129,10 +144,10 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(len(got["evidence"]["snapshot_attachments_sha256"]), 64)
 
     def test_no_snapshot_means_no_digests(self):
-        self.write(digests=None, extra_evidence={"refusal": "notice_invalid"})
+        self.write(digests=None, extra_evidence={"note": "x"})
         (got,) = self.items()
         self.assertIsNone(got["digests"])
-        self.assertEqual(got["evidence"]["refusal"], "notice_invalid")
+        self.assertEqual(got["evidence"]["note"], "x")
 
 
 if __name__ == "__main__":
