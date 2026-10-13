@@ -42,6 +42,7 @@ KC = "router.tests.test_ingress_classify.ClassifyTests."
 FC = "router.tests.test_ingress_facts_check.FactsCheckTests."
 LK = "router.tests.test_ingress_link_pin.LinkPinTests."
 RC = "router.tests.test_ingress_recipient.RecipientTests."
+PU = "router.tests.test_ingress_pump."
 
 M = [
  # -- the inbound reader's link (config) ----------------------------------------
@@ -85,6 +86,36 @@ M = [
  ('R5 list elements not stripped', IG,
   '            addr = addr_of(element.strip())\n', '            addr = addr_of(element)\n',
   [RC + "test_l_among_others_in_to_or_cc"]),
+ # -- the pump: one dispatch order ----------------------------------------------
+ ('U1 the key lookup skipped (read first)', IG,
+  '        key = key_for("notice", self.link, self.gen, entry_id)\n        rec = read(self.state_dir, self.logical_id, self.gen, "notice", key)\n        if rec is not None:\n',
+  '        key = key_for("notice", self.link, self.gen, entry_id)\n        rec = read(self.state_dir, self.logical_id, self.gen, "notice", key)\n        if False:\n',
+  [PU + "DispatchTests.test_a_differing_republication_is_held_and_never_placed_again"]),
+ ('U2 a terminal hold re-evaluated', IG,
+  '            if st == HELD and is_terminal(reason):\n                return "terminal"\n', '',
+  [PU + "DispatchTests.test_a_terminal_hold_is_never_read_or_moved"]),
+ ('U3 a snapshot hold re-read upstream', IG,
+  '            if st == HELD and "snapshot" in rec:\n                return self.from_snapshot(entry_id, rec)\n', '',
+  [PU + "DispatchTests.test_a_snapshot_hold_is_reevaluated_from_the_snapshot_never_reread"]),
+ ('U4 the late check skipped in dispatch', IG,
+  '        if not current:\n            return self.quarantine(entry_id, parsed, digests, quarantine_mod.CAUSE_LATE_INBOUND)\n', '',
+  [PU + "LateTests.test_an_entry_read_through_a_fenced_generation_is_late"]),
+ ('U5 the recipient binding skipped in dispatch', IG,
+  '        if not bound:\n            return self.hold_with_snapshot(', '        if False:\n            return self.hold_with_snapshot(',
+  [PU + "DispatchTests.test_mail_for_another_identity_is_held"]),
+ ('U6 a re-read hold refused invalid quarantined as first sight', IG,
+  '        if rec is not None:\n            self.jw(entry_id, HELD, reason=HELD_NOTICE_INVALID)\n            return "held"\n', '',
+  [PU + "DispatchTests.test_a_reread_hold_later_refused_invalid_is_held_not_quarantined"]),
+ ('U7 the listing cursor dropped', IG,
+  '    _CURSORS[key] = ids[-1] if (truncated and ids) else None\n', '    _CURSORS[key] = None\n',
+  [PU + "DispatchTests.test_listing_is_paged_with_a_cursor"]),
+ ('U8 a duplicate taken as identical unread', IG,
+  '        same = (_digests_of(parsed) == rec["snapshot"])\n', '        same = True\n',
+  [PU + "DispatchTests.test_a_differing_republication_is_held_and_never_placed_again"]),
+ ('U9 E17 precedence inverted (late before the refusal)', IG,
+  '            if refusal == HELD_NOTICE_INVALID:\n                return self.quarantine_refused(entry_id, rec)\n            return None\n        try:',
+  '            if refusal == HELD_NOTICE_INVALID:\n                if generation_is_current(self.state_dir, self.logical_id, self.gen) is False:\n                    write_quarantine_item(self.state_dir, self.logical_id, self.gen, "notice", self.link, entry_id, quarantine_mod.CAUSE_LATE_INBOUND)\n                    return "quarantined"\n                return self.quarantine_refused(entry_id, rec)\n            return None\n        try:',
+  [PU + "LateTests.test_refused_and_late_is_notice_invalid_e17_precedence"]),
  # -- the facts version guard (driven directly at the guard unit) -------------
  ('G1 facts_version unchecked (presence selects version 2)', IG,
   '    if type(v) is int and v == 2:\n', '    if True:\n',

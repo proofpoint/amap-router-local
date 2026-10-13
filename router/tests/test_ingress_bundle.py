@@ -25,7 +25,7 @@ def b64(raw: bytes) -> str:
 
 
 def make(*, blobs=(b"hello",), clean=True, notice_extra=None, drop_message_attachments=False,
-         nid=NID, facts_extra=None):
+         nid=NID, facts_extra=None, to=None):
     # `clean` is one flag for every part, or one per part.
     cleans = list(clean) if isinstance(clean, (list, tuple)) else [clean] * len(blobs)
     descs = []
@@ -51,8 +51,10 @@ def make(*, blobs=(b"hello",), clean=True, notice_extra=None, drop_message_attac
         the_facts = facts_extra(the_facts)
     bundle = {"schema": transport.NOTICE_BUNDLE_SCHEMA,
               "notice": b64(json.dumps(notice).encode()),
-              "spool": b64(json.dumps({"contract_version": "2", "notice_id": nid,
-                                       "body_text": "b", "attachments": descs}).encode()),
+              "spool": b64(json.dumps(dict({"contract_version": "2", "notice_id": nid,
+                                            "body_text": "b", "attachments": descs},
+                                           **({"to": to} if to is not None else {})
+                                           )).encode()),
               "hop": b64(canonical(the_facts)),
               "attachments": [b64(b) if c else None for b, c in zip(blobs, cleans)]}
     return bundle

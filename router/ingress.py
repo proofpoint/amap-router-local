@@ -30,6 +30,7 @@ import base64 as _base64
 import binascii as _binascii
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -49,6 +50,8 @@ from . import quarantine as quarantine_mod
 from . import transport as transport_mod
 from .hoplink import canonical
 from .util import _mkdir_durable, atomic_write, fsync_dir, mint_notice_id, utc_ts
+
+logger = logging.getLogger("amap_router_local.ingress")
 
 SCHEMA = "amap-router-local.ingress-journal/1"
 DIR_NAME = "ingress"
@@ -1654,3 +1657,452 @@ def addressed_to(cfg: Any, report: Any, logical_id: str,
             return True
     return False
 
+
+# ---------------------------------------------------------------------------
+# THE PUMP: one dispatch order, per (identity, generation), under the drain
+# lock (`run` and `once` hold it for the whole process).
+#
+#   0. recovery: every `placing` record through the table; every `prepared`
+#      one through `place`; a `published` one moved on. These keys are never
+#      re-dispatched below.
+#   1. list the generation's notices.
+#   2. key lookup on the listed id, BEFORE any read: a placed or quarantined
+#      key is a DUPLICATE (compared whole-bundle, never placed again); a held
+#      key goes to its row (terminal: skipped; snapshot kept: re-evaluated
+#      from the snapshot; otherwise re-read).
+#   3. read_entry: the reader's refusal class gives notice_incomplete (held)
+#      or notice_invalid (first sight: quarantined, E17); a runtime class or
+#      OSError gives no decision this pump.
+#   4-5. the bundle (`parse_bundle`): bundle_schema, entry_id_mismatch,
+#      bundle_invalid, each held, no snapshot.
+#   6. the facts version (`facts_version`): notice_invalid.
+#   7. LATE (E16): the generation is not current -> late_inbound.
+#   8. the recipient: the registry names this identity's instance, or no
+#      decision (a transient hold, no snapshot).
+#   9-10. `classify_facts`.
+#   11. snapshot, `prepared`, then `place` (the generation check again).
+#
+# Removal from upstream is not here: `*_waiting_remove` records wait for the
+# remover (`advance_removal`).
+# ---------------------------------------------------------------------------
+
+#: A record held for one of these is never re-evaluated by a pump: only an
+#: operator verb releases it.
+TERMINAL_REASON_PREFIXES = ("snapshot_invalid:",)
+TERMINAL_REASONS = TERMINAL_HOLDS + (QuarantineConflict.reason, HELD_EXISTS_DIFFERENT)
+#: Holds that keep the snapshot and are re-evaluated FROM it, never re-read.
+SNAPSHOT_HOLDS = (HELD_FAILURE_NOTICE, HELD_BOUND_REPLY, HELD_NOT_PLACEABLE,
+                  HELD_INCONSISTENT, HELD_LINK_MISMATCH, HELD_UNKNOWN_HOST,
+                  HELD_NOT_THIS_IDENTITY)
+DUPLICATE_STATES = (PUBLISHED_WAITING_REMOVE, COMPLETE, QUARANTINED_WAITING_REMOVE,
+                    QUARANTINED_COMPLETE)
+HELD_NOTICE_INCOMPLETE = "notice_incomplete"
+HELD_NOTICE_INVALID = "notice_invalid"
+
+
+def is_terminal(reason: Optional[str]) -> bool:
+    return reason in TERMINAL_REASONS or any(
+        isinstance(reason, str) and reason.startswith(p) for p in TERMINAL_REASON_PREFIXES)
+
+
+class Pump:
+    """What one generation's dispatch needs, fixed for the pump: the config
+    as the poll keyed it, the reader, and this router's own decisions about
+    the identity (its instance name, or why there is none)."""
+
+    def __init__(self, cfg: Any, reader: Any, logical_id: str, gen: str, link: str, *,
+                 report: Any, recipient: Optional[str], unresolved: Optional[str],
+                 attachment_cap: int, runtime_classes: tuple = (),
+                 proven_unknown: bool = False):
+        self.cfg, self.reader, self.report = cfg, reader, report
+        # A4: the registry was read, valid, and the identity is absent or
+        # retired. Every generation of it is then non-current (E16).
+        self.proven_unknown = proven_unknown
+        self.logical_id, self.gen, self.link = logical_id, gen, link
+        self.recipient, self.unresolved = recipient, unresolved
+        self.attachment_cap = attachment_cap
+        self.runtime_classes = runtime_classes
+        self.counts: Dict[str, int] = {}
+
+    @property
+    def state_dir(self) -> Path:
+        return Path(self.cfg.state_dir)
+
+    def count(self, what: str) -> None:
+        self.counts[what] = self.counts.get(what, 0) + 1
+
+    def jw(self, entry_id: str, state: str, **kw: Any) -> Dict[str, Any]:
+        return write(self.state_dir, self.logical_id, self.gen, "notice", self.link,
+                     entry_id, state, **kw)
+
+    # -- 0. recovery ------------------------------------------------------
+
+    def recover(self) -> None:
+        records = journal_records(self.state_dir, self.logical_id, self.gen, "notice")
+        for entry_id, rec in sorted(records.items()):
+            st = rec["state"]
+            if st == PLACING:
+                self.count("recovered_placing")
+                recover_placing(self.cfg, self.state_dir, self.logical_id, self.gen,
+                                self.link, entry_id, attachment_cap=self.attachment_cap)
+            elif st == PREPARED:
+                self.count("recovered_prepared")
+                place(self.cfg, self.state_dir, self.logical_id, self.gen, self.link,
+                      entry_id, attachment_cap=self.attachment_cap)
+            elif st == PUBLISHED:
+                self.jw(entry_id, PUBLISHED_WAITING_REMOVE)
+            elif st == QUARANTINED:
+                self.jw(entry_id, QUARANTINED_WAITING_REMOVE)
+
+    # -- 2. onward, one listed entry ---------------------------------------
+
+    def dispatch(self, entry_id: str) -> Optional[str]:
+        """One listed entry through steps 2-11. Returns what happened, for the
+        counts; None when nothing could be decided this pump."""
+        key = key_for("notice", self.link, self.gen, entry_id)
+        rec = read(self.state_dir, self.logical_id, self.gen, "notice", key)
+        if rec is not None:
+            st, reason = rec["state"], rec.get("reason")
+            if st in (PREPARED, PLACING, PUBLISHED, QUARANTINED):
+                return None          # step 0's, never re-dispatched
+            if st == DUPLICATE_DIFFERENT_HELD:
+                return "terminal"
+            if st in DUPLICATE_STATES:
+                return self.duplicate(entry_id, rec)
+            if st == HELD and is_terminal(reason):
+                return "terminal"
+            if st == HELD and "snapshot" in rec:
+                return self.from_snapshot(entry_id, rec)
+        return self.first_read(entry_id, rec)
+
+    def _read(self, entry_id: str):
+        """`(bytes, None)`, `(None, refusal_reason)`, or `(None, None)` for no
+        decision this pump."""
+        try:
+            return self.reader.port.read_entry("notice", entry_id), None
+        except self.reader.notice_refused as e:
+            return None, getattr(e, "reason", None)
+        except (OSError,) + tuple(self.runtime_classes):
+            return None, None
+
+    def first_read(self, entry_id: str, rec: Optional[Dict[str, Any]]) -> Optional[str]:
+        raw, refusal = self._read(entry_id)
+        if raw is None:
+            if refusal == HELD_NOTICE_INCOMPLETE:
+                self.jw(entry_id, HELD, reason=HELD_NOTICE_INCOMPLETE)
+                return "held"
+            if refusal == HELD_NOTICE_INVALID:
+                return self.quarantine_refused(entry_id, rec)
+            return None
+        try:
+            parsed = parse_bundle(raw, entry_id, attachment_cap=self.attachment_cap)
+            check_facts(parsed)
+        except BundleRefused as e:
+            self.jw(entry_id, HELD, reason=e.reason)
+            return "held"
+        except FactsInvalid:
+            return self.quarantine_refused(entry_id, rec)
+        return self.decide(entry_id, parsed, rec=rec)
+
+    def quarantine_refused(self, entry_id: str, rec: Optional[Dict[str, Any]]) -> str:
+        """notice_invalid. On FIRST sight (no record for the key) it is
+        quarantined, E17: the evidence is the refusal's reason, nothing read
+        from the refused bytes. A key that already has a record (re-read
+        holds) is held instead: its first sight was not invalid."""
+        if rec is not None:
+            self.jw(entry_id, HELD, reason=HELD_NOTICE_INVALID)
+            return "held"
+        try:
+            write_quarantine_item(self.state_dir, self.logical_id, self.gen, "notice",
+                                  self.link, entry_id, quarantine_mod.CAUSE_NOTICE_INVALID)
+        except QuarantineConflict:
+            self.jw(entry_id, HELD, reason=QuarantineConflict.reason)
+            return "held"
+        self.jw(entry_id, QUARANTINED, reason=quarantine_mod.CAUSE_NOTICE_INVALID)
+        self.jw(entry_id, QUARANTINED_WAITING_REMOVE)
+        return "quarantined"
+
+    def decide(self, entry_id: str, parsed: Dict[str, Any],
+               digests: Optional[Dict[str, Any]] = None,
+               rec: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Steps 7-11 over a valid bundle. `rec` is the entry's record, if
+        any; `digests` its snapshot, already kept, when re-evaluating a held
+        one."""
+        current = (False if self.proven_unknown
+                   else generation_is_current(self.state_dir, self.logical_id, self.gen))
+        if current is None:
+            return None
+        if not current:
+            return self.quarantine(entry_id, parsed, digests, quarantine_mod.CAUSE_LATE_INBOUND)
+        if self.recipient is None:
+            return None              # a transient registry hold: no snapshot
+        bound = addressed_to(self.cfg, self.report, self.logical_id, parsed["spool"])
+        if bound is None:
+            return None
+        if not bound:
+            return self.hold_with_snapshot(entry_id, parsed, digests, HELD_NOT_THIS_IDENTITY,
+                                           rec)
+        try:
+            outcome, why = classify_facts(parsed["facts"], link=self.link,
+                                          fleet_hosts=self.cfg.fleet_hosts,
+                                          trusted_fleet_hosts=self.cfg.trusted_fleet_hosts)
+        except FactsInvalid:
+            return self.quarantine_refused(entry_id, rec)
+        if outcome == QUARANTINE:
+            return self.quarantine(entry_id, parsed, digests, why)
+        if outcome == HOLD:
+            return self.hold_with_snapshot(entry_id, parsed, digests, why, rec)
+        # Placeable. A held entry places from the snapshot it already kept.
+        prepare(self.cfg, self.state_dir, self.logical_id, self.gen, self.link, entry_id,
+                parsed, recipient=self.recipient, digests=digests)
+        got = place(self.cfg, self.state_dir, self.logical_id, self.gen, self.link, entry_id,
+                    attachment_cap=self.attachment_cap)
+        return {PUBLISHED_WAITING_REMOVE: "placed"}.get(got, got and got.lower())
+
+    def _snapshot(self, entry_id: str, parsed: Dict[str, Any],
+                  digests: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if digests is not None:
+            return digests
+        return take_snapshot(self.state_dir, self.logical_id, self.gen, "notice", self.link,
+                             entry_id, parsed)
+
+    def quarantine(self, entry_id: str, parsed: Dict[str, Any],
+                   digests: Optional[Dict[str, Any]], cause: str) -> str:
+        digests = self._snapshot(entry_id, parsed, digests)
+        try:
+            write_quarantine_item(self.state_dir, self.logical_id, self.gen, "notice",
+                                  self.link, entry_id, cause, digests=digests)
+        except QuarantineConflict:
+            self.jw(entry_id, HELD, reason=QuarantineConflict.reason, snapshot=digests)
+            return "held"
+        self.jw(entry_id, QUARANTINED, reason=cause, snapshot=digests)
+        self.jw(entry_id, QUARANTINED_WAITING_REMOVE)
+        return "quarantined"
+
+    def hold_with_snapshot(self, entry_id: str, parsed: Dict[str, Any],
+                           digests: Optional[Dict[str, Any]], reason: str,
+                           rec: Optional[Dict[str, Any]]) -> str:
+        if digests is not None:
+            if rec is not None and rec.get("reason") != reason:
+                self.jw(entry_id, HELD, reason=reason)
+            return "held"            # unchanged: no journal churn every pump
+        digests = self._snapshot(entry_id, parsed, None)
+        self.jw(entry_id, HELD, reason=reason, snapshot=digests)
+        return "held"
+
+    def from_snapshot(self, entry_id: str, rec: Dict[str, Any]) -> Optional[str]:
+        """A snapshot-kept hold, re-evaluated from what was READ, never
+        re-read: the late check first (E16 takes precedence), then the
+        order again."""
+        try:
+            kept = verify_snapshot(self.state_dir, self.logical_id, self.gen, "notice",
+                                   self.link, entry_id, rec.get("snapshot"),
+                                   attachment_cap=self.attachment_cap)
+        except SnapshotInvalid as e:
+            self.jw(entry_id, HELD, reason=e.reason)
+            return "held"
+        parsed = {"notice": json.loads(kept["notice"]), "spool": json.loads(kept["spool"]),
+                  "facts": json.loads(kept["hop"]),
+                  "raw": {"notice": kept["notice"], "spool": kept["spool"],
+                          "facts": kept["hop"]},
+                  "attachments": kept["attachments"]}
+        return self.decide(entry_id, parsed, digests=rec["snapshot"], rec=rec)
+
+    # -- duplicates (whole-bundle until the projection gate opens) ----------
+
+    def duplicate(self, entry_id: str, rec: Dict[str, Any]) -> Optional[str]:
+        """A placed or quarantined key listed again. Never placed or
+        quarantined again. Compared WHOLE-BUNDLE against its snapshot: the
+        same bytes go back to removal; anything else is
+        `duplicate_different_held`, terminal. A re-read refused as
+        notice_incomplete is removed again; one refused as notice_invalid
+        over a valid snapshot holds."""
+        raw, refusal = self._read(entry_id)
+        if raw is None:
+            if refusal == HELD_NOTICE_INCOMPLETE:
+                return self.remove_again(entry_id, rec)
+            if refusal == HELD_NOTICE_INVALID:
+                if "snapshot" not in rec:
+                    # Quarantined as invalid on first sight, and invalid
+                    # still: the same entry, removed again.
+                    return self.remove_again(entry_id, rec)
+                self.jw(entry_id, DUPLICATE_DIFFERENT_HELD, reason=HELD_NOTICE_INVALID)
+                return "terminal"
+            return None
+        if "snapshot" not in rec:
+            # Quarantined on first sight as invalid: nothing was kept to
+            # compare with, and a listed copy that now reads is different.
+            self.jw(entry_id, DUPLICATE_DIFFERENT_HELD, reason="differs")
+            return "terminal"
+        try:
+            parsed = parse_bundle(raw, entry_id, attachment_cap=self.attachment_cap)
+        except BundleRefused:
+            self.jw(entry_id, DUPLICATE_DIFFERENT_HELD, reason="differs")
+            return "terminal"
+        same = (_digests_of(parsed) == rec["snapshot"])
+        if not same:
+            self.jw(entry_id, DUPLICATE_DIFFERENT_HELD, reason="differs")
+            return "terminal"
+        return self.remove_again(entry_id, rec)
+
+    def remove_again(self, entry_id: str, rec: Dict[str, Any]) -> str:
+        st = rec["state"]
+        if st == COMPLETE:
+            self.jw(entry_id, PUBLISHED_WAITING_REMOVE)
+        elif st == QUARANTINED_COMPLETE:
+            self.jw(entry_id, QUARANTINED_WAITING_REMOVE)
+        return "duplicate"
+
+
+def _digests_of(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    raw = parsed["raw"]
+    return {"notice": hashlib.sha256(raw["notice"]).hexdigest(),
+            "spool": hashlib.sha256(raw["spool"]).hexdigest(),
+            "hop": hashlib.sha256(raw["facts"]).hexdigest(),
+            "attachments": [None if b is None else hashlib.sha256(b).hexdigest()
+                            for b in parsed["attachments"]]}
+
+
+# ---------------------------------------------------------------------------
+# Driving the pump: one listing page per reader per poll.
+# ---------------------------------------------------------------------------
+
+#: (state_dir, logical_id, gen) -> the listing cursor (`after`), kept per
+#: process. A page with `truncated` False restarts it from None.
+_CURSORS: Dict[tuple, Optional[str]] = {}
+HELD_LISTING_TOO_LARGE = "hop_listing_too_large"
+
+
+#: (state_dir, logical_id, gen) -> why inbound is latched off for the process.
+_LINK_LATCHED: Dict[tuple, str] = {}
+
+
+def pump_generation(pump: Pump, *, listing_too_large: Any = (),
+                    limit: int = transport_mod.LIST_LIMIT_MAX) -> Dict[str, int]:
+    """Step 0, then one listing page and each listed entry through
+    `Pump.dispatch`. A `listing_too_large` (the runtime's class) is a
+    self-clearing hold for this generation, counted; nothing is listed or
+    read past it this pump. `pump.link` must be the generation's PIN
+    (`pinned_link`), never the live config value."""
+    pump.recover()
+    key = (str(pump.state_dir), pump.logical_id, pump.gen)
+    try:
+        ids, truncated = pump.reader.port.list_entries("notice", limit=limit,
+                                                         after=_CURSORS.get(key))
+    except listing_too_large:
+        pump.count(HELD_LISTING_TOO_LARGE)
+        logger.error("ingress %s gen %s: listing too large; held this pump",
+                     pump.logical_id, pump.gen)
+        return pump.counts
+    _CURSORS[key] = ids[-1] if (truncated and ids) else None
+    for entry_id in ids:
+        try:
+            what = pump.dispatch(entry_id)
+        except JournalError:
+            # A damaged record is never read as absent (absent would let the
+            # entry be placed again): logged, and the entry left alone.
+            logger.exception("ingress %s gen %s: a damaged journal record",
+                             pump.logical_id, pump.gen)
+            what = "journal_damaged"
+        pump.count(what or "undecided")
+    return pump.counts
+
+
+def identities(cfg: Any, report: Any) -> List[Dict[str, Any]]:
+    """Every identity the pump reads for: each configured name's logical_id
+    the registry knows (its instance the recipient when resolved, else none:
+    a transient hold), plus each identity with generations in `state_dir`
+    that no configured name maps to. That last is PROVEN UNKNOWN only when
+    the registry was read and valid and has no active entry for it; any
+    other reading is transient (no decision)."""
+    out: List[Dict[str, Any]] = []
+    known = dict(report.known or {})
+    seen = set()
+    for name in sorted(cfg.instances):
+        lid = known.get(name)
+        if lid is None:
+            continue
+        seen.add(lid)
+        out.append({"logical_id": lid, "recipient": name if name in (report.resolved or {})
+                    else None, "unresolved": (report.held or {}).get(name),
+                    "proven_unknown": False})
+    active = {e.logical_id for e in report.all_entries if e.state == "active"}
+    try:
+        names = sorted(os.listdir(cfg.state_dir))
+    except FileNotFoundError:
+        names = []
+    for lid in names:
+        if lid in seen or not _GEN_RE.fullmatch(lid):
+            continue
+        if not generations_mod.gen_file(Path(cfg.state_dir), lid).exists():
+            continue
+        proven = report.state == "ok" and lid not in active
+        out.append({"logical_id": lid, "recipient": None,
+                    "unresolved": None if proven else "identity_unresolved",
+                    "proven_unknown": proven})
+    return out
+
+
+def pump_link(cfg: Any, logical_id: str, gen: str) -> Optional[str]:
+    """The link to pump `gen` with: the generation's pin, checked against
+    `config.hop.link` BEFORE anything is listed. A refusal latches that
+    generation's inbound off for the process, with one ERROR; nothing is
+    re-keyed or rewritten."""
+    key = (str(cfg.state_dir), logical_id, gen)
+    if key in _LINK_LATCHED:
+        return None
+    link, why = pinned_link(Path(cfg.state_dir), logical_id, gen, cfg.hop.link)
+    if why is not None:
+        _LINK_LATCHED[key] = why
+        logger.error("ingress %s gen %s: inbound off (%s)", logical_id, gen, why)
+        return None
+    return link
+
+
+def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
+    """One poll's inbound pass, under the drain lock: every identity
+    (`identities`), every generation of it with a recorded tree, through
+    `pump_link` (the pin, before any listing), the cached reader
+    (`hoplink.reader_for`) and `pump_generation`. Each generation is
+    isolated: a failure in one is logged and the next proceeds. Returns
+    `{"<logical_id>/<gen>": counts}` for status; never part of the drain
+    summary."""
+    from . import hoplink as hoplink_mod   # local: hoplink imports this module's peers
+    out: Dict[str, Dict[str, int]] = {}
+    if cfg.hop is None or cfg.hop.link is None:
+        return out
+    fsops = runtime.fsops
+    runtime_classes = tuple(c for c in (getattr(fsops, "UnsafeRead", None),) if c)
+    too_large = getattr(fsops, "ListingTooLarge", ())
+    for ident in identities(cfg, report):
+        lid = ident["logical_id"]
+        try:
+            doc = generations_mod.read_doc(Path(cfg.state_dir), lid)
+        except generations_mod.GenerationHeld:
+            continue
+        if doc is None:
+            continue
+        for g in doc["gens"]:
+            gen = g["gen"]
+            label = f"{lid}/{gen}"
+            link = pump_link(cfg, lid, gen)
+            if link is None:
+                out[label] = {_LINK_LATCHED.get((str(cfg.state_dir), lid, gen),
+                                                HELD_LINK_UNSET): 1}
+                continue
+            try:
+                reader = hoplink_mod.reader_for(runtime, cfg, lid, gen)
+            except hoplink_mod.HopHold as e:
+                out[label] = {e.reason: 1}
+                continue
+            pump = Pump(cfg, reader, lid, gen, link, report=report,
+                        recipient=ident["recipient"], unresolved=ident["unresolved"],
+                        attachment_cap=cfg.hop.cap("attachment"),
+                        runtime_classes=runtime_classes,
+                        proven_unknown=ident["proven_unknown"])
+            try:
+                out[label] = pump_generation(pump, listing_too_large=too_large)
+            except Exception:  # noqa: BLE001 -- isolated per generation
+                logger.exception("ingress %s: pump failed; isolated", label)
+                out[label] = {"pump_errored": 1}
+    return out
