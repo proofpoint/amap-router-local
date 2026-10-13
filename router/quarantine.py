@@ -2,9 +2,10 @@
 read-only inspection (`router quarantine list|show`).
 
 OWNERSHIP IS SPLIT, deliberately. This module FREEZES the format and READS
-it. The WRITER (cross-host inbound held in a generation's quarantine) and
-the expiry SWEEP are a later step's, and that step must write exactly this
-format. Nothing here creates, moves or deletes anything.
+it. The WRITER (cross-host inbound held in a generation's quarantine) is
+`ingress.write_quarantine_item`, which checks every item against this
+module's rules before writing it; the expiry SWEEP is still a later step's.
+Nothing here creates, moves or deletes anything.
 
 WHERE: `state_dir/<logical_id>/gen-<g>/ingress-quarantine/<id>.json`, one
 file per item, in every generation of the identity (late inbound for a
@@ -28,8 +29,8 @@ current (fenced or retired) and is held in THAT generation, never placed
 into a later one. The
 peer-origin profile's §5 causes join it when the profile revision that
 defines them is published: until then they are not this public
-repository's to copy, and an item naming one is DAMAGED. No writer exists
-yet, so nothing that could be written is lost meanwhile.
+repository's to copy, and an item naming one is DAMAGED. The writer refuses
+a cause outside the vocabulary before writing anything.
 
 `evidence` is HOSTILE INPUT: what arrived, described by the writer from
 what the sender controlled. At most 32 members; each key 1-64 printable

@@ -32,12 +32,14 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import generations as generations_mod
+from . import quarantine as quarantine_mod
 from . import transport as transport_mod
 from .hoplink import canonical
 from .util import _mkdir_durable, atomic_write, fsync_dir, utc_ts
@@ -611,4 +613,168 @@ def snapshots(state_dir: Path, logical_id: str, gen: str, kind: str) -> List[str
         if not ok:
             raise SnapshotInvalid("identity", f"{d / name}: its id does not match its name")
         out.append(ident["entry_id"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The quarantine WRITER: exactly `quarantine`'s frozen item format, one item
+# per journal key, CREATE-IF-ABSENT. `quarantine` stays read-only.
+#
+# The item id is `sha256(key)[:32]`. An item already there is ADOPTED when it
+# is byte-identical to the one this call would write given that item's own
+# `arrival_ts` (the time this router first observed the entry, which a
+# crash-and-re-presentation must not move); any other existing entry at that
+# name, a damaged one included, raises `QuarantineConflict` and is never
+# overwritten. The journal moves to `quarantined` only after this returns.
+# ---------------------------------------------------------------------------
+
+#: A comma-joined per-part digest list longer than this is omitted from the
+#: evidence (an evidence string's cap); the count and the aggregate digest
+#: over the list are always recorded.
+_ATT_LIST_SEP = ","
+_ATT_NONE = "-"
+
+
+class QuarantineConflict(Exception):
+    """A different (or damaged) item already holds this key's name. The
+    entry is held as `quarantine_item_conflict`."""
+
+    reason = "quarantine_item_conflict"
+
+
+def quarantine_item_id(key: str) -> str:
+    if not _KEY_RE.fullmatch(key):
+        raise ValueError(f"not a journal key: {key!r}")
+    return hashlib.sha256(key.encode("ascii")).hexdigest()[:32]
+
+
+def _evidence(kind: str, link: str, entry_id: str, key: str,
+              digests: Optional[Dict[str, Any]], extra: Dict[str, Any]) -> Dict[str, Any]:
+    ev: Dict[str, Any] = {"kind": kind, "link": link, "entry_id": entry_id,
+                          "journal_key": key}
+    if digests is not None:
+        atts = digests["attachments"]
+        ev.update({"snapshot_notice_sha256": digests["notice"],
+                   "snapshot_spool_sha256": digests["spool"],
+                   "snapshot_hop_sha256": digests["hop"],
+                   "snapshot_attachments_count": len(atts),
+                   "snapshot_attachments_sha256":
+                       hashlib.sha256(canonical(atts)).hexdigest()})
+        joined = _ATT_LIST_SEP.join(_ATT_NONE if d is None else d for d in atts)
+        if len(joined) <= quarantine_mod.EVIDENCE_STR_MAX:
+            ev["snapshot_attachments"] = joined
+    clash = set(ev) & set(extra)
+    if clash:
+        raise ValueError(f"extra evidence reuses reserved keys: {sorted(clash)}")
+    ev.update(extra)
+    return ev
+
+
+def _item_bytes(doc: Dict[str, Any]) -> bytes:
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def write_quarantine_item(state_dir: Path, logical_id: str, gen: str, kind: str, link: str,
+                          entry_id: str, cause: str, *,
+                          digests: Optional[Dict[str, Any]] = None,
+                          extra_evidence: Optional[Dict[str, Any]] = None,
+                          now: Optional[str] = None) -> str:
+    """Write the entry's quarantine item in generation `gen`, or adopt the
+    identical one already there. Returns `"created"` or `"adopted"`. The
+    item is checked against the frozen format BEFORE anything is written
+    (`ValueError` when this router would write a damaged one)."""
+    key = key_for(kind, link, gen, entry_id)
+    item_id = quarantine_item_id(key)
+    if cause not in quarantine_mod.CAUSES:
+        raise ValueError(f"{cause!r} is not in the closed cause vocabulary")
+    evidence = _evidence(kind, link, entry_id, key, digests, dict(extra_evidence or {}))
+
+    def build(ts: str) -> Dict[str, Any]:
+        doc = {"schema": quarantine_mod.SCHEMA, "id": item_id, "generation": gen,
+               "arrival_ts": ts, "causes": [cause], "evidence": evidence}
+        try:
+            quarantine_mod.check_item(doc, item_id=item_id, generation=gen,
+                                      now=quarantine_mod._now(ts))
+        except quarantine_mod.Damaged as e:
+            raise ValueError(f"this router would write a damaged item: {e}") from None
+        return doc
+
+    qdir = generations_mod.gen_dir(state_dir, logical_id, gen) / quarantine_mod.DIR_NAME
+    name = f"{item_id}.json"
+    fresh = _item_bytes(build(now or utc_ts()))
+    # The temporary file lives in THIS module's own directory, on the same
+    # filesystem: one left by a crash is never an unexpected name in the
+    # quarantine (which lists every such name as DAMAGED).
+    stage = generations_mod.gen_dir(state_dir, logical_id, gen) / DIR_NAME
+    _mkdir_durable(qdir, Path(state_dir))
+    _mkdir_durable(stage, Path(state_dir))
+    tmp = stage / f".quarantine-{item_id}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(fresh)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, qdir / name, follow_symlinks=False)
+            created = True
+        except FileExistsError:
+            created = False
+    finally:
+        os.unlink(tmp)
+    fsync_dir(qdir)
+    if created:
+        return "created"
+    return _adopt(qdir, name, item_id, gen, build)
+
+
+def _adopt(qdir: Path, name: str, item_id: str, gen: str, build) -> str:
+    dfd = os.open(qdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            raw, _st = quarantine_mod.read_pinned(dfd, name, quarantine_mod.ITEM_MAX_BYTES)
+            doc = quarantine_mod._strict_json(raw)
+            ts = doc.get("arrival_ts") if isinstance(doc, dict) else None
+            quarantine_mod.check_item(doc, item_id=item_id, generation=gen,
+                                      now=quarantine_mod._now(None))
+        except quarantine_mod.Damaged as e:
+            raise QuarantineConflict(f"{qdir / name}: an existing entry is damaged ({e})") from None
+    finally:
+        os.close(dfd)
+    if raw != _item_bytes(build(ts)):
+        raise QuarantineConflict(f"{qdir / name}: an existing item differs")
+    return "adopted"
+
+
+def quarantine_items(state_dir: Path, logical_id: str, name: str, gen: str, *,
+                     days: int) -> List[Dict[str, Any]]:
+    """Read-only probe over one generation's ingress quarantine: per item,
+    `entry_id`, `cause` (the first), `arrived_at`, the evidence and the
+    snapshot digests `{notice, spool, hop, attachments}` as recorded
+    (`attachments` is None when the list was too long to record). A DAMAGED
+    item is returned with `damaged` set, never omitted."""
+    out = []
+    for item in quarantine_mod.list_ingress(state_dir, logical_id, name, days=days):
+        if item.generation != gen:
+            continue
+        if item.damaged is not None:
+            out.append({"id": item.id, "damaged": item.damaged})
+            continue
+        ev = item.doc["evidence"]
+        digests = None
+        if "snapshot_notice_sha256" in ev:
+            joined = ev.get("snapshot_attachments")
+            digests = {"notice": ev["snapshot_notice_sha256"],
+                       "spool": ev["snapshot_spool_sha256"],
+                       "hop": ev["snapshot_hop_sha256"],
+                       "attachments": None if joined is None else [
+                           None if d == _ATT_NONE else d
+                           for d in (joined.split(_ATT_LIST_SEP) if joined else [])]}
+        out.append({"id": item.id, "damaged": None, "entry_id": ev.get("entry_id"),
+                    "cause": item.doc["causes"][0], "arrived_at": item.doc["arrival_ts"],
+                    "evidence": ev, "digests": digests})
     return out

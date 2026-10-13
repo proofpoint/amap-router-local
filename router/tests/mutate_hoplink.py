@@ -35,6 +35,7 @@ IG = "router/ingress.py"
 FV = "router.tests.test_ingress_facts_version.FactsVersionTests."
 BT = "router.tests.test_ingress_bundle.BundleTests."
 SN = "router.tests.test_ingress_snapshot."
+QW = "router.tests.test_ingress_quarantine_writer.WriterTests."
 
 M = [
  # -- the facts version guard (driven directly at the guard unit) -------------
@@ -108,7 +109,8 @@ M = [
   '    os.mkdir(path, 0o700)\n    os.chmod(path, 0o700)\n', '    os.mkdir(path)\n',
   [SN + "TakeTests.test_round_trip_and_modes"]),
  ('N2 snapshot files group-readable', IG,
-  '        os.fchmod(fd, 0o600)\n', '        os.fchmod(fd, 0o640)\n',
+  '        os.fchmod(fd, 0o600)\n        view = memoryview(data)\n',
+  '        os.fchmod(fd, 0o640)\n        view = memoryview(data)\n',
   [SN + "TakeTests.test_round_trip_and_modes"]),
  ('N3 snapshot files not fsynced', IG,
   '            view = view[os.write(fd, view):]\n        os.fsync(fd)\n',
@@ -171,6 +173,30 @@ M = [
  # (No mutant for O_NONBLOCK on member opens: without it a FIFO member blocks
  # the open forever, and this runner has no timeout to turn a hang into a
  # FAILURE. The FIFO witness above runs with it in place.)
+ # -- the quarantine writer: create-if-absent ----------------------------------
+ ('Q1 an existing item overwritten', IG,
+  '        except FileExistsError:\n            created = False\n',
+  '        except FileExistsError:\n            os.unlink(qdir / name)\n            os.link(tmp, qdir / name)\n            created = True\n',
+  [QW + "test_a_different_item_is_a_conflict_and_is_kept"]),
+ ('Q2 an existing item adopted unread', IG,
+  '    if raw != _item_bytes(build(ts)):\n', '    if False:\n',
+  [QW + "test_a_different_item_is_a_conflict_and_is_kept"]),
+ ('Q3 adoption compared at the new arrival time', IG,
+  '    return _adopt(qdir, name, item_id, gen, build)\n',
+  '    return _adopt(qdir, name, item_id, gen, lambda _ts: build(now or utc_ts()))\n',
+  [QW + "test_five_presentations_give_one_item"]),
+ ('Q4 a damaged existing entry adopted', IG,
+  '            raise QuarantineConflict(f"{qdir / name}: an existing entry is damaged ({e})") from None\n',
+  '            return "adopted"\n',
+  [QW + "test_a_damaged_item_is_a_conflict_and_is_kept"]),
+ ('Q5 the item group-readable', IG,
+  '            os.fchmod(fd, 0o600)\n            view = memoryview(fresh)\n',
+  '            os.fchmod(fd, 0o644)\n            view = memoryview(fresh)\n',
+  [QW + "test_the_written_item_is_in_the_frozen_format_and_private"]),
+ # (No mutant for the explicit cause check: `check_item` refuses the same
+ # value before anything is written, so removing it changes only the message.
+ # None for the temporary file's directory either: it matters only after a
+ # process death between create and unlink, which no in-process test makes.)
  # -- the intake-reader seam ----------------------------------------------------
  ('D1 no reader cache', HL,
   '    reader = _READERS.get(key)\n    if reader is not None:\n        return reader\n',
