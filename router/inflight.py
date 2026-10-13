@@ -1012,3 +1012,51 @@ def settlement_record(state_dir: Path, logical_id: str, gen: str,
                 return {"state": "inflight", "req_id": p.name[: -len(".json")],
                         "outcome": None}
     return None
+
+
+def transaction_facts(state_dir: Path, logical_id: str, gen: str,
+                      n: str) -> Optional[Dict[str, Any]]:
+    """What THIS router recorded of its own outbound transaction `n` in
+    generation `gen`, for matching a correlation the downstream runtime
+    makes back to it (a failure report, a reply): `{"req_id", "recipients",
+    "message_id", "source"}`, or None. The recipients are what was actually
+    SENT TO: the anchor Result's `recipients` when an anchor exists (source
+    "anchor"); otherwise the evaluated set of an in-flight record that WAS
+    HANDED OVER (its marker names `n`; source "record"). A record never
+    handed over names nothing that was sent, so it matches nothing.
+    `message_id` is the anchor Result's, when it has one. A damaged record
+    or anchor RAISES (`RecordDamaged`, or the JSON error); it is never read
+    as absent."""
+    if not (isinstance(n, str) and _TRANSPORT_ID_RE.fullmatch(n)):
+        raise ValueError(f"{n!r} is not a transport id")
+    gdir = Path(state_dir) / logical_id / f"gen-{gen}"
+    results = gdir / "results"
+    if results.is_dir():
+        for p in sorted(results.iterdir()):
+            if not p.name.endswith(".json"):
+                continue
+            doc = json.loads(p.read_bytes().decode("utf-8"))
+            if not (isinstance(doc, dict) and isinstance(doc.get("result"), dict)):
+                raise RecordDamaged(f"{p}: not an anchor envelope")
+            if doc.get("transport_req_id") != n:
+                continue
+            result = doc["result"]
+            recipients = result.get("recipients")
+            mid = result.get("message_id")
+            return {"req_id": p.name[: -len(".json")], "source": "anchor",
+                    "recipients": [r for r in recipients if isinstance(r, str)]
+                    if isinstance(recipients, list) else [],
+                    "message_id": mid if isinstance(mid, str) and mid else None}
+    d = gdir / INFLIGHT_DIR
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if not p.name.endswith(".json"):
+                continue
+            rec = check_record(json.loads(p.read_bytes().decode("utf-8")))
+            if rec["transport_req_id"] != n:
+                continue
+            if not _was_handed(p.with_suffix(HANDED_SUFFIX), n):
+                return None
+            return {"req_id": p.name[: -len(".json")], "source": "record",
+                    "recipients": list(rec["recipients"]), "message_id": None}
+    return None

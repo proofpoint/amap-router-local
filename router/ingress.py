@@ -39,7 +39,7 @@ import re
 import secrets
 import shutil
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -53,7 +53,8 @@ from . import generations as generations_mod
 from . import quarantine as quarantine_mod
 from . import transport as transport_mod
 from .hoplink import canonical
-from .util import _mkdir_durable, atomic_write, fsync_dir, mint_notice_id, parse_utc_ts, utc_ts
+from .util import (_mkdir_durable, atomic_write, format_utc_ts, fsync_dir, mint_notice_id,
+                   parse_utc_ts, utc_ts)
 
 logger = logging.getLogger("amap_router_local.ingress")
 
@@ -74,20 +75,26 @@ QUARANTINED = "quarantined"
 QUARANTINED_WAITING_REMOVE = "quarantined_waiting_remove"
 QUARANTINED_COMPLETE = "quarantined_complete"
 DUPLICATE_DIFFERENT_HELD = "duplicate_different_held"
+#: A failure report whose every (transaction, recipient, action) pair was
+#: already announced: nothing is placed, and the entry is removed upstream
+#: like any other (the quarantine path's shape).
+SUPPRESSED_WAITING_REMOVE = "suppressed_waiting_remove"
+SUPPRESSED_COMPLETE = "suppressed_complete"
 
 STATES = (HELD, PREPARED, PLACING, PUBLISHED, PUBLISHED_WAITING_REMOVE, COMPLETE,
           QUARANTINED, QUARANTINED_WAITING_REMOVE, QUARANTINED_COMPLETE,
-          DUPLICATE_DIFFERENT_HELD)
+          DUPLICATE_DIFFERENT_HELD, SUPPRESSED_WAITING_REMOVE, SUPPRESSED_COMPLETE)
 
 #: The terminal states that keep the key as a TOMBSTONE.
-TOMBSTONES = (COMPLETE, QUARANTINED_COMPLETE)
+TOMBSTONES = (COMPLETE, QUARANTINED_COMPLETE, SUPPRESSED_COMPLETE)
 
 #: state -> the states it may move to. A new record may be written in any of
 #: `INITIAL`. Re-writing the SAME state (a refreshed reason or timestamp) is
 #: allowed for `held` and `duplicate_different_held` only.
-INITIAL = (HELD, PREPARED, QUARANTINED)
+INITIAL = (HELD, PREPARED, QUARANTINED, SUPPRESSED_WAITING_REMOVE)
 TRANSITIONS: Dict[str, tuple] = {
-    HELD: (HELD, PREPARED, QUARANTINED),
+    # suppressed: a held failure report, re-evaluated, matches with nothing new.
+    HELD: (HELD, PREPARED, QUARANTINED, SUPPRESSED_WAITING_REMOVE),
     # quarantined: the late check before placing; held: snapshot_invalid, or a
     # quarantine item conflict met on the way to quarantine.
     PREPARED: (PLACING, QUARANTINED, HELD),
@@ -102,6 +109,8 @@ TRANSITIONS: Dict[str, tuple] = {
     QUARANTINED_WAITING_REMOVE: (QUARANTINED_COMPLETE, DUPLICATE_DIFFERENT_HELD),
     QUARANTINED_COMPLETE: (QUARANTINED_WAITING_REMOVE, DUPLICATE_DIFFERENT_HELD),
     DUPLICATE_DIFFERENT_HELD: (DUPLICATE_DIFFERENT_HELD,),
+    SUPPRESSED_WAITING_REMOVE: (SUPPRESSED_COMPLETE, DUPLICATE_DIFFERENT_HELD),
+    SUPPRESSED_COMPLETE: (SUPPRESSED_WAITING_REMOVE, DUPLICATE_DIFFERENT_HELD),
 }
 
 _GEN_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -1154,7 +1163,8 @@ def _rewrite_refs(descs: Any, notice_id: str) -> None:
 
 
 def final_documents(notice_raw: bytes, spool_raw: bytes, notice_id: str,
-                    ts: str) -> "tuple[Dict[str, Any], Dict[str, Any]]":
+                    ts: str, in_reply_to: Optional[str] = None
+                    ) -> "tuple[Dict[str, Any], Dict[str, Any]]":
     """The (spool, notice) this router places for an upstream notice: the
     received documents with THIS router's minted `notice_id` (and the
     notice's `ts`), `mailbox` "inbox", and every `content_ref` re-pointed to
@@ -1166,6 +1176,9 @@ def final_documents(notice_raw: bytes, spool_raw: bytes, notice_id: str,
     notice["notice_id"] = notice_id
     notice["ts"] = ts
     notice["message"]["mailbox"] = "inbox"
+    if in_reply_to is not None:
+        # A matched reply to this router's own send: threaded to it.
+        notice["message"]["in_reply_to"] = in_reply_to
     _rewrite_refs(notice["message"].get("attachments"), notice_id)
     spool["notice_id"] = notice_id
     _rewrite_refs(spool.get("attachments"), notice_id)
@@ -1184,7 +1197,8 @@ def _verified(notice: Dict[str, Any], blobs: List[Optional[bytes]]
 
 def prepare(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: str,
             entry_id: str, parsed: Dict[str, Any], *, recipient: str,
-            digests: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            digests: Optional[Dict[str, Any]] = None,
+            in_reply_to: Optional[str] = None) -> Dict[str, Any]:
     """Snapshot `parsed` (unless `digests` names the snapshot already kept
     and verified for it, a held entry now placeable), mint the target
     identity once, and journal `prepared` with the final parts' digests and
@@ -1193,19 +1207,52 @@ def prepare(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: str,
         digests = take_snapshot(state_dir, logical_id, gen, "notice", link, entry_id, parsed)
     notice_id, ts = mint_notice_id(), utc_ts()
     spool, notice = final_documents(parsed["raw"]["notice"], parsed["raw"]["spool"],
-                                    notice_id, ts)
+                                    notice_id, ts, in_reply_to)
     ledger = binding_mod.record_delivery(
         state_dir, notice_id=notice_id, from_instance=None,
         from_address=notice["message"]["from"], to_instance=recipient, ts=ts, req_id="",
         message_id=notice["message"]["id"], transport=LEDGER_TRANSPORT,
-        tree=deliver_mod.TREE_INBOX)
+        tree=deliver_mod.TREE_INBOX,
+        mail_origin=mail_origin(cfg, logical_id, gen, link, parsed, ts))
     ledger = deliver_mod._stamp_ids(cfg, ledger, None, recipient)
     final = {"notice": _part(_doc_bytes(notice)), "spool": _part(_doc_bytes(spool)),
              "ledger": _part(ledger),
              "attachments": [None if b is None else _part(b) for b in parsed["attachments"]]}
+    extra = {"in_reply_to": in_reply_to} if in_reply_to is not None else {}
     return write(state_dir, logical_id, gen, "notice", link, entry_id, PREPARED,
                  snapshot=digests, notice_id=notice_id, ts=ts, recipient=recipient,
-                 ledger=ledger.decode("utf-8"), final=final)
+                 ledger=ledger.decode("utf-8"), final=final, **extra)
+
+
+def canonical_address(raw: Any) -> Optional[str]:
+    """THE canonical form of an address for every comparison and every
+    recorded binding across the external leg (`classify.parse_address`'s:
+    the domain lowercased, the local part exact), or None."""
+    try:
+        return classify_mod.parse_address(raw).canonical()
+    except classify_mod.Malformed:
+        return None
+
+
+def mail_origin(cfg: Any, logical_id: str, gen: str, link: str, parsed: Dict[str, Any],
+                ts: str) -> Optional[Dict[str, Any]]:
+    """The reply binding a placed mail's ledger record carries
+    (`binding.MAIL_ORIGIN_MEMBERS`), computed ONCE, here, at `prepared`: its
+    `expires_at` is fixed by the window configured now, and a later change
+    never moves it. None, so the record never resolves as a binding, when the
+    sender's address has no canonical form."""
+    counterparty = canonical_address(addr_of(parsed["notice"]["message"].get("from")))
+    received = parse_utc_ts(ts)
+    if counterparty is None or received is None:
+        return None
+    facts = parsed["facts"]
+    expires = received + timedelta(seconds=cfg.mail_reply_window_seconds)
+    return {"agent": logical_id, "counterparty": counterparty,
+            "origin_notice_id": facts["notice_id"], "origin_link": link,
+            "origin_logical_id": logical_id, "origin_generation": gen,
+            "admission": facts["admission"], "admission_link": facts["admission_link"],
+            "admission_rule": facts["admission_rule"], "received_at": ts,
+            "expires_at": format_utc_ts(expires)}
 
 
 def generation_is_current(state_dir: Path, logical_id: str, gen: str) -> Optional[bool]:
@@ -1228,16 +1275,25 @@ def _rebuild(state_dir: Path, logical_id: str, gen: str, link: str, entry_id: st
                                rec.get("snapshot"), attachment_cap=attachment_cap)
     except SnapshotInvalid as e:
         return None, e.reason
-    spool, notice = final_documents(kept["notice"], kept["spool"], rec["notice_id"], rec["ts"])
+    failure = rec.get("failure")
+    if failure is not None:
+        # A failure notice: router-authored, rebuilt from what was recorded;
+        # the snapshot is evidence only and none of its bytes are placed.
+        spool, notice = failure_documents(failure, rec["notice_id"], rec["ts"])
+        attachments: List[Optional[bytes]] = []
+    else:
+        spool, notice = final_documents(kept["notice"], kept["spool"], rec["notice_id"],
+                                        rec["ts"], rec.get("in_reply_to"))
+        attachments = kept["attachments"]
     ledger = rec["ledger"].encode("utf-8")
     final = rec["final"]
     if (_part(_doc_bytes(notice)) != final["notice"] or _part(_doc_bytes(spool)) != final["spool"]
             or _part(ledger) != final["ledger"]
-            or [None if b is None else _part(b) for b in kept["attachments"]]
+            or [None if b is None else _part(b) for b in attachments]
             != final["attachments"]):
         return None, HELD_SNAPSHOT_FINAL
     return {"notice": notice, "spool": spool, "ledger": ledger,
-            "attachments": kept["attachments"]}, None
+            "attachments": attachments}, None
 
 
 def _quarantine_late(state_dir: Path, logical_id: str, gen: str, link: str, entry_id: str,
@@ -1437,13 +1493,19 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
 
 # ---------------------------------------------------------------------------
 # The §7.2 order and admission, on the FACTS only (provenance is never an
-# input). FIRST MATCH WINS; one outcome per facts document:
+# input). FIRST MATCH WINS; one outcome per facts document. The INTEGRITY
+# rows come first, for every class: a failure report or a reply never skips
+# them. Then the two classes allowed to pre-empt the COLD rows (3, 6, 7), and
+# only those:
 #
-#   1  notice_class is not "mail"           -> held (failure notice, a later unit's)
-#   2  in_reply_to present                  -> held (bound reply, a later unit's)
+#   I4 fleet_hosts, ingress not "hub"       -> held admission_inconsistent
+#   I5 admission_link is not this link      -> held admission_link_mismatch
+#   1  notice_class "failure_notice"        -> FAILURE (the pump matches it)
+#   2  in_reply_to present                  -> REPLY (the pump matches it; an
+#                                              unmatched reply is classified
+#                                              again with `reply_unmatched`,
+#                                              from row 3: never widened)
 #   3  admission "open"                     -> held admission_not_placeable
-#   4  fleet_hosts, ingress not "hub"       -> held admission_inconsistent
-#   5  admission_link is not this link      -> held admission_link_mismatch
 #   6  origin_host a trusted fleet host     -> quarantined cold_fleet_mail
 #   7  origin_host not a fleet host         -> held unknown_host
 #   8  otherwise (untrusted fleet mail)     -> PLACE
@@ -1460,6 +1522,8 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
 PLACE = "place"
 HOLD = "hold"
 QUARANTINE = "quarantine"
+FAILURE = "failure"
+REPLY = "reply"
 
 HELD_FAILURE_NOTICE = "failure_notice"
 HELD_BOUND_REPLY = "bound_reply"
@@ -1475,11 +1539,14 @@ ADMISSIONS = ("fleet_hosts", "open")
 INGRESSES = ("hub",)
 
 
-def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fleet_hosts
-                   ) -> "tuple[str, Optional[str]]":
-    """`(PLACE, None)`, `(HOLD, reason)` or `(QUARANTINE, cause)` for one
-    facts document already through `facts_version`. Raises `FactsInvalid`
-    for a value outside the enums, or a member of the wrong type."""
+def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fleet_hosts,
+                   reply_unmatched: bool = False) -> "tuple[str, Optional[str]]":
+    """`(PLACE, None)`, `(HOLD, reason)`, `(QUARANTINE, cause)`, `(FAILURE,
+    None)` or `(REPLY, None)` for one facts document already through
+    `facts_version`. `reply_unmatched`: the pump found no match for this
+    reply, so it is classified from row 3 like mail without one. Raises
+    `FactsInvalid` for a value outside the enums, or a member of the wrong
+    type."""
     nc = facts.get("notice_class")
     if nc not in NOTICE_CLASSES:
         raise FactsInvalid(f"notice_class {nc!r} is not one of {list(NOTICE_CLASSES)}")
@@ -1500,19 +1567,19 @@ def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fle
             raise FactsInvalid("origin_host is not a host name") from None
         if canonical != origin:
             raise FactsInvalid("origin_host is not in canonical (lowercase) form")
-    if nc != "mail":
-        return HOLD, HELD_FAILURE_NOTICE
-    if "in_reply_to" in facts:
-        return HOLD, HELD_BOUND_REPLY
-    if admission == "open":
-        return HOLD, HELD_NOT_PLACEABLE
-    # Row 4 is unreachable while the codec's ingress enum is {"hub"}: any
+    # Row I4 is unreachable while the codec's ingress enum is {"hub"}: any
     # other value is refused above as notice_invalid, as the plugin's reader
     # refuses it. Kept, in its frozen place, for the version that adds one.
     if ingress_v != "hub":
         return HOLD, HELD_INCONSISTENT
     if facts["admission_link"] != link:
         return HOLD, HELD_LINK_MISMATCH
+    if nc != "mail":
+        return FAILURE, None
+    if "in_reply_to" in facts and not reply_unmatched:
+        return REPLY, None
+    if admission == "open":
+        return HOLD, HELD_NOT_PLACEABLE
     if origin in trusted_fleet_hosts:
         return QUARANTINE, quarantine_mod.CAUSE_COLD_FLEET_MAIL
     if origin not in fleet_hosts:
@@ -1689,6 +1756,268 @@ def addressed_to(cfg: Any, report: Any, logical_id: str,
     return not elsewhere
 
 # ---------------------------------------------------------------------------
+# Rows 1 and 2: a correlation the downstream runtime makes back to one
+# of THIS router's own outbound transactions (a failure report, a reply). It
+# is believed only when this router's own record of that transaction agrees.
+# ---------------------------------------------------------------------------
+
+HELD_FAILURE_UNMATCHED = "failure_unmatched"
+FAILURE_SEEN_DIR = "failure-seen"
+FAILURE_SUBJECT = {"failed": "Not delivered: ", "delayed": "Delayed: ",
+                   "mixed": "Delivery report: "}
+#: The local description of a delivery status's subject (its middle digit).
+_STATUS_SUBJECT = {"0": "other", "1": "addressing", "2": "mailbox", "3": "mail system",
+                   "4": "network or routing", "5": "mail delivery protocol",
+                   "6": "message content or media", "7": "security or policy"}
+
+
+class Undecided(Exception):
+    """A record this decision needs cannot be read or validated: no decision
+    this pump, never a guess in either direction."""
+
+
+def recorded_link(state_dir: Path, logical_id: str, gen: str) -> Optional[str]:
+    """The link generation `gen` is PINNED to (its ingress link pin), or None
+    when it has none. One hop link per deployment, pinned per generation at
+    its first inbound use, so this is the link its outbound transactions went
+    over too. An unreadable pin is `Undecided`."""
+    try:
+        raw = _read_pin(link_pin_path(state_dir, logical_id, gen))
+    except (OSError, ValueError) as e:
+        raise Undecided(f"the link pin of {gen} cannot be read: {e}") from None
+    if raw is None:
+        return None
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+        link = doc["link"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise Undecided(f"the link pin of {gen} is damaged: {e}") from None
+    return link if isinstance(link, str) else None
+
+
+def own_transaction(state_dir: Path, logical_id: str,
+                    txn: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """THIS router's record of the transaction `txn` names, or None. Matches
+    only when: `txn.logical_id` is this identity; `txn.generation` is one of
+    its generations (ANY, fenced or retired included: authorising a reply
+    survives a rebind); `txn.link` is the link that generation is pinned to;
+    and `txn.n` is a transaction this router SENT in it (an anchor, or a
+    handed-over in-flight record). The result's `recipients` are what was
+    sent to; `canonical` their canonical forms. A record that cannot be read
+    is `Undecided`."""
+    if txn.get("logical_id") != logical_id:
+        return None
+    gen = txn.get("generation")
+    try:
+        doc = generations_mod.read_doc(state_dir, logical_id)
+    except generations_mod.GenerationHeld as e:
+        raise Undecided(f"the generations record cannot be read: {e}") from None
+    if doc is None or gen not in {g["gen"] for g in doc["gens"]}:
+        return None
+    if recorded_link(state_dir, logical_id, gen) != txn.get("link"):
+        return None
+    from . import inflight as inflight_mod   # local: inflight is a leaf here
+    try:
+        facts = inflight_mod.transaction_facts(state_dir, logical_id, gen, txn["n"])
+    except (ValueError, OSError) as e:
+        raise Undecided(f"transaction {txn.get('n')} of {gen} cannot be read: {e}") from None
+    if facts is None:
+        return None
+    facts["canonical"] = {}
+    for raw in facts["recipients"]:
+        c = canonical_address(raw)
+        if c is not None:
+            facts["canonical"].setdefault(c, raw)
+    return facts
+
+
+def pair_key(txn: Dict[str, Any], recipient: str, action: str) -> str:
+    return hashlib.sha256(canonical({"txn": txn, "recipient": recipient,
+                                     "action": action})).hexdigest()
+
+
+def reservation_path(state_dir: Path, logical_id: str, key: str) -> Path:
+    return Path(state_dir) / logical_id / FAILURE_SEEN_DIR / f"{key}.json"
+
+
+#: A reservation's OWNER journal record, by state. The classifier is TOTAL:
+#: `held` is decided by its reason; every state named in neither tuple, now
+#: or added later, is SEEN (the at-most-once direction).
+SEEN_STATES = (PREPARED, PLACING, PUBLISHED, PUBLISHED_WAITING_REMOVE, COMPLETE,
+               DUPLICATE_DIFFERENT_HELD, SUPPRESSED_WAITING_REMOVE, SUPPRESSED_COMPLETE)
+RELEASED_STATES = (QUARANTINED, QUARANTINED_WAITING_REMOVE, QUARANTINED_COMPLETE)
+#: Held reasons whose owner provably never reached `placing`: its pairs are
+#: released. Every other held reason keeps them SEEN.
+RELEASING_HOLDS = ("notice_invalid", QuarantineConflict.reason)
+RELEASING_HOLD_PREFIXES = ("snapshot_invalid:",)
+
+SEEN, RELEASED, REUSED = "seen", "released", "reused"
+
+
+def owner_verdict(state_dir: Path, logical_id: str, reservation: Dict[str, Any],
+                  asking_key: str) -> str:
+    """SEEN, RELEASED or REUSED for one reservation, from its owner's
+    CURRENT journal state (so a release needs no write). An owner whose
+    record is cleanly absent is RELEASED whatever the reservation's age (an
+    orphan of a crash before `prepared`, or an owner tombstone swept past
+    the dedup horizon), except that the asking entry REUSES its own. An
+    owner record that cannot be read or validated is `Undecided`."""
+    owner_key = reservation.get("owner_key")
+    owner_gen = reservation.get("owner_gen")
+    if not (isinstance(owner_key, str) and _KEY_RE.fullmatch(owner_key)
+            and isinstance(owner_gen, str) and _GEN_RE.fullmatch(owner_gen)):
+        raise Undecided("a reservation names no valid owner")
+    try:
+        rec = read(state_dir, logical_id, owner_gen, "notice", owner_key)
+    except (JournalError, OSError, ValueError) as e:
+        raise Undecided(f"the reservation's owner {owner_key} cannot be read: {e}") from None
+    if rec is None:
+        return REUSED if owner_key == asking_key else RELEASED
+    if owner_key == asking_key:
+        return REUSED
+    st = rec["state"]
+    if st in RELEASED_STATES:
+        return RELEASED
+    if st == HELD:
+        reason = rec.get("reason") or ""
+        if reason in RELEASING_HOLDS or any(reason.startswith(p)
+                                             for p in RELEASING_HOLD_PREFIXES):
+            return RELEASED
+    return SEEN
+
+
+def reserve_new_pairs(state_dir: Path, logical_id: str, owner_gen: str, owner_key: str,
+                      txn: Dict[str, Any], pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The pairs this entry announces: each one not SEEN under another owner,
+    reserved durably for this entry BEFORE anything is prepared. Raises
+    `Undecided` (nothing written) when any reservation or owner cannot be
+    read."""
+    new, to_write = [], []
+    for p in pairs:
+        key = pair_key(txn, p["canonical"], p["action"])
+        path = reservation_path(state_dir, logical_id, key)
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            raw = None
+        except OSError as e:
+            raise Undecided(f"reservation {key} cannot be read: {e}") from None
+        if raw is None:
+            verdict = RELEASED
+        else:
+            try:
+                res = json.loads(raw.decode("utf-8"))
+            except ValueError as e:
+                raise Undecided(f"reservation {key} is damaged: {e}") from None
+            if not isinstance(res, dict):
+                raise Undecided(f"reservation {key} is not an object")
+            verdict = owner_verdict(state_dir, logical_id, res, owner_key)
+        if verdict == SEEN:
+            continue
+        new.append(p)
+        if verdict == RELEASED:
+            to_write.append((path, {"txn": txn, "recipient": p["canonical"],
+                                    "action": p["action"], "owner_gen": owner_gen,
+                                    "owner_key": owner_key, "reserved_at": utc_ts()}))
+    for path, doc in to_write:
+        atomic_write(path, canonical(doc), durable_root=Path(state_dir))
+    return new
+
+
+def sweep_reservations(state_dir: Path, logical_id: str, horizon_s: int,
+                       now: datetime) -> int:
+    """Housekeeping only: remove reservations older than the dedup horizon
+    whose owner is absent or released. The horizon is the SAME as the
+    ingress tombstones' (`config.ingress_dedup_horizon_days`): a
+    reservation's owner is never swept before the reservation could be.
+    Correctness never depends on this running. Returns how many went."""
+    d = Path(state_dir) / logical_id / FAILURE_SEEN_DIR
+    try:
+        names = sorted(os.listdir(d))
+    except FileNotFoundError:
+        return 0
+    gone = 0
+    for name in names:
+        if not (name.endswith(".json") and _KEY_RE.fullmatch(name[:-5])):
+            continue
+        try:
+            res = json.loads((d / name).read_bytes().decode("utf-8"))
+            at = parse_utc_ts(res.get("reserved_at"))
+            if at is None or (now - at).total_seconds() <= horizon_s:
+                continue
+            if owner_verdict(state_dir, logical_id, res, "") == SEEN:
+                continue
+        except (OSError, ValueError, Undecided, AttributeError):
+            continue
+        os.unlink(d / name)
+        gone += 1
+    return gone
+
+
+def describe_status(status: str) -> str:
+    """A delivery status code in words, from this router's own table only."""
+    klass = "permanent failure" if status.startswith("5") else "temporary failure"
+    return f"{klass}: {_STATUS_SUBJECT.get(status.split('.')[1], 'other')}"
+
+
+def failure_documents(composed: Dict[str, Any], notice_id: str,
+                      ts: str) -> "tuple[Dict[str, Any], Dict[str, Any]]":
+    """The (spool, notice) of a failure notice: RUNTIME-AUTHORED only, from
+    this router's own records and local table (no text from the report, the
+    failed message, or what the downstream runtime wrote). A pure function of
+    its arguments, so a rebuild writes the same bytes."""
+    actions = {p["action"] for p in composed["pairs"]}
+    action = actions.pop() if len(actions) == 1 else "mixed"
+    lines = [
+        {"failed": "The downstream mail runtime reported that your message was not "
+                   "delivered to the recipients below.",
+         "delayed": "The downstream mail runtime reported that delivery of your message "
+                    "to the recipients below is delayed.",
+         "mixed": "The downstream mail runtime reported on the delivery of your message "
+                  "to the recipients below."}[action],
+        "",
+        f"your request: {composed['req_id']}",
+        f"transport id: {composed['n']}",
+        "",
+    ]
+    for p in composed["pairs"]:
+        lines.append(f"{p['recipient']}: {p['action']}, status {p['status']} "
+                     f"({describe_status(p['status'])})")
+    return deliver_mod._message_and_notice(
+        notice_id=notice_id, message_id=notice_id, ts=ts, kind=deliver_mod.KIND_DELIVER,
+        mailbox="inbox", from_address=composed["from_address"],
+        to_address=composed["to_address"],
+        subject=f"{FAILURE_SUBJECT.get(action, 'Not delivered: ')}{composed['req_id']}",
+        body_text="\n".join(lines) + "\n", attachments=[],
+        in_reply_to=composed["in_reply_to"], provenance="internal")
+
+
+def prepare_failure(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: str,
+                    entry_id: str, parsed: Dict[str, Any], *, recipient: str,
+                    composed: Dict[str, Any],
+                    digests: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """As `prepare`, for a failure notice: the snapshot kept as evidence, the
+    target identity minted once, and the FINAL router-authored parts (built
+    from `composed`, which is recorded) journalled `prepared`. Ledgered as a
+    router-authored notice: a reply to it never resolves."""
+    if digests is None:
+        digests = take_snapshot(state_dir, logical_id, gen, "notice", link, entry_id, parsed)
+    notice_id, ts = mint_notice_id(), utc_ts()
+    spool, notice = failure_documents(composed, notice_id, ts)
+    ledger = binding_mod.record_delivery(
+        state_dir, notice_id=notice_id, from_instance=None,
+        from_address=composed["from_address"], to_instance=recipient, ts=ts, req_id="",
+        message_id=notice_id, transport=LEDGER_TRANSPORT, tree=deliver_mod.TREE_INBOX,
+        authored_by=deliver_mod.ROUTER_AUTHOR)
+    ledger = deliver_mod._stamp_ids(cfg, ledger, None, recipient)
+    final = {"notice": _part(_doc_bytes(notice)), "spool": _part(_doc_bytes(spool)),
+             "ledger": _part(ledger), "attachments": []}
+    return write(state_dir, logical_id, gen, "notice", link, entry_id, PREPARED,
+                 snapshot=digests, notice_id=notice_id, ts=ts, recipient=recipient,
+                 ledger=ledger.decode("utf-8"), final=final, failure=composed)
+
+
+# ---------------------------------------------------------------------------
 # THE PUMP: one dispatch order, per (identity, generation), under the drain
 # lock (`run` and `once` hold it for the whole process).
 #
@@ -1729,9 +2058,9 @@ TERMINAL_REASONS = TERMINAL_HOLDS + (QuarantineConflict.reason, HELD_EXISTS_DIFF
 #: Holds that keep the snapshot and are re-evaluated FROM it, never re-read.
 SNAPSHOT_HOLDS = (HELD_FAILURE_NOTICE, HELD_BOUND_REPLY, HELD_NOT_PLACEABLE,
                   HELD_INCONSISTENT, HELD_LINK_MISMATCH, HELD_UNKNOWN_HOST,
-                  HELD_NOT_THIS_IDENTITY)
+                  HELD_NOT_THIS_IDENTITY, HELD_FAILURE_UNMATCHED)
 DUPLICATE_STATES = (PUBLISHED_WAITING_REMOVE, COMPLETE, QUARANTINED_WAITING_REMOVE,
-                    QUARANTINED_COMPLETE)
+                    QUARANTINED_COMPLETE, SUPPRESSED_WAITING_REMOVE, SUPPRESSED_COMPLETE)
 
 
 def is_terminal(reason: Optional[str]) -> bool:
@@ -1828,15 +2157,55 @@ class Pump:
     def _read(self, entry_id: str, *, missing_is_gone: bool = False):
         """`(bytes, None)`, `(None, refusal_reason)`, or `(None, None)` for no
         decision this pump. With `missing_is_gone`, an entry `read_entry`
-        reports absent (FileNotFoundError, and only that) is `(GONE, None)`."""
+        reports absent (FileNotFoundError, and only that) is `(GONE, None)`.
+        A no-decision refusal (the runtime's own class, or an OSError) is
+        tracked until a read decides (`note_read_refusal`)."""
         try:
-            return self.reader.port.read_entry("notice", entry_id), None
+            raw = self.reader.port.read_entry("notice", entry_id)
         except self.reader.notice_refused as e:
+            self.clear_read_refusal(entry_id)
             return None, getattr(e, "reason", None)
         except FileNotFoundError:
+            self.clear_read_refusal(entry_id)
             return (GONE if missing_is_gone else None), None
-        except (OSError,) + tuple(self.runtime_classes):
+        except (OSError,) + tuple(self.runtime_classes) as e:
+            self.note_read_refusal(entry_id, e)
             return None, None
+        self.clear_read_refusal(entry_id)
+        return raw, None
+
+    def _refusal_reason(self, exc: BaseException) -> str:
+        kind, detail = transport_mod.classify(exc, runtime=self.runtime_roles)
+        if kind == "runtime":
+            why = getattr(exc, "reason", None)
+            return f"{detail}:{why}" if type(why) is str and why else str(detail)
+        if kind == "oserror":
+            return f"oserror:{detail or type(exc).__name__}"
+        return type(exc).__name__
+
+    def note_read_refusal(self, entry_id: str, exc: BaseException) -> None:
+        """A read that decides nothing, again: kept per journal key with its
+        first sighting, logged at WARNING while young and at ERROR once it
+        has persisted `READ_REFUSAL_STALE_S`, and counted in status. The
+        entry id goes to the log only, never to status (count-only)."""
+        key = key_for("notice", self.link, self.gen, entry_id)
+        table = READ_REFUSALS.setdefault((str(self.state_dir), self.logical_id, self.gen), {})
+        reason = self._refusal_reason(exc)
+        now = _clock()
+        prior = table.get(key)
+        if prior is None or prior["reason"] != reason:
+            prior = {"reason": reason, "since": now, "since_ts": utc_ts()}
+            table[key] = prior
+        age = now - prior["since"]
+        (logger.warning if age < READ_REFUSAL_STALE_S else logger.error)(
+            "ingress %s/%s: entry %r (journal key %s) cannot be read (%s, for %ds); no "
+            "decision, read again next pump", self.logical_id, self.gen, entry_id, key,
+            reason, age)
+
+    def clear_read_refusal(self, entry_id: str) -> None:
+        table = READ_REFUSALS.get((str(self.state_dir), self.logical_id, self.gen))
+        if table:
+            table.pop(key_for("notice", self.link, self.gen, entry_id), None)
 
     def first_read(self, entry_id: str, rec: Optional[Dict[str, Any]]) -> Optional[str]:
         raw, refusal = self._read(entry_id)
@@ -1918,18 +2287,113 @@ class Pump:
             outcome, why = classify_facts(parsed["facts"], link=self.link,
                                           fleet_hosts=self.cfg.fleet_hosts,
                                           trusted_fleet_hosts=self.cfg.trusted_fleet_hosts)
+            in_reply_to = None
+            if outcome == REPLY:
+                try:
+                    in_reply_to = self.match_reply(parsed)
+                except Undecided as e:
+                    logger.error("ingress %s/%s: entry %r: a reply's transaction cannot be "
+                                 "checked (%s); no decision this pump", self.logical_id,
+                                 self.gen, entry_id, e)
+                    return None
+                if in_reply_to is None:
+                    # No match: exactly as mail without the correlation.
+                    outcome, why = classify_facts(
+                        parsed["facts"], link=self.link, fleet_hosts=self.cfg.fleet_hosts,
+                        trusted_fleet_hosts=self.cfg.trusted_fleet_hosts, reply_unmatched=True)
+                else:
+                    outcome = PLACE
         except FactsInvalid:
             return self.quarantine_refused(entry_id, rec)
+        if outcome == FAILURE:
+            return self.failure(entry_id, parsed, digests, rec)
         if outcome == QUARANTINE:
             return self.quarantine(entry_id, parsed, digests, why)
         if outcome == HOLD:
             return self.hold_with_snapshot(entry_id, parsed, digests, why, rec)
         # Placeable. A held entry places from the snapshot it already kept.
         prepare(self.cfg, self.state_dir, self.logical_id, self.gen, self.link, entry_id,
-                parsed, recipient=self.recipient, digests=digests)
+                parsed, recipient=self.recipient, digests=digests, in_reply_to=in_reply_to)
         got = place(self.cfg, self.state_dir, self.logical_id, self.gen, self.link, entry_id,
                     attachment_cap=self.attachment_cap)
         return {PUBLISHED_WAITING_REMOVE: "placed"}.get(got, got and got.lower())
+
+    def match_reply(self, parsed: Dict[str, Any]) -> Optional[str]:
+        """The Message-ID a matched reply threads to, or None: its correlated
+        transaction is this router's own (`own_transaction`), the sender's
+        canonical address is one it SENT TO, and the correlated Message-ID is
+        the one this router recorded for it, when it recorded one."""
+        irt = parsed["facts"]["in_reply_to"]
+        mine = own_transaction(self.state_dir, self.logical_id, irt["transaction"])
+        if mine is None:
+            return None
+        sender = canonical_address(addr_of(parsed["notice"]["message"].get("from")))
+        if sender is None or sender not in mine["canonical"]:
+            return None
+        if mine["message_id"] is not None and irt["message_id"] != mine["message_id"]:
+            return None
+        return irt["message_id"]
+
+    def failure(self, entry_id: str, parsed: Dict[str, Any],
+                digests: Optional[Dict[str, Any]], rec: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Row 1: a failure report on one of this router's own
+        transactions, every reported recipient one it sent to. ONE notice per
+        report, listing only the pairs not announced before (reserved durably
+        first); none new: suppressed. Otherwise held `failure_unmatched`
+        (a snapshot hold: a record of the transaction may land later)."""
+        report = parsed["facts"]["failure"]
+        txn = report["transaction"]
+        try:
+            mine = own_transaction(self.state_dir, self.logical_id, txn)
+        except Undecided as e:
+            logger.error("ingress %s/%s: entry %r: a failure report's transaction cannot be "
+                         "checked (%s); no decision this pump", self.logical_id, self.gen,
+                         entry_id, e)
+            return None
+        pairs = []
+        for r in report["reports"]:
+            c = canonical_address(r["recipient"])
+            if mine is None or c is None or c not in mine["canonical"]:
+                pairs = None
+                break
+            pairs.append({"canonical": c, "recipient": mine["canonical"][c],
+                          "action": r["action"], "status": r["status"]})
+        if pairs is None:
+            self._log_unmatched(entry_id, rec)
+            return self.hold_with_snapshot(entry_id, parsed, digests, HELD_FAILURE_UNMATCHED,
+                                           rec)
+        key = key_for("notice", self.link, self.gen, entry_id)
+        try:
+            new = reserve_new_pairs(self.state_dir, self.logical_id, self.gen, key, txn, pairs)
+        except Undecided as e:
+            self.count("failure_reservations_undecided")
+            logger.error("ingress %s/%s: entry %r (journal key %s): a reservation cannot be "
+                         "decided (%s); no decision this pump, nothing released",
+                         self.logical_id, self.gen, entry_id, key, e)
+            return None
+        if not new:
+            self.jw(entry_id, SUPPRESSED_WAITING_REMOVE, snapshot=self._snapshot(entry_id,
+                                                                                 parsed, digests))
+            return "suppressed"
+        composed = {"req_id": mine["req_id"], "n": txn["n"],
+                    "pairs": [{k: p[k] for k in ("recipient", "action", "status")} for p in new],
+                    "in_reply_to": mine["message_id"],
+                    "from_address": config_mod.router_address(self.cfg.fleet_domain),
+                    "to_address": config_mod.address_for(self.recipient, self.cfg.fleet_domain)}
+        prepare_failure(self.cfg, self.state_dir, self.logical_id, self.gen, self.link,
+                        entry_id, parsed, recipient=self.recipient, composed=composed,
+                        digests=digests)
+        got = place(self.cfg, self.state_dir, self.logical_id, self.gen, self.link, entry_id,
+                    attachment_cap=self.attachment_cap)
+        return {PUBLISHED_WAITING_REMOVE: "placed"}.get(got, got and got.lower())
+
+    def _log_unmatched(self, entry_id: str, rec: Optional[Dict[str, Any]]) -> None:
+        first = parse_utc_ts(rec.get("first_seen_ts")) if rec else None
+        age = (self.now - first).total_seconds() if first is not None else 0
+        (logger.warning if age < READ_REFUSAL_STALE_S else logger.error)(
+            "ingress %s/%s: entry %r: a failure report this router cannot match to its "
+            "own transaction (for %ds); held, re-checked every pump", self.logical_id,
+            self.gen, entry_id, age)
 
     def _snapshot(self, entry_id: str, parsed: Dict[str, Any],
                   digests: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2023,6 +2487,8 @@ class Pump:
             self.jw(entry_id, PUBLISHED_WAITING_REMOVE)
         elif st == QUARANTINED_COMPLETE:
             self.jw(entry_id, QUARANTINED_WAITING_REMOVE)
+        elif st == SUPPRESSED_COMPLETE:
+            self.jw(entry_id, SUPPRESSED_WAITING_REMOVE)
         return "duplicate"
 
 
@@ -2052,7 +2518,8 @@ REMOVER_NOT_OFFERED = "not_offered"
 REMOVER_AVAILABLE = "available"
 REMOVER_HELD = "held"
 WAITING_REMOVE = {PUBLISHED_WAITING_REMOVE: COMPLETE,
-                  QUARANTINED_WAITING_REMOVE: QUARANTINED_COMPLETE}
+                  QUARANTINED_WAITING_REMOVE: QUARANTINED_COMPLETE,
+                  SUPPRESSED_WAITING_REMOVE: SUPPRESSED_COMPLETE}
 HOLD_REMOVE_PROTOCOL = "hop_remove_protocol"
 HOLD_REMOVE_LISTING_TOO_LARGE = "hop_remove_listing_too_large"
 HOLD_OBJECT_CLOSED = "hop_object_closed"
@@ -2167,6 +2634,11 @@ def advance_removal(pump: "Pump", now: datetime, horizon_s: int) -> None:
             if age is not None and age >= horizon_s:
                 drop_tombstone(pump.state_dir, pump.logical_id, pump.gen, "notice", key)
                 pump.count("tombstone_dropped")
+    # The failure-report reservations, with the SAME horizon as the
+    # tombstones (`horizon_s` is config.ingress_dedup_horizon_days): never
+    # before an owner's tombstone could have gone.
+    if sweep_reservations(pump.state_dir, pump.logical_id, horizon_s, now):
+        pump.count("reservations_swept")
 
 
 def sweep_quarantine(state_dir: Path, logical_id: str, gen: str, days: int,
@@ -2251,6 +2723,20 @@ def reset_traversal(key: tuple) -> None:
 
 #: (state_dir, logical_id, gen) -> why inbound is latched off for the process.
 _LINK_LATCHED: Dict[tuple, str] = {}
+
+#: (state_dir, logical_id, gen) -> {journal key: {reason, since, since_ts}}:
+#: the entries whose reads decide nothing (the runtime's own refusal class,
+#: or an OSError), until a read decides. Process state, like the cursors.
+READ_REFUSALS: Dict[tuple, Dict[str, Dict[str, Any]]] = {}
+#: How long a no-decision read stays a WARNING before it is an ERROR (the
+#: same bound as a hop retry's: `inflight.STALE_AFTER_S`).
+READ_REFUSAL_STALE_S = 3600
+
+
+def _clock() -> float:
+    """The read-refusal ages' clock: the hop half's, which tests replace."""
+    from . import hoplink as hoplink_mod
+    return hoplink_mod._clock()
 
 
 def pump_generation(pump: Pump, *, listing_too_large: Any = (),
@@ -2491,6 +2977,20 @@ def status_doc(cfg: Any, last_pump: Optional[Dict[str, Dict[str, int]]] = None
         "ingress_dedup_horizon_s": cfg.ingress_dedup_horizon_days * 86400,
         "inbound": "on" if (cfg.hop is not None and cfg.hop.link is not None) else "off",
         "generations": {}, "last_pump": dict(last_pump or {})}
+    control = quarantine_mod.control_dir_for(cfg)
+    if control is not None:
+        # COUNT-ONLY: the downstream runtime's items, listed read-only;
+        # "expired" is past this router's report threshold (its owner sweeps).
+        items = quarantine_mod.list_control(control, days=cfg.ingress_quarantine_days)
+        ages = [i.age_s for i in items if i.age_s is not None]
+        out["control"] = {
+            "items": len(items),
+            "expired": sum(1 for i in items if i.expires_in_s is not None
+                           and i.expires_in_s <= 0),
+            "in_flight": sum(1 for i in items if i.meta.get("in_flight")),
+            "damaged": sum(1 for i in items if i.damaged is not None),
+            "oldest_age_s": max(ages) if ages else None,
+            "report_threshold_s": cfg.ingress_quarantine_days * 86400}
     try:
         lids = sorted(n for n in os.listdir(state_dir) if _GEN_RE.fullmatch(n))
     except FileNotFoundError:
@@ -2552,11 +3052,20 @@ def status_doc(cfg: Any, last_pump: Optional[Dict[str, Dict[str, int]]] = None
             rs = REMOVER_STATE.get((str(state_dir), lid, gen))
             if rs is not None:
                 entry["remover"] = rs
+            refusals = READ_REFUSALS.get((str(state_dir), lid, gen)) or {}
+            if refusals:
+                now = _clock()
+                reasons: Dict[str, int] = {}
+                for r in refusals.values():
+                    reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+                entry["read_refusals"] = {
+                    "count": len(refusals), "reasons": reasons,
+                    "oldest_age_s": int(max(now - r["since"] for r in refusals.values()))}
             high = LISTING_ENTRIES_HIGH.get((str(state_dir), lid, gen))
             if high is not None:
                 entry["listing_entries_high"] = {"count": high, "label": LISTING_PROXY_LABEL}
             if any(entry[k] for k in ("states", "quarantine", "snapshots", "damaged")) \
                     or entry["link_pinned"] or latched or high is not None \
-                    or rs is not None:
+                    or rs is not None or refusals:
                 out["generations"][f"{lid}/{gen}"] = entry
     return out

@@ -26,10 +26,10 @@ def facts(**kw):
 
 class ClassifyTests(unittest.TestCase):
 
-    def outcome(self, doc):
+    def outcome(self, doc, **kw):
         try:
             return ingress.classify_facts(doc, link=LINK, fleet_hosts=FLEET,
-                                          trusted_fleet_hosts=TRUSTED)
+                                          trusted_fleet_hosts=TRUSTED, **kw)
         except ingress.FactsInvalid as e:
             self.fail(f"refused as invalid: {e}")
 
@@ -44,13 +44,24 @@ class ClassifyTests(unittest.TestCase):
     def test_row_8_untrusted_fleet_mail_is_placed(self):
         self.assertEqual(self.outcome(facts()), (ingress.PLACE, None))
 
-    def test_row_1_a_failure_notice_is_held(self):
+    def test_row_1_a_failure_notice_goes_to_the_matcher(self):
         self.assertEqual(self.outcome(facts(notice_class="failure_notice")),
-                         (ingress.HOLD, ingress.HELD_FAILURE_NOTICE))
+                         (ingress.FAILURE, None))
 
-    def test_row_2_a_bound_reply_is_held(self):
+    def test_row_2_a_reply_goes_to_the_matcher(self):
         self.assertEqual(self.outcome(facts(in_reply_to={"message_id": "<a@b>"})),
-                         (ingress.HOLD, ingress.HELD_BOUND_REPLY))
+                         (ingress.REPLY, None))
+
+    def test_an_unmatched_reply_is_classified_as_mail_without_one(self):
+        irt = {"message_id": "<a@b>"}
+        for kw, want in (({}, (ingress.PLACE, None)),
+                         ({"origin_host": "fleet-a.example"},
+                          (ingress.QUARANTINE, "cold_fleet_mail")),
+                         ({"admission": "open", "origin_host": None},
+                          (ingress.HOLD, ingress.HELD_NOT_PLACEABLE))):
+            with self.subTest(**{k: str(v) for k, v in kw.items()}):
+                self.assertEqual(self.outcome(facts(in_reply_to=irt, **kw),
+                                              reply_unmatched=True), want)
 
     def test_row_3_open_admission_is_not_placeable(self):
         self.assertEqual(self.outcome(facts(admission="open", origin_host=None)),
@@ -75,20 +86,34 @@ class ClassifyTests(unittest.TestCase):
                                             admission_link="link-b")),
                          (ingress.HOLD, ingress.HELD_LINK_MISMATCH))
 
-    def test_open_admission_from_a_fleet_origin_is_row_3(self):
+    def test_the_link_integrity_row_comes_before_open_admission(self):
         self.assertEqual(self.outcome(facts(admission="open", origin_host=None,
                                             admission_link="link-b")),
-                         (ingress.HOLD, ingress.HELD_NOT_PLACEABLE))
+                         (ingress.HOLD, ingress.HELD_LINK_MISMATCH))
 
-    def test_a_bound_reply_from_a_trusted_host_is_row_2(self):
+    def test_a_reply_pre_empts_only_the_cold_rows(self):
         self.assertEqual(self.outcome(facts(origin_host="fleet-a.example",
                                             in_reply_to={"message_id": "<a@b>"})),
-                         (ingress.HOLD, ingress.HELD_BOUND_REPLY))
+                         (ingress.REPLY, None), "row 6 (cold) is pre-empted")
+        self.assertEqual(self.outcome(facts(admission="open", origin_host=None,
+                                            in_reply_to={"message_id": "<a@b>"})),
+                         (ingress.REPLY, None), "row 3 (cold) is pre-empted")
+        self.assertEqual(self.outcome(facts(in_reply_to={"message_id": "<a@b>"},
+                                            admission_link="link-b")),
+                         (ingress.HOLD, ingress.HELD_LINK_MISMATCH),
+                         "the link integrity row is NOT pre-empted")
 
-    def test_a_failure_notice_is_row_1_whatever_else_it_says(self):
+    def test_a_failure_notice_pre_empts_only_the_cold_rows(self):
         self.assertEqual(self.outcome(facts(notice_class="failure_notice",
                                             origin_host="fleet-a.example")),
-                         (ingress.HOLD, ingress.HELD_FAILURE_NOTICE))
+                         (ingress.FAILURE, None))
+        self.assertEqual(self.outcome(facts(notice_class="failure_notice",
+                                            origin_host="elsewhere.example")),
+                         (ingress.FAILURE, None), "row 7 (cold) is pre-empted")
+        self.assertEqual(self.outcome(facts(notice_class="failure_notice",
+                                            admission_link="link-b")),
+                         (ingress.HOLD, ingress.HELD_LINK_MISMATCH),
+                         "the link integrity row is NOT pre-empted")
 
     # -- outside the enums: notice_invalid, never a row -----------------
 

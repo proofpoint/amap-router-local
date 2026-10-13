@@ -197,8 +197,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_qs.add_argument("id", help="the item id")
     for p in (p_ql, p_qs):
         p.add_argument("--control-dir", type=Path, default=None,
-                       help="the .control/ intake to list too (read-only; its path is not "
-                            "configured yet)")
+                       help="the .control/ intake to list too, for a router WITHOUT `hop` "
+                            "(read-only); with `hop` it is <hop.root>/.control/ and this "
+                            "option is refused")
 
     return parser
 
@@ -222,21 +223,31 @@ def _quarantine(cfg, args) -> int:
         return quarantine_mod.list_ingress(cfg.state_dir, lid, name,
                                            days=cfg.ingress_quarantine_days)
 
+    derived = quarantine_mod.control_dir_for(cfg)
+    if derived is not None and args.control_dir is not None:
+        print(f"router: quarantine: --control-dir is refused with `hop` configured: the "
+              f".control/ intake is {derived}", file=sys.stderr)
+        return 1
+    control_dir = derived if derived is not None else args.control_dir
+
+    def control():
+        return quarantine_mod.list_control(control_dir, days=cfg.ingress_quarantine_days)
+
     try:
         if args.quarantine_command == "list":
             names = [args.name] if args.name else sorted(cfg.instances)
             items = [i for n in names for i in ingress(n)]
-            if args.control_dir is not None:
-                items += quarantine_mod.list_control(args.control_dir)
+            if control_dir is not None:
+                items += control()
             for item in items:
                 print(quarantine_mod.render_line(item))
             return 0
         if args.source == "control":
-            if args.name != "-" or args.generation != "-" or args.control_dir is None:
+            if args.name != "-" or args.generation != "-" or control_dir is None:
                 print("router: quarantine show: a control entry is NAME - and GEN -, and "
-                      "needs --control-dir", file=sys.stderr)
+                      "needs `hop` (or --control-dir without it)", file=sys.stderr)
                 return 1
-            items = quarantine_mod.list_control(args.control_dir)
+            items = control()
         else:
             items = [i for i in ingress(args.name) if i.generation == args.generation]
     except KeyError as e:

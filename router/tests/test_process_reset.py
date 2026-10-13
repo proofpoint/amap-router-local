@@ -34,7 +34,7 @@ CONSTANTS = {
                 "NOT_WRITE_REASONS", "PROCESS_STATE", "HOLD_HINTS"},
     "inflight": {"_RECORD_KEYS"},
     "ingress": {"TRANSITIONS", "_STATUS_DETAIL", "_V1_REQUIRED", "_V1_OPTIONAL",
-                "WAITING_REMOVE"},
+                "WAITING_REMOVE", "FAILURE_SUBJECT", "_STATUS_SUBJECT"},
     "outcomes": {"_DSN_MEANING"},
     "provision": {"LANE_LEAVES"},
     "registry": {"_CONFUSABLES"},

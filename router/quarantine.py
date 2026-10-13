@@ -65,11 +65,15 @@ progress: listed IN FLIGHT and not read. Any other link count is DAMAGED.
 The writer commits `candidate.json` LAST, so a 32-hex directory without one
 is not yet an item: listed IN FLIGHT, and nothing in it is read, never
 DAMAGED. `.stage` is the writer's own stage and is not listed. The
-intake's path is the inbound step's to configure; until then the CLI takes
-it as `--control-dir`.
+intake's path is DERIVED, `<hop.root>/.control/`, whenever `hop` is
+configured (a second key could disagree with the hop root); `--control-dir`
+names it only for a router without `hop`.
 
 RETENTION: `ingress_quarantine_days` (config, default 14). `list` shows each
-item's age and how long until its writer's sweep removes it.
+item's age and how long until its writer's sweep removes it. For the
+`.control/` intake that number is this router's REPORT THRESHOLD only: the
+items are the downstream runtime's, which owns their sweep (never sooner
+than this threshold), and this router never removes one.
 """
 
 from __future__ import annotations
@@ -367,9 +371,20 @@ def _list_generation(lid_fd: int, gen_name: str, gen: str, name: str, days: int,
         os.close(gen_fd)
 
 
-def list_control(control_dir: Path, *, now: Optional[str] = None) -> List[Item]:
+def control_dir_for(cfg: Any) -> Optional[Path]:
+    """The `.control/` intake: `<hop.root>/.control/` when `hop` is
+    configured, else None (module docstring)."""
+    hop = getattr(cfg, "hop", None)
+    return None if hop is None else Path(hop.root) / ".control"
+
+
+def list_control(control_dir: Path, *, now: Optional[str] = None,
+                 days: Optional[int] = None) -> List[Item]:
     """Every entry in the `.control/` intake, metadata only (module
-    docstring). Never moves, opens for writing, or deletes anything."""
+    docstring). Never moves, opens for writing, or deletes anything. With
+    `days` (the report threshold), each item's `expires_in_s` is how long
+    until it counts as expired; at or below zero it IS expired, reported and
+    left for its owner's sweep."""
     now_dt = _now(now)
     try:
         c_fd = _open_dir(str(control_dir))
@@ -380,7 +395,10 @@ def list_control(control_dir: Path, *, now: Optional[str] = None) -> List[Item]:
         for entry in sorted(os.listdir(c_fd)):
             if entry == STAGE_NAME:
                 continue    # the writer's own stage, never an item
-            out.append(_control_item(c_fd, entry, now_dt))
+            item = _control_item(c_fd, entry, now_dt)
+            if days is not None and item.age_s is not None:
+                item.expires_in_s = days * 86400 - item.age_s
+            out.append(item)
         return out
     finally:
         os.close(c_fd)
@@ -428,7 +446,11 @@ def render_line(item: Item) -> str:
     if item.source == SOURCE_CONTROL and item.meta.get("in_flight"):
         return f"{item.key()} IN FLIGHT ({item.meta['why']})"
     if item.source == SOURCE_CONTROL:
-        return f"{item.key()} candidate age={item.age_s}s bytes={item.meta['candidate_bytes']}"
+        line = f"{item.key()} candidate age={item.age_s}s bytes={item.meta['candidate_bytes']}"
+        if item.expires_in_s is not None:
+            line += (f" expires_in={item.expires_in_s}s" if item.expires_in_s > 0
+                     else " expired (its writer sweeps it)")
+        return line
     causes = ",".join(item.doc["causes"])  # vocabulary-checked: printable as is
     left = (f"expires_in={item.expires_in_s}s" if item.expires_in_s > 0
             else "expired (awaiting its sweep)")

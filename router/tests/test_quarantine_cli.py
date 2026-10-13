@@ -9,10 +9,11 @@ import errno
 import io
 import json
 import os
+import time
 import unittest
 from unittest import mock
 
-from router import __main__ as cli, generations, quarantine, service
+from router import __main__ as cli, generations, ingress, quarantine, service
 from router.status import StatusTracker
 from router.tests.helpers import gen_state, keyed_for_poll
 from router.tests.test_generations import LIDS, _Gens
@@ -371,3 +372,57 @@ class ControlTests(_Q):
                      ("show", "-", "control", "-", ID1)):
             with self.subTest(argv=argv):
                 self.assertEqual(self.run_cli(*argv)[0], 1)
+
+
+class DerivedControlTests(_Q):
+    """With `hop`, the `.control/` intake is `<hop.root>/.control/`: listed
+    without any option, `--control-dir` refused beside it, an item past the
+    report threshold reported `expired` (never removed), and counted in the
+    ingress status, count-only."""
+
+    def setUp(self):
+        super().setUp()
+        from dataclasses import replace
+        from router import config as config_mod
+        from router.tests import helpers
+        hop_root = self.tmp / "hop"
+        self.control = hop_root / ".control"
+        self.control.mkdir(parents=True)
+        self.cfg = replace(self.cfg, hop=config_mod.HopConfig(
+            root=str(hop_root), peer_uid=0, version_write=1,
+            caps=tuple(helpers.TEST_HOP_CAPS.items())))
+
+    def candidate(self, name, age_s=0):
+        d = self.control / name
+        d.mkdir()
+        (d / "candidate.json").write_bytes(b'{"x": 1}')
+        if age_s:
+            t = time.time() - age_s
+            os.utime(d / "candidate.json", (t, t))
+
+    def test_listed_from_the_derived_path_without_an_option(self):
+        self.candidate(ID1)
+        code, out, _ = self.run_cli("list")
+        self.assertEqual(code, 0)
+        self.assertIn(f"- control - {ID1} candidate age=", out)
+        code, out, _ = self.run_cli("show", "-", "control", "-", ID1)
+        self.assertEqual(code, 0, "show needs no option with hop")
+
+    def test_the_option_is_refused_beside_hop_naming_the_derived_path(self):
+        code, _out, err = self.run_cli("list", "--control-dir", str(self.tmp / "elsewhere"))
+        self.assertEqual(code, 1)
+        self.assertIn(str(self.control), err)
+
+    def test_past_the_threshold_it_is_reported_expired_and_left(self):
+        threshold = self.cfg.ingress_quarantine_days * 86400
+        self.candidate(ID1, age_s=threshold + 60)
+        self.candidate(ID2, age_s=60)
+        _code, out, _ = self.run_cli("list")
+        lines = {line.split()[3]: line for line in out.splitlines() if " control " in line}
+        self.assertIn("expired", lines[ID1])
+        self.assertIn("expires_in=", lines[ID2])
+        self.assertTrue((self.control / ID1).exists(), "an expired item was removed")
+        doc = ingress.status_doc(self.cfg)["control"]
+        self.assertEqual((doc["items"], doc["expired"], doc["report_threshold_s"]),
+                         (2, 1, threshold))
+        self.assertNotIn(ID1, json.dumps(doc), "an item id reached status")
