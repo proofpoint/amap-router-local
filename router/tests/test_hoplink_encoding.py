@@ -57,6 +57,26 @@ class RefusalReasonTests(unittest.TestCase):
         self.assertEqual(hoplink.canonical([True, False, None, {}, []]), b"[true,false,null,{},[]]")
 
 
+class DepthTests(unittest.TestCase):
+    """The deep-nesting rows. The shared vectors' encoding row is at depth
+    32 exactly, within both implementations; neither ENCODER caps depth.
+    Depth 33 is refused only by the plugin's strict DECODER ("too_deep"),
+    which runs before this router ever sees a document, so the 33 row is
+    the decoder's: here it encodes."""
+
+    def test_depth_32_encodes_to_its_exact_bytes(self):
+        v = 0
+        for _ in range(32):
+            v = [v]
+        self.assertEqual(hoplink.canonical(v), b"[" * 32 + b"0" + b"]" * 32)
+
+    def test_depth_33_is_not_an_encoding_refusal(self):
+        v = 0
+        for _ in range(33):
+            v = [v]
+        self.assertEqual(hoplink.canonical(v), b"[" * 33 + b"0" + b"]" * 33)
+
+
 class AddressTests(unittest.TestCase):
 
     def test_octet_boundaries(self):

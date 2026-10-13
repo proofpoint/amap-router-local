@@ -1,7 +1,26 @@
 """`ingress.check_facts`: this router's additional strict check over the
 facts, verdict-identical with the plugin's reader (member names and
 grammars only). One witness per rule, each beside the valid twin it is
-measured against; every refusal is FactsInvalid (notice_invalid)."""
+measured against; every refusal is FactsInvalid (notice_invalid).
+
+VERDICT IDENTITY, and where it is measured. Run offline over the codec
+owner's facts-version-2 corpus at its merged head, this check agreed on
+valid-versus-refused in every case but one, which does not apply here (a
+read without the spool; this router always reads it). Recorded beside it,
+so neither reads as a gap:
+
+  * version-1 facts CARRYING `attachments` are refused here at the
+    version guard and there at the version-1 closed schema: the same
+    verdict, no difference (Opus N1, as corrected).
+  * a spool that is not JSON or not an object, and a present null
+    `attachments` on the notice or the spool, are refused here at the
+    BUNDLE layer (`bundle_invalid`, a re-read hold) where the plugin's
+    reader says notice_invalid. The reader refuses such a bundle first, so
+    this router never sees one; the difference is of layer, not of
+    outcome reaching an agent.
+
+The corpus rows themselves stay PENDING to the fixture upgrade; nothing of
+the private corpus is copied into this repository."""
 from __future__ import annotations
 
 import base64
