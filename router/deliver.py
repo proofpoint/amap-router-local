@@ -76,12 +76,14 @@ mailbox content is: `router reset` (see this package's README, "Reset").
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from . import attachments as attachments_mod
 from . import audit as audit_mod
 from . import binding
+from . import config as config_mod
 from . import exposure as exposure_mod
 from . import generations as generations_mod
 from .config import (RouterConfig, address_for, router_address, state_key, target_hold,
@@ -249,12 +251,16 @@ def _message_and_notice(
     attachments: List[attachments_mod.VerifiedAttachment],
     in_reply_to: Optional[str], provenance: Optional[str],
     extra_message: Optional[Dict[str, Any]] = None,
+    descriptors: Optional[List[Dict[str, Any]]] = None,
 ) -> "tuple[Dict[str, Any], Dict[str, Any]]":
     """The two agent-visible documents for one placement: the message spool
     doc (`inbound-message.schema.json`, identical on both lanes — it does
     not carry `sender_exposure`) and the notice (`deliver-notice` or
     `peer-notice`, differing in `kind`, `mailbox`, `provenance` and the
-    profile's optional members in `extra_message`)."""
+    profile's optional members in `extra_message`). `descriptors`, when
+    given, are the attachment descriptors exactly as both documents carry
+    them (a signed placement's, `_signed_descriptor`), in place of the ones
+    `attachments` would give."""
     message_doc: Dict[str, Any] = {
         "contract_version": "2",
         "notice_id": notice_id,
@@ -265,7 +271,10 @@ def _message_and_notice(
         "to": to_address,
         "subject": subject,
     }
-    if attachments:
+    if descriptors is not None:
+        if descriptors:
+            message_doc["attachments"] = [dict(d) for d in descriptors]
+    elif attachments:
         message_doc["attachments"] = [
             _attachment_descriptor(att, i, notice_id, with_content_ref=True)
             for i, att in enumerate(attachments)
@@ -282,7 +291,10 @@ def _message_and_notice(
         message_field["provenance"] = provenance
     if in_reply_to:
         message_field["in_reply_to"] = in_reply_to
-    if attachments:
+    if descriptors is not None:
+        if descriptors:
+            message_field["attachments"] = [dict(d) for d in descriptors]
+    elif attachments:
         # `content_ref` IS emitted here, and this is a v3.0.0 correction
         # rather than a preference. It used to be omitted, deliberately:
         # emission is a MAY, and this router would not assert a grant at a
@@ -676,3 +688,122 @@ def deliver_router_notice(
         audit_line=audit_line, audit_instance=recipient,
     )
     return {"notice_id": notice_id, "message_id": message_id, "recipient": recipient}
+
+
+# ---------------------------------------------------------------------------
+# Signed cross-host peer tasks
+# ---------------------------------------------------------------------------
+
+#: The notice grammar a published peer message id (and `in_reply_to`) must
+#: match (peer-notice `message.id`): a leading `-` is not publishable.
+_NOTICE_MESSAGE_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+DISPOSITION_CLEAN = "clean"
+DISPOSITION_STRIPPED = "stripped"
+DISPOSITION_UNSCANNED = "unscanned"
+
+
+def signed_dispositions(cfg: RouterConfig, sizes: List[int]) -> List[str]:
+    """Each signed attachment's disposition, by index. This router's own
+    caps decide first (an index beyond `attachment_max_count`, over
+    `attachment_max_bytes`, or crossing `attachment_max_total_bytes` is
+    `stripped`; the total counts only bytes actually published); the
+    deployment's basis decides the rest: `clean` under
+    `delegation.attachment_basis` "closed_fleet", otherwise `unscanned`. The
+    declared media type never enters it: this router sniffs nothing and
+    keys no policy on a type."""
+    basis = getattr(cfg.delegation, "attachment_basis", None) if cfg.delegation else None
+    out, published_total = [], 0
+    for i, size in enumerate(sizes):
+        if (i >= cfg.attachment_max_count or size > cfg.attachment_max_bytes
+                or published_total + size > cfg.attachment_max_total_bytes):
+            out.append(DISPOSITION_STRIPPED)
+        elif basis == config_mod.ATTACHMENT_BASIS_CLOSED_FLEET:
+            out.append(DISPOSITION_CLEAN)
+            published_total += size
+        else:
+            out.append(DISPOSITION_UNSCANNED)
+    return out
+
+
+def _signed_descriptor(att: attachments_mod.SignedAttachment, index: int,
+                       notice_id: str) -> Dict[str, Any]:
+    """A signed attachment's descriptor: the signed strings exactly; `sha256`
+    and `content_ref` only for `clean` (the schemas' own conditionals)."""
+    doc: Dict[str, Any] = {"filename": att.filename, "media_type": att.media_type,
+                           "size_bytes": att.size_bytes, "disposition": att.disposition}
+    if att.disposition == DISPOSITION_CLEAN:
+        doc["sha256"] = att.sha256
+        doc["content_ref"] = attachments_mod.content_ref_for(notice_id, index)
+    return doc
+
+
+def deliver_signed_peer(cfg: RouterConfig, state_dir: Path, auth: Any, *,
+                        in_reply_to_resolved: Optional[str] = None) -> Dict[str, Any]:
+    """Place a DECIDED signed peer task (`peerbind.resume`'s value, and only
+    that) into its recorded recipient's `peer/` tree. Before anything is
+    written: the seal is checked, the value must be decided, the recipient
+    still configured (`RecipientGone`), the value consistent with its own
+    statement (`RecoveryCorrupt`), and every published id publishable
+    (`Unpublishable`). Nothing here re-decides: no hosting, no key, no time.
+    Idempotent under the recorded notice id: a notice already present is not
+    written again."""
+    from . import peerbind
+    from .ingress import LEDGER_TRANSPORT   # local: ingress imports this module
+    peerbind.check_seal(auth)
+    if auth.origin != peerbind.ORIGIN_DECIDED:
+        raise TypeError("placement needs a persisted decision")
+    recipient = auth.hosted
+    if recipient not in cfg.instances:
+        raise peerbind.RecipientGone(recipient)
+    peerbind.consistency(auth)
+    payload = auth.payload
+    if not _NOTICE_MESSAGE_ID_RE.fullmatch(str(payload.get("id", ""))):
+        raise peerbind.Unpublishable("id", "not in the notice id grammar")
+    if in_reply_to_resolved is not None and not _NOTICE_MESSAGE_ID_RE.fullmatch(
+            in_reply_to_resolved):
+        raise peerbind.Unpublishable("in_reply_to", "not in the notice id grammar")
+    pub = peerbind.published(auth, in_reply_to_resolved=in_reply_to_resolved)
+    _gate(cfg, recipient)
+    recipient_cfg = cfg.instances[recipient]
+    if recipient_cfg.peer_root is None:
+        raise PeerLaneUnavailable(f"instance {recipient!r} has no peer tree")
+    notice_id, ts = auth.notice_id, auth.ts
+    if (recipient_cfg.peer_root / "notices" / f"notice-{notice_id}.json").exists():
+        return {"notice_id": notice_id, "message_id": pub["id"], "recipient": recipient,
+                "placed": False}
+    dispositions = signed_dispositions(cfg, [len(a) for a in auth.attachments])
+    signed = [attachments_mod.SignedAttachment(
+        filename=d["filename"], media_type=d["media_type"], size_bytes=d["size_bytes"],
+        sha256=d["sha256"], data=data, disposition=disp)
+        for d, data, disp in zip(pub["attachments"], auth.attachments, dispositions)]
+    descriptors = [_signed_descriptor(a, i, notice_id) for i, a in enumerate(signed)]
+    extra = {"sender_exposure": pub["sender_exposure"]} if "sender_exposure" in pub else None
+    message_doc, notice_doc = _message_and_notice(
+        notice_id=notice_id, message_id=pub["id"], ts=ts, kind=KIND_PEER, mailbox="peer",
+        from_address=pub["from"], to_address=pub["to"], subject=pub["subject"],
+        body_text=pub["body_text"], attachments=[], in_reply_to=pub.get("in_reply_to"),
+        provenance=None, extra_message=extra, descriptors=descriptors)
+    ledger_bytes = binding.record_delivery(
+        state_dir, notice_id=notice_id, from_instance=None, from_address=pub["from"],
+        to_instance=recipient, ts=ts, req_id="", message_id=pub["id"],
+        transport=LEDGER_TRANSPORT, tree=TREE_PEER)
+    ledger_bytes = _stamp_ids(cfg, ledger_bytes, None, recipient)
+    audit_line = audit_mod.build_line(
+        audit_mod.EVENT_PEER_NOTICE_PLACED, recipient, {
+            "notice_id": notice_id, "message_id": pub["id"], "tree": TREE_PEER,
+            "from": pub["from"], "to": pub["to"], "from_instance": None,
+            "to_instance": recipient, "req_id": "", "in_reply_to": pub.get("in_reply_to"),
+            "reply_basis": "ledger" if pub.get("in_reply_to") else None,
+            "sender_exposure": pub.get("sender_exposure"), "origin": "fleet",
+            "signature_verdict": "verified", "key_id": auth.key_id, "runtime": auth.runtime,
+            "demotion_cause": None,
+        })
+    _place(
+        cfg=cfg, root=recipient_cfg.root, tree_root=recipient_cfg.peer_root, state_dir=state_dir,
+        recipient=recipient, notice_id=notice_id, recipient_key=state_key(cfg, recipient),
+        message_doc=message_doc, notice_doc=notice_doc, ledger_bytes=ledger_bytes,
+        attachments=[a if a.disposition == DISPOSITION_CLEAN else None for a in signed],
+        audit_line=audit_line, audit_instance=recipient,
+    )
+    return {"notice_id": notice_id, "message_id": pub["id"], "recipient": recipient,
+            "placed": True}

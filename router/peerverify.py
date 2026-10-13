@@ -28,10 +28,14 @@ from . import peerlane
 @dataclass(frozen=True)
 class Verified:
     """Checks 1 and 3-5 passed and check 2 found nothing: the statement's
-    `kind`, its decoded `payload`, and the configured `key` that signed it."""
+    `kind`, its decoded `payload`, the configured `key` that signed it, the
+    `key_id` it was selected by (`k`, which check 5 proved equals the
+    statement's), and the exact signed `statement` bytes."""
     kind: str
     payload: Any
     key: Any
+    key_id: str
+    statement: bytes
 
 
 @dataclass(frozen=True)
@@ -64,4 +68,4 @@ def verify(fields: Iterable[Tuple[str, Any]], *, delegation: "peerlane.Delegatio
         if peerlane.error_kind(delegation, e) == "CodecError":
             return Refused(e.reason)
         raise
-    return Verified(kind, payload, key)
+    return Verified(kind, payload, key, k, statement)

@@ -107,6 +107,25 @@ class VerifiedAttachment:
     data: bytes
 
 
+@dataclass(frozen=True)
+class SignedAttachment:
+    """One attachment of a signed cross-host peer task, published exactly as
+    the verified statement names it. `filename` and `media_type` are the
+    SIGNED strings, never sanitized: they may contain path separators or
+    control characters, and nothing here uses either as a path (the blob is
+    `<notice_id>.attachments/<index>`); escaping belongs to the connector at
+    presentation. `size_bytes`/`sha256` were checked against `data`.
+    `disposition` is `clean` (bytes published), `stripped` (withheld by this
+    router's caps) or `unscanned` (no basis to assert clean)."""
+
+    filename: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    data: bytes
+    disposition: str
+
+
 class AttachmentIngestError(Exception):
     """Raised by `ingest_attachments` for a whole-request outcome. `outcome`
     is `"rejected"` (malformed/mismatched — §4's first path: never a

@@ -1564,7 +1564,7 @@ JSON object this router builds, signs with its own Ed25519 key through the
 plugin, and hands over as envelope kind `"peer"`. Off unless `delegation` is
 configured; then item 5e is on.
 
-**Config** (`delegation`, every member required):
+**Config** (`delegation`; every member required except `attachment_basis`):
 
 ```
 "delegation": {
@@ -1573,14 +1573,18 @@ configured; then item 5e is on.
   "runtimes": [{"name": "...", "runtime": "amap.router@<host>", "domains": ["<host>"],
                 "keys": [{"key_id": "...", "public_key": "<64 hex>",
                           "not_before": "...Z", "not_after": "...Z"}]}],
-  "crypto": {"crypto_backend": "pyca" | "openssl", "openssl_path": "/abs/openssl"}
+  "crypto": {"crypto_backend": "pyca" | "openssl", "openssl_path": "/abs/openssl"},
+  "attachment_basis": "closed_fleet"
 }
 ```
 
 - Without `partition_verified` the config is refused: delegation never runs
   without the deploy's evidence.
 - Each runtime's domains must be trusted fleet hosts (never this router's own
-  domain), and its `runtime` must be `amap.router@` one of them.
+  domain), and its `runtime` must be `amap.router@` one of them. A domain
+  belongs to exactly one runtime (`domain_shared` otherwise).
+- `attachment_basis`, optional: absent, or `"closed_fleet"`, the deployment's
+  basis for asserting `clean` on a signed peer task's attachments (below).
 - `signing_key.path` is in normal form and lexically outside `state_dir`,
   `hop.root`, the registry, the intake directory and every agent-reachable
   root, each compared as configured AND as resolved, by path components.
@@ -1654,6 +1658,67 @@ production path begins one, and an in-flight record pinning one is damaged.
 check 2 (`known`, required), then checks 3-5, each refusal the codec's cause
 token; a local backend fault propagates. The candidate journal and replay
 index that answer check 2 are a later unit's.
+
+**Binding checks and placement** (`router/peerbind.py`, public;
+`deliver.deliver_signed_peer`). After verification, `peerbind.bind` runs the
+profile's checks 6 (the domain of `from` is one of the domains this router's
+config lists for the runtime owning the key), 7 and 8 (supplied by the
+caller, required), 9 (the body decodes strictly as `utf-8` or `us-ascii`, an
+absent label meaning `us-ascii`, then CRLF -> LF, and hashes to
+`body_sha256`), 10 (the attachment count, then each index's size and
+digest) and 11 (exactly one `Message-ID`, exactly `<id@domain-of-from>`,
+folding removed and its whitespace kept); the first failure decides, as one
+of `key_domain`, `body_charset`, `body_digest`, `attachment_count`,
+`attachment_digest`, `message_id`. `peerbind.hosting` decides whether `to`
+is hosted here: an exact local part at the fleet domain (compared ASCII
+case-insensitively), or an ACTIVE alias; a registry-held target, an alias
+without a decision or an unverifiable one is undecided, never misrouted.
+Unlike the mail lane's resolver, the local part compares exactly, as the
+profile compares addresses. A peer domain belongs to exactly one configured
+runtime: `delegation.runtimes` listing one domain twice is refused at load
+(`domain_shared`).
+
+A placement needs a PERSISTED decision. `authorise` yields a sealed fresh
+value; `confirm` re-checks it against the current configuration;
+`decision_record` turns a confirmed one into the decision's bytes, MAC'd
+under `state_dir/peer-decision.key` (32 bytes, 0600, created once at
+activation and made durable before use; never rotated; a reset leaves it,
+and the candidate journal, alone); `commit_decision` links those bytes into
+`<state_dir>/<logical_id>/peer-candidates/<key>/decision.json` without ever
+replacing a file, makes every step durable, reads them back, and only then
+returns a receipt; `resume` takes only a receipt, re-reads the file through
+it, and yields the decided value `deliver_signed_peer` requires. After a
+restart `reopen_decision` gives the receipt from the file on disk. A decided
+record is resumed as recorded: nothing re-decides it, and any mismatch is a
+visible hold (`RecoveryCorrupt`), never a different disposition. Sealed
+values cannot be pickled and do not outlive the process. These are
+cooperative guarantees: code in this process that reads a private key can
+forge, and nothing else can by mistake.
+
+What a placement publishes comes from the verified statement, never from
+headers: `message.id` (the sender's id, not the notice id), `from`, the
+spool's `to`, `subject`, `sender_exposure` as signed, the body text check 9
+produced, and each attachment's `filename`, `media_type` and `size_bytes`.
+`in_reply_to` is published only when the caller resolved it from its own
+ledger; `references` never. A signed `filename` or `media_type` is
+published EXACTLY: it may contain path separators, CR/LF, NUL or bidi
+controls, and nothing here uses it as a path (the bytes live at
+`<notice_id>.attachments/<index>`); escaping belongs to the connector. An
+id the notice grammar cannot carry (a leading `-`) is held as
+`Unpublishable`, never rewritten.
+
+The bytes stay under core §5. A signature authenticates a sender; it is not
+a verdict on the bytes. This router asserts `clean` for a signed
+attachment only on the deployment's explicit basis,
+`delegation.attachment_basis: "closed_fleet"` (every trusted fleet host is
+operator-supervised and no external sender reaches the peer lane); without
+it every signed attachment is `unscanned` and no bytes, `sha256` or
+`content_ref` are published. This router's caps decide first: an index
+beyond `attachment_max_count`, over `attachment_max_bytes`, or crossing
+`attachment_max_total_bytes` (counting only bytes actually published) is
+`stripped`. Only the cap values are shared with the local lane, which
+refuses a whole request at a cap. No type is sniffed and no policy keys on
+a type, so the declared `media_type` never changes a disposition.
 
 **Disposal tombstones.** For a host-intake candidate (`.unresolved/`,
 `.control/`) the receiving side commits a tombstone under
