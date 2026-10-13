@@ -115,6 +115,7 @@ result is never read; the agent's outbox was emptied by the same reset.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import logging
@@ -313,35 +314,31 @@ def read_snapshot(cfg: RouterConfig, name: str, req_id: str,
     `attachments`): every directory and blob opened no-follow, each blob a
     regular file with one link, EXACTLY `size_bytes` long (read with a
     one-byte lookahead) and of digest `sha256`. The bound is the RECORD's,
-    never the current config's. Raises `SnapshotDamaged`."""
+    never the current config's. Raises `SnapshotDamaged` ONLY for what the
+    snapshot itself shows (absent, a link, not a directory, not a regular
+    file, the wrong size or digest); any other error (EMFILE, EIO, ENOMEM,
+    EACCES, ...) propagates, so the poll is retried rather than the request
+    settled or the generation held."""
     gen = config_mod.gen_state_dir(cfg, name)
-    try:
-        gen_fd = _open_dir_nofollow(gen)
-    except FileNotFoundError:
-        raise SnapshotDamaged("missing", f"{gen}: no generation directory") from None
-    except OSError as e:
-        raise SnapshotDamaged("not_a_directory", f"{gen}: {e.strerror}") from None
+    gen_fd = _open_snapshot_dir(None, str(gen), str(gen))
     fds = [gen_fd]
     try:
         cur = gen_fd
         for part in (SNAPSHOT_DIR, req_id):
-            kind, fd = _pin_child(cur, part)
-            if kind == "missing":
-                raise SnapshotDamaged("missing", f"{part}: absent")
-            if kind != "dir" or not _own_dir(fd):
-                if fd is not None:
-                    os.close(fd)
-                raise SnapshotDamaged("not_a_directory", f"{part}: not this uid's real directory")
+            fd = _open_snapshot_dir(cur, part, part)
             fds.append(fd)
+            if not _own_dir(fd):
+                raise SnapshotDamaged("not_a_directory", f"{part}: not this uid's directory")
             cur = fd
         out = []
         for i, want in enumerate(expected):
             try:
                 bfd = os.open(str(i), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cur)
-            except FileNotFoundError:
-                raise SnapshotDamaged("missing", f"blob {i}: absent") from None
             except OSError as e:
-                raise SnapshotDamaged("linked", f"blob {i}: {e.strerror}") from None
+                why = _DAMAGE_ERRNO.get(e.errno)
+                if why is None:
+                    raise          # transient: retried next poll, never damage
+                raise SnapshotDamaged(why, f"blob {i}: {e.strerror}") from None
             try:
                 st = os.fstat(bfd)
                 if not stat.S_ISREG(st.st_mode):
@@ -366,6 +363,27 @@ def read_snapshot(cfg: RouterConfig, name: str, req_id: str,
     finally:
         for fd in reversed(fds):
             os.close(fd)
+
+
+#: The open errors that ARE the snapshot's own state; every other errno is
+#: transient and propagates.
+_DAMAGE_ERRNO = {errno.ENOENT: "missing", errno.ELOOP: "linked", errno.ENOTDIR: "not_a_directory"}
+
+
+def _open_snapshot_dir(parent_fd: Optional[int], name: str, label: str) -> int:
+    """A snapshot-path directory, opened `O_DIRECTORY | O_NOFOLLOW`
+    (relative to `parent_fd` when given). Absent is `missing`, a link or a
+    non-directory is `not_a_directory`; any other error propagates."""
+    try:
+        if parent_fd is None:
+            return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            raise SnapshotDamaged("missing", f"{label}: absent") from None
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise SnapshotDamaged("not_a_directory", f"{label}: not a real directory") from None
+        raise
 
 
 def _pin_child(parent_fd: int, part: str) -> "Tuple[str, Optional[int]]":
@@ -405,10 +423,18 @@ def _record_absent(gen_fd: int, req_id: str) -> Optional[bool]:
         os.close(ifd)
 
 
+class SnapshotNotOwned(OSError):
+    """A directory on a snapshot path that is not this uid's: never listed,
+    never deleted. Begin fails (retried next poll); the sweep retains it and
+    counts it uncertain; cleanup leaves it for the sweep."""
+
+
 def _remove_entry(parent_fd: int, entry: str) -> None:
     """Remove one snapshot directory (its blobs, then itself), every step
-    relative to a pinned descriptor and never following a link. A non-
-    directory at that name is unlinked as it is."""
+    relative to a pinned descriptor and never following a link. EVERY
+    directory is checked to be this uid's before it is listed or removed
+    (`SnapshotNotOwned` otherwise, nothing more removed). A non-directory at
+    that name is unlinked as it is."""
     kind, fd = _pin_child(parent_fd, entry)
     if kind == "missing":
         return
@@ -416,6 +442,8 @@ def _remove_entry(parent_fd: int, entry: str) -> None:
         os.unlink(entry, dir_fd=parent_fd)
         return
     try:
+        if not _own_dir(fd):
+            raise SnapshotNotOwned(f"{entry}: not this uid's directory; not removed")
         for child in os.listdir(fd):
             try:
                 os.unlink(child, dir_fd=fd)
@@ -443,6 +471,8 @@ def _remove_snapshot_at(gen: Path, req_id: str) -> None:
                          gen, SNAPSHOT_DIR, req_id)
             return
         try:
+            if not _own_dir(sfd):
+                raise SnapshotNotOwned(f"{SNAPSHOT_DIR}: not this uid's directory")
             _remove_entry(sfd, req_id)
             os.fsync(sfd)
         finally:

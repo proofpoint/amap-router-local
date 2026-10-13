@@ -13,6 +13,17 @@ after; every named test must pass unmutated first, and a mutant is RED only
 when unittest reports a FAILURE of the named test (an ERROR is printed and
 is not red). Exit 0 only when every mutant turns every named test red. Not a
 test module itself (its name keeps it out of discovery).
+
+EQUIVALENT mutants, recorded here and NOT run (each reachable by no input):
+  * `inflight-snapshots/` made by a plain `os.mkdir`, with no parent fsync:
+    the record's own `atomic_write(durable_root=state_dir)` fsyncs every
+    directory from `state_dir` down, the generation directory included
+    (`util._mkdir_durable`), before the record exists, so no power loss can
+    leave a durable record without that entry.
+  * begin applying the hop's per-file or total cap ALONE, where this
+    router's cap is the smaller: ingest has already refused anything over
+    this router's caps before begin runs. The reverse (this router's cap
+    alone, where the hop's is smaller) is J7 and J8.
 """
 import os
 import pathlib
@@ -1241,6 +1252,36 @@ M = [
   '    snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None\n',
   '    snapshot = ([{"size_bytes": a.size_bytes, "sha256": a.sha256} for a in attachments]\n                if attachments else None)\n',
   ["router.tests.test_inflight.LifecycleTests.test_attachments_go_over_the_leg_from_the_router_s_snapshot"]),
+ ('J19 read-back: a transient open error taken as damage', IF,
+  '                if why is None:\n                    raise          # transient: retried next poll, never damage\n',
+  '                if why is None:\n                    why = "linked"\n',
+  [IA + "DamageRowTests.test_a_transient_error_never_handed_over_neither_settles_nor_holds",
+   IA + "DamageRowTests.test_a_transient_error_after_a_hand_over_neither_settles_nor_holds"]),
+ ('J20 begin: the snapshot written after the record', IF,
+  [('    snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None\n',
+    '    snapshot = ([{"size_bytes": a.size_bytes, "sha256": a.sha256} for a in attachments]\n                if attachments else None)\n'),
+   ('    _write_record(cfg, name, req_id, record, "record")\n    return record\n',
+    '    _write_record(cfg, name, req_id, record, "record")\n    if attachments:\n        write_snapshot(cfg, name, req_id, attachments)\n    return record\n')],
+  None, [IA + "PowerLossTests.test_begin_power_loss_at_every_point_keeps_record_and_snapshot_together_nonregression"]),
+ ('J21 damage caught as HandoverUnavailable', IF,
+  [('    except SnapshotDamaged as e:\n        # This router', '    except ArithmeticError as e:\n        # This router'),
+   ('    except (FrontierUndecidable, HandoverUnavailable) as e:\n        # Decided BEFORE',
+    '    except (FrontierUndecidable, HandoverUnavailable, SnapshotDamaged) as e:\n        # Decided BEFORE')],
+  None, [IA + "DamageRowTests.test_damage_after_a_hand_over_holds_the_generation"]),
+ ('J22 the sweep follows a symlinked inflight/', IF,
+  '    kind, ifd = _pin_child(gen_fd, INFLIGHT_DIR)\n',
+  '    kind, ifd = "dir", os.open(INFLIGHT_DIR, os.O_RDONLY | os.O_DIRECTORY, dir_fd=gen_fd)\n',
+  [IA + "SweepTests.test_an_uncertain_lookup_retains_and_counts"]),
+ ('J23 removal: a directory\'s owner not checked', IF,
+  '        if not _own_dir(fd):\n            raise SnapshotNotOwned(f"{entry}: not this uid\'s directory; not removed")\n',
+  '        if False:\n            raise SnapshotNotOwned(f"{entry}: not this uid\'s directory; not removed")\n',
+  [IA + "ForeignOwnerTests.test_the_sweep_keeps_a_foreign_req_dir_and_counts_it",
+   IA + "ForeignOwnerTests.test_begin_refuses_a_foreign_leftover",
+   IA + "ForeignOwnerTests.test_cleanup_leaves_a_foreign_req_dir"]),
+ ('J24 cleanup: the snapshot root\'s owner not checked', IF,
+  '            if not _own_dir(sfd):\n                raise SnapshotNotOwned(f"{SNAPSHOT_DIR}: not this uid\'s directory")\n',
+  '            if False:\n                raise SnapshotNotOwned(f"{SNAPSHOT_DIR}: not this uid\'s directory")\n',
+  [IA + "ForeignOwnerTests.test_cleanup_leaves_a_foreign_snapshot_root"]),
 ]
 
 

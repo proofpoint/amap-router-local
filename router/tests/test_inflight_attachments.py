@@ -11,6 +11,7 @@ after a hand-over holds the generation.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -236,6 +237,48 @@ class DamageRowTests(_Att):
         self.assertFalse(self.has_result(), "settled after a hand-over")
         self.assertTrue(inflight.record_path(self.cfg, "alice", "00000001").exists())
 
+    def _blob_open_fails(self, err):
+        real = os.open
+
+        def failing(path, flags, *a, **k):
+            if (k.get("dir_fd") is not None and path == "0" and not flags & os.O_DIRECTORY
+                    and inflight.SNAPSHOT_DIR in _fd_path(k["dir_fd"])):
+                raise OSError(err, os.strerror(err))
+            return real(path, flags, *a, **k)
+        return mock.patch.object(os, "open", failing)
+
+    def test_a_transient_error_never_handed_over_neither_settles_nor_holds(self):
+        """EMFILE or EIO on the blob open is not damage: nothing is settled,
+        nothing is held, and the next poll hands over."""
+        for err in (errno.EMFILE, errno.EIO):
+            with self.subTest(errno=errno.errorcode[err]):
+                self.tearDown()
+                self.setUp()
+                self.submit([b"good"])
+                with self._blob_open_fails(err):
+                    self.drain()
+                self.assertFalse(self.has_result(), "a transient error settled the request")
+                self.assertIsNone(hoplink.write_hold(self.cfg, "alice"), "a transient error held")
+                self.assertEqual(self.port.writes, [])
+                self.drain()
+                self.assertEqual(self.port.writes, ["00000001"], "the retry did not hand over")
+
+    def test_a_transient_error_after_a_hand_over_neither_settles_nor_holds(self):
+        for err in (errno.EMFILE, errno.EIO):
+            with self.subTest(errno=errno.errorcode[err]):
+                self.tearDown()
+                self.setUp()
+                self.port = _FailOnce()
+                self.submit([b"good"])
+                self.drain()
+                self.assertTrue(inflight.handed_path(self.cfg, "alice", "00000001").exists())
+                with self._blob_open_fails(err):
+                    self.drain()
+                self.assertFalse(self.has_result(), "a transient error settled the request")
+                self.assertIsNone(hoplink.write_hold(self.cfg, "alice"), "a transient error held")
+                self.drain()
+                self.assertIn("00000001", self.port.pending, "the retry did not hand over")
+
     def test_the_hold_reason_is_never_a_write_table_row(self):
         self.assertNotIn(hoplink.HOLD_SNAPSHOT_DAMAGED, hoplink.LATCHED_WRITE_REASONS)
         self.assertNotIn(hoplink.HOLD_SNAPSHOT_DAMAGED, hoplink.LATCHED_WRITE_REASONS.values())
@@ -311,6 +354,16 @@ class ReadBackTests(_Att):
 
 class SweepTests(_Att):
 
+    def fenced_view(self):
+        """A generation directory of its own (another state root), so the
+        current generation's sweep can never be what reaches it."""
+        import dataclasses
+        other = self.tmp / "fenced-state"
+        other.mkdir()
+        view = dataclasses.replace(self.cfg, state_dir=other)
+        self.assertNotEqual(config_mod.gen_state_dir(view, "alice"), self.gen())
+        return view
+
     def plant(self, name, gen=None):
         d = (gen or self.gen()) / inflight.SNAPSHOT_DIR / name
         d.mkdir(parents=True, mode=0o700)
@@ -343,15 +396,83 @@ class SweepTests(_Att):
             self.assertEqual(inflight.sweep_snapshots(self.cfg, "alice"), 1)
         self.assertTrue(odd.exists())
 
+    def test_a_fenced_generation_s_uncertain_count_reaches_the_summary(self):
+        view = self.fenced_view()
+        self.plant("-odd-name", gen=config_mod.gen_state_dir(view, "alice"))
+        with mock.patch.object(outbound, "_fenced_views", lambda c, n: [view]), \
+                self.assertLogs("amap_router_local", level="ERROR"):
+            summary = self.drain()
+        self.assertEqual(summary.get("snapshot_sweep_uncertain"), 1,
+                         "the fenced generation's uncertain count did not reach the summary")
+
     def test_a_fenced_generation_is_swept_records_or_not(self):
-        keys = dict(self.cfg.gen_keys)
-        keys["alice"] = keys.get("alice", "alice") + "-fenced"
-        view = generations.keyed(self.cfg, keys)
+        view = self.fenced_view()
         fgen = config_mod.gen_state_dir(view, "alice")
         orphan = self.plant("00000077", gen=fgen)
         with mock.patch.object(outbound, "_fenced_views", lambda c, n: [view]):
             outbound._drain_fenced(self.cfg, "alice", None)
         self.assertFalse(orphan.exists(), "a fenced generation's orphan was not swept")
+
+
+def _not_owned(target_name):
+    """`inflight._own_dir` as it answers for a directory another uid owns,
+    for the one directory named `target_name` (no root in CI)."""
+    real = inflight._own_dir
+
+    def own(fd):
+        return False if os.path.basename(_fd_path(fd)) == target_name else real(fd)
+    return mock.patch.object(inflight, "_own_dir", own)
+
+
+class ForeignOwnerTests(_Att):
+    """No destructive path lists or deletes a directory this uid does not
+    own: the begin leftover rule raises (retried next poll), the sweep
+    retains and counts, cleanup leaves it for the sweep."""
+
+    def plant(self, name):
+        d = self.gen() / inflight.SNAPSHOT_DIR / name
+        d.mkdir(parents=True, mode=0o700)
+        (d / "0").write_bytes(b"x")
+        return d
+
+    def test_the_sweep_keeps_a_foreign_req_dir_and_counts_it(self):
+        orphan = self.plant("00000099")
+        with _not_owned("00000099"), self.assertLogs("amap_router_local", level="ERROR"):
+            self.assertEqual(inflight.sweep_snapshots(self.cfg, "alice"), 1)
+        self.assertTrue((orphan / "0").exists(), "a foreign directory was emptied")
+
+    def test_the_sweep_keeps_a_foreign_temp_dir(self):
+        tmp = self.plant(".tmp-r98-0123456789abcdef")
+        with _not_owned(".tmp-r98-0123456789abcdef"), \
+                self.assertLogs("amap_router_local", level="ERROR"):
+            self.assertEqual(inflight.sweep_snapshots(self.cfg, "alice"), 1)
+        self.assertTrue((tmp / "0").exists())
+
+    def test_cleanup_leaves_a_foreign_snapshot_root(self):
+        self.submit([b"a"])
+        self.drain()
+        record = inflight.record_path(self.cfg, "alice", "00000001")
+        with _not_owned(inflight.SNAPSHOT_DIR), self.assertLogs("amap_router_local", level="ERROR"):
+            inflight._cleanup(record, inflight.handed_path(self.cfg, "alice", "00000001"))
+        self.assertFalse(record.exists(), "control: the record went")
+        self.assertTrue((self.snap() / "0").exists(), "a foreign snapshot root was descended")
+
+    def test_cleanup_leaves_a_foreign_req_dir(self):
+        self.submit([b"a"])
+        self.drain()
+        record = inflight.record_path(self.cfg, "alice", "00000001")
+        with _not_owned("00000001"), self.assertLogs("amap_router_local", level="ERROR"):
+            inflight._cleanup(record, inflight.handed_path(self.cfg, "alice", "00000001"))
+        self.assertTrue((self.snap() / "0").exists())
+
+    def test_begin_refuses_a_foreign_leftover(self):
+        leftover = self.plant("00000001")
+        self.submit([b"a"])
+        with _not_owned("00000001"):
+            self.drain()
+        self.assertFalse(self.has_result(), "settled instead of retried")
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), [], "a record was begun")
+        self.assertTrue((leftover / "0").exists(), "a foreign leftover was emptied")
 
 
 class PlacementTests(unittest.TestCase):
@@ -507,7 +628,7 @@ class PowerLossTests(_Att):
         return log
 
     def assert_never_a_record_without_its_snapshot(self, log, record, snap):
-        self.assertGreater(len(log.syncs), 2, "control: the barriers were logged")
+        self.assertGreaterEqual(len(log.syncs), 2, "control: the barriers were logged")
         seen_record = False
         for k in range(len(log.syncs) + 1):
             rec = log.present_after(k, record)

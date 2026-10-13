@@ -2924,7 +2924,7 @@ def _fenced_views(cfg: RouterConfig, name: str) -> List[RouterConfig]:
 def _drain_fenced(
     cfg: RouterConfig, name: str, transport: Optional[inflight_mod.TransportPort],
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
-    cold_policy: Optional[ColdPolicy] = None,
+    cold_policy: Optional[ColdPolicy] = None, sweep_uncertain: Optional[List[int]] = None,
 ) -> Set[str]:
     """Step every fenced generation's work. Its in-flight records advance
     under their existing transport ids (a fenced generation never allocates
@@ -2965,8 +2965,11 @@ def _drain_fenced(
             except Exception:
                 logger.exception("instance %r: error stepping fenced in-flight work — "
                                  "isolated, its files stay claimed", name)
-        # Its orphan attachment snapshots, records or not (`_sweep_snapshots`).
-        _sweep_snapshots(view, name)
+        # Its orphan attachment snapshots, records or not (`_sweep_snapshots`);
+        # what could not be decided joins the drain summary's count.
+        n_uncertain = _sweep_snapshots(view, name)
+        if sweep_uncertain is not None:
+            sweep_uncertain.append(n_uncertain)
         # A record whose anchor exists is already answered (an error after the
         # anchor left it behind): it goes, as in the current generation, and
         # its verdict is completed by step 3 below, never replayed here.
@@ -3260,8 +3263,9 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # A fenced generation's work first (its own transport ids, its own
     # snapshots); what it still owns at this root is neither first-sighted
     # nor drained by the current generation.
+    fenced_uncertain: List[int] = []
     fenced_owned = _drain_fenced(cfg, name, fenced_transport, deliver_backend=deliver_backend,
-                                 cold_policy=cold_policy)
+                                 cold_policy=cold_policy, sweep_uncertain=fenced_uncertain)
     marker_doc, first_sight = firstsight.record_first_sight(cfg, name, exclude=fenced_owned)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)
 
@@ -3272,6 +3276,9 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     if transport is not None or inflight_mod.list_records(cfg, name):
         inflight_summary = _advance_inflight(cfg, name, transport, outcomes,
                                              cold_policy=cold_policy)
+    if sum(fenced_uncertain):
+        inflight_summary["snapshot_sweep_uncertain"] = (
+            inflight_summary.get("snapshot_sweep_uncertain", 0) + sum(fenced_uncertain))
 
     _sweep_answered_pending(cfg, name)
     filenames, skipped_symlinks = list_outbound(cfg, name)

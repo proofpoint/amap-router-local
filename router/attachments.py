@@ -466,7 +466,9 @@ def _mkdir_and_pin(parent_fd: int, name: str, *, mode: Optional[int] = None) -> 
     already must be this uid's and carry no bit outside `mode`: it is then
     set to exactly `mode` (what an interrupted creation, between the mkdir
     and the fchmod, leaves). Another owner, or a wider mode, is refused,
-    never repaired. Without `mode`, behaviour is as it always was."""
+    never repaired. Without `mode`, behaviour is as it always was. The
+    fchmod itself is not made durable: a power loss can leave the directory
+    narrower than `mode`, which the next call completes as above."""
     try:
         if mode is None:
             os.mkdir(name, dir_fd=parent_fd)
