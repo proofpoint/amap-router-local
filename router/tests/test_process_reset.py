@@ -138,10 +138,18 @@ class FsOpsResetTests(_HopCase):
         with self.assertRaises(fsops_mod.BindingError):
             ops.open_root_nofollow(str(self.hop))  # a closed port binds nothing
         fresh = fsops_mod.FsOps(hop_root=self.hop, private_roots=[self.priv])
-        tree = fresh.descend_pinned(fresh.open_root_nofollow(str(self.hop)), f"{LID}/{GEN}")
-        with self.assertRaises(fsops_mod.FsOpsError):
-            fresh.open_stage_dir(tree, "up")       # validated again, and refused
-        fresh.close()
+        root = fresh.open_root_nofollow(str(self.hop))
+        try:
+            tree = fresh.descend_pinned(root, f"{LID}/{GEN}")
+            try:
+                with self.assertRaises(fsops_mod.FsOpsError):
+                    fresh.open_stage_dir(tree, "up")   # validated again, and refused
+            finally:
+                os.close(tree)
+        finally:
+            os.close(root)
+            fresh.close()
+        self.assertEqual(fds(), baseline, "the second port's descriptors outlived the test")
 
 
 def _tree(name):

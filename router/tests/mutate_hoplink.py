@@ -58,6 +58,7 @@ FN = "router.tests.test_hop_fence."
 LA = "router.tests.test_hop_lost_ack.LostAckTests."
 PB = "router.tests.test_hop_probes.ProbeRetryTests."
 RS = "router.tests.test_process_reset."
+AV = "router.tests.test_agent_visible_durability."
 
 M = [
  # -- the inbound reader's link (config) ----------------------------------------
@@ -1150,6 +1151,26 @@ M = [
   '    if nc != "mail":\n        return FAILURE, None\n    if facts["admission_link"] != link:\n        return HOLD, HELD_LINK_MISMATCH\n',
   [CL + "test_a_failure_notice_pre_empts_only_the_cold_rows",
    FR + "FailureNoticeTests.test_a_matched_report_with_another_admission_link_holds"]),
+
+ ('A1 a Result not made durable is archived anyway', OB,
+  '                    "private result next poll", name, req_id, req_id, e,\n                )\n                return\n',
+  '                    "private result next poll", name, req_id, req_id, e,\n                )\n',
+  [AV + "ResultPublicationIsDurableTests.test_a_result_not_made_durable_is_left_unarchived_then_resumed",
+   AV + "ExternalLegResultIsDurableTests.test_a_settled_result_not_made_durable_is_made_durable_before_it_is_archived"]),
+ ('A2 no barrier on processed/ after the archive rename', OB,
+  '    for label, fd in (("processed/", processed_fd), ("the outbox", outbox_fd)):\n',
+  '    for label, fd in (("the outbox", outbox_fd),):\n',
+  [AV + "ResultPublicationIsDurableTests.test_the_archive_rename_is_followed_by_both_directory_barriers",
+   AV + "ResultPublicationIsDurableTests.test_a_failed_archive_barrier_is_logged_and_the_request_stays_answered"]),
+ ('A3 no barrier on the outbox after the archive rename', OB,
+  '    for label, fd in (("processed/", processed_fd), ("the outbox", outbox_fd)):\n',
+  '    for label, fd in (("processed/", processed_fd),):\n',
+  [AV + "ResultPublicationIsDurableTests.test_the_archive_rename_is_followed_by_both_directory_barriers",
+   AV + "ResultPublicationIsDurableTests.test_a_failed_outbox_barrier_after_the_archive_is_logged"]),
+ ('A4 the archive barriers never called', OB,
+  '                            _sync_archive(name, req_id, processed_fd, outbox_fd)\n', '',
+  [AV + "ResultPublicationIsDurableTests.test_the_archive_rename_is_followed_by_both_directory_barriers",
+   AV + "ResultPublicationIsDurableTests.test_a_failed_archive_barrier_is_logged_and_the_request_stays_answered"]),
 ]
 
 

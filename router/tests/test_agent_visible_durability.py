@@ -9,6 +9,7 @@ above it. Without these, a power loss could keep the private record that
 says a notice was delivered and lose the notice."""
 from __future__ import annotations
 
+import json
 import os
 import stat
 import tempfile
@@ -138,6 +139,136 @@ class PlacementIsDurableTests(RouterTestCase):
         outbound.drain_instance(self.cfg, "alice")
         self.assertEqual(len(list_notices(self.cfg, "bob")), 1)
 
+
+
+class _FailOnce:
+    """A `_Recorder.fail` predicate: true for the FIRST fsync of `target` only."""
+
+    def __init__(self, target):
+        self.target, self.fired = target, 0
+
+    def __call__(self, t):
+        if t == self.target and not self.fired:
+            self.fired += 1
+            return True
+        return False
+
+
+@unittest.skipUnless(os.path.isdir("/proc/self/fd"), "needs /proc/self/fd")
+class ResultPublicationIsDurableTests(RouterTestCase):
+    """The outbox Result (`_publish_result_and_archive`). A Result whose
+    directory barrier failed is visible but may not survive, so the request
+    is NOT archived: the next poll re-publishes it from the private result
+    (nothing is delivered or handed over again) and only then archives it.
+    The archive rename is followed by a barrier on `processed/` and then on
+    the outbox."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.make_config({"alice": ["bob"], "bob": ["alice"]})
+        write_request(self.cfg, "alice", "00000001", to=["agent.bob@local"])
+        self.outbox = Path(os.path.realpath(str(self.cfg.instances["alice"].outbox_root)))
+
+    def drain(self, rec):
+        with rec.patched()[0], rec.patched()[1]:
+            return outbound.drain_instance(self.cfg, "alice")
+
+    def test_a_result_not_made_durable_is_left_unarchived_then_resumed(self):
+        fail = _FailOnce(("dir", str(self.outbox / "results")))
+        self.drain(_Recorder(fail=fail))
+        self.assertEqual(fail.fired, 1, "control: the results/ barrier was injected")
+        result = self.outbox / "results" / "00000001.json"
+        self.assertTrue(result.exists(), "control: the Result was published before the barrier")
+        self.assertTrue((self.outbox / "req-00000001.json").exists(),
+                        "archived over a Result that might not survive")
+        self.assertFalse((self.outbox / "processed" / "req-00000001.json").exists())
+        published = result.read_bytes()
+        rec = _Recorder()
+        self.drain(rec)
+        self.assertIn(("fsync", "dir", str(self.outbox / "results")), rec.events,
+                      "the resume did not re-establish the Result's durability")
+        self.assertTrue((self.outbox / "processed" / "req-00000001.json").exists())
+        self.assertFalse((self.outbox / "req-00000001.json").exists())
+        self.assertEqual(result.read_bytes(), published, "the resume changed the Result")
+        self.assertEqual(len(list_notices(self.cfg, "bob")), 1, "delivered again on the resume")
+
+    def test_the_archive_rename_is_followed_by_both_directory_barriers(self):
+        rec = _Recorder()
+        self.drain(rec)
+        at = rec.events.index(("rename", str(self.outbox / "processed" / "req-00000001.json")))
+        self.assertEqual(rec.events[at + 1:at + 3],
+                         [("fsync", "dir", str(self.outbox / "processed")),
+                          ("fsync", "dir", str(self.outbox))])
+
+    def test_a_failed_archive_barrier_is_logged_and_the_request_stays_answered(self):
+        fail = _FailOnce(("dir", str(self.outbox / "processed")))
+        with self.assertLogs("amap_router_local", level="WARNING") as cm:
+            self.drain(_Recorder(fail=fail))
+        self.assertEqual(fail.fired, 1, "control: the processed/ barrier was injected")
+        self.assertTrue(any("was not made durable" in r.getMessage() for r in cm.records))
+        self.assertTrue((self.outbox / "processed" / "req-00000001.json").exists())
+        self.assertTrue((self.outbox / "results" / "00000001.json").exists())
+
+    def test_a_failed_outbox_barrier_after_the_archive_is_logged(self):
+        archive = ("rename", str(self.outbox / "processed" / "req-00000001.json"))
+        rec = _Recorder()
+        fired = []
+
+        def fail(t):
+            # only the outbox barrier AFTER the archive rename (the outbox is
+            # also synced earlier, when results/ is made)
+            if t == ("dir", str(self.outbox)) and archive in rec.events and not fired:
+                fired.append(t)
+                return True
+            return False
+        rec.fail = fail
+        with self.assertLogs("amap_router_local", level="WARNING") as cm:
+            self.drain(rec)
+        self.assertEqual(len(fired), 1, "control: the outbox barrier after the archive was injected")
+        self.assertTrue(any("the outbox was not made durable" in r.getMessage() for r in cm.records))
+        self.assertTrue((self.outbox / "processed" / "req-00000001.json").exists())
+
+
+@unittest.skipUnless(os.path.isdir("/proc/self/fd"), "needs /proc/self/fd")
+class ExternalLegResultIsDurableTests(RouterTestCase):
+    """The same rule on the external leg: a Result settled from the
+    downstream runtime whose barrier failed is re-published from the private
+    result, and the request is never handed over again."""
+
+    def setUp(self):
+        super().setUp()
+        from router.tests.test_inflight import EXT, FakeTransport, _external
+        self.ext, self.policy = EXT, _external
+        self.cfg = self.make_config({"alice": []})
+        self.port = FakeTransport()
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.outbox = Path(os.path.realpath(str(self.cfg.instances["alice"].outbox_root)))
+
+    def drain(self, rec):
+        with rec.patched()[0], rec.patched()[1]:
+            return outbound.drain_instance(self.cfg, "alice", transport=self.port,
+                                           cold_policy=self.policy)
+
+    def test_a_settled_result_not_made_durable_is_made_durable_before_it_is_archived(self):
+        """The settle step leaves the request unarchived; the same poll's
+        listing then finds the anchor and resumes it: the Result's barrier
+        succeeds BEFORE the archive rename, and nothing is handed over again."""
+        self.drain(_Recorder())
+        self.assertEqual(self.port.writes, ["00000001"])
+        self.port.send_all(recipients=[self.ext])
+        fail = _FailOnce(("dir", str(self.outbox / "results")))
+        rec = _Recorder(fail=fail)
+        self.drain(rec)
+        self.assertEqual(fail.fired, 1, "control: the results/ barrier was injected")
+        archive = ("rename", str(self.outbox / "processed" / "req-00000001.json"))
+        self.assertIn(archive, rec.events, "control: the request was archived")
+        synced = ("fsync", "dir", str(self.outbox / "results"))
+        self.assertIn(synced, rec.events[:rec.events.index(archive)],
+                      "archived before the Result was made durable")
+        self.drain(_Recorder())
+        self.assertEqual(self.port.writes, ["00000001"], "handed over again")
+        doc = json.loads((self.outbox / "results" / "00000001.json").read_text())
+        self.assertEqual(doc["outcome"], "accepted")
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,8 +88,8 @@ NAME_MAX = 255
 
 #: The host intakes under the hop root (contract §4.1).
 INTAKES = (".unresolved", ".control")
-#: The runtime's own generation trees live under this name instead of a
-#: logical_id.
+#: The runtime control tree's generations (logical_id "runtime": this
+#: router's control transport) live under this name instead of a logical_id.
 RUNTIME_DIR = ".runtime"
 
 _RENAME_NOREPLACE = 1  # <linux/fs.h>

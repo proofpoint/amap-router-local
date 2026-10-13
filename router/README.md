@@ -1348,6 +1348,25 @@ handover's `from_address` (at most 254 octets, a local part of at most 64,
 the bare addr-spec pattern): one that cannot is refused at load, by the
 same check begin runs.
 
+**Who creates what under `root`.** `root` itself is the deployment's
+(this router's uid, the downstream runtime's group, 2750), and so are the
+downstream runtime's own host intakes beside the identities (`.unresolved/`,
+`.control/`, where inbound control mail lands). `.runtime/` is different:
+it is this router's OUTBOUND runtime control tree, the upstream side of
+control notices, which is not built yet. When it is, this router creates it
+and admits its generations exactly as it does an agent's (identity
+`logical_id` "runtime" and the router's own address), and the downstream
+runtime creates `down/` and its receiver directories on first sight. The
+deployment never pre-creates it. Everything under `<root>/<logical_id>/` is the
+plugin's, created when a generation is admitted or first seen. This router,
+admitting a generation, creates `<root>/<logical_id>/`, the generation tree
+with its `up/`, and the upstream directories: `outbound/` and `inbound/` with
+its parents (2770 under the setgid root) and `withdrawn/` (2750). The
+downstream runtime, on its first sight of the generation, creates `down/`
+and its `claimed/`, `results/` and `processed/`. The deployment must not
+pre-create or chown `<root>/<logical_id>/` or anything under it: the plugin's
+owner checks refuse a tree it did not make.
+
 **One sender per generation.** The drain asks for the current
 generation's sender on first use. Before the first construction this router
 writes the generation's binding pin, `transport/hop.json` (the root,
@@ -2208,6 +2227,31 @@ disk lost: a power loss lands in the re-presentation residual below. An
 injected backend that cannot take the `preset` and `from_address` keywords is
 called directly, as before, and keeps the old exposure: a failure after its
 placement can place again under a new id.
+
+The outbox Result follows the same rule. It is written through the same
+barriers, and one whose directory barrier failed (`PublishedNotDurable`) is
+visible but not yet durable, so the request is NOT archived: the next
+listing finds its private result and re-publishes the Result from it
+(nothing is delivered or handed over again), and only then archives it. The
+archive rename is followed by a barrier on `processed/` and then on the
+outbox; the rename has happened by then, so a failure of either is logged
+and not retried, and the private result stays the authority.
+
+Residuals of that rule:
+- A barrier that keeps failing keeps the request unarchived: its Result is
+  re-published (the same bytes, from the private result) and a WARNING
+  logged on every poll until the barrier succeeds.
+- While the request is unarchived, the agent can still replace the file
+  under that req_id. The next listing then refuses the new file as
+  `req_id_reused`, and that refusal overwrites the visible Result; the
+  original verdict survives only in the private result.
+- A `req_id_reused` refusal has no private result of its own. After a
+  failed barrier it is issued again on the next listing: the same outcome
+  and reason with a new `ts`, so different bytes. Its status count can
+  include the repeat.
+- A Result write that fails BEFORE its rename (nothing was published) is
+  logged and the request is archived anyway, with no Result in the outbox:
+  the private result is the answer, as it was before this rule.
 
 A crash after the notice write but before the "delivered" mark replays with
 the SAME id. If the agent consumed the notice in that window, it reappears

@@ -1716,6 +1716,19 @@ def _publish_result_and_archive(
                     )
                 finally:
                     os.close(results_fd)
+            except attachments_mod.PublishedNotDurable as e:
+                # The Result IS visible, but its directory barrier failed, so
+                # it may not survive a power loss. The request stays in the
+                # outbox, unarchived: the next poll's resume re-publishes it
+                # from the private result (no resend) and only then archives
+                # it. Archiving now would leave nothing to retry from.
+                logger.warning(
+                    "instance %r req %r: outbound/results/%s.json was published "
+                    "but its directory was not made durable (%s); the request "
+                    "is left unarchived and the Result is re-published from the "
+                    "private result next poll", name, req_id, req_id, e,
+                )
+                return
             except (NamespaceEscapeError, OSError) as e:
                 logger.warning(
                     "instance %r req %r: could not publish outbound/results/"
@@ -1735,6 +1748,7 @@ def _publish_result_and_archive(
                                 src_dir_fd=outbox_fd, dst_dir_fd=processed_fd,
                             )
                             archived = True
+                            _sync_archive(name, req_id, processed_fd, outbox_fd)
                         except FileNotFoundError:
                             pass  # nothing to archive (already archived by an
                                   # earlier attempt at this req_id) — see docstring
@@ -1786,6 +1800,22 @@ def _publish_result_and_archive(
             "sidecar dir (non-fatal — the result above is authoritative)",
             name, req_id,
         )
+
+
+def _sync_archive(name: str, req_id: str, processed_fd: int, outbox_fd: int) -> None:
+    """The archive rename's barriers: `processed/` (the name arrived) and
+    then the outbox (the name left). The rename has happened, so a failure
+    cannot be retried from here: it is logged, and the private result stays
+    authoritative."""
+    for label, fd in (("processed/", processed_fd), ("the outbox", outbox_fd)):
+        try:
+            os.fsync(fd)
+        except OSError as e:
+            logger.warning(
+                "instance %r req %r: archived, but %s was not made durable "
+                "(%s: %s); the private result is still authoritative",
+                name, req_id, label, type(e).__name__, e,
+            )
 
 
 def _quarantine_one(
