@@ -114,3 +114,6 @@ class SurfaceTests(_PluginDir):
     def test_the_optional_fsops_method_is_only_listed_optionally(self):
         self.assertEqual(dict(transport.HOPFSOPS_OPTIONAL_METHODS), {"stat_group_pinned": (3, 1)})
         self.assertNotIn("stat_group_pinned", transport.HOPFSOPS_METHODS)
+        doc = " ".join(transport.HopFsOps.__doc__.split())
+        self.assertIn("OPTIONAL AT (3, 1)", doc)
+        self.assertIn("`stat_group_pinned(dir_fd, name) -> (uid, gid, mode, kind)`", doc)

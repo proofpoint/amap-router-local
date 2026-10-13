@@ -735,7 +735,21 @@ class HopFsOps(Protocol):
     The scan visits at most `LIST_SCAN_MAX` names: on visiting one more it
     stops at once and raises this instance's `ListingTooLarge`, so no scan
     is longer than that whatever the directory holds. A failure raises; it
-    never returns an empty list for an error."""
+    never returns an empty list for an error.
+
+    OPTIONAL AT (3, 1), used only by the optional remover's objects
+    (`HOPFSOPS_OPTIONAL_METHODS`): `stat_group_pinned(dir_fd, name) -> (uid,
+    gid, mode, kind)`, EXACTLY `stat_owner_pinned`'s semantics (one
+    NON-following stat of `name` in the bound `dir_fd`, the stale-binding
+    check applying; `mode` the `S_IMODE`, so setuid, setgid and sticky are
+    included; `kind` "file" / "dir" / "other"; a missing name a raw
+    `FileNotFoundError`; any other failure its own `OSError`) plus that same
+    stat's `st_gid`. It is not in `HOPFSOPS_METHODS`, and adding it is minor:
+    only a `(3, 1)` runtime constructs a remover, handing it its own `(3, 1)`
+    filesystem port. The `(3, 1)` postcondition on `remove_pinned` travels
+    with it: before acting on `name` it sweeps every aside of THAT name (the
+    exact pattern its own rename-aside gives one), emptying each in place,
+    so a call that returns has left neither `name` nor any aside."""
 
     #: This implementation's "committed not yet" result (above).
     NOT_YET: object
