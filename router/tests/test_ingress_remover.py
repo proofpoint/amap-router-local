@@ -108,6 +108,23 @@ class RemoverPassTests(_Pump):
         self.assertNotIn(key, hoplink._REMOVERS)
         self.assertIsNone(pump.remover)
 
+    def test_after_a_close_the_rest_of_the_pass_waits_never_the_interim_rule(self):
+        # Two waiting records: the first closes the remover; the second is
+        # gone upstream and past the horizon, so the not-offered rule WOULD
+        # tombstone it. It must stay waiting until the remover is rebuilt.
+        e2 = "1700000000-2"
+        self.port.entries[E1] = entry(E1)
+        self.port.entries[e2] = entry(e2)
+        self.pump_with()
+        del self.port.entries[e2]
+        remover = RecordingRemover(raises=_Reasoned("closed"))
+        counts, pump = self.pump_with(remover, now=LATER)
+        self.assertEqual(remover.calls, [("notice", E1)], "the closed remover was called again")
+        self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
+        self.assertEqual(self.state(e2), (ingress.PUBLISHED_WAITING_REMOVE, None),
+                         "the rest of the pass fell to the interim rule")
+        self.assertEqual(pump.remover_hold, ingress.HOLD_OBJECT_CLOSED)
+
     def test_a_held_remover_leaves_entries_waiting_even_gone_past_the_horizon(self):
         self.placed()
         del self.port.entries[E1]

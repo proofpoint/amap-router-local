@@ -110,6 +110,20 @@ class RemoveBoundedTests(_Dir):
         self.assertEqual(os.listdir(self.dir), [])
         self.assertEqual((target / "keep").read_bytes(), b"k")
 
+    def test_a_directory_larger_than_one_batch_is_emptied_whole(self):
+        # More names than one batch at the real batch size: every batch after
+        # the first relies on a fresh scan seeing what is left.
+        (self.dir / "x").mkdir()
+        n = fsops_mod._REMOVE_BATCH + 37
+        for i in range(n):
+            fd = os.open(self.dir / "x" / f"f{i:05d}", os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+        try:
+            self.fs.remove_pinned(self.fd, "x")
+        except OSError as e:
+            self.fail(f"remove_pinned raised {e!r}")
+        self.assertEqual(os.listdir(self.dir), [])
+
     def test_emptying_holds_a_bounded_batch_not_a_full_listing(self):
         (self.dir / "x").mkdir()
         for i in range(10):

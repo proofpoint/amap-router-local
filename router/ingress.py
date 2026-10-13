@@ -2078,6 +2078,9 @@ def remove_one(pump: "Pump", entry_id: str, state: str) -> Optional[str]:
             from . import hoplink as hoplink_mod
             hoplink_mod.evict_remover(pump.cfg, pump.logical_id, pump.gen)
             pump.remover = None
+            # The remover is rebuilt NEXT pass; for the rest of THIS one an
+            # offered remover's entries wait, never the not-offered rule.
+            pump.remover_hold = HOLD_OBJECT_CLOSED
             why = HOLD_OBJECT_CLOSED
         elif kind == "reason" and detail in ("layout", "owner"):
             why = f"hop_remove_anomaly:{detail}"
