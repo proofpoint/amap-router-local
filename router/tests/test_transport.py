@@ -121,7 +121,7 @@ class LoaderTests(_PluginDir):
         MAJOR change: a plugin written for (2, x), or the (1, x) of E5's
         time, would call ports that differ from the ones it was written
         against, so it is refused before any factory runs."""
-        self.assertEqual(transport.PLUGIN_API, (3, 0))
+        self.assertEqual(transport.PLUGIN_API, (3, 1))
         for old in (b"(2, 0)", b"(2, 9)", b"(1, 9)"):
             with self.subTest(api=old):
                 marker, factory = self._calls_marker()
@@ -141,12 +141,25 @@ class LoaderTests(_PluginDir):
         self.write(GOOD.replace(b"PLUGIN_API = (3, 0)", b"PLUGIN_API = (4, 0)"))
         self.refused("api_mismatch")
 
-    def test_an_older_minor_is_refused(self):
-        self.refused("api_mismatch", api=(3, 1))
+    def test_a_minor_below_the_required_minor_is_refused(self):
+        """The minor is compared with REQUIRED_MINOR, never with PLUGIN_API's:
+        a runtime that required minor 1 would refuse this (3, 0) plugin."""
+        self.refused("api_mismatch", required_minor=1)
+
+    def test_an_older_minor_plugin_loads_under_this_3_1_runtime(self):
+        """REQUIRED_MINOR is 0: a (3, 0) plugin loads, and the optional
+        capabilities it predates are simply OFF."""
+        self.assertEqual(transport.REQUIRED_MINOR, 0)
+        try:
+            got = self.load()
+        except transport.PluginRefused as e:
+            self.fail(f"a (3, 0) plugin was refused: {e.reason}: {e}")
+        self.assertEqual(got.api, (3, 0))
+        self.assertEqual(got.optional_capabilities, frozenset())
 
     def test_a_newer_minor_is_accepted(self):
-        """(3, 1), for example the optional remover pending a decision,
-        loads under this (3, 0) runtime, which never calls it."""
+        """(3, 2) and later load under this (3, 1) runtime, which uses only
+        what it knows."""
         for newer in ((3, 1), (3, 7)):
             with self.subTest(api=newer):
                 self.write(GOOD.replace(b"PLUGIN_API = (3, 0)",
@@ -323,7 +336,7 @@ class NoPluginImportTests(unittest.TestCase):
     """The interface module imports no plugin and never imports by name."""
 
     ALLOWED = {"__future__", "errno", "hashlib", "hmac", "os", "stat", "types",
-               "dataclasses", "pathlib", "typing", "re", "datetime"}
+               "dataclasses", "pathlib", "typing", "re", "datetime", "logging"}
 
     def test_transport_imports_only_the_standard_modules_it_needs(self):
         tree = ast.parse(Path(transport.__file__).read_text(encoding="utf-8"))
