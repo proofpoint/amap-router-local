@@ -78,6 +78,30 @@ class HopConfigTests(helpers.RouterTestCase):
             with self.subTest(why=why):
                 self.refused(self.doc(root=root), "must not be nested")
 
+    def test_every_agent_reachable_directory_is_checked_from_the_one_list(self):
+        """The overlap check and the plugin loader read ONE list
+        (`config.agent_reachable_roots`): a hop root inside any directory it
+        names is refused, so the two cannot drift."""
+        from router import service
+        cfg = config_mod.load_obj(self.doc())
+        roots = config_mod.agent_reachable_roots(cfg.instances)
+        self.assertEqual(service._agent_reachable_roots(cfg), roots)
+        self.assertGreaterEqual(len(roots), 3, "the list names almost nothing")
+        for other in roots:
+            with self.subTest(inside=str(other)):
+                self.refused(self.doc(root=str(other / "hop")), "agent-reachable",
+                             "must not be nested")
+
+    def test_the_attachment_cap_is_at_least_the_hops_sidecar_cap(self):
+        floor = config_mod.HOP_ATTACHMENT_CAP_MIN
+        self.assertEqual(floor, 1 << 20)
+        doc = self.doc()
+        doc["hop"]["caps"]["attachment"] = floor
+        self.assertEqual(config_mod.load_obj(doc).hop.cap("attachment"), floor)
+        doc = self.doc()
+        doc["hop"]["caps"]["attachment"] = floor - 1
+        self.refused(doc, "config.hop.caps.attachment", "per-sidecar cap")
+
     def test_the_members_and_their_types(self):
         doc = self.doc()
         doc["hop"]["extra"] = 1

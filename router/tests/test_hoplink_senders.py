@@ -24,14 +24,50 @@ class _Reasoned(Exception):
         self.reason = reason
 
 
+class GenerationAbsent(Exception):
+    """The fake store's verdict class for an absent tree."""
+
+
+class FakeStore:
+    """An `UpstreamMarkers` double: `retire` answers `result` (or raises
+    `raises`), and records every call; `retired` answers `retired_answer`
+    (or raises it, when it is an exception)."""
+
+    GenerationAbsent = GenerationAbsent
+
+    def __init__(self, settings, result="created", raises=None, retired_answer=True):
+        self.settings, self.result, self.raises = dict(settings), result, raises
+        self.retired_answer = retired_answer
+        self.retires, self.closes = [], 0
+
+    def retire(self, retired_at):
+        self.retires.append(retired_at)
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+    def retired(self):
+        if isinstance(self.retired_answer, BaseException):
+            raise self.retired_answer
+        return self.retired_answer
+
+    def close(self):
+        self.closes += 1
+
+
 class StandInPlugin:
     """Plugin-shaped: `make_sender` returns a fake port per call, or raises
-    what `fail` says, the next `fail_times` calls."""
+    what `fail` says, the next `fail_times` calls. `make_upstream_marker_store`
+    returns a `FakeStore` configured by `store_result` / `store_raises`, or
+    raises `store_fail`."""
 
     def __init__(self):
         self.calls = []
         self.fail, self.fail_times = None, 0
         self.ports = []
+        self.store_result, self.store_raises, self.store_fail = "created", None, None
+        self.store_retired = True
+        self.stores = []
 
     def make_sender(self, settings, fsops):
         self.calls.append(dict(settings))
@@ -46,7 +82,11 @@ class StandInPlugin:
         raise AssertionError("not used here")
 
     def make_upstream_marker_store(self, settings, fsops):
-        raise AssertionError("not used here")
+        if self.store_fail is not None:
+            raise self.store_fail
+        store = FakeStore(settings, self.store_result, self.store_raises, self.store_retired)
+        self.stores.append(store)
+        return store
 
 
 class _Senders(_Gens):
@@ -201,17 +241,18 @@ class ConstructionTests(_Senders):
 
 class PredecessorTests(_Senders):
 
-    def test_no_successor_sender_while_an_admitted_predecessor_is_unretired(self):
+    def test_no_successor_sender_while_an_admitted_predecessor_cannot_be_retired(self):
         write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
         self.drain()                                     # G1 admitted
         self.put(alpha={"binding_seq": 9})               # a rebind fences G1
         hoplink.forget_senders()
+        self.plugin.store_raises = OSError(5, "EIO")
         self.drain()                                     # G2's first sight
         write_request(self.cfg, "alpha", "00000002", to=[EXTERNAL])
         k, _ = self.drain()
         hold = hoplink.HOLDS.get((str(k.state_dir), "alpha"))
         self.assertIsNotNone(hold, "no hold: a successor sender was constructed")
-        self.assertEqual((hold.reason, hold.scope), ("hop_predecessor_unretired", "instance"))
+        self.assertEqual((hold.reason, hold.scope), ("hop_retire_failed:EIO", "instance"))
         self.assertEqual(len(self.plugin.calls), 1, "G2 was admitted before G1 was retired")
         self.assertTrue((k.instances["alpha"].outbox_root / "req-00000002.json").exists())
 

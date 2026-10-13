@@ -1159,8 +1159,8 @@ it is a test and embedding hook.
 handed to a second runtime and settled from that runtime's result. The
 classifier above routes an item 6 or item 7 request here when a transport
 is present. The transport is an optional plugin, activated at startup
-(below); the hand-over is built, while retiring a fenced generation's tree
-and re-placement are designed but not built yet.
+(below); the hand-over and the retirement of a fenced generation's tree are
+built, while re-placement is designed but not built yet.
 
 * A record per request at `state_dir/<name>/inflight/<req_id>.json`, holding
   the staged copy; the agent's file stays in its outbox, skipped, until settled.
@@ -1259,8 +1259,9 @@ What `(3, 0)` adds:
   `transport.TRANSPORT_REASONS`, and `transport.classify` is the one
   classifier, in a fixed order: the captured verdict classes, the
   runtime's own classes, a plugin reason, `OSError`, anything else.
-- PENDING the owner's decision: an optional `make_intake_remover` at
-  `(3, 1)`, a minor addition. Nothing in `(3, 0)` depends on it.
+- An optional `make_intake_remover` at `(3, 1)`, a minor addition: the
+  ingress pass removes a waiting entry through it when the plugin offers
+  one. Nothing in `(3, 0)` depends on it.
 
 The contracts on `HopFsOps` worth knowing before implementing it:
 
@@ -1316,13 +1317,19 @@ its sender by logical_id, and generations exist only under a registry.
 ```
 
 `root` is absolute, written in normal form, and never nested with
-`state_dir`, `registry_dir`, `intake_dir` or an instance root. `peer_uid`
+`state_dir`, `registry_dir`, `intake_dir` or any directory an agent can
+reach (the same list the plugin loader refuses a plugin inside). It is
+fixed for the life of `state_dir`: every generation pins it, retiring a
+generation needs that generation's root, and there is no move procedure, so
+moving the hop tree means a new `state_dir`. `peer_uid`
 is the downstream runtime's uid. `version_write` is the envelope's
 `hop_contract`, 1 to 2^31-1. The caps are the plugin's, in bytes: the
 handover document, the request file, one decoded attachment, all of them.
 `caps.document` must be at least the largest handover an accepted request
 can make, computed exactly at load (`hoplink.document_floor`), or the
-config is refused. The floor counts the attachment caps (the smaller of
+config is refused. `caps.attachment` is at least 1 MiB, the hop's own
+per-sidecar cap: a smaller one would refuse, on every read, an inbound
+sidecar the peer may commit. The floor counts the attachment caps (the smaller of
 the plugin's and this router's), so at this router's defaults it is about
 43.7 MiB. `link`, optional, names the inbound reader's link in the hop
 codec's link grammar (`[a-z0-9][a-z0-9-]{0,62}`): it keys the ingress
@@ -1350,12 +1357,61 @@ damaged pin, an unreadable generations record) is likewise a retried
 construction hold (`hop_construct_failed:<class>`), never an error that
 stops the instance's local mail. A latched construction hold
 (`hop_settings_refused`, `hop_identity_conflict`, `hop_plugin_vocabulary`)
-is not re-attempted until a restart or a new generation. While a FENCED
-generation that was PINNED is not yet retired, no successor is admitted
-(`hop_predecessor_unretired`, for the whole instance): the pin, not
-`admitted.json`, is the key, since a construction can admit the tree and
-then fail before confirming it. One live generation per identity; a fenced
-generation's own work is left alone until it is retired.
+is not re-attempted until a restart or a new generation.
+
+**Fence and retire.** The order is the private record (the generations
+file naming the new current generation, already durable when a poll first
+sees it), then retire every fenced predecessor this router PINNED, then
+admit the current generation by constructing its sender. Each poll, under
+the drain lock and before any construction, every pinned predecessor not
+yet retired in this process is retired through the plugin's upstream marker
+store, built from that generation's pin, at that generation's `fenced_ts`
+(never the clock). EVERY such predecessor is attempted each poll: one that
+holds never stops a newer one being retired, and the oldest hold is the one
+kept. A start that finds one unretired retires it first, so recovery is the
+same code. The pin, not `admitted.json`, decides what may
+exist: a construction can admit the tree and then fail before confirming
+it. `created`, `exists_same` and `exists` mean retired, and the store is
+then closed. `created` and `exists` each write one AUDIT line,
+`generation_retired`, with the attempted `retired_at`. For `exists` the
+marker's own value cannot be read through the plugin (`UpstreamMarkers` has
+`retire` and a boolean `retired`), and the line says so
+(`recorded_retired_at: null`, `recorded_value: "not readable through
+PLUGIN_API (3, 1)"`). A replay after a restart (`exists_same`) writes none.
+A failure to write the line is an ERROR and never undoes or holds the
+retirement, which has already happened. `absent` means there was nothing to retire unless
+`admitted.json` says the tree was admitted, in which case the tree is lost:
+the whole instance holds `hop_tree_lost` and no successor is admitted until
+`router generation new` acknowledges it (below). Any exception holds the
+whole instance (`hop_retire_failed:<reason or class>`), retried next poll
+with the same store, constructed once. While a predecessor is unretired no
+successor is admitted, and the hold says why. Every hold's status entry
+names its exit where there is one.
+
+**A fenced generation's own work** gets its own sender, constructed only
+after that generation's tree is retired in this process, never before (a
+construction is then always the replay of an admitted tree, never a first
+admission). A record that was never handed over is answered
+`rejected`/`no_route` ("generation fenced before hand-over; nothing was
+sent"): there is never a first hand-over into a retired tree. A handed-over
+record is probed and settled as in the current generation. A generation
+whose tree was absent is never served through the hop: its records are left
+for disposal (§5.4). The sender is closed once that generation's in-flight
+set is empty; the current generation's sender is never closed while current.
+
+**A lost tree's exit is `router generation new <name> --reason <text>`**
+(router stopped). Under the lock, BEFORE anything is written, the verb
+finds the lost set itself, never from `status.json`: each fenced generation
+with `admitted.json` and no acknowledgement is probed through an upstream
+marker store only (`retired()`; a missing tree is the store's
+`GenerationAbsent`; a sender is never constructed by any CLI verb). A probe
+it cannot decide refuses the verb with nothing changed; a `layout` or
+`marker_unreadable` refusal means the tree is present but damaged, NOT
+lost. Then the new generation and its audit line are written, and only
+then each lost generation's `transport/lost_ack.json`. A crash between the
+audit line and the acknowledgement leaves the hold standing; running the
+verb again recovers (one more never-admitted generation is harmless).
+Nothing else writes the acknowledgement.
 
 **The handover document** is built from the in-flight record only:
 `{"schema": "amap-hop-handover/1", "request", "envelope", "attachments",
@@ -1403,15 +1459,30 @@ hint naming both: the peer's `down/` not existing yet, which clears, or this
 router's own tree directories missing, which does not. `hop_anomaly:<reason>`,
 `hop_unsafe_read:<reason>` and `hop_object_closed` (the sender is rebuilt)
 log an ERROR every poll. An exception the table does not name is
-`hop_unexpected`, logged with its traceback. A failed status probe never
-settles anything. While a sender is held, or this generation's hand-overs
+`hop_unexpected`, logged with its traceback. A failed status probe
+(`has_result`, `has_pending`, `has_archived`, `read_result`) never settles
+anything: whatever it raises, the record, its transport id and its handed
+marker are kept, status shows `hop_probe_failed:<reason or class>` (a
+WARNING until stale, then an ERROR), and the next poll settles from the
+real result. A result that reads but fails validation is still settled
+`transport_anomaly`. An I/O error while listing `inflight/` for the
+frontier, even a transient one, latches `hop_frontier_undecidable` too:
+fail-closed, and `router generation new` releases it. While a sender is held, or this generation's hand-overs
 are latched, an external request stays in the outbox, unconsumed: it is
 decided once the hold clears or `router generation new` moves the instance
 on, never stranded in the held generation.
 
+**A process end, modelled** (`hoplink.reset_process_state(*runtimes)`, for
+the hop fixture's restart and for tests): every hop object is closed, each
+given runtime's filesystem port is closed (`FsOps.close`: its pinned stage
+descriptors and its bindings, so a new port validates the stages again), and
+every per-process container in the package is emptied. The runtime is then
+spent: build a new one. The plugin module is not reloaded.
+
 **`status.json`** carries a `hop` section, never the drained summary line:
 per instance the sender hold, the latched hand-over hold and the current
-retry, each with its first sighting and age, and the senders this process
+retry, each with its first sighting and age (and a hint naming the exit
+where a hold has one), and the senders and marker stores this process
 holds open.
 
 ## The ingress journal (`router/ingress.py`)

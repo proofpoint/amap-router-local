@@ -333,6 +333,28 @@ class FsOps:
         self._validated_stages: set = set()
         self._lock = threading.RLock()
         self._dest_locks: Dict[Tuple[int, int], threading.Lock] = {}
+        self._closed = False
+
+    def close(self) -> None:
+        """End this instance, as a process end does: close every stage
+        descriptor it pinned (the ones it owns: a plugin object never closes
+        them), and forget every binding and validation, so nothing it held
+        outlives it. Idempotent. Afterwards nothing can be bound through it
+        (`BindingError`). Descriptors a plugin object obtained are that
+        object's to close, never this method's. Not part of `HopFsOps`."""
+        with self._lock:
+            fds = list(self._stage_cache.values())
+            self._stage_cache.clear()
+            self._by_fd.clear()
+            self._by_dir.clear()
+            self._validated_stages.clear()
+            self._dest_locks.clear()
+            self._closed = True
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     # -- the step seam ------------------------------------------------------
 
@@ -347,6 +369,8 @@ class FsOps:
         st = os.fstat(fd)
         if not stat.S_ISDIR(st.st_mode):
             raise BindingError("a binding must be a directory")
+        if self._closed:
+            raise BindingError("this FsOps is closed")
         b = Binding(kind, tree, rel, st.st_dev, st.st_ino, st.st_uid)
         # The tag is derived, and its charset and length checked, only when a
         # commit uses this directory as a destination (`commit_durable`), so

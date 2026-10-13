@@ -30,7 +30,7 @@ from router.tests.helpers import keyed_for_poll, read_json, result_path, write_r
 from router.tests.peer_helpers import addr
 from router.tests.test_hoplink_senders import EXTERNAL, StandInPlugin, _Reasoned, _Senders
 from router.tests.test_hoplink_write_table import _FailingPort
-from router.tests.test_inflight import EXT, _InflightCase
+from router.tests.test_inflight import EXT, _InflightCase, _external
 
 
 def _fd_count():
@@ -195,21 +195,60 @@ class ConstructionFailureTests(_Runtime):
         self.assertEqual(len(self.plugin.calls), 2, "a retried hold was not retried")
 
 
+class FsOpsCheckFailureTests(_Runtime):
+
+    def test_any_failure_of_the_fsops_class_check_is_a_hold_never_an_abort(self):
+        class Exploding:
+            @property
+            def UnsafeRead(self):
+                raise RuntimeError("the port's classes cannot be read")
+        hoplink._RUNTIME_CLASSES.clear()
+        self.addCleanup(hoplink._RUNTIME_CLASSES.clear)
+        rt = service.HopRuntime(plugin=self.plugin, fsops=Exploding(), hop=self.cfg.hop)
+        write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
+        k = keyed_for_poll(self.cfg)
+        try:
+            outbound.drain_instance(k, "alpha", transport=rt, cold_policy=_external)
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome is a FAILURE
+            self.fail(f"the check's failure escaped the drain: {e!r}")
+        hold = self.hold(k)
+        self.assertEqual((hold.reason, hold.latched, hold.scope),
+                         ("hop_construct_failed:RuntimeError", False, "instance"))
+        self.assertEqual(self.plugin.calls, [], "a sender was built past a failed check")
+
+
 class PinnedPredecessorTests(_Runtime):
 
-    def test_a_pinned_but_unconfirmed_predecessor_blocks_the_successor(self):
+    def test_a_pinned_but_unconfirmed_predecessor_is_retired_before_the_successor(self):
+        """The pin, not the confirmation, says a tree may exist: G1's
+        construction admitted it and the confirmation was never written, so
+        G1 is retired (its tree exists) before G2 is admitted."""
         write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
         k, _ = self.drain()                                 # G1 pinned and admitted
         (hoplink.transport_dir(k, "alpha") / hoplink.ADMITTED_FILE).unlink()   # never confirmed
+        g1 = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))[1]
         self.put(alpha={"binding_seq": 9})                  # a rebind fences G1
         hoplink.forget_senders()
+        self.plugin.store_raises = OSError(5, "EIO")
         self.drain()
         write_request(self.cfg, "alpha", "00000002", to=[EXTERNAL])
         k, _ = self.drain()
         hold = self.hold(k)
-        self.assertIsNotNone(hold, "no hold: a successor sender was constructed")
-        self.assertEqual((hold.reason, hold.scope), ("hop_predecessor_unretired", "instance"))
+        self.assertIsNotNone(hold, "no hold: G2 admitted while G1's tree is unretired")
+        self.assertEqual((hold.reason, hold.scope), ("hop_retire_failed:EIO", "instance"))
         self.assertEqual(len(self.plugin.calls), 1, "G2 admitted while G1's tree is unretired")
+        [store] = self.plugin.stores
+        self.assertEqual(store.settings["generation"], g1)
+        self.assertEqual(len(store.retires), 2, "the held store was not kept and retried")
+        store.raises = None
+        k, _ = self.drain()
+        g2 = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))[1]
+        self.assertIsNone(self.hold(k))
+        # After G1's retire: G2 admitted, and G1's own sender built again to
+        # serve its handed request (the replay of an admitted, retired tree).
+        self.assertEqual(sorted(c["generation"] for c in self.plugin.calls[1:]),
+                         sorted([g1, g2]))
+        self.assertEqual(store.closes, 1, "the store was not closed once retired")
 
     def test_the_fenced_generations_work_is_left_alone(self):
         write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])

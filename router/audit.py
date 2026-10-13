@@ -92,6 +92,12 @@ EVENT_REUSE_PENDING = "req_id_reused_pending"
 #: `fence-legacy`): the verb, its `--reason`, the binding and root observed,
 #: the generations it made, and the digest of the journal it completed.
 EVENT_MIGRATION = "generation_migrated"
+#: A fenced generation's hop tree was retired by this router
+#: (`router/hoplink.py`): `result` "created", or "exists" (already retired at
+#: another instant). The attempted `retired_at` is recorded; the marker's own
+#: value is recorded only when the plugin can read it, and otherwise the line
+#: says so. A replay ("exists_same") writes no line.
+EVENT_GENERATION_RETIRED = "generation_retired"
 #: The alias store (`router/aliases.py`), in the router-level log
 #: `state_dir/registry/aliases.audit.jsonl`: its first initialisation (the
 #: creation witness's line) or a recovery of it, each tombstone written, each

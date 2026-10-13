@@ -4,6 +4,7 @@ quietly only while a routine retry is young, and kept out of the drained
 summary line. Driven through the real drain under a registry."""
 from __future__ import annotations
 
+import json
 import logging
 
 from router import config as config_mod
@@ -78,7 +79,8 @@ class RetryStatusTests(_Status):
         port = self.first_poll_with(_Reasoned("version"))
         (k, summary), records = self.logs(self.drain)
         self.assertEqual([r.levelname for r in records], ["WARNING"])
-        retry = self.section(k)["instances"]["alpha"]["retry"]
+        retry = self.section(k)["instances"].get("alpha", {}).get("retry")
+        self.assertIsNotNone(retry, "the retry is not in status")
         self.assertEqual((retry["status"], retry["transport_req_id"], retry["age_s"]),
                          ("hop_version_unavailable", "00000002", 0))
         self.assertEqual(summary.get("inflight_errored", 0), 0, "a named retry is not an error")
@@ -86,7 +88,8 @@ class RetryStatusTests(_Status):
         port.raise_on_write = _Reasoned("version")
         (k, _), records = self.logs(self.drain)
         self.assertEqual([r.levelname for r in records], ["ERROR"], "stale: loud")
-        retry = self.section(k)["instances"]["alpha"]["retry"]
+        retry = self.section(k)["instances"].get("alpha", {}).get("retry")
+        self.assertIsNotNone(retry, "the retry is not in status")
         self.assertEqual(retry["age_s"], inflight.STALE_AFTER_S, "the first sighting is kept")
         k, _ = self.drain()                              # it goes
         self.assertEqual(port.writes, ["00000001", "00000002"])
@@ -178,6 +181,22 @@ class HoldStatusTests(_Status):
         held = self.section(k)["instances"].get("alpha", {}).get("write_hold", {})
         self.assertEqual((held.get("reason"), held.get("transport_req_id")),
                          ("hop_handover_invalid", "00000002"))
+        self.assertIn("router generation new <name> --reason <text>", held.get("hint", ""),
+                      "a latched hold's status does not name its exit")
+        self.assertIn("left for disposal", held["hint"])
+
+    def test_a_binding_change_names_its_exit(self):
+        write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
+        k, _ = self.drain()
+        pin_path = hoplink.transport_dir(k, "alpha") / hoplink.PIN_FILE
+        pin = json.loads(pin_path.read_text())
+        pin["peer_uid"] = 7
+        pin_path.write_text(json.dumps(pin))
+        hoplink.forget_senders()
+        k, _ = self.drain()
+        hold = self.section(k)["instances"]["alpha"]["sender_hold"]
+        self.assertEqual(hold["reason"], "hop_binding_changed")
+        self.assertIn("fixed for the life of state_dir", hold.get("hint", ""))
 
     def test_a_quiet_instance_has_no_entry_and_the_senders_are_counted(self):
         write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL])
