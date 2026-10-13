@@ -38,6 +38,7 @@ SN = "router.tests.test_ingress_snapshot."
 QW = "router.tests.test_ingress_quarantine_writer.WriterTests."
 DF = "router.tests.test_ingress_documents.FixtureTests.test_invalid_fixtures_are_refused"
 PL = "router.tests.test_ingress_place."
+KC = "router.tests.test_ingress_classify.ClassifyTests."
 
 M = [
  # -- the facts version guard (driven directly at the guard unit) -------------
@@ -254,6 +255,34 @@ M = [
   '                    if att is not None:\n                        _write_blob_pinned(side_fd, i, att.data)\n',
   '                    _write_blob_pinned(side_fd, i, att.data)\n',
   [PL + "PlaceTests.test_a_gap_keeps_every_later_index"]),
+ # -- the §7.2 order and A5 admission (first match wins) --------------------------
+ ('K1 rows 5 and 6 swapped', IG,
+  '    if facts["admission_link"] != link:\n        return HOLD, HELD_LINK_MISMATCH\n    if origin in trusted_fleet_hosts:\n        return QUARANTINE, quarantine_mod.CAUSE_COLD_FLEET_MAIL\n',
+  '    if origin in trusted_fleet_hosts:\n        return QUARANTINE, quarantine_mod.CAUSE_COLD_FLEET_MAIL\n    if facts["admission_link"] != link:\n        return HOLD, HELD_LINK_MISMATCH\n',
+  [KC + "test_trusted_with_the_wrong_link_is_row_5_not_cold"]),
+ ('K2 a failure notice not held', IG,
+  '    if nc != "mail":\n        return HOLD, HELD_FAILURE_NOTICE\n', '',
+  [KC + "test_row_1_a_failure_notice_is_held"]),
+ ('K3 a bound reply not held', IG,
+  '    if "in_reply_to" in facts:\n        return HOLD, HELD_BOUND_REPLY\n', '',
+  [KC + "test_a_bound_reply_from_a_trusted_host_is_row_2"]),
+ ('K4 open admission not held', IG,
+  '    if admission in ("inbound_allowlist", "open"):\n        return HOLD, HELD_NOT_PLACEABLE\n', '',
+  [KC + "test_row_3_open_admission_is_not_placeable"]),
+ ('K5 an unknown host placed', IG,
+  '    if origin not in fleet_hosts:\n        return HOLD, HELD_UNKNOWN_HOST\n', '',
+  [KC + "test_row_7_an_unknown_host_is_held"]),
+ ('K6 origin_host case not canonical', IG,
+  '        if canonical != origin:\n', '        if False:\n',
+  [KC + "test_values_outside_the_enums_are_invalid"]),
+ ('K7 any admission value read', IG,
+  '    if admission not in ADMISSIONS:\n', '    if False:\n',
+  [KC + "test_values_outside_the_enums_are_invalid"]),
+ ('K8 any ingress value read', IG,
+  '    if ingress_v not in INGRESSES:\n', '    if False:\n',
+  [KC + "test_non_hub_ingress_is_invalid_while_the_enum_is_hub_only"]),
+ # (No mutant for row 4 alone: it is unreachable while the ingress enum is
+ # {"hub"}, so removing it is equivalent; K8 is what pins the enum.)
  # -- the intake-reader seam ----------------------------------------------------
  ('D1 no reader cache', HL,
   '    reader = _READERS.get(key)\n    if reader is not None:\n        return reader\n',

@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional
 
 from . import attachments as attachments_mod
 from . import binding as binding_mod
+from . import classify as classify_mod
 from . import config as config_mod
 from . import deliver as deliver_mod
 from . import generations as generations_mod
@@ -1213,3 +1214,87 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
         return None
     _commit_recorded(cfg, state_dir, rec, parts)
     return _published(state_dir, logical_id, gen, link, entry_id)
+
+
+# ---------------------------------------------------------------------------
+# The §7.2 order and A5 admission, on the FACTS only (provenance is never an
+# input). FIRST MATCH WINS; one outcome per facts document:
+#
+#   1  notice_class is not "mail"           -> held (failure notice, RL-07b)
+#   2  in_reply_to present                  -> held (bound reply, RL-07b)
+#   3  admission "inbound_allowlist"/"open" -> held admission_not_placeable
+#   4  fleet_hosts, ingress not "hub"       -> held admission_inconsistent
+#   5  admission_link is not this link      -> held admission_link_mismatch
+#   6  origin_host a trusted fleet host     -> quarantined cold_fleet_mail
+#   7  origin_host not a fleet host         -> held unknown_host
+#   8  otherwise (D12, untrusted fleet mail)-> PLACE
+#
+# Untrusted fleet mail (row 8) is the ONLY placeable class, and that set is
+# empty in every deployment today. A value outside the codec's enums is
+# `FactsInvalid` (notice_invalid), never a row.
+#
+# PENDING (recorded, not resolved here): whether "inbound_allowlist" is in
+# the frozen codec's admission enum is a question put to the codec's owner.
+# If it is not, row 3 is "open" alone and "inbound_allowlist" is
+# notice_invalid, identical to the plugin's reader.
+# ---------------------------------------------------------------------------
+
+PLACE = "place"
+HOLD = "hold"
+QUARANTINE = "quarantine"
+
+HELD_FAILURE_NOTICE = "failure_notice"
+HELD_BOUND_REPLY = "bound_reply"
+HELD_NOT_PLACEABLE = "admission_not_placeable"
+HELD_INCONSISTENT = "admission_inconsistent"
+HELD_LINK_MISMATCH = "admission_link_mismatch"
+HELD_UNKNOWN_HOST = "unknown_host"
+
+NOTICE_CLASSES = ("mail", "failure_notice")
+ADMISSIONS = ("inbound_allowlist", "fleet_hosts", "open")
+INGRESSES = ("hub",)
+
+
+def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fleet_hosts
+                   ) -> "tuple[str, Optional[str]]":
+    """`(PLACE, None)`, `(HOLD, reason)` or `(QUARANTINE, cause)` for one
+    facts document already through `facts_version`. Raises `FactsInvalid`
+    for a value outside the enums, or a member of the wrong type."""
+    nc = facts.get("notice_class")
+    if nc not in NOTICE_CLASSES:
+        raise FactsInvalid(f"notice_class {nc!r} is not one of {list(NOTICE_CLASSES)}")
+    admission = facts.get("admission")
+    if admission not in ADMISSIONS:
+        raise FactsInvalid(f"admission {admission!r} is not one of {list(ADMISSIONS)}")
+    ingress_v = facts.get("ingress")
+    if ingress_v not in INGRESSES:
+        raise FactsInvalid(f"ingress {ingress_v!r} is not one of {list(INGRESSES)}")
+    if not (_str(facts.get("admission_link"), nonempty=True)
+            and _str(facts.get("admission_rule"), nonempty=True)):
+        raise FactsInvalid("admission_link and admission_rule must be non-empty strings")
+    origin = facts.get("origin_host")
+    if admission == "fleet_hosts":
+        try:
+            canonical = classify_mod.canonical_host(origin)
+        except classify_mod.Malformed:
+            raise FactsInvalid("origin_host is not a host name") from None
+        if canonical != origin:
+            raise FactsInvalid("origin_host is not in canonical (lowercase) form")
+    if nc != "mail":
+        return HOLD, HELD_FAILURE_NOTICE
+    if "in_reply_to" in facts:
+        return HOLD, HELD_BOUND_REPLY
+    if admission in ("inbound_allowlist", "open"):
+        return HOLD, HELD_NOT_PLACEABLE
+    # Row 4 is unreachable while the codec's ingress enum is {"hub"}: any
+    # other value is refused above as notice_invalid, as the plugin's reader
+    # refuses it. Kept, in its frozen place, for the version that adds one.
+    if ingress_v != "hub":
+        return HOLD, HELD_INCONSISTENT
+    if facts["admission_link"] != link:
+        return HOLD, HELD_LINK_MISMATCH
+    if origin in trusted_fleet_hosts:
+        return QUARANTINE, quarantine_mod.CAUSE_COLD_FLEET_MAIL
+    if origin not in fleet_hosts:
+        return HOLD, HELD_UNKNOWN_HOST
+    return PLACE, None
