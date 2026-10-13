@@ -37,6 +37,7 @@ BT = "router.tests.test_ingress_bundle.BundleTests."
 SN = "router.tests.test_ingress_snapshot."
 QW = "router.tests.test_ingress_quarantine_writer.WriterTests."
 DF = "router.tests.test_ingress_documents.FixtureTests.test_invalid_fixtures_are_refused"
+PL = "router.tests.test_ingress_place."
 
 M = [
  # -- the facts version guard (driven directly at the guard unit) -------------
@@ -75,7 +76,7 @@ M = [
   'if notice.get("notice_id") != entry_id or spool', 'if spool',
   [BT + "test_the_notice_id_must_be_the_listed_entry"]),
  ('B8 an absent member not read as zero attachments', IG,
-  'notice["message"].get("attachments", [])', 'notice["message"].get("attachments")',
+  '    descs = notice["message"].get("attachments", [])', '    descs = notice["message"].get("attachments")',
   [BT + "test_zero_attachments_with_the_member_absent"]),
  ('B9 attachments not positional', IG,
   '    if not isinstance(atts, list) or len(atts) != len(descs):\n', '    if not isinstance(atts, list):\n',
@@ -211,6 +212,48 @@ M = [
  # value before anything is written, so removing it changes only the message.
  # None for the temporary file's directory either: it matters only after a
  # process death between create and unlink, which no in-process test makes.)
+ # -- placement: recorded bytes, the generation check, the recovery table --------
+ ('P1 no generation check before placing', IG,
+  '    if not current:\n        return _quarantine_late(state_dir, logical_id, gen, link, entry_id, rec)\n    write(state_dir, logical_id, gen, "notice", link, entry_id, PLACING)\n',
+  '    write(state_dir, logical_id, gen, "notice", link, entry_id, PLACING)\n',
+  [PL + "PlaceTests.test_a_mint_between_prepared_and_placing_quarantines_to_the_old_generation"]),
+ ('P2 row 2 without the generation check', IG,
+  '    if not current:\n        return _quarantine_late(state_dir, logical_id, gen, link, entry_id, rec)\n    if any(',
+  '    if any(',
+  [PL + "RecoveryTests.test_row_2_after_a_mint_quarantines_late"]),
+ ('P3 an unverified survivor published', IG,
+  '        if notice_state and ledger_got == parts["ledger"] and all(\n                present(p, b) for p, b in expected[1:]):\n',
+  '        if True:\n',
+  [PL + "RecoveryTests.test_row_1_a_corrupt_survivor_holds"]),
+ ('P4 survivors-only checking', IG,
+  '                present(p, b) for p, b in expected[1:]):\n',
+  '                present(p, b) is not False for p, b in expected[1:]):\n',
+  [PL + "RecoveryTests.test_row_1_every_expected_part_is_required"]),
+ ('P5 placing_ambiguous re-placed', IG,
+  '    if ledger_got is not None:\n        # Row 3.\n        return hold(HELD_PLACING_AMBIGUOUS)\n', '',
+  [PL + "RecoveryTests.test_row_3_the_ledger_without_the_notice_is_ambiguous_and_terminal",
+   PL + "RecoveryTests.test_row_1_a_consumed_notice_is_row_3"]),
+ ('P6 a live rebuild instead of the recorded bytes', IG,
+  '    write(state_dir, logical_id, gen, "notice", link, entry_id, PLACING)\n    _commit_recorded',
+  '    write(state_dir, logical_id, gen, "notice", link, entry_id, PLACING)\n    parts["notice"]["ts"] = utc_ts() + "x"\n    _commit_recorded',
+  [PL + "PlaceTests.test_the_recorded_bytes_are_placed_once"]),
+ ('P7 a held recipient placed', IG,
+  '    if config_mod.target_hold(cfg, rec["recipient"]) is not None:\n        return None\n', '',
+  [PL + "PlaceTests.test_a_held_recipient_gets_nothing_and_the_record_waits"]),
+ ('P8 a different survivor overwritten in row 2', IG,
+  '    if any(present(p, b) is False for p, b in expected[1:]):\n        return hold(HELD_EXISTS_DIFFERENT)\n', '',
+  [PL + "RecoveryTests.test_row_2_a_different_survivor_holds"]),
+ ('P9 the survivor notice not fsynced', IG,
+  '            _fsync_agent(icfg.root, notice_path)\n', '',
+  [PL + "RecoveryTests.test_row_1_the_notice_present_publishes_without_placing_again"]),
+ ('P10 a snapshot not re-verified before placing', IG,
+  '    parts, why = _rebuild(state_dir, logical_id, gen, link, entry_id, rec, attachment_cap)\n    if parts is None:\n        write(state_dir, logical_id, gen, "notice", link, entry_id, HELD, reason=why)\n        return HELD\n',
+  '    parts, why = _rebuild(state_dir, logical_id, gen, link, entry_id, rec, attachment_cap)\n',
+  [PL + "PlaceTests.test_a_tampered_snapshot_holds_and_places_nothing"]),
+ ('P11 a positional gap written as a blob', "router/attachments.py",
+  '                    if att is not None:\n                        _write_blob_pinned(side_fd, i, att.data)\n',
+  '                    _write_blob_pinned(side_fd, i, att.data)\n',
+  [PL + "PlaceTests.test_a_gap_keeps_every_later_index"]),
  # -- the intake-reader seam ----------------------------------------------------
  ('D1 no reader cache', HL,
   '    reader = _READERS.get(key)\n    if reader is not None:\n        return reader\n',

@@ -17,30 +17,33 @@ def b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
-def make(*, blobs=(b"hello",), clean=True, notice_extra=None, drop_message_attachments=False):
+def make(*, blobs=(b"hello",), clean=True, notice_extra=None, drop_message_attachments=False,
+         nid=NID):
+    # `clean` is one flag for every part, or one per part.
+    cleans = list(clean) if isinstance(clean, (list, tuple)) else [clean] * len(blobs)
     descs = []
     for k, blob in enumerate(blobs):
         d = {"filename": f"f{k}.txt", "media_type": "text/plain", "size_bytes": len(blob),
-             "disposition": "clean" if clean else "stripped"}
-        if clean:
+             "disposition": "clean" if cleans[k] else "stripped"}
+        if cleans[k]:
             d["sha256"] = hashlib.sha256(blob).hexdigest()
-            d["content_ref"] = f"{NID}.attachments/{k}"
+            d["content_ref"] = f"{nid}.attachments/{k}"
         descs.append(d)
     message = {"id": "42", "from": "a@x.example", "subject": "s", "preview": "b",
                "mailbox": "inbox", "provenance": "fleet-remote"}
     if not drop_message_attachments:
         message["attachments"] = descs
-    notice = {"contract_version": "2", "kind": "deliver", "notice_id": NID,
+    notice = {"contract_version": "2", "kind": "deliver", "notice_id": nid,
               "ts": "2026-10-13T00:00:00Z", "message": message}
     if notice_extra:
         notice.update(notice_extra)
     bundle = {"schema": transport.NOTICE_BUNDLE_SCHEMA,
               "notice": b64(json.dumps(notice).encode()),
-              "spool": b64(json.dumps({"contract_version": "2", "notice_id": NID,
+              "spool": b64(json.dumps({"contract_version": "2", "notice_id": nid,
                                        "body_text": "b", "attachments": descs}).encode()),
-              "hop": b64(json.dumps({"notice_id": NID, "facts_version": 2,
+              "hop": b64(json.dumps({"notice_id": nid, "facts_version": 2,
                                      "attachments": []}).encode()),
-              "attachments": [b64(b) if clean else None for b in blobs]}
+              "attachments": [b64(b) if c else None for b, c in zip(blobs, cleans)]}
     return bundle
 
 

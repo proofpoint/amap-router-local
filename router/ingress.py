@@ -38,11 +38,15 @@ import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import attachments as attachments_mod
+from . import binding as binding_mod
+from . import config as config_mod
+from . import deliver as deliver_mod
 from . import generations as generations_mod
 from . import quarantine as quarantine_mod
 from . import transport as transport_mod
 from .hoplink import canonical
-from .util import _mkdir_durable, atomic_write, fsync_dir, utc_ts
+from .util import _mkdir_durable, atomic_write, fsync_dir, mint_notice_id, utc_ts
 
 SCHEMA = "amap-router-local.ingress-journal/1"
 DIR_NAME = "ingress"
@@ -883,3 +887,329 @@ def quarantine_items(state_dir: Path, logical_id: str, name: str, gen: str, *,
                     "cause": item.doc["causes"][0], "arrived_at": item.doc["arrival_ts"],
                     "evidence": ev, "digests": digests})
     return out
+
+
+# ---------------------------------------------------------------------------
+# Placement: the RECORDED bytes, through `deliver`'s commit routine, at most
+# once per upstream entry id.
+#
+# `prepare` keeps the snapshot, mints the target identity (`notice_id`, `ts`)
+# ONCE, builds the ledger record, and journals `prepared` with the sha256 and
+# length of every part it will write. `place` rebuilds the notice and spool
+# from the snapshot and the minted identity (a pure function, so the bytes are
+# the recorded ones or the record is held), runs the GENERATION CHECK (a
+# generation that is no longer current gets the entry as `late_inbound` in
+# its quarantine, nothing placed), journals `placing`, and commits through
+# `deliver._place`: blobs, spool, ledger, notice LAST. Once `placing` is
+# written, only `recover_placing`'s table decides.
+#
+# THE GUARANTEE, accepted by the owner: at most one agent-visible notice per
+# upstream entry id, ever. A crash between the ledger write and the notice
+# commit, with no delivery evidence, is a terminal, visible operator hold
+# (`placing_ambiguous`). It rests on the ledger being durable before the
+# notice (`deliver._commit`: `atomic_write`, then the notice).
+# ---------------------------------------------------------------------------
+
+#: The ledger's `transport` for a notice placed from the external leg.
+LEDGER_TRANSPORT = "hop"
+
+HELD_PLACING_AMBIGUOUS = "placing_ambiguous"
+HELD_SURVIVOR_MISMATCH = "placing_survivor_mismatch"
+HELD_EXISTS_DIFFERENT = "exists_different"
+HELD_SNAPSHOT_FINAL = "snapshot_invalid:final"
+#: The holds no pump re-evaluates; only an operator verb releases them.
+TERMINAL_HOLDS = (HELD_PLACING_AMBIGUOUS, HELD_SURVIVOR_MISMATCH)
+
+
+def _doc_bytes(doc: Dict[str, Any]) -> bytes:
+    """Exactly the bytes `deliver._commit` writes for a document."""
+    return json.dumps(doc, sort_keys=True).encode("utf-8")
+
+
+def _part(data: bytes) -> Dict[str, Any]:
+    return {"sha256": hashlib.sha256(data).hexdigest(), "len": len(data)}
+
+
+def _rewrite_refs(descs: Any, notice_id: str) -> None:
+    if isinstance(descs, list):
+        for k, d in enumerate(descs):
+            if isinstance(d, dict) and "content_ref" in d:
+                d["content_ref"] = attachments_mod.content_ref_for(notice_id, k)
+
+
+def final_documents(notice_raw: bytes, spool_raw: bytes, notice_id: str,
+                    ts: str) -> "tuple[Dict[str, Any], Dict[str, Any]]":
+    """The (spool, notice) this router places for an upstream notice: the
+    received documents with THIS router's minted `notice_id` (and the
+    notice's `ts`), `mailbox` "inbox", and every `content_ref` re-pointed to
+    the minted id at its own position. Everything else is as received. A
+    pure function of its arguments, so a re-placement after a crash writes
+    the same bytes."""
+    notice = json.loads(notice_raw.decode("utf-8"))
+    spool = json.loads(spool_raw.decode("utf-8"))
+    notice["notice_id"] = notice_id
+    notice["ts"] = ts
+    notice["message"]["mailbox"] = "inbox"
+    _rewrite_refs(notice["message"].get("attachments"), notice_id)
+    spool["notice_id"] = notice_id
+    _rewrite_refs(spool.get("attachments"), notice_id)
+    return spool, notice
+
+
+def _verified(notice: Dict[str, Any], blobs: List[Optional[bytes]]
+              ) -> List[Optional[attachments_mod.VerifiedAttachment]]:
+    out: List[Optional[attachments_mod.VerifiedAttachment]] = []
+    for d, blob in zip(notice["message"].get("attachments", []), blobs):
+        out.append(None if blob is None else attachments_mod.VerifiedAttachment(
+            filename=d["filename"], media_type=d["media_type"], size_bytes=len(blob),
+            sha256=hashlib.sha256(blob).hexdigest(), data=blob))
+    return out
+
+
+def prepare(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: str,
+            entry_id: str, parsed: Dict[str, Any], *, recipient: str) -> Dict[str, Any]:
+    """Snapshot `parsed`, mint the target identity once, and journal
+    `prepared` with the final parts' digests and the ledger bytes."""
+    digests = take_snapshot(state_dir, logical_id, gen, "notice", link, entry_id, parsed)
+    notice_id, ts = mint_notice_id(), utc_ts()
+    spool, notice = final_documents(parsed["raw"]["notice"], parsed["raw"]["spool"],
+                                    notice_id, ts)
+    ledger = binding_mod.record_delivery(
+        state_dir, notice_id=notice_id, from_instance=None,
+        from_address=notice["message"]["from"], to_instance=recipient, ts=ts, req_id="",
+        message_id=notice["message"]["id"], transport=LEDGER_TRANSPORT,
+        tree=deliver_mod.TREE_INBOX)
+    ledger = deliver_mod._stamp_ids(cfg, ledger, None, recipient)
+    final = {"notice": _part(_doc_bytes(notice)), "spool": _part(_doc_bytes(spool)),
+             "ledger": _part(ledger),
+             "attachments": [None if b is None else _part(b) for b in parsed["attachments"]]}
+    return write(state_dir, logical_id, gen, "notice", link, entry_id, PREPARED,
+                 snapshot=digests, notice_id=notice_id, ts=ts, recipient=recipient,
+                 ledger=ledger.decode("utf-8"), final=final)
+
+
+def generation_is_current(state_dir: Path, logical_id: str, gen: str) -> Optional[bool]:
+    """True or False, or None when the generations file cannot say (held:
+    no decision this pump)."""
+    try:
+        doc = generations_mod.read_doc(state_dir, logical_id)
+    except generations_mod.GenerationHeld:
+        return None
+    if doc is None:
+        return None
+    return doc["current"] == gen
+
+
+def _rebuild(state_dir: Path, logical_id: str, gen: str, link: str, entry_id: str,
+             rec: Dict[str, Any], attachment_cap: int):
+    """The recorded parts, rebuilt from the snapshot, or a hold reason."""
+    try:
+        kept = verify_snapshot(state_dir, logical_id, gen, "notice", link, entry_id,
+                               rec.get("snapshot"), attachment_cap=attachment_cap)
+    except SnapshotInvalid as e:
+        return None, e.reason
+    spool, notice = final_documents(kept["notice"], kept["spool"], rec["notice_id"], rec["ts"])
+    ledger = rec["ledger"].encode("utf-8")
+    final = rec["final"]
+    if (_part(_doc_bytes(notice)) != final["notice"] or _part(_doc_bytes(spool)) != final["spool"]
+            or _part(ledger) != final["ledger"]
+            or [None if b is None else _part(b) for b in kept["attachments"]]
+            != final["attachments"]):
+        return None, HELD_SNAPSHOT_FINAL
+    return {"notice": notice, "spool": spool, "ledger": ledger,
+            "attachments": kept["attachments"]}, None
+
+
+def _quarantine_late(state_dir: Path, logical_id: str, gen: str, link: str, entry_id: str,
+                     rec: Dict[str, Any]) -> str:
+    try:
+        write_quarantine_item(state_dir, logical_id, gen, "notice", link, entry_id,
+                              quarantine_mod.CAUSE_LATE_INBOUND, digests=rec.get("snapshot"))
+    except QuarantineConflict:
+        write(state_dir, logical_id, gen, "notice", link, entry_id, HELD,
+              reason=QuarantineConflict.reason)
+        return HELD
+    write(state_dir, logical_id, gen, "notice", link, entry_id, QUARANTINED,
+          reason=quarantine_mod.CAUSE_LATE_INBOUND)
+    return QUARANTINED
+
+
+def _commit_recorded(cfg: Any, state_dir: Path, rec: Dict[str, Any],
+                     parts: Dict[str, Any]) -> None:
+    recipient = rec["recipient"]
+    icfg = cfg.instances[recipient]
+    deliver_mod._place(
+        cfg=cfg, root=icfg.root, tree_root=icfg.inbox_root, state_dir=state_dir,
+        recipient=recipient, notice_id=rec["notice_id"],
+        recipient_key=config_mod.state_key(cfg, recipient),
+        message_doc=parts["spool"], notice_doc=parts["notice"], ledger_bytes=parts["ledger"],
+        attachments=_verified(parts["notice"], parts["attachments"]))
+
+
+def _published(state_dir: Path, logical_id: str, gen: str, link: str, entry_id: str) -> str:
+    write(state_dir, logical_id, gen, "notice", link, entry_id, PUBLISHED)
+    # Never a resting state: moved on in the same pump (a restart that finds
+    # one moves it on first).
+    write(state_dir, logical_id, gen, "notice", link, entry_id, PUBLISHED_WAITING_REMOVE)
+    return PUBLISHED_WAITING_REMOVE
+
+
+def place(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: str, entry_id: str,
+          *, attachment_cap: int) -> Optional[str]:
+    """Move a `prepared` record on: held, quarantined (late), or placed and
+    `published_waiting_remove`. None when nothing could be decided this pump
+    (the record stays `prepared`). Call it under the drain lock."""
+    key = key_for("notice", link, gen, entry_id)
+    rec = read(state_dir, logical_id, gen, "notice", key)
+    if rec is None or rec["state"] != PREPARED:
+        raise JournalError(f"place: the record is {rec and rec['state']!r}, not prepared")
+    parts, why = _rebuild(state_dir, logical_id, gen, link, entry_id, rec, attachment_cap)
+    if parts is None:
+        write(state_dir, logical_id, gen, "notice", link, entry_id, HELD, reason=why)
+        return HELD
+    # The local-delivery gate (`deliver._gate`'s, for a direct placement): a
+    # recipient the registry holds gets nothing this pump.
+    if config_mod.target_hold(cfg, rec["recipient"]) is not None:
+        return None
+    # THE GENERATION CHECK, immediately before the first commit byte.
+    current = generation_is_current(state_dir, logical_id, gen)
+    if current is None:
+        return None
+    if not current:
+        return _quarantine_late(state_dir, logical_id, gen, link, entry_id, rec)
+    write(state_dir, logical_id, gen, "notice", link, entry_id, PLACING)
+    _commit_recorded(cfg, state_dir, rec, parts)
+    return _published(state_dir, logical_id, gen, link, entry_id)
+
+
+def _read_agent(root: Path, path: Path, cap: int) -> Optional[bytes]:
+    """`path` under the agent-owned `root`, read pinned: None when it is
+    absent; raises `SnapshotInvalid("not_regular")`-shaped `ValueError` when
+    it is anything but a regular file with one link."""
+    root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        dfd = attachments_mod._descend_pinned(root_fd, path.parent.relative_to(root))
+    finally:
+        os.close(root_fd)
+    if dfd is None:
+        return None
+    try:
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise ValueError(f"{path}: {e.strerror}") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise ValueError(f"{path}: not a regular file with one link")
+            data = b""
+            while len(data) <= cap:
+                chunk = os.read(fd, cap + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return data
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+
+
+def _fsync_agent(root: Path, path: Path) -> None:
+    root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        dfd = attachments_mod._descend_pinned(root_fd, path.parent.relative_to(root))
+    finally:
+        os.close(root_fd)
+    if dfd is None:
+        raise FileNotFoundError(str(path.parent))
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: str,
+                    entry_id: str, *, attachment_cap: int) -> Optional[str]:
+    """THE recovery table, for a record found in `placing` (and only one):
+
+    1. the notice is present: published only if EVERY recorded part (each
+       blob, the spool, the ledger and the notice) is present with its
+       recorded bytes, after fsyncing the notice and its directory; anything
+       missing or different is `placing_survivor_mismatch`, terminal.
+    2. the ledger and the notice are both absent: the generation check again;
+       a generation no longer current gets `late_inbound` (the only
+       `placing -> quarantined` edge, nothing having been committed); else a
+       re-placement with the SAME identity and recorded bytes, after any
+       part already there is found identical (`exists_different` holds).
+    3. the ledger is present and the notice absent: `placing_ambiguous`,
+       terminal. It never re-enters this table.
+
+    None when nothing could be decided this pump."""
+    key = key_for("notice", link, gen, entry_id)
+    rec = read(state_dir, logical_id, gen, "notice", key)
+    if rec is None or rec["state"] != PLACING:
+        raise JournalError(f"recover_placing: the record is {rec and rec['state']!r}")
+
+    def hold(why: str) -> str:
+        write(state_dir, logical_id, gen, "notice", link, entry_id, HELD, reason=why)
+        return HELD
+
+    parts, why = _rebuild(state_dir, logical_id, gen, link, entry_id, rec, attachment_cap)
+    if parts is None:
+        return hold(why)
+    recipient = rec["recipient"]
+    icfg = cfg.instances[recipient]
+    nid = rec["notice_id"]
+    tree = icfg.inbox_root
+    notice_path = tree / "notices" / f"notice-{nid}.json"
+    spool_path = tree / "messages" / f"notice-{nid}.json"
+    side = tree / "notices" / attachments_mod.sidecar_dir_name(nid)
+    ledger_path = binding_mod.ledger_path(state_dir, recipient, nid,
+                                          state_key=config_mod.state_key(cfg, recipient))
+    expected = [(notice_path, _doc_bytes(parts["notice"])),
+                (spool_path, _doc_bytes(parts["spool"]))]
+    expected += [(side / str(k), b) for k, b in enumerate(parts["attachments"]) if b is not None]
+
+    def present(path: Path, want: bytes) -> Optional[bool]:
+        """True identical, False different or damaged, None absent."""
+        try:
+            got = _read_agent(icfg.root, path, len(want))
+        except ValueError:
+            return False
+        return None if got is None else got == want
+
+    try:
+        ledger_got: Optional[bytes] = ledger_path.read_bytes()
+    except FileNotFoundError:
+        ledger_got = None
+    notice_state = present(notice_path, expected[0][1])
+    if notice_state is not None:
+        # Row 1.
+        if notice_state and ledger_got == parts["ledger"] and all(
+                present(p, b) for p, b in expected[1:]):
+            _fsync_agent(icfg.root, notice_path)
+            return _published(state_dir, logical_id, gen, link, entry_id)
+        return hold(HELD_SURVIVOR_MISMATCH)
+    if ledger_got is not None:
+        # Row 3.
+        return hold(HELD_PLACING_AMBIGUOUS)
+    # Row 2.
+    current = generation_is_current(state_dir, logical_id, gen)
+    if current is None:
+        return None
+    if not current:
+        return _quarantine_late(state_dir, logical_id, gen, link, entry_id, rec)
+    if any(present(p, b) is False for p, b in expected[1:]):
+        return hold(HELD_EXISTS_DIFFERENT)
+    if config_mod.target_hold(cfg, recipient) is not None:
+        return None
+    _commit_recorded(cfg, state_dir, rec, parts)
+    return _published(state_dir, logical_id, gen, link, entry_id)
