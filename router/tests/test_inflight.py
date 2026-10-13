@@ -16,6 +16,8 @@ catches it the way a restart would discard the process.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -255,16 +257,23 @@ class LifecycleTests(_InflightCase):
         self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
         self.assertEqual(s["outbound_inflight_waiting"], 1)
 
-    def test_attachments_settle_as_an_anomaly_until_staging_exists(self):
-        sidecar = helpers.stage_outbound_sidecars(self.cfg, "alice", "00000001", [b"x"])
-        write_request(self.cfg, "alice", "00000001", to=[EXT],
-                      attachments=[helpers.attachment_descriptor(b"x", filename="a.txt")])
+    def test_attachments_go_over_the_leg_from_the_router_s_snapshot(self):
+        """Carried, not refused: the handover's attachments are the bytes
+        ingest verified, the draft's descriptors pass through unchanged, and
+        the record names the snapshot."""
+        desc = helpers.attachment_descriptor(b"x", filename="a.txt")
+        helpers.stage_outbound_sidecars(self.cfg, "alice", "00000001", [b"x"])
+        write_request(self.cfg, "alice", "00000001", to=[EXT], attachments=[desc])
         self.drain()
-        r = self.result()
-        self.assertEqual((r["outcome"], r["reason_code"]),
-                         ("queued_for_human", "transport_anomaly"))
-        self.assertEqual(self.port.writes, [])
-        self.assertIsNotNone(sidecar)
+        self.assertFalse(self.has_result(), "settled instead of handed over")
+        self.assertEqual(self.port.writes, ["00000001"])
+        doc = json.loads(self.port.pending["00000001"])
+        self.assertEqual(doc["attachments"], [base64.b64encode(b"x").decode("ascii")])
+        self.assertEqual(doc["request"]["draft"]["attachments"], [desc],
+                         "the descriptors changed on the way to the leg")
+        rec = inflight.read_record(self.cfg, "alice", "00000001")
+        self.assertEqual(rec["attachments"],
+                         [{"size_bytes": 1, "sha256": hashlib.sha256(b"x").hexdigest()}])
 
     def test_a_router_without_the_external_leg_reports_no_inflight_keys(self):
         write_request(self.cfg, "alice", "00000001", to=["agent.nobody@local"])

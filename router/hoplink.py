@@ -803,6 +803,11 @@ HOLD_TREE_LOST = "hop_tree_lost"                     # the whole instance
 HOLD_RETIRE_FAILED = "hop_retire_failed"             # the whole instance, retried
 HOLD_FENCED_TREE_ABSENT = "hop_fenced_tree_absent"   # that generation's work only
 HOLD_FENCED_UNPINNED = "hop_fenced_unpinned"         # that generation's work only
+#: This router's own attachment snapshot failed its read-back for a request
+#: already handed over (`inflight.SnapshotDamaged`): that generation's
+#: hand-overs are latched (`set_write_hold`) until `router generation new`.
+#: RL-internal: never a plugin `.reason`, so not a write-table row.
+HOLD_SNAPSHOT_DAMAGED = "hop_snapshot_damaged"       # that generation's work only
 #: The points the test-only hook is called at (`service.FENCE_STOP_AT`).
 FENCE_POINTS = ("fence_recorded", "retired_written")
 #: The hint `status.json` gives with a lost tree.

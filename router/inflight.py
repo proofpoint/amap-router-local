@@ -114,10 +114,14 @@ result is never read; the agent's outbox was emptied by the same reset.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -213,6 +217,303 @@ def handed_path(cfg: RouterConfig, name: str, req_id: str) -> Path:
     return _inflight_dir(cfg, name) / f"{req_id}{HANDED_SUFFIX}"
 
 
+# ---------------------------------------------------------------------------
+# THE ATTACHMENT SNAPSHOT: the bytes ingest verified, copied ONCE into this
+# router's private state at begin, so every hand-over of the request carries
+# exactly them, whatever later happens to the agent's own sidecars.
+#
+#   <gen>/inflight-snapshots/<req_id>/<i>     0700 directories, 0600 blobs
+#
+# A SIBLING of `inflight/`, never inside it: `generations._handed_out` counts
+# ANY entry of `inflight/` as an allocated transport id, and the status scans
+# read its entries, so `inflight/` holds records and markers only.
+#
+# Written BEFORE the record, which is the commit point: a temp directory
+# (`.tmp-<req_id>-<16 hex>`: a leading dot, so no req_id can collide with
+# it), its blobs, the rename to `<req_id>`, then `inflight-snapshots/`
+# fsynced. The record's own `attachments` member names what the snapshot must
+# hold. A durable record therefore always has its snapshot; a snapshot can
+# outlive its record (an orphan), never the reverse. Removed only after the
+# record is durably gone (`_cleanup`), or by the sweep once the record's
+# absence is PROVEN (ENOENT).
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_DIR = "inflight-snapshots"
+SNAPSHOT_DIR_MODE = 0o700
+_TMP_PREFIX = ".tmp-"
+_TMP_RE = re.compile(r"\.tmp-(.+)-[0-9a-f]{16}\Z")
+_SNAP_REQ_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+
+DETAIL_SNAPSHOT_DAMAGED = ("the router's attachment snapshot is damaged; "
+                           "nothing was handed over")
+
+
+class SnapshotDamaged(ValueError):
+    """The attachment snapshot does not prove the bytes its record names.
+    `reason` is one of `REASONS`. This router's own state damage, never the
+    agent's: not handed over, the request is settled as an anomaly; handed
+    over, this generation's hand-overs are held."""
+
+    REASONS = ("missing", "size", "sha256", "not_regular", "linked", "not_a_directory")
+
+    def __init__(self, reason: str, detail: str) -> None:
+        assert reason in self.REASONS, reason
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+
+
+def _open_dir_nofollow(path: Path) -> int:
+    return os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _own_dir(fd: int) -> bool:
+    st = os.fstat(fd)
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid()
+
+
+def write_snapshot(cfg: RouterConfig, name: str, req_id: str,
+                   attachments: List[Any]) -> List[Dict[str, Any]]:
+    """Write the snapshot of `attachments` (ingest's `VerifiedAttachment`s)
+    durably, and return the record's `attachments` member. Call it BEFORE the
+    record exists. A leftover `<req_id>` (or temp) found first is removed only
+    when the record's absence is proven; anything uncertain raises."""
+    from . import attachments as attachments_mod  # local: attachments -> reset -> inflight
+    from .util import _mkdir_durable
+    gen = config_mod.gen_state_dir(cfg, name)
+    _mkdir_durable(gen, Path(cfg.state_dir))
+    gen_fd = _open_dir_nofollow(gen)
+    try:
+        snaps_fd = attachments_mod._mkdir_and_pin(gen_fd, SNAPSHOT_DIR, mode=SNAPSHOT_DIR_MODE)
+        try:
+            for entry in os.listdir(snaps_fd):
+                if _snapshot_owner(entry) == req_id:
+                    if _record_absent(gen_fd, req_id) is not True:
+                        raise OSError(f"{SNAPSHOT_DIR}/{entry}: a leftover whose record's "
+                                      f"absence cannot be proven")
+                    _remove_entry(snaps_fd, entry)
+            tmp = f"{_TMP_PREFIX}{req_id}-{secrets.token_hex(8)}"
+            tmp_fd = attachments_mod._mkdir_and_pin(snaps_fd, tmp, mode=SNAPSHOT_DIR_MODE)
+            try:
+                for i, a in enumerate(attachments):
+                    attachments_mod._write_blob_pinned(tmp_fd, i, a.data)
+            finally:
+                os.close(tmp_fd)
+            _effect("snapshot", os.rename, tmp, req_id, src_dir_fd=snaps_fd, dst_dir_fd=snaps_fd)
+            os.fsync(snaps_fd)
+        finally:
+            os.close(snaps_fd)
+    finally:
+        os.close(gen_fd)
+    return [{"size_bytes": a.size_bytes, "sha256": a.sha256} for a in attachments]
+
+
+def read_snapshot(cfg: RouterConfig, name: str, req_id: str,
+                  expected: List[Dict[str, Any]]) -> List[bytes]:
+    """The snapshot's blobs, each re-proved against `expected` (the record's
+    `attachments`): every directory and blob opened no-follow, each blob a
+    regular file with one link, EXACTLY `size_bytes` long (read with a
+    one-byte lookahead) and of digest `sha256`. The bound is the RECORD's,
+    never the current config's. Raises `SnapshotDamaged`."""
+    gen = config_mod.gen_state_dir(cfg, name)
+    try:
+        gen_fd = _open_dir_nofollow(gen)
+    except FileNotFoundError:
+        raise SnapshotDamaged("missing", f"{gen}: no generation directory") from None
+    except OSError as e:
+        raise SnapshotDamaged("not_a_directory", f"{gen}: {e.strerror}") from None
+    fds = [gen_fd]
+    try:
+        cur = gen_fd
+        for part in (SNAPSHOT_DIR, req_id):
+            kind, fd = _pin_child(cur, part)
+            if kind == "missing":
+                raise SnapshotDamaged("missing", f"{part}: absent")
+            if kind != "dir" or not _own_dir(fd):
+                if fd is not None:
+                    os.close(fd)
+                raise SnapshotDamaged("not_a_directory", f"{part}: not this uid's real directory")
+            fds.append(fd)
+            cur = fd
+        out = []
+        for i, want in enumerate(expected):
+            try:
+                bfd = os.open(str(i), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cur)
+            except FileNotFoundError:
+                raise SnapshotDamaged("missing", f"blob {i}: absent") from None
+            except OSError as e:
+                raise SnapshotDamaged("linked", f"blob {i}: {e.strerror}") from None
+            try:
+                st = os.fstat(bfd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise SnapshotDamaged("not_regular", f"blob {i}")
+                if st.st_nlink != 1:
+                    raise SnapshotDamaged("linked", f"blob {i}: {st.st_nlink} links")
+                size = want["size_bytes"]
+                data = b""
+                while len(data) <= size:
+                    chunk = os.read(bfd, size + 1 - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                os.close(bfd)
+            if len(data) != size:
+                raise SnapshotDamaged("size", f"blob {i}: {len(data)} bytes, not {size}")
+            if hashlib.sha256(data).hexdigest() != want["sha256"]:
+                raise SnapshotDamaged("sha256", f"blob {i}: digest differs")
+            out.append(data)
+        return out
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def _pin_child(parent_fd: int, part: str) -> "Tuple[str, Optional[int]]":
+    from .util import open_child_pinned
+    return open_child_pinned(parent_fd, part)
+
+
+def _snapshot_owner(entry: str) -> Optional[str]:
+    """The req_id an `inflight-snapshots/` entry belongs to, or None for a
+    name of neither form."""
+    m = _TMP_RE.fullmatch(entry)
+    if m is not None:
+        return m.group(1) if _SNAP_REQ_ID_RE.fullmatch(m.group(1)) else None
+    return entry if _SNAP_REQ_ID_RE.fullmatch(entry) else None
+
+
+def _record_absent(gen_fd: int, req_id: str) -> Optional[bool]:
+    """True only when `inflight/<req_id>.json` is PROVEN absent (ENOENT, or no
+    `inflight/` at all), through a pinned, owner-checked, no-follow lookup;
+    False when an entry is there; None when it cannot be told."""
+    kind, ifd = _pin_child(gen_fd, INFLIGHT_DIR)
+    if kind == "missing":
+        return True
+    if kind != "dir":
+        return None
+    try:
+        if not _own_dir(ifd):
+            return None
+        try:
+            os.stat(f"{req_id}.json", dir_fd=ifd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return None
+        return False
+    finally:
+        os.close(ifd)
+
+
+def _remove_entry(parent_fd: int, entry: str) -> None:
+    """Remove one snapshot directory (its blobs, then itself), every step
+    relative to a pinned descriptor and never following a link. A non-
+    directory at that name is unlinked as it is."""
+    kind, fd = _pin_child(parent_fd, entry)
+    if kind == "missing":
+        return
+    if kind != "dir":
+        os.unlink(entry, dir_fd=parent_fd)
+        return
+    try:
+        for child in os.listdir(fd):
+            try:
+                os.unlink(child, dir_fd=fd)
+            except IsADirectoryError:
+                _remove_entry(fd, child)
+    finally:
+        os.close(fd)
+    os.rmdir(entry, dir_fd=parent_fd)
+
+
+def _remove_snapshot_at(gen: Path, req_id: str) -> None:
+    """`_cleanup`'s snapshot step: remove `<gen>/inflight-snapshots/<req_id>`
+    and fsync `inflight-snapshots/`. A missing one is done; one that cannot
+    be removed is logged and left for the sweep."""
+    try:
+        gen_fd = _open_dir_nofollow(gen)
+    except FileNotFoundError:
+        return
+    try:
+        kind, sfd = _pin_child(gen_fd, SNAPSHOT_DIR)
+        if kind == "missing":
+            return
+        if kind != "dir":
+            logger.error("%s/%s is not a real directory; snapshot %r left for the sweep",
+                         gen, SNAPSHOT_DIR, req_id)
+            return
+        try:
+            _remove_entry(sfd, req_id)
+            os.fsync(sfd)
+        finally:
+            os.close(sfd)
+    except OSError as e:
+        logger.error("%s: snapshot %r not removed (%s); left for the sweep", gen, req_id, e)
+    finally:
+        os.close(gen_fd)
+
+
+def sweep_snapshots(cfg: RouterConfig, name: str) -> int:
+    """Remove orphan snapshots in `name`'s generation (the view's): an entry
+    goes ONLY when its record's absence is PROVEN by ENOENT. A listing that
+    fails, a name of neither form, or a lookup that cannot decide RETAINS it
+    with an ERROR. Returns how many were retained as uncertain. Call under
+    the drain lock."""
+    gen = config_mod.gen_state_dir(cfg, name)
+    try:
+        gen_fd = _open_dir_nofollow(gen)
+    except FileNotFoundError:
+        return 0
+    except OSError as e:
+        logger.error("%s: snapshot sweep cannot open the generation (%s)", gen, e.strerror)
+        return 1
+    uncertain = 0
+    try:
+        kind, sfd = _pin_child(gen_fd, SNAPSHOT_DIR)
+        if kind == "missing":
+            return 0
+        if kind != "dir" or not _own_dir(sfd):
+            if sfd is not None:
+                os.close(sfd)
+            logger.error("%s/%s is not this uid's real directory: nothing swept", gen, SNAPSHOT_DIR)
+            return 1
+        try:
+            try:
+                entries = sorted(os.listdir(sfd))
+            except OSError as e:
+                logger.error("%s/%s cannot be listed (%s): nothing swept", gen, SNAPSHOT_DIR,
+                             e.strerror)
+                return 1
+            removed = False
+            for entry in entries:
+                owner = _snapshot_owner(entry)
+                if owner is None:
+                    uncertain += 1
+                    logger.error("%s/%s/%s: not a snapshot name; retained", gen, SNAPSHOT_DIR, entry)
+                    continue
+                absent = _record_absent(gen_fd, owner)
+                if absent is None:
+                    uncertain += 1
+                    logger.error("%s/%s/%s: its record's absence cannot be proven; retained",
+                                 gen, SNAPSHOT_DIR, entry)
+                    continue
+                if absent:
+                    try:
+                        _remove_entry(sfd, entry)
+                        removed = True
+                    except OSError as e:
+                        uncertain += 1
+                        logger.error("%s/%s/%s: orphan not removed (%s)", gen, SNAPSHOT_DIR,
+                                     entry, e)
+            if removed:
+                os.fsync(sfd)
+        finally:
+            os.close(sfd)
+    finally:
+        os.close(gen_fd)
+    return uncertain
+
+
 def counter_path(cfg: RouterConfig, name: str) -> Path:
     return config_mod.gen_state_dir(cfg, name) / TRANSPORT_STATE_DIR / COUNTER_FILE
 
@@ -233,9 +534,10 @@ class RecordDamaged(ValueError):
 _RECORD_KEYS = {
     "digest": False, "transport_req_id": True, "recipients": True, "request": True,
     "written_ts": True, "policy_digest": False, "route": False,
-    "revocation_unenforceable": False, "from_address": False,
+    "revocation_unenforceable": False, "from_address": False, "attachments": False,
 }
 _ROUTES = ("fleet_host", "internet")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
@@ -267,7 +569,30 @@ def check_record(doc: Any) -> Dict[str, Any]:
         raise RecordDamaged("policy_digest is not sha256:<64 hex>")
     if "route" in doc and doc["route"] not in _ROUTES:
         raise RecordDamaged("route is not a known route")
+    if "attachments" in doc:
+        _check_record_attachments(doc)
     return doc
+
+
+def _check_record_attachments(doc: Dict[str, Any]) -> None:
+    """The record's own `attachments`: the snapshot's identity, one closed
+    `{size_bytes, sha256}` per staged descriptor, in order. It must equal the
+    staged request's `draft.attachments` (size and digest) position by
+    position, or the record is damaged: the two never diverge silently."""
+    atts = doc["attachments"]
+    if not (isinstance(atts, list) and atts):
+        raise RecordDamaged("attachments is not a non-empty list")
+    for i, a in enumerate(atts):
+        if not (isinstance(a, dict) and set(a) == {"size_bytes", "sha256"}
+                and type(a["size_bytes"]) is int and a["size_bytes"] >= 0
+                and isinstance(a["sha256"], str) and _SHA256_RE.fullmatch(a["sha256"])):
+            raise RecordDamaged(f"attachments[{i}] is not {{size_bytes, sha256}}")
+    draft = doc["request"].get("draft")
+    descs = draft.get("attachments") if isinstance(draft, dict) else None
+    if not (isinstance(descs, list) and len(descs) == len(atts) and all(
+            isinstance(d, dict) and d.get("size_bytes") == a["size_bytes"]
+            and d.get("sha256") == a["sha256"] for d, a in zip(descs, atts))):
+        raise RecordDamaged("attachments does not match the staged draft's descriptors")
 
 
 def read_record(cfg: RouterConfig, name: str, req_id: str) -> Optional[Dict[str, Any]]:
@@ -316,7 +641,7 @@ def begin(
     cfg: RouterConfig, name: str, req_id: str,
     *, digest: Optional[str], request_doc: Dict[str, Any], recipients: List[str],
     policy_digest: Optional[str] = None, route: Optional[str] = None,
-    from_address: Optional[str] = None,
+    from_address: Optional[str] = None, attachments: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """Put `req_id` in flight: allocate its transport id, then write the
     record. Returns the record. A crash between the two burns the id; the
@@ -324,8 +649,10 @@ def begin(
     processes it afresh and allocates a new one. `policy_digest` and `route`
     are the sender's policy digest and the request's class when it was
     classified (`router/classify.py`), recorded BEFORE anything is handed
-    over."""
+    over. `attachments` (ingest's verified attachments) are snapshotted
+    BEFORE the record is written, and the record names them."""
     n = allocate_transport_req_id(cfg, name)
+    snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None
     record: Dict[str, Any] = {
         "digest": digest,
         "transport_req_id": n,
@@ -341,6 +668,8 @@ def begin(
         # Pinned here, never filled in later from the current config: a
         # retry must hand over exactly what the first attempt did.
         record["from_address"] = from_address
+    if snapshot is not None:
+        record["attachments"] = snapshot
     check_record(record)
     _write_record(cfg, name, req_id, record, "record")
     return record
@@ -401,7 +730,8 @@ def settled_through(cfg: RouterConfig, name: str) -> int:
     return min(live) - 1
 
 
-def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]) -> bytes:
+def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any],
+                            *, req_id: Optional[str] = None) -> bytes:
     """The HANDOVER DOCUMENT this router hands to the transport for one
     record (`router/hoplink.py`, API (3, 0)), built from the STAGED copy.
     The request's `req_id` is the transport id and its `agent_id` this
@@ -415,7 +745,9 @@ def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]
     raises `HandoverUnavailable`. `settled_through` is this generation's
     frontier, asserted below the record's own id. Request, envelope and
     attachments are identical on every retry of the same id; only
-    `settled_through` may rise."""
+    `settled_through` may rise. The attachments are the SNAPSHOT's, re-proved
+    against the record on every call (`read_snapshot`: `SnapshotDamaged`);
+    `req_id` names the snapshot (the staged request's own, by default)."""
     mismatch = recipient_mismatch(record)
     if mismatch is not None:
         raise RecipientSetMismatch(mismatch)
@@ -442,9 +774,14 @@ def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]
         # (`config.load` requires `hop` beside a plugin, so a deployment
         # cannot), and the envelope's version is the first one.
         version_write = 1
+    blobs: List[bytes] = []
+    if record.get("attachments"):
+        rid = req_id if req_id is not None else record["request"].get("req_id")
+        blobs = read_snapshot(cfg, name, rid, record["attachments"])
     return hoplink.build_handover(
         doc, from_address=record["from_address"], version_write=version_write,
-        attachments=(), settled_through=frontier)
+        attachments=[base64.b64encode(b).decode("ascii") for b in blobs],
+        settled_through=frontier)
 
 
 class RecipientSetMismatch(Exception):
@@ -775,7 +1112,24 @@ def _advance(
             held.get("transport_req_id"))
         return BLOCKED
     try:
-        data = transport_request_bytes(cfg, name, record)
+        data = transport_request_bytes(cfg, name, record, req_id=req_id)
+    except SnapshotDamaged as e:
+        # This router's own state damage, decided BEFORE the handed marker
+        # is written for this attempt. Handed over before: the request may
+        # be pending downstream, so it is never settled from here and never
+        # handed over different bytes: this generation's hand-overs are held.
+        # Never handed over: nothing reached the hop, so it is settled.
+        if _was_handed(handed, n):
+            hoplink.set_write_hold(cfg, name, hoplink.HOLD_SNAPSHOT_DAMAGED,
+                                   f"SnapshotDamaged: {e}", n)
+            logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
+                         name, req_id, hoplink.HOLD_SNAPSHOT_DAMAGED, e)
+            return BLOCKED
+        logger.error("instance %r req %r: %s (%s); settled as an anomaly", name, req_id,
+                     DETAIL_SNAPSHOT_DAMAGED, e)
+        _effect("settle", settle, _anomaly(DETAIL_SNAPSHOT_DAMAGED), record.get("digest"))
+        _effect("unlink", _cleanup, path, handed)
+        return SETTLED
     except (FrontierUndecidable, HandoverUnavailable) as e:
         # Decided BEFORE the handed marker: nothing is published, the record
         # and its transport id stay as they are, and the hold is this
@@ -935,14 +1289,22 @@ def _was_handed(handed: Path, n: str) -> bool:
 
 
 def _cleanup(record: Path, handed: Path) -> None:
-    """Remove a settled record, then its marker, durably. The record goes
-    FIRST: a record left without its marker by a crash here is already
-    settled (`already_settled`), so the missing marker is never consulted."""
-    for p in (record, handed):
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
+    """Remove a settled record, then its marker, then its attachment
+    snapshot, durably. The record goes FIRST and is made durably gone (its
+    directory fsynced) BEFORE anything of the snapshot is touched: across a
+    power loss a durable record then always has its snapshot, and what can
+    be left is an orphan snapshot (swept) or an orphan marker (which never
+    vouches for another record: THE HANDED MARKER)."""
+    try:
+        record.unlink()
+    except FileNotFoundError:
+        pass
+    fsync_dir(record.parent)
+    try:
+        handed.unlink()
+    except FileNotFoundError:
+        pass
+    _remove_snapshot_at(record.parent.parent, record.name[: -len(".json")])
     fsync_dir(record.parent)
 
 

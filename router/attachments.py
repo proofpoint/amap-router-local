@@ -132,6 +132,32 @@ class AttachmentIngestError(Exception):
         self.attachment_outcome = attachment_outcome
 
 
+def check_effective_caps(attachments: List["VerifiedAttachment"], *, file_cap: int,
+                         total_cap: int) -> None:
+    """The external leg's caps on verified attachments, BEFORE anything is
+    allocated: each file at most `file_cap` and all of them at most
+    `total_cap` (the caller passes the EFFECTIVE caps, the smaller of the
+    hop's and this router's). Raises `AttachmentIngestError` in ingest's own
+    vocabulary: `queued_for_human` / `attachment_too_large`, the per-file row
+    with the `too_large` per-attachment outcome, the total row without."""
+    total = 0
+    for i, a in enumerate(attachments):
+        if a.size_bytes > file_cap:
+            raise AttachmentIngestError(
+                "queued_for_human", REASON_ATTACHMENT_TOO_LARGE,
+                f"attachments[{i}]: {a.size_bytes} bytes exceeds the external leg's "
+                f"{file_cap}-byte per-file cap",
+                index=i, attachment_outcome=ATTACH_OUTCOME_TOO_LARGE,
+            )
+        total += a.size_bytes
+    if total > total_cap:
+        raise AttachmentIngestError(
+            "queued_for_human", REASON_ATTACHMENT_TOO_LARGE,
+            f"total {total} bytes across {len(attachments)} attachment(s) exceeds the "
+            f"external leg's {total_cap}-byte combined cap",
+        )
+
+
 def _sanitize_display(raw: Any, limit: int, fallback: str) -> str:
     """`filename`/`media_type` are attacker-controlled untrusted display
     strings end to end (§5) — collapse control/newline characters to a
@@ -420,7 +446,7 @@ def remove_outbound_sidecar_dir(cfg: RouterConfig, name: str, req_id: str) -> No
 # --------------------------------------------------------------------
 
 
-def _mkdir_and_pin(parent_fd: int, name: str) -> int:
+def _mkdir_and_pin(parent_fd: int, name: str, *, mode: Optional[int] = None) -> int:
     """Create `name` as a directory under `parent_fd` if it doesn't
     already exist (tolerating a concurrent/repeat creator — a crash-and-
     resume of the SAME delivery is a real, expected case even though a
@@ -432,9 +458,20 @@ def _mkdir_and_pin(parent_fd: int, name: str) -> int:
     The parent is fsynced every time, created now or not: a directory an
     earlier, interrupted run created may never have been made durable, and
     every file placed beneath it rests on its entry (`util._mkdir_durable`
-    does the same for `state_dir`)."""
+    does the same for `state_dir`).
+
+    With `mode` (a private directory of this router's own): created with
+    it, and the pinned descriptor is then `fchmod`ed to exactly `mode`, so
+    a umask that clears owner bits cannot narrow it. A directory found
+    already must be this uid's and carry no bit outside `mode`: it is then
+    set to exactly `mode` (what an interrupted creation, between the mkdir
+    and the fchmod, leaves). Another owner, or a wider mode, is refused,
+    never repaired. Without `mode`, behaviour is as it always was."""
     try:
-        os.mkdir(name, dir_fd=parent_fd)
+        if mode is None:
+            os.mkdir(name, dir_fd=parent_fd)
+        else:
+            os.mkdir(name, mode, dir_fd=parent_fd)
     except FileExistsError:
         pass
     os.fsync(parent_fd)
@@ -444,6 +481,16 @@ def _mkdir_and_pin(parent_fd: int, name: str) -> int:
             f"refusing to publish attachments into {name!r}: exists but is "
             f"not a real directory"
         )
+    if mode is not None:
+        try:
+            st = os.fstat(fd)
+            if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & ~mode:
+                raise NamespaceEscapeError(
+                    f"refusing {name!r}: not this uid's, or a mode wider than {mode:o}")
+            os.fchmod(fd, mode)
+        except BaseException:
+            os.close(fd)
+            raise
     return fd
 
 

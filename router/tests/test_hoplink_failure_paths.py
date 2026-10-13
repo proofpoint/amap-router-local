@@ -18,6 +18,7 @@ what is left unconsumed, and what never leaks or aborts the instance.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 from unittest import mock
@@ -306,21 +307,24 @@ class MailOnlyTests(_InflightCase):
 
 class AttachmentsUnderARuntimeTests(_Runtime):
 
-    def test_an_attachment_bearing_request_is_refused_at_begin(self):
+    def test_an_attachment_bearing_request_is_handed_over_with_its_snapshot(self):
+        """Under a real runtime: one transport id, one hand-over carrying the
+        verified bytes, and a record that names its snapshot."""
         data = b"bytes"
         write_request(self.cfg, "alpha", "00000001", to=[EXTERNAL],
                       attachments=[helpers.attachment_descriptor(data)])
         helpers.stage_outbound_sidecars(self.cfg, "alpha", "00000001", [data])
-        k0 = keyed_for_poll(self.cfg)                       # begins the generation
-        counter = inflight.counter_path(k0, "alpha")
-        before = counter.read_bytes() if counter.exists() else None
         k, _ = self.drain()
-        r = read_json(result_path(self.cfg, "alpha", "00000001"))
-        self.assertEqual((r["outcome"], r["reason_code"]), ("queued_for_human", "transport_anomaly"))
-        self.assertEqual(inflight.list_records(k, "alpha"), [])
-        after = counter.read_bytes() if counter.exists() else None
-        self.assertEqual(after, before, "a transport id was allocated")
-        self.assertEqual([p.writes for p in self.plugin.ports], [[]] * len(self.plugin.ports))
+        self.assertFalse(result_path(self.cfg, "alpha", "00000001").exists(), "settled at begin")
+        (rid,) = inflight.list_records(k, "alpha")
+        rec = inflight.read_record(k, "alpha", rid)
+        writes = [(n, d) for p in self.plugin.ports for n, d in p.pending.items()]
+        self.assertEqual(len(writes), 1)
+        n, sent = writes[0]
+        self.assertEqual(n, rec["transport_req_id"])
+        self.assertEqual(json.loads(sent)["attachments"], [base64.b64encode(data).decode("ascii")])
+        snap = config_mod.gen_state_dir(k, "alpha") / inflight.SNAPSHOT_DIR / rid / "0"
+        self.assertEqual(snap.read_bytes(), data)
 
 
 if __name__ == "__main__":
