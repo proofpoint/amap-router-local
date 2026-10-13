@@ -1351,8 +1351,13 @@ same check begin runs.
 **Who creates what under `root`.** `root` itself is the deployment's
 (this router's uid, the downstream runtime's group, 2750), and so are the
 downstream runtime's own host intakes beside the identities (`.unresolved/`,
-`.control/`). `.runtime/` holds the downstream runtime's own generation
-trees; this router never creates it. Everything under `<root>/<logical_id>/` is the
+`.control/`, where inbound control mail lands). `.runtime/` is different:
+it is this router's OUTBOUND runtime control tree, the upstream side of
+control notices, which is not built yet. When it is, this router creates it
+and admits its generations exactly as it does an agent's (identity
+`logical_id` "runtime" and the router's own address), and the downstream
+runtime creates `down/` and its receiver directories on first sight. The
+deployment never pre-creates it. Everything under `<root>/<logical_id>/` is the
 plugin's, created when a generation is admitted or first seen. This router,
 admitting a generation, creates `<root>/<logical_id>/`, the generation tree
 with its `up/`, and the upstream directories: `outbound/` and `inbound/` with
