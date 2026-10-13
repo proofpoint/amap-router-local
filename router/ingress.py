@@ -1507,3 +1507,100 @@ def classify_facts(facts: Dict[str, Any], *, link: str, fleet_hosts, trusted_fle
         return HOLD, HELD_UNKNOWN_HOST
     return PLACE, None
 
+
+# ---------------------------------------------------------------------------
+# The inbound link, PINNED per generation (design delta v3.5 B1). The link is
+# inside every journal key, so a config edit must never re-key: the first
+# inbound use writes the pin, every later pump compares, and a difference
+# latches that generation's inbound off. Changing the link means fencing a
+# new generation.
+# ---------------------------------------------------------------------------
+
+LINK_PIN_SCHEMA = "amap-router-local.ingress-link/1"
+LINK_PIN_NAME = "link.json"
+HELD_LINK_UNSET = "hop_link_unset"
+HELD_LINK_CHANGED = "hop_link_changed"
+HELD_LINK_PIN_DAMAGED = "hop_link_pin_damaged"
+
+
+def link_pin_path(state_dir: Path, logical_id: str, gen: str) -> Path:
+    return generations_mod.gen_dir(state_dir, logical_id, gen) / DIR_NAME / LINK_PIN_NAME
+
+
+def _any_record(state_dir: Path, logical_id: str, gen: str) -> bool:
+    for kind in KINDS:
+        try:
+            if any(n.endswith(".json") for n in os.listdir(
+                    kind_dir(state_dir, logical_id, gen, kind))):
+                return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def _read_pin(path: Path) -> Optional[bytes]:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
+            raise ValueError("not a regular file with one link")
+        return os.read(fd, RECORD_MAX + 1)
+    finally:
+        os.close(fd)
+
+
+def pinned_link(state_dir: Path, logical_id: str, gen: str,
+                configured: Optional[str]) -> "tuple[Optional[str], Optional[str]]":
+    """`(link, None)` to pump this generation with, or `(None, reason)` to
+    leave its inbound off: `hop_link_unset` (no `hop.link`),
+    `hop_link_changed` (the config differs from the pin), or
+    `hop_link_pin_damaged` (an unreadable pin, or journal records with no
+    pin). The pin is written create-if-absent on first use and never
+    rewritten."""
+    if configured is None:
+        return None, HELD_LINK_UNSET
+    path = link_pin_path(state_dir, logical_id, gen)
+    try:
+        raw = _read_pin(path)
+    except (OSError, ValueError):
+        return None, HELD_LINK_PIN_DAMAGED
+    if raw is None:
+        if _any_record(state_dir, logical_id, gen):
+            return None, HELD_LINK_PIN_DAMAGED
+        doc = json.dumps({"schema": LINK_PIN_SCHEMA, "link": configured},
+                         sort_keys=True).encode("utf-8")
+        _mkdir_durable(path.parent, Path(state_dir))
+        tmp = path.parent / f".{LINK_PIN_NAME}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                os.write(fd, doc)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.link(tmp, path, follow_symlinks=False)
+            except FileExistsError:
+                pass                     # another writer pinned first: compare below
+        finally:
+            os.unlink(tmp)
+        fsync_dir(path.parent)
+        try:
+            raw = _read_pin(path)
+        except (OSError, ValueError):
+            return None, HELD_LINK_PIN_DAMAGED
+    try:
+        pin = json.loads((raw or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, HELD_LINK_PIN_DAMAGED
+    if not (isinstance(pin, dict) and set(pin) == {"schema", "link"}
+            and pin["schema"] == LINK_PIN_SCHEMA and isinstance(pin["link"], str)
+            and config_mod.HOP_LINK_RE.fullmatch(pin["link"])):
+        return None, HELD_LINK_PIN_DAMAGED
+    if pin["link"] != configured:
+        return None, HELD_LINK_CHANGED
+    return pin["link"], None
+

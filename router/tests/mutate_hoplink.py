@@ -40,6 +40,7 @@ DF = "router.tests.test_ingress_documents.FixtureTests.test_invalid_fixtures_are
 PL = "router.tests.test_ingress_place."
 KC = "router.tests.test_ingress_classify.ClassifyTests."
 FC = "router.tests.test_ingress_facts_check.FactsCheckTests."
+LK = "router.tests.test_ingress_link_pin.LinkPinTests."
 
 M = [
  # -- the inbound reader's link (config) ----------------------------------------
@@ -50,6 +51,20 @@ M = [
  ('L2 hop.link not carried into the config', CF,
   '        link=link)\n', '        link=None)\n',
   [HC + "test_the_inbound_link_is_optional_and_in_the_link_grammar"]),
+ # -- the link pin (a config change never re-keys) ------------------------------
+ ('L3 a changed link accepted', IG,
+  '    if pin["link"] != configured:\n', '    if False:\n',
+  [LK + "test_a_changed_config_latches_off_and_never_rewrites"]),
+ ('L4 records without a pin re-pinned', IG,
+  '        if _any_record(state_dir, logical_id, gen):\n            return None, HELD_LINK_PIN_DAMAGED\n', '',
+  [LK + "test_records_without_a_pin_are_damage"]),
+ ('L5 a damaged pin trusted', IG,
+  '            and config_mod.HOP_LINK_RE.fullmatch(pin["link"])):\n',
+  '            and True):\n',
+  [LK + "test_a_damaged_pin_latches"]),
+ # (No mutant for replace-instead-of-link on the pin write: that path runs only
+ # while no pin exists, so either writes the same; a differing pin never
+ # reaches it, which L3 pins.)
  # -- the facts version guard (driven directly at the guard unit) -------------
  ('G1 facts_version unchecked (presence selects version 2)', IG,
   '    if type(v) is int and v == 2:\n', '    if True:\n',
