@@ -224,3 +224,34 @@ def journal_records(state_dir: Path, logical_id: str, gen: str,
         out[doc["entry_id"]] = {"state": doc["state"], "reason": doc.get("reason"),
                                 "notice_id": doc.get("notice_id")}
     return out
+
+
+# ---------------------------------------------------------------------------
+# The facts version guard: this router's own strict check, ADDITIONAL to the
+# plugin reader's and verdict-identical to it over its corpus.
+# ---------------------------------------------------------------------------
+
+class FactsInvalid(Exception):
+    """The facts' version members are not a valid combination: the entry is
+    `notice_invalid` (quarantined on first sight)."""
+
+
+def facts_version(facts: Any) -> int:
+    """The facts document's version: 1 when `facts_version` is ABSENT (no
+    `attachments` member allowed, compared whole-bundle), 2 when it is
+    PRESENT, exactly the integer 2 (`type(v) is int and v == 2`, so JSON
+    `true` and `2.0` are refused), with `attachments` REQUIRED. Anything else,
+    a present 1 included, raises `FactsInvalid`. Never a membership test over
+    a list of readable versions: version 1 is expressed only by absence."""
+    if not isinstance(facts, dict):
+        raise FactsInvalid("the facts are not an object")
+    if "facts_version" not in facts:
+        if "attachments" in facts:
+            raise FactsInvalid("version-1 facts carry no attachments member")
+        return 1
+    v = facts["facts_version"]
+    if type(v) is int and v == 2:
+        if "attachments" not in facts:
+            raise FactsInvalid("version-2 facts require an attachments member")
+        return 2
+    raise FactsInvalid(f"facts_version {v!r} is not a version this router reads")

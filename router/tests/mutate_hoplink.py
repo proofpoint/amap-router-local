@@ -31,8 +31,23 @@ FP = "router.tests.test_hoplink_failure_paths."
 RD = "router.tests.test_hoplink_readers."
 CF, HL, IF, OB, SV, SS = ("router/config.py", "router/hoplink.py", "router/inflight.py",
                           "router/outbound.py", "router/service.py", "router/status.py")
+IG = "router/ingress.py"
+FV = "router.tests.test_ingress_facts_version.FactsVersionTests."
 
 M = [
+ # -- the facts version guard (driven directly at the guard unit) -------------
+ ('G1 facts_version unchecked (presence selects version 2)', IG,
+  '    if type(v) is int and v == 2:\n', '    if True:\n',
+  [FV + "test_every_other_present_value_is_refused"]),
+ ('G2 the type check removed', IG,
+  '    if type(v) is int and v == 2:\n', '    if v == 2:\n',
+  [FV + "test_every_other_present_value_is_refused"]),
+ ('G3 version-1 facts may carry attachments', IG,
+  '        if "attachments" in facts:\n            raise FactsInvalid("version-1 facts carry no attachments member")\n', '',
+  [FV + "test_version_1_carrying_attachments_is_refused"]),
+ ('G4 version 2 without attachments accepted', IG,
+  '        if "attachments" not in facts:\n            raise FactsInvalid("version-2 facts require an attachments member")\n', '',
+  [FV + "test_version_2_without_attachments_is_refused"]),
  # -- the intake-reader seam ----------------------------------------------------
  ('D1 no reader cache', HL,
   '    reader = _READERS.get(key)\n    if reader is not None:\n        return reader\n',
