@@ -708,6 +708,11 @@ def ensure_decision_key(state_dir: Path) -> bytes:
 
 
 def _decision_key(state_dir: Path) -> bytes:
+    """The decision key as it is on disk, read with every check but WITHOUT
+    the present-key durability barrier: every caller (`decision_record`,
+    `commit_decision`, `reopen_decision`, `resume`) runs only under an active
+    delegation, and activation has already made the key durable
+    (`ensure_decision_key`)."""
     dirfd = _open_dir(Path(state_dir))
     try:
         data, fd, _dev, _ino = _read_checked(dirfd, DECISION_KEY_FILE, size=DECISION_KEY_BYTES)

@@ -17,6 +17,12 @@ EQUIVALENT under one rule, recorded and NOT run:
   * placement's own entry seal check removed: `peerbind.consistency` and
     `peerbind.published` each re-check the seal before anything is written,
     so the forgery witness stays green; `published()`'s check alone is S4.
+  * `peerbind.consistency()` removed from placement: a decided value is
+    sealed over every part it binds and its payload is derived from its own
+    statement, so it is consistent by construction.
+  * resume's key_id comparison removed: the snapshot's statement is bound by
+    its digest (R12), and a statement with the recorded digest carries the
+    recorded key_id.
 
 NOT EXPRESSIBLE as a single-rule mutant, recorded here:
   * "the declared media_type consulted for a disposition":
@@ -373,6 +379,54 @@ M = [
   '_STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR, PEER_LEDGER_DIR,\n               PEER_JOURNAL_DIR)',
   '_STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR, PEER_LEDGER_DIR)',
   [T + 'ResetKeepsTests.test_reset_keeps_the_candidate_journal']),
+ ('R12 resume not binding the statement digest', PB,
+  '    if _sha(snapshot.statement) != rec["statement_sha256"]:\n        raise RecoveryCorrupt("snapshot", "statement")\n',
+  '',
+  [T + 'ResumeBindingTests.test_a_snapshot_of_another_statement']),
+ ('R13 resume not binding the body', PB,
+  '    if text is None or _sha(text.encode("utf-8")) != rec["body_sha256"]:\n        raise RecoveryCorrupt("snapshot", "body")\n',
+  '    if text is None:\n        raise RecoveryCorrupt("snapshot", "body")\n',
+  [T + 'ResumeBindingTests.test_a_snapshot_with_another_body']),
+ ('R14 resume not binding the attachments', PB,
+  '    if [_sha(a) for a in leaves] != list(rec["attachment_sha256s"]):\n        raise RecoveryCorrupt("snapshot", "attachments")\n',
+  '',
+  [T + 'ResumeBindingTests.test_a_snapshot_with_another_attachment']),
+ ('F1 the staged temp not fsynced before its link', PB,
+  '        os.fsync(fd)\n    finally:\n        os.close(fd)\n    try:\n        os.link(',
+  '    finally:\n        os.close(fd)\n    try:\n        os.link(',
+  [T + 'FileFsyncTests.test_the_temp_is_fsynced_before_its_link']),
+ ('F2 reopen not fsyncing the record', PB,
+  '        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n        os.fsync(dirfd)\n        _parse_record(data, key, record_id)',
+  '        os.close(fd)\n        os.fsync(dirfd)\n        _parse_record(data, key, record_id)',
+  [T + 'FileFsyncTests.test_reopen_fsyncs_the_record']),
+ ('F3 the present key not fsynced', PB,
+  '    try:\n        os.fsync(fd)\n    finally:\n        os.close(fd)\n    os.fsync(dirfd)\n    return data',
+  '    os.close(fd)\n    os.fsync(dirfd)\n    return data',
+  [T + 'FileFsyncTests.test_the_present_key_is_fsynced_before_use']),
+ ("C4 confirm not rechecking the key's runtime", PB,
+  '    if runtime is None or runtime.runtime != auth.runtime:\n        raise AuthorisationMismatch("stale", "runtime")\n',
+  '',
+  [T + 'ConfirmAndRecordTests.test_confirm_refuses_a_renamed_runtime']),
+ ('D1 a held recipient placed', DL,
+  '    _gate(cfg, recipient)\n    recipient_cfg = cfg.instances[recipient]',
+  '    recipient_cfg = cfg.instances[recipient]',
+  [T + 'HeldRecipientTests.test_held_writes_nothing_and_released_places_once']),
+ ('S2 notice_id left out of the seal', PB,
+  '               "notice_id": notice_id, "ts": ts}\n    return hmac.new(key, _LABEL_AUTHORISED',
+  '               "ts": ts}\n    return hmac.new(key, _LABEL_AUTHORISED',
+  [T + 'DecidedValueTests.test_a_decided_values_preset_and_record_id_cannot_be_replaced']),
+ ('S2 ts left out of the seal', PB,
+  '               "notice_id": notice_id, "ts": ts}\n    return hmac.new(key, _LABEL_AUTHORISED',
+  '               "notice_id": notice_id}\n    return hmac.new(key, _LABEL_AUTHORISED',
+  [T + 'DecidedValueTests.test_a_decided_values_preset_and_record_id_cannot_be_replaced']),
+ ('S2 record_id left out of the seal', PB,
+  '"confirmed": confirmed, "record_id": record_id,\n',
+  '"confirmed": confirmed,\n',
+  [T + 'DecidedValueTests.test_a_decided_values_preset_and_record_id_cannot_be_replaced']),
+ ('S7 a receipt picklable', PB,
+  '    def __reduce_ex__(self, protocol):\n        raise TypeError("a PersistedDecision is not persisted")\n',
+  '',
+  [T + 'DecidedValueTests.test_a_receipt_is_not_picklable_and_copies_are_identical']),
 ]
 
 

@@ -367,6 +367,15 @@ class SealTests(_Chain):
 
 class ConfirmAndRecordTests(_Chain):
 
+    def test_confirm_refuses_a_renamed_runtime(self):
+        auth, _snap = self.fresh()
+        rt = self.dc.runtimes[0]
+        moved = dataclasses.replace(self.cfg, delegation=dataclasses.replace(
+            self.dc, runtimes=(dataclasses.replace(rt, runtime=f"amap.router@{T2}"),)))
+        with self.assertRaises(peerbind.AuthorisationMismatch) as cm:
+            peerbind.confirm(auth, cfg=moved)
+        self.assertEqual(cm.exception.detail, "runtime")
+
     def test_confirm_refuses_a_moved_world(self):
         auth, _snap = self.fresh()
         with mock.patch.object(config_mod, "target_hold", return_value="held"):
@@ -393,6 +402,26 @@ class ConfirmAndRecordTests(_Chain):
             with self.assertRaises(peerbind.AuthorisationMismatch):
                 peerbind.decision_record(confirmed, record_id=RECORD_ID, preset=PRESET,
                                          cfg=self.cfg, state_dir=self.state_dir)
+
+
+class DecidedValueTests(_Chain):
+
+    def test_a_decided_values_preset_and_record_id_cannot_be_replaced(self):
+        auth, snap = self.fresh()
+        _rec, rcp = self.decide(auth)
+        d = peerbind.resume(rcp, snap, state_dir=self.state_dir)
+        for part, value in (("notice_id", "f" * 32), ("ts", "2026-10-14T00:00:00Z"),
+                            ("record_id", "cand-0002")):
+            with self.subTest(part=part):
+                with self.assertRaises(TypeError):
+                    dataclasses.replace(d, **{part: value})
+
+    def test_a_receipt_is_not_picklable_and_copies_are_identical(self):
+        auth, _snap = self.fresh()
+        _rec, rcp = self.decide(auth)
+        with self.assertRaisesRegex(TypeError, "not persisted"):
+            pickle.dumps(rcp)
+        self.assertIs(copy.copy(rcp), rcp)
 
 
 class PersistenceTests(_Chain):
@@ -756,9 +785,11 @@ class PlacementTests(_Chain):
         self.assertEqual(self.tree(), self.baseline)
 
     def test_a_decision_survives_a_changed_world(self):
-        """Decided, then the recipient is held and the alias table changes:
-        the record is resumed and placed to the RECORDED instance, never
-        re-decided (resume consults no hosting, no key and no time)."""
+        """Decided, then hosting would now say NotHosted (the alias table or
+        the configuration moved): the record is resumed and placed to the
+        RECORDED instance, never re-decided (resume and placement consult no
+        hosting, no key and no time). A registry HOLD on the recorded
+        recipient is different: see the held/released witness."""
         auth, snap = self.fresh()
         _rec, rcp = self.decide(auth)
         with mock.patch.object(peerbind, "hosting", return_value=peerbind.NotHosted()):
@@ -769,6 +800,104 @@ class PlacementTests(_Chain):
             except Exception as e:  # noqa: BLE001
                 self.fail(f"a persisted decision was re-decided: {type(e).__name__}: {e}")
         self.assertTrue(placed)
+
+
+class HeldRecipientTests(_Chain):
+    """A decided record whose recipient the registry holds is not placed
+    (the local lane's gate) and is not re-decided: nothing is written, and
+    once the hold is released the same decided value places once."""
+
+    def test_held_writes_nothing_and_released_places_once(self):
+        auth, snap = self.fresh()
+        _rec, rcp = self.decide(auth)
+        d = peerbind.resume(rcp, snap, state_dir=self.state_dir)
+        with mock.patch.object(deliver, "target_hold", return_value="held"):
+            try:
+                deliver.deliver_signed_peer(self.cfg, self.state_dir, d)
+            except Exception as e:  # noqa: BLE001
+                self.assertIsInstance(e, deliver.RecipientHeld)
+            else:
+                self.fail("placed while the recipient is held")
+        self.assertEqual(self.tree(), self.baseline)
+        self.assertTrue(deliver.deliver_signed_peer(self.cfg, self.state_dir, d)["placed"])
+        self.assertFalse(deliver.deliver_signed_peer(self.cfg, self.state_dir, d)["placed"])
+
+
+class ResumeBindingTests(_Chain):
+    """resume binds the snapshot to the decided record: the statement digest,
+    the body and each attachment. (The record's key_id is bound through the
+    statement digest: a snapshot whose statement digest matches carries the
+    recorded key_id, so that check cannot fail alone.)"""
+
+    def refused(self, rcp, snap, detail):
+        try:
+            peerbind.resume(rcp, snap, state_dir=self.state_dir)
+        except peerbind.RecoveryCorrupt as e:
+            self.assertEqual((e.reason, e.detail), ("snapshot", detail))
+        else:
+            self.fail(f"resumed over a snapshot whose {detail} differs")
+
+    def test_a_snapshot_of_another_statement(self):
+        auth, _snap = self.fresh()
+        _rec, rcp = self.decide(auth)
+        _other, other_snap = self.fresh(subject="Another task")
+        self.refused(rcp, other_snap, "statement")
+
+    def test_a_snapshot_with_another_body(self):
+        auth, snap = self.fresh()
+        _rec, rcp = self.decide(auth)
+        cand = dict(snap.candidate, body={"charset": "utf-8", "octets_b64": b64(b"changed\n")})
+        self.refused(rcp, peerbind.Snapshot(snap.statement, cand), "body")
+
+    def test_a_snapshot_with_another_attachment(self):
+        atts = [("a", "text/plain", b"AAAA")]
+        auth, snap = self.fresh(atts=atts, atts_raw=atts)
+        _rec, rcp = self.decide(auth)
+        cand = dict(snap.candidate, attachments=[{"octets_b64": b64(b"BBBB")}])
+        self.refused(rcp, peerbind.Snapshot(snap.statement, cand), "attachments")
+
+
+class FileFsyncTests(_Chain):
+    """The FILE fsyncs: the staged temp before its link, the record on
+    reopen, and the key on the present-key path. Each failure gives no
+    receipt, no key and no effect."""
+
+    def failing_file_fsync(self):
+        real = os.fsync
+
+        def fsync(fd):
+            import stat as st
+            if st.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(5, "EIO")
+            return real(fd)
+        return mock.patch.object(peerbind.os, "fsync", fsync)
+
+    def record(self):
+        auth, snap = self.fresh()
+        rec = peerbind.decision_record(peerbind.confirm(auth, cfg=self.cfg), record_id=RECORD_ID,
+                                       preset=PRESET, cfg=self.cfg, state_dir=self.state_dir)
+        return rec, snap
+
+    def test_the_temp_is_fsynced_before_its_link(self):
+        rec, _snap = self.record()
+        with self.failing_file_fsync():
+            with self.assertRaises(OSError):
+                peerbind.commit_decision(self.state_dir, self.record_dir, rec,
+                                         record_id=RECORD_ID)
+        self.assertFalse((self.state_dir / self.record_dir / peerbind.DECISION_FILE).exists(),
+                         "nothing is linked before the temp is durable")
+
+    def test_reopen_fsyncs_the_record(self):
+        rec, _snap = self.record()
+        peerbind.commit_decision(self.state_dir, self.record_dir, rec, record_id=RECORD_ID)
+        with self.failing_file_fsync():
+            with self.assertRaises(OSError):
+                peerbind.reopen_decision(self.state_dir, self.record_dir, record_id=RECORD_ID)
+
+    def test_the_present_key_is_fsynced_before_use(self):
+        with self.failing_file_fsync():
+            with self.assertRaises(OSError):
+                peerbind.ensure_decision_key(self.state_dir)
 
 
 class AttachmentTests(_Chain):
