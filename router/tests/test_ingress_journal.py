@@ -132,6 +132,33 @@ class StateMachineTests(_J):
             self.write(ingress.HELD, state_ts="x")
 
 
+class EnumerationTests(_J):
+
+    def test_a_generation_kind_is_enumerated_by_entry_id(self):
+        self.assertEqual(ingress.journal_records(self.state_dir, LID, GEN, "notice"), {})
+        self.write(ingress.HELD, "a", reason="bundle_schema")
+        self.write(ingress.PREPARED, "b", notice_id="n" * 32)
+        self.write(ingress.HELD, "c", kind="candidate", reason="r")
+        self.assertEqual(ingress.journal_records(self.state_dir, LID, GEN, "notice"), {
+            "a": {"state": "held", "reason": "bundle_schema", "notice_id": None},
+            "b": {"state": "prepared", "reason": None, "notice_id": "n" * 32}})
+
+    def test_damage_raises_never_hidden(self):
+        self.write(ingress.HELD, "a", reason="r")
+        self.path("a").write_text("{damaged")
+        with self.assertRaises(ingress.JournalError):
+            ingress.journal_records(self.state_dir, LID, GEN, "notice")
+        (self.path("a").parent / "stray.json").write_text("{}")
+        self.path("a").unlink()
+        with self.assertRaises(ingress.JournalError):
+            ingress.journal_records(self.state_dir, LID, GEN, "notice")
+
+    def test_recovery_row_2_may_quarantine_from_placing(self):
+        for s in (ingress.PREPARED, ingress.PLACING, ingress.QUARANTINED):
+            self.write(s)
+        self.assertEqual(self.read()["state"], ingress.QUARANTINED)
+
+
 class DurabilityAndDamageTests(_J):
 
     def test_records_are_private(self):

@@ -69,7 +69,9 @@ INITIAL = (HELD, PREPARED, QUARANTINED)
 TRANSITIONS: Dict[str, tuple] = {
     HELD: (HELD, PREPARED, QUARANTINED),
     PREPARED: (PLACING, QUARANTINED),
-    PLACING: (PUBLISHED, HELD),
+    # Recovery row 1 (published), rows 1/3 (terminal holds), row 2 when the
+    # generation is no longer current and nothing was committed (quarantined).
+    PLACING: (PUBLISHED, HELD, QUARANTINED),
     PUBLISHED: (PUBLISHED_WAITING_REMOVE,),
     PUBLISHED_WAITING_REMOVE: (COMPLETE,),
     COMPLETE: (PUBLISHED_WAITING_REMOVE, DUPLICATE_DIFFERENT_HELD),
@@ -195,3 +197,27 @@ def journal_state(state_dir: Path, logical_id: str, gen: str, kind: str, link: s
         return None
     return {"state": doc["state"], "reason": doc.get("reason"),
             "notice_id": doc.get("notice_id")}
+
+
+def journal_records(state_dir: Path, logical_id: str, gen: str,
+                    kind: str) -> Dict[str, Dict[str, Any]]:
+    """Read-only enumeration of a generation's records of one kind:
+    `{entry_id: {"state", "reason", "notice_id"}}`. A damaged record raises
+    (`JournalError`), never omitted: an enumeration that hid one could prove a
+    false absence."""
+    d = kind_dir(state_dir, logical_id, gen, kind)
+    try:
+        names = sorted(os.listdir(d))
+    except FileNotFoundError:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        key = name[:-len(".json")]
+        if not _KEY_RE.fullmatch(key):
+            raise JournalError(f"{d / name}: not a journal record name")
+        doc = read(state_dir, logical_id, gen, kind, key)
+        out[doc["entry_id"]] = {"state": doc["state"], "reason": doc.get("reason"),
+                                "notice_id": doc.get("notice_id")}
+    return out
