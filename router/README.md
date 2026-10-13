@@ -1351,11 +1351,15 @@ same check begin runs.
 **Who creates what under `root`.** `root` itself is the deployment's
 (this router's uid, the downstream runtime's group, 2750), and so are the
 downstream runtime's own host intakes beside the identities (`.unresolved/`,
-`.control/`). Everything else is created by this router, through the
-plugin, when a generation is admitted: `<root>/<logical_id>/`, each
-generation tree, and the upstream `inbound/` parents (2770, setgid). The
-deployment must not pre-create or chown `<root>/<logical_id>/` or anything
-under it: the plugin's owner checks refuse a tree this router did not make.
+`.control/`). Everything else under `<root>/<logical_id>/` is the
+plugin's, created when a generation is admitted or first seen. This router,
+admitting a generation, creates `<root>/<logical_id>/`, the generation tree
+with its `up/`, and the upstream directories: `outbound/` and `inbound/` with
+its parents (2770 under the setgid root) and `withdrawn/` (2750). The
+downstream runtime, on its first sight of the generation, creates `down/`
+and its `claimed/`, `results/` and `processed/`. The deployment must not
+pre-create or chown `<root>/<logical_id>/` or anything under it: the plugin's
+owner checks refuse a tree it did not make.
 
 **One sender per generation.** The drain asks for the current
 generation's sender on first use. Before the first construction this router
