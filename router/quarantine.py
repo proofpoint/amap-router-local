@@ -21,8 +21,11 @@ THE ITEM, a JSON object with exactly these members:
      "causes": ["<cause>", ...],          # non-empty, no duplicates, CAUSES
      "evidence": {"<key>": <value>, ...}} # see below
 
-`causes` is drawn from a CLOSED vocabulary. Today it holds one cause,
-`cold_fleet_mail`, for cold traffic from a trusted fleet host. The
+`causes` is drawn from a CLOSED vocabulary. Today it holds two causes:
+`cold_fleet_mail`, for cold traffic from a trusted fleet host, and
+`late_inbound`, for an entry that arrived for a generation that is no longer
+current (fenced or retired) and is held in THAT generation, never placed
+into a later one. The
 peer-origin profile's §5 causes join it when the profile revision that
 defines them is published: until then they are not this public
 repository's to copy, and an item naming one is DAMAGED. No writer exists
@@ -96,7 +99,10 @@ SOURCES = (SOURCE_INGRESS, SOURCE_CONTROL)
 #: This router's own cause for cold trusted-host traffic. The profile's §5
 #: causes are added beside it once published (module docstring).
 CAUSE_COLD_FLEET_MAIL = "cold_fleet_mail"
-CAUSES = (CAUSE_COLD_FLEET_MAIL,)
+#: An entry that arrived for a fenced or retired generation (the ingress
+#: journal's late-inbound rule): held in that generation, never placed.
+CAUSE_LATE_INBOUND = "late_inbound"
+CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND)
 
 ITEM_MAX_BYTES = 64 * 1024
 CANDIDATE_MAX_BYTES = 1024 * 1024
