@@ -22,6 +22,8 @@ import subprocess
 import sys
 
 TP = "router/transport.py"
+SV = "router/service.py"
+ST = "router.tests.test_transport.StartupTests."
 FS = "router/fsops.py"
 MX = "router.tests.test_transport_e8b.MatrixTests."
 SF = "router.tests.test_transport_e8b.SurfaceTests."
@@ -59,6 +61,12 @@ M = [
  ('E7 no INFO line for an ignored name', TP,
   '            if name in namespace:\n                _logger.info(', '            if False:\n                _logger.info(',
   [MX + "test_one_info_line_for_an_ignored_present_name"]),
+ ('E8 no warning for a shared uid', SV,
+  '    if cfg.hop.peer_uid == os.geteuid():\n', '    if False:\n',
+  [ST + "test_peer_uid_equal_to_this_router_s_uid_is_accepted_with_one_warning"]),
+ ('E9 the warning whatever the uids', SV,
+  '    if cfg.hop.peer_uid == os.geteuid():\n', '    if True:\n',
+  [ST + "test_distinct_uids_give_no_such_warning"]),
  # -- HopFsOps: remove_pinned crash-resumable and bounded; stat_group_pinned --
  ('F1 the aside sweep skipped', FS,
   '        for aside in self._asides(dir_fd, name):\n', '        for aside in []:\n',

@@ -29,6 +29,7 @@ the connector's own watcher (`inbox-delivery`) (already running, unmodified) doe
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -99,6 +100,11 @@ def start_transport(cfg: RouterConfig) -> Optional["HopRuntime"]:
     transport_mod.check_fsops_classes(fsops)
     logger.info("transport plugin activated: %s (sha256 %s, PLUGIN_API %s), hop root %s",
                 plugin.path, plugin.sha256, plugin.api, cfg.hop.root)
+    if cfg.hop.peer_uid == os.geteuid():
+        # Accepted (single-uid deployments, unprivileged fixtures), and said
+        # once: the hop tree's owner rules compare the two sides' uids.
+        logger.warning("hop.peer_uid equals this router's uid: owner checks cannot "
+                       "distinguish the two sides")
     return HopRuntime(plugin=plugin, fsops=fsops, hop=cfg.hop)
 
 

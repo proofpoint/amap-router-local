@@ -528,14 +528,16 @@ class CanonicalPathTests(_PluginDir):
 class StartupTests(_PluginDir):
     """`service.start_transport`: loaded once, refusal stops startup."""
 
-    def _cfg(self, pin=None):
+    def _cfg(self, pin=None, peer_uid=None):
         base = helpers.RouterTestCase("run")
         base.setUp()
         self.addCleanup(base.tearDown)
         cfg = base.make_config({"alice": []})
         from dataclasses import replace
+        if peer_uid is None:
+            peer_uid = os.geteuid() + 1        # distinct from this router's uid
         hop = None if pin is None else config_mod.HopConfig(
-            root=str(base.tmp / "hop"), peer_uid=0, version_write=1,
+            root=str(base.tmp / "hop"), peer_uid=peer_uid, version_write=1,
             caps=tuple(helpers.TEST_HOP_CAPS.items()))
         return replace(cfg, transport_plugin=pin, hop=hop)
 
@@ -579,6 +581,21 @@ class StartupTests(_PluginDir):
         self.assertEqual(rt.plugin.namespace["LOADS"], ["executed"])
         log.info.assert_called()   # the activation is logged, naming the pin
         self.assertIn(self.sha, " ".join(map(str, log.info.call_args[0])))
+
+    def test_peer_uid_equal_to_this_router_s_uid_is_accepted_with_one_warning(self):
+        pin = config_mod.TransportPluginPin(str(self.path), self.sha)
+        with self._trusting_me(), self.assertLogs("amap_router_local", logging.WARNING) as logs:
+            self.assertIsInstance(service.start_transport(self._cfg(pin, peer_uid=os.geteuid())),
+                                  service.HopRuntime)
+        warned = [m for m in logs.output if "peer_uid" in m]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("owner checks cannot distinguish the two sides", warned[0])
+
+    def test_distinct_uids_give_no_such_warning(self):
+        pin = config_mod.TransportPluginPin(str(self.path), self.sha)
+        with self._trusting_me(), mock.patch.object(service, "logger") as log:
+            service.start_transport(self._cfg(pin))
+        log.warning.assert_not_called()
 
     def test_run_forever_refuses_to_start_and_never_polls(self):
         self.path.unlink()
