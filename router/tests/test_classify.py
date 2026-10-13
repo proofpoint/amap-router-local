@@ -495,9 +495,10 @@ class TrustedHostTests(_Case):
         self.assertEqual(d.detail, "the cross-host peer lane is not available on this router")
         size.assert_not_called()
 
-    def test_the_size_seam_default_raises(self):
-        with self.assertRaises(NotImplementedError):
-            classify.statement_size(make_cfg(self), "alice", {}, STAMP)
+    def test_without_delegation_the_peer_lane_is_unavailable(self):
+        """Item 5e is on only with `delegation` configured and activated
+        (`router/peerlane.py`); a config without it has no peer lane."""
+        self.assertFalse(classify.peer_lane_available(make_cfg(self)))
 
     def test_statement_too_large_through_the_seam(self):
         for size, want in ((8193, "peer_statement_too_large"), (8192, None)):

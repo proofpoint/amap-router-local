@@ -121,7 +121,7 @@ class LoaderTests(_PluginDir):
         MAJOR change: a plugin written for (2, x), or the (1, x) of E5's
         time, would call ports that differ from the ones it was written
         against, so it is refused before any factory runs."""
-        self.assertEqual(transport.PLUGIN_API, (3, 1))
+        self.assertEqual(transport.PLUGIN_API, (3, 3))
         for old in (b"(2, 0)", b"(2, 9)", b"(1, 9)"):
             with self.subTest(api=old):
                 marker, factory = self._calls_marker()
@@ -336,7 +336,7 @@ class NoPluginImportTests(unittest.TestCase):
     """The interface module imports no plugin and never imports by name."""
 
     ALLOWED = {"__future__", "errno", "hashlib", "hmac", "os", "stat", "types",
-               "dataclasses", "pathlib", "typing", "re", "datetime", "logging"}
+               "dataclasses", "pathlib", "typing", "re", "datetime", "logging", "builtins"}
 
     def test_transport_imports_only_the_standard_modules_it_needs(self):
         tree = ast.parse(Path(transport.__file__).read_text(encoding="utf-8"))
@@ -368,6 +368,7 @@ class RefusalVocabularyTests(unittest.TestCase):
             "parent_owner", "parent_writable", "missing", "symlink", "not_regular",
             "owner", "mode", "too_large", "hash_mismatch", "exec_failed",
             "api_mismatch", "missing_factory", "fsops_unavailable", "role_mismatch",
+            "delegation_capability_missing",
         })
 
 

@@ -18,6 +18,8 @@ from router.tests.test_transport import GOOD, _PluginDir
 #: The (3, 0) public surface, and the names (3, 1) adds to it: exactly these.
 SURFACE_3_0 = ['CLASSES', 'CommitResult', 'Dependency', 'EntryKind', 'FACTORY_PORTS', 'HOPFSOPS_ATTRIBUTES', 'HOPFSOPS_METHODS', 'HOP_FACTS_MAX', 'HopFsOps', 'INBOUNDPORT_ATTRIBUTES', 'INBOUND_KINDS', 'InboundPort', 'KeyOps', 'LIST_LIMIT_MAX', 'LIST_SCAN_MAX', 'LoadedPlugin', 'MAX_PLUGIN_BYTES', 'MakeHopReceiver', 'MakeHopSender', 'MakeIntakeReader', 'MakeIntakeWriter', 'MakeMarkerStore', 'MakeSender', 'MakeSigner', 'MakeUpstreamMarkerStore', 'MakeVerifier', 'NOTICE_BUNDLE_SCHEMA', 'NOTICE_REFUSAL_REASONS', 'NullTransport', 'PLUGIN_API', 'PluginRefused', 'REFUSAL_REASONS', 'REQUIRED_FACTORIES', 'RETIRED_AT_RE', 'RETIRE_RESULTS', 'RUNTIME_ROLES', 'RenameResult', 'RetireResult', 'SEAM_REFUSAL_REASONS', 'SeamRefused', 'Settings', 'Signer', 'StageSide', 'TRANSPORT_REASONS', 'TRUSTED_UIDS', 'TransportPort', 'UNSAFE_READ_REASONS', 'UPSTREAM_MARKER_ATTRIBUTES', 'UpstreamMarkers', 'Verifier', 'WITHDRAW_RESULTS', 'WithdrawResult', 'capture_verdict_class', 'check_disjoint', 'check_fsops_classes', 'check_list_args', 'check_retired_at', 'classify', 'is_current_bundle_schema', 'load_plugin']
 ADDED_AT_3_1 = ['HOPFSOPS_OPTIONAL_METHODS', 'IntakeRemover', 'OPTIONAL_FACTORIES', 'REMOVE_DIR_ENTRIES_MAX', 'REMOVE_RESULTS', 'REQUIRED_MINOR', 'RemoveResult']
+#: The names (3, 3) adds: the peer seam (`check_delegation`).
+ADDED_AT_3_3 = ['DELEGATION_FACTORIES', 'DELEGATION_MINOR', 'DelegationCapabilities', 'NO_ARGUMENTS', 'PEER_ERROR_NAMES', 'check_delegation']
 
 ABSENT = b""
 CALLABLE = (b"\nREMOVER_CALLS = []\n"
@@ -102,7 +104,7 @@ class SurfaceTests(_PluginDir):
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 names.add(node.target.id)
         public = {n for n in names if not n.startswith("_")}
-        self.assertEqual(public, set(SURFACE_3_0) | set(ADDED_AT_3_1))
+        self.assertEqual(public, set(SURFACE_3_0) | set(ADDED_AT_3_1) | set(ADDED_AT_3_3))
 
     def test_remove_results_are_their_own_vocabulary(self):
         self.assertEqual(transport.REMOVE_RESULTS, ("removed", "absent"))

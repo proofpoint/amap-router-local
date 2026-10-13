@@ -54,8 +54,8 @@ M = [
   '        if self.kind == INTAKE:\n            return self.rel == (".stage",)\n',
   [E + 'PrivateStageTests.test_commit_into_the_private_root_and_a_per_item_directory']),
  ('P6 NOT_YET on a private binding', F,
-  '        return self.kind in (GENERATION, INTAKE)\n',
-  '        return self.kind in (GENERATION, INTAKE, PRIVATE)\n',
+  '        return self.kind in (GENERATION, INTAKE, DISPOSED)\n',
+  '        return self.kind in (GENERATION, INTAKE, DISPOSED, PRIVATE)\n',
   [E + 'PrivateStageTests.test_an_interrupted_private_commit_raises_on_read_and_recovers']),
  ('P7 the private stage may be a destination', F,
   '    if b.kind in (INTAKE, PRIVATE):\n        return b.rel[:1] == (".stage",)\n',
@@ -232,7 +232,7 @@ M = [
   ['router.tests.test_transport.LoaderTests.test_an_older_major_plugin_is_refused_by_this_major_3_runtime',
    'router.tests.test_transport.LoaderTests.test_a_major_3_plugin_is_refused_by_an_older_major_runtime']),
  ('A2 the runtime stays at an older major', 'router/transport.py',
-  'PLUGIN_API: Tuple[int, int] = (3, 1)\n', 'PLUGIN_API: Tuple[int, int] = (2, 1)\n',
+  'PLUGIN_API: Tuple[int, int] = (3, 3)\n', 'PLUGIN_API: Tuple[int, int] = (2, 3)\n',
   ['router.tests.test_transport.LoaderTests.test_an_older_major_plugin_is_refused_by_this_major_3_runtime']),
 ]
 

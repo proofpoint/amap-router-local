@@ -121,6 +121,7 @@ other instance's.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import errno
 import hashlib
@@ -145,13 +146,14 @@ from . import generations as generations_mod
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
 from . import hoplink
-from .config import (RouterConfig, address_for, gen_state_dir, instance_for, state_key,
+from .config import (RouterConfig, address_for, gen_key, gen_state_dir, instance_for, state_key,
                      target_hold, target_known_id, target_logical_id)
 from .util import (
     DEFAULT_READ_CAP,
     NamespaceEscapeError,
     ReadTooLargeError,
     atomic_write,
+    format_utc_ts,
     fsync_dir,
     mint_notice_id,
     parse_utc_ts,
@@ -1381,11 +1383,11 @@ def _drain_cold(
         decided: Any = ColdRefusal(classified.outcome, classified.reason_code,
                                    detail=classified.detail, hold=classified.hold)
     elif isinstance(classified, classify_mod.PeerRemote):
-        # Item 5 passed in full. No production path gets here: item 5e
-        # refuses first while this router cannot sign a cross-host peer
-        # statement. Answered, never dropped, and nothing is published.
-        decided = ColdRefusal("queued_for_human", REASON_TRANSPORT_ANOMALY,
-                              detail="the cross-host peer lane is not built; nothing was sent")
+        # Item 5 passed in full, so delegation is active (item 5e): a signed
+        # peer task to a trusted fleet host (`router/peerlane.py`).
+        return _begin_peer(cfg, name, req_id, doc, draft, classified,
+                           req_digest=req_digest, attachments=attachments,
+                           transport=transport, cold_policy=cold_policy)
     elif isinstance(classified, classify_mod.Remote):
         klass = classified.klass
         decided = _remote_decision(cfg, name, draft, classified, cold_policy)
@@ -1520,6 +1522,82 @@ def _drain_cold(
 INFLIGHT = "inflight"
 
 
+def _generation_id(cfg: RouterConfig, name: str) -> str:
+    """`name`'s current generation id (its gen key's last component, less
+    the `gen-` prefix; the instance name without a registry)."""
+    last = gen_key(cfg, name).rsplit("/", 1)[-1]
+    return last[len(generations_mod.GEN_PREFIX):] if last.startswith(
+        generations_mod.GEN_PREFIX) else last
+
+
+def _begin_peer(
+    cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], draft: Dict[str, Any],
+    peer: "classify_mod.PeerRemote", *, req_digest: Optional[str],
+    attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    transport: Optional[inflight_mod.TransportPort], cold_policy: Optional[ColdPolicy],
+) -> str:
+    """A signed peer task (`router/peerlane.py`): build the statement, check
+    its exact size and its encoding, sign it, and begin it as kind `peer`.
+    Nothing is allocated before the statement is signed. A local crypto
+    fault (`BackendError`) holds the request unconsumed, retried next poll.
+    The begin order is the in-flight table's: the transport id, the
+    attachment snapshot, the peer ledger's `issued` record, the in-flight
+    record (pinning the statement, signature and header), the hand-over."""
+    from . import peerlane
+    delegation = peerlane.active(cfg)
+    if delegation is None:
+        result = _result_doc(req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
+                             recipients=[], detail="delegation is not active; nothing was sent")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    peer_id, ts = peerlane.mint_peer_id(), utc_ts()
+    try:
+        raw = classify_mod.peer_statement(cfg, name, draft, peer.recipient, peer.exposure,
+                                          delegation, peer_id=peer_id, ts=ts)
+    except peerlane.StatementRefused as e:
+        result = _result_doc(req_id, "rejected", reason_code=REASON_MALFORMED, recipients=[],
+                             detail=str(e))
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    if len(raw) > peerlane.STATEMENT_MAX_BYTES:
+        result = _result_doc(req_id, "rejected", reason_code=classify_mod.REASON_STATEMENT_TOO_LARGE,
+                             recipients=[])
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    try:
+        signed = peerlane.sign_statement(delegation, raw)
+    except peerlane.StatementRefused as e:
+        logger.error("instance %r req %r: %s; nothing was signed", name, req_id, e)
+        result = _result_doc(req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
+                             recipients=[], detail="this router's statement was refused by the "
+                                                   "peer codec; nothing was signed")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    except Exception as e:  # noqa: BLE001 -- classified exactly
+        if peerlane.error_kind(delegation, e) == "BackendError":
+            logger.warning("instance %r req %r: held unconsumed, the signer failed locally "
+                           "(%s)", name, req_id, type(e).__name__)
+            return HELD
+        raise
+    staged_draft = {k: v for k, v in draft.items() if k not in ("to", "cc", "bcc")}
+    staged_draft["to"] = [peer.recipient]
+    if isinstance(staged_draft.get("body_text"), str):
+        staged_draft["body_text"] = peerlane.normalise_body(staged_draft["body_text"])
+    staged = dict(doc, draft=staged_draft)
+    pin = {"kind": hoplink.PEER_KIND, "id": peer_id,
+           "message_id": peerlane.message_id(peer_id, cfg.fleet_domain),
+           "key_id": delegation.key_id,
+           "statement": base64.b64encode(signed.statement).decode("ascii"),
+           "signature": base64.b64encode(signed.signature).decode("ascii"),
+           "statement_header": signed.header, "in_reply_to": None, "references": []}
+    expires = parse_utc_ts(ts) + timedelta(seconds=cfg.peer_reply_window_seconds)
+    issued = peerlane.issued_record(
+        peer_id=peer_id, logical_id=state_key(cfg, name),
+        local_address=address_for(name, cfg.fleet_domain), remote=peer.recipient,
+        generation=_generation_id(cfg, name), expires_at=format_utc_ts(expires))
+    return _begin_external(
+        cfg, name, req_id, staged, ExternalRoute((peer.recipient,)),
+        req_digest=req_digest, attachments=attachments, transport=transport,
+        klass=classify_mod.CLASS_TRUSTED, cold_policy=cold_policy, peer_pin=pin,
+        before_record=lambda: peerlane.write_issued(cfg, issued))
+
+
 def _begin_external(
     cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], route: ExternalRoute,
     *, req_digest: Optional[str],
@@ -1527,6 +1605,8 @@ def _begin_external(
     transport: Optional[inflight_mod.TransportPort],
     klass: Optional[str] = None, cold_policy: Optional[ColdPolicy] = None,
     bound_reply: Optional[Dict[str, Any]] = None,
+    peer_pin: Optional[Dict[str, Any]] = None,
+    before_record: Optional[Callable[[], None]] = None,
 ) -> str:
     """Put a request in flight and take its first step (which writes the
     transport request). No transport configured settles at once,
@@ -1573,7 +1653,8 @@ def _begin_external(
     # Mail only (D4): the hand-over carries kind "mail", so a request the
     # classifier did not put in a cold mail class is refused before
     # anything is allocated, never handed over as mail.
-    if klass not in (classify_mod.CLASS_FLEET, classify_mod.CLASS_INTERNET):
+    if klass not in (classify_mod.CLASS_FLEET, classify_mod.CLASS_INTERNET) and not (
+            peer_pin is not None and klass == classify_mod.CLASS_TRUSTED):
         result = _result_doc(
             req_id, "rejected", reason_code=classify_mod.REASON_NO_ROUTE, recipients=[],
             detail="only mail of the fleet-host or internet class is handed to the hop")
@@ -1605,6 +1686,21 @@ def _begin_external(
         result = _result_doc(req_id, e.outcome, reason_code=e.reason_code,
                              recipients=[], detail=e.detail)
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    if peer_pin is not None and cfg.hop is not None:
+        # The document floor is sized for a mail envelope; a signed kind's
+        # `peer` object is larger, so its fit is checked here.
+        size = hoplink.handover_len_max(
+            probe, from_address=from_address, version_write=cfg.hop.version_write,
+            attachment_sizes=[a.size_bytes for a in attachments or []], kind=peer_pin["kind"],
+            peer={"statement_header": peer_pin["statement_header"],
+                  "message_id": peer_pin["message_id"], "in_reply_to": peer_pin["in_reply_to"],
+                  "references": list(peer_pin["references"])})
+        if size > cfg.hop.cap("document"):
+            result = _result_doc(
+                req_id, "rejected", reason_code=hoplink.REASON_MALFORMED_REQUEST,
+                recipients=[], detail=f"the peer task's handover can be {size} bytes; it "
+                                      f"exceeds the hop document cap ({cfg.hop.cap('document')})")
+            return _finish(cfg, name, req_id, result, req_digest=req_digest)
     if bound_reply is not None and cfg.hop is not None:
         # The document floor (`hoplink.document_floor`) is sized for a mail
         # envelope; a bound reply's is larger, so its fit is checked here.
@@ -1625,7 +1721,7 @@ def _begin_external(
         policy_digest=(bound_reply["bound"]["policy_digest"] if bound_reply is not None
                        else classify_mod.policy_digest(cfg, name)),
         route=klass, from_address=from_address, attachments=attachments or None,
-        bound_reply=bound_reply,
+        bound_reply=bound_reply, peer=peer_pin, before_record=before_record,
     )
     _advance_one(cfg, name, req_id, record, transport, cold_policy=cold_policy)
     return INFLIGHT
@@ -1697,6 +1793,8 @@ def _recheck(
 
     if "bound_reply" in record:
         return _recheck_bound(cfg, name, record, cold_policy, refused)
+    if "peer" in record:
+        return _recheck_peer(cfg, name, record, refused)
     draft = record.get("request", {}).get("draft")
     if not isinstance(draft, dict):
         return refused("the staged request has no draft")
@@ -1728,6 +1826,46 @@ def _recheck(
         return refused("the permitted recipient set changed")
     return inflight_mod.Recheck(True, policy_digest=classify_mod.policy_digest(cfg, name),
                                 route=decided.klass)
+
+
+#: The re-check's reason when a not-yet-handed peer task was signed under a
+#: signing key that is no longer the configured one.
+DETAIL_KEY_ROTATED = "signed under a signing key no longer configured; never re-signed"
+
+
+def _recheck_peer(
+    cfg: RouterConfig, name: str, record: Dict[str, Any],
+    refused: Callable[[str], inflight_mod.Recheck],
+) -> inflight_mod.Recheck:
+    """`_recheck` for a signed peer task. Permitted only while delegation is
+    active, the recipient is still a trusted fleet host, `task_deny` still
+    permits the pair and the sender is not quarantined. A record NOT yet
+    handed over is also refused when its signing key is no longer the
+    configured one: it is never re-signed. A handed record is pending
+    downstream and validly signed, so rotation alone never refuses it.
+    Exposure and `sender_since` are in the signed bytes: never re-evaluated."""
+    from . import peerlane
+    delegation = peerlane.active(cfg)
+    if delegation is None:
+        return refused("delegation is not active")
+    pin = record["peer"]
+    rid = record.get("request", {}).get("req_id")
+    handed = isinstance(rid, str) and inflight_mod._was_handed(
+        inflight_mod.handed_path(cfg, name, rid), record["transport_req_id"])
+    if not handed and pin["key_id"] != delegation.key_id:
+        return refused(DETAIL_KEY_ROTATED)
+    recipient = record["recipients"][0]
+    try:
+        klass, addr = classify_mod.address_class(cfg, recipient)
+    except classify_mod.Malformed:
+        return refused("the recipient is no longer an address")
+    if klass != classify_mod.CLASS_TRUSTED:
+        return refused(f"route changed from {classify_mod.CLASS_TRUSTED} to {klass}")
+    if classify_mod.task_denied(cfg, name, addr):
+        return refused(f"now {classify_mod.REASON_PEER_DENIED}")
+    if classify_mod.sender_age_refusal(cfg, name, utc_ts()) is not None:
+        return refused(f"now {classify_mod.REASON_PEER_QUARANTINED}")
+    return inflight_mod.Recheck(True, route=classify_mod.CLASS_TRUSTED)
 
 
 def _recheck_bound(

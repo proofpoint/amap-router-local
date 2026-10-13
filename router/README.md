@@ -717,6 +717,8 @@ view.
 - `delivered_domains_file` — optional, an absolute path: the set of domains
   the downstream hub delivers to, as the deployment renders it. Below,
   "Bound replies over the hop".
+- `delegation` — optional: cross-host SIGNED peer tasks to trusted fleet
+  hosts. Below, "Signed peer tasks (delegation)".
 - `intake_dir` — the cross-host intake spool's parent; `provision` creates
   `<intake_dir>/<instance>/`, `docker/derive-mounts.py` mounts it. Nothing
   reads it until an email router exists.
@@ -1012,14 +1014,14 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `rejected` | `req_id_mismatch` | Body `req_id` != the filename's id |
 | `rejected` | `agent_id_mismatch` | Body `agent_id` present and != the namespace instance |
 | `rejected` | `attachment_mismatch` | An attachment descriptor and its sidecar bytes disagree, or the sidecar dir's shape is wrong: sha/size mismatch, missing/extra ordinal, non-ordinal entry name, symlinked/hardlinked/non-regular sidecar, dir present with no attachments declared (or vice versa) — see "Attachment transport" below |
-| `rejected` | `recipient_unknown` | Cold send: an address at this router's own domain names no instance (classification step 3); or, with no transport plugin, any cross-host address (step 4); or a trusted-host peer task that passed every check, because this router cannot yet sign a cross-host peer statement (item 5e) |
+| `rejected` | `recipient_unknown` | Cold send: an address at this router's own domain names no instance (classification step 3); or, with no transport plugin, any cross-host address (step 4); or a trusted-host peer task while `delegation` is not configured and activated, so this router cannot sign it (item 5e) |
 | `rejected` | `mixed_recipient_classes` | Cold send: `to` ∪ `cc` spans more than one class (local, trusted fleet host, other fleet host, internet). One request, one class |
 | `rejected` | `no_route` | Cold send to the internet, and this host has no `egress`. Decided before `send_to`. Also a bound reply whose counterparty is not a fleet host: "no reply path to this counterparty in this deployment", with nothing allocated |
 | `rejected` | `fleet_mail_disabled` | Cold send to a trusted fleet host that cannot be a peer task: more than one recipient, or any `cc` |
 | `rejected` | `peer_denied` | Trusted fleet host: the sender's `task_deny` removes the edge (an exact address or `@domain`) |
 | `rejected` | `peer_quarantined` | Trusted fleet host: the sender's registry `first_registered_ts` is under 24 h old, in the future, or absent ("sender age unknown") |
 | `rejected` | `exposure_unavailable` | Trusted fleet host: the `sender_exposure` assessment returned nothing or failed; a cross-host peer task never goes without it |
-| `rejected` | `peer_statement_too_large` | Trusted fleet host: the signed statement would exceed 8192 bytes. Reachable only once a signer exists (item 5e decides first today) |
+| `rejected` | `peer_statement_too_large` | Trusted fleet host: the signed statement would exceed 8192 bytes, measured exactly before anything is allocated or signed |
 | `rejected` | `unresolved_reply` | Reply: `in_reply_to` doesn't resolve to a ledger record for this sender; or, for a bound reply, the record binds another agent, has expired, lacks its binding members, or cannot make a valid `bound` |
 | `rejected` | `self_send` | Recipient resolves to the sender's own instance |
 | `rejected` | `req_id_reused` | The filename's `req_id` was already anchored to a DIFFERENT request (agent deleted its own `outbound/{results,processed}` and resubmitted under a reused id) — refused rather than replaying the stale verdict |
@@ -1029,7 +1031,7 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `accepted` | `peer_routed` | Peer lane: placed in the recipient's `peer/` tree along a declared edge (or, for a reply, the reverse edge). `message_id` is the peer message id. Fresh task and reply alike — the code names the TREE |
 | `rejected` | `peer_single_recipient` | Peer lane: a submit touching a declared edge named more than one recipient or carried `cc`. Refused whole; a mixed-lane submit is never half-sent |
 | `rejected` | `peer_reply_window_expired` | Peer lane: the reply key resolves to a peer notice, no edge exists in the reply's direction, and the notice is older than `peer_reply_window_seconds` |
-| `queued_for_human` | `transport_anomaly` | External leg (see "In-flight requests"): the transport request was archived without a result, its result failed validation, the router's own attachment snapshot was damaged before anything was handed over, a custom cold policy routed outside the request's class, or a trusted-host peer task passed every check with no cross-host peer lane built to carry it. Never resubmitted |
+| `queued_for_human` | `transport_anomaly` | External leg (see "In-flight requests"): the transport request was archived without a result, its result failed validation, the router's own attachment snapshot was damaged before anything was handed over, a custom cold policy routed outside the request's class, or the plugin's peer codec refused this router's own statement (nothing was signed). Never resubmitted |
 
 **Codes this router never originates.** They reach an agent only as a
 transport verdict, passed through verbatim with `detail` prefixed
@@ -1220,6 +1222,13 @@ fixed `PluginRefused.reason`:
 | `exec_failed` | those bytes, the only ones ever executed, fail to run |
 | `api_mismatch` | its `PLUGIN_API` is not `(our major, at least our minor)` |
 | `missing_factory` | it lacks a callable `make_sender`, `make_intake_reader` or `make_upstream_marker_store` |
+
+With `delegation` configured, a plugin is also refused
+`delegation_capability_missing` unless its `PLUGIN_API` is at least `(3, 3)`,
+`make_signer`, `make_verifier`, `make_peer_codec` and `make_peer_errors` are all
+callable, and its own `OPTIONAL_FACTORIES` declares the two new names at
+`(3, 3)` or later (`transport.check_delegation`). Without `delegation` none of
+this is consulted, so an older compatible plugin still loads.
 
 `REFUSAL_REASONS` also lists `fsops_unavailable` and `role_mismatch`, which
 this router never raises (the first only until its filesystem port was
@@ -1548,6 +1557,105 @@ retry, each with its first sighting and age (and a hint naming the exit
 where a hold has one), and the senders and marker stores this process
 holds open.
 
+## Signed peer tasks (delegation, `router/peerlane.py`)
+
+A peer task to a TRUSTED fleet host travels as a signed statement: a small
+JSON object this router builds, signs with its own Ed25519 key through the
+plugin, and hands over as envelope kind `"peer"`. Off unless `delegation` is
+configured; then item 5e is on.
+
+**Config** (`delegation`, every member required):
+
+```
+"delegation": {
+  "partition_verified": "<the deploy's evidence that the downstream runtime cannot read the key or write peer/>",
+  "signing_key": {"path": "/abs/seed", "key_id": "<id>", "public_key": "<64 lower hex>"},
+  "runtimes": [{"name": "...", "runtime": "amap.router@<host>", "domains": ["<host>"],
+                "keys": [{"key_id": "...", "public_key": "<64 hex>",
+                          "not_before": "...Z", "not_after": "...Z"}]}],
+  "crypto": {"crypto_backend": "pyca" | "openssl", "openssl_path": "/abs/openssl"}
+}
+```
+
+- Without `partition_verified` the config is refused: delegation never runs
+  without the deploy's evidence.
+- Each runtime's domains must be trusted fleet hosts (never this router's own
+  domain), and its `runtime` must be `amap.router@` one of them.
+- `signing_key.path` is in normal form and lexically outside `state_dir`,
+  `hop.root`, the registry, the intake directory and every agent-reachable
+  root, each compared as configured AND as resolved, by path components.
+
+**Activation**, at startup and at every reload (`peerlane.activate`):
+1. the plugin's delegation capabilities (`transport.check_delegation`);
+2. the peer codec (`make_peer_codec({})`), whose published reason sets become
+   this router's vocabulary;
+3. the seed, read by walking from `/` with no symlink followed: every
+   directory owned by root or this process and writable by group or others
+   only when sticky, none of them a forbidden root (by device and inode);
+   the file this process's, mode 0400, one link, exactly 32 bytes. Its bytes
+   go to the plugin's signer and nowhere else;
+4. the peer table through the codec's key gate (a duplicate `key_id` across
+   all runtimes, inverted validity, a non-canonical or small-order key, a
+   malformed entry: each refused with its token);
+5. this router's own key through the same gate, its `key_id` never equal to
+   a peer's;
+6. a sign/verify PROBE over a fixed message: the configured `public_key` must
+   verify the seed's signature, or `signing_key_mismatch`.
+
+A failure stops startup, or refuses the reload: the last good config and
+delegation stay in force, `reload_failed` is set, and `status.json`'s
+`classification.config_reload_failure` says since when and why. While a
+reload is refused, a key REMOVED in the refused config is not applied; a key
+whose `not_after` passes is refused anyway, because validity is evaluated at
+verification time, inclusive at both ends. Only an exception that IS exactly
+one of the plugin's four classes (`make_peer_errors()`), with a reason in the
+codec's set, is a verdict; anything else is a bug and propagates.
+
+**Sending** (`outbound._begin_peer`), after item 5 passes in full:
+- the statement (`v` 1, closed: key id, kind, a fresh 128-bit id, from, to,
+  ts, subject, the SHA-256 of `body_text` with CRLF replaced by LF, the
+  attachments in order, `sender_exposure`, and `sender_since`, the sender's
+  registry `first_registered_ts`) is serialised canonically, measured exactly
+  (at most 8192 bytes), checked by the codec's own decoder, and signed;
+- then, in order, each durable before the next: the transport id, the
+  attachment snapshot, the peer ledger's closed `issued` record
+  (`state_dir/<logical_id>/peer-ledger/<id>.json`: id, local, local address,
+  remote, direction, generation, expiry by `peer_reply_window_seconds`), the
+  in-flight record pinning the statement, signature and header, and the
+  hand-over (`peer`: the unfolded header, `<id@fleet_domain>`, no
+  `in_reply_to`, no references). The draft goes over addressed to the one
+  recipient, with the normalised body;
+- a local signer fault holds the request unconsumed, retried next poll;
+  every retry hands over the pinned bytes, never re-signed;
+- the re-check at every publication attempt and pending poll refuses
+  (`queued_for_human`/`recipient_not_allowlisted`) when delegation is no
+  longer active, the recipient is no longer a trusted host, `task_deny` now
+  removes the pair, the sender is quarantined, or, for a task not yet handed
+  over, the signing key is no longer the configured one. A handed task is
+  never refused for a rotation alone.
+
+`router reset` KEEPS the peer ledger: a fenced generation's peer tasks can
+still be handed over after a reset, and a reply must still resolve. Control
+notices are a later unit's: the hand-over accepts kind `"control"`, but no
+production path begins one, and an in-flight record pinning one is damaged.
+
+**Verifying** (`router/peerverify.py`, public): check 1, then the caller's
+check 2 (`known`, required), then checks 3-5, each refusal the codec's cause
+token; a local backend fault propagates. The candidate journal and replay
+index that answer check 2 are a later unit's.
+
+**Disposal tombstones.** For a host-intake candidate (`.unresolved/`,
+`.control/`) the receiving side commits a tombstone under
+`<hop.root>/.disposed/<intake>/<id>` with `commit_durable`, from bytes frozen
+in its journal, before it marks the candidate done; the downstream runtime
+removes an entry only on a valid tombstone. `peerlane.tombstone_bytes` gives
+the exact form (a closed object: `v` 1, `intake`, `id` as 32 lower-case hex,
+`candidate_sha256` as 64 lower-case hex, `disposition`, and `disposed_at` as
+`YYYY-MM-DDTHH:MM:SSZ`), and `fsops` binds `.disposed/<intake>/` as this
+router's own kind, rooted at the hop root, with a private `.stage/`. Nothing
+writes a tombstone yet: the candidate journal does, in a later unit, which
+will also create and check `.stage/` at startup.
+
 ## The ingress journal (`router/ingress.py`)
 
 Inbound from the external leg arrives through the plugin's intake reader
@@ -1779,7 +1887,14 @@ router quarantine list [NAME]              one line per item: NAME SOURCE GEN ID
 router quarantine show NAME SOURCE GEN ID  one item as escaped JSON
 ```
 
-SOURCE is `ingress` or `control`. `.control/` entries (candidates another
+SOURCE is `ingress`, `control` or `unresolved`. `.unresolved/` entries
+(candidates with no live tree) are listed exactly like `.control/` ones, from
+`<hop.root>/.unresolved/`, keyed `- unresolved - ID`, under the same
+threshold. An entry of either intake that this router has DISPOSED of (its
+disposal tombstone exists under `<hop.root>/.disposed/<intake>/<ID>`, a
+regular file of this router's at one link, at most 0640, naming that intake,
+ID and the candidate's digest) is listed `disposed` and never counted as an
+item or as expired: it waits only for its owner's removal. `.control/` entries (candidates another
 runtime writes) are listed from `<hop.root>/.control/` whenever `hop` is
 configured (no key of its own, so it can never disagree with the hop root;
 `--control-dir` names it only for a router WITHOUT `hop`, and is refused
@@ -1790,8 +1905,8 @@ inbound step freezes their format. They are the downstream runtime's
 entry older than `ingress_quarantine_days` is REPORTED `expired`; that is
 this router's report threshold, and the downstream runtime, which owns the
 sweep, never removes an entry sooner. The ingress status counts them
-(`control`: items, expired, in flight, damaged, the oldest age and the
-threshold). A `candidate.json` caught
+(`control` and `unresolved`: items, expired, in flight, damaged, disposed and
+pending removal, the oldest age and the threshold). A `candidate.json` caught
 mid-commit (exactly two links) is listed IN FLIGHT, not DAMAGED. Its writer
 commits `candidate.json` LAST, so a directory without one is not yet an item:
 listed IN FLIGHT ("no committed candidate.json yet"), and nothing in it is

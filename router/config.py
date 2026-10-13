@@ -229,7 +229,7 @@ _TOP_KEYS = {
     "peer_senders", "peers",
     "transport_plugin", "registry_dir", "aliases", "hop",
     "trusted_fleet_hosts", "fleet_hosts", "egress", "ingress_quarantine_days",
-    "ingress_dedup_horizon_days", "delivered_domains_file",
+    "ingress_dedup_horizon_days", "delivered_domains_file", "delegation",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders",
                   "task_deny", "send_to", "remote_fleet"}
@@ -582,6 +582,10 @@ class RouterConfig:
     #: COUNTS (delivered but not in `fleet_hosts`, in `fleet_hosts` but not
     #: delivered). Every bound reply is held while it is set; nothing else is.
     delivered_drift: Optional[Tuple[int, int]] = None
+    #: `delegation` (`_delegation`): cross-host signed peer traffic, or None.
+    #: What needs the plugin (the key gate, the signing-key probe) is checked
+    #: when it is activated (`router/peerlane.py`), at startup and each reload.
+    delegation: Optional["DelegationConfig"] = None
     #: PROCESS state, never read from a file: the last reload of the config
     #: failed or was refused (`service.reload_config`), and this is the last
     #: good config kept in its place. While it is set the external leg fails
@@ -1741,6 +1745,8 @@ def load_obj(
         hop=hop,
         aliases=_aliases(top, registry_dir, fleet_domain),
     )
+    if "delegation" in top:
+        cfg = replace(cfg, delegation=_delegation(top["delegation"], cfg))
     if "delivered_domains_file" in top:
         artifact = _require_absolute(top["delivered_domains_file"],
                                      "config.delivered_domains_file")
@@ -1846,6 +1852,168 @@ def _delivered_domains(path: Path, fleet_hosts: Iterable[str]) -> Optional[Tuple
         "but not a fleet host, %d fleet hosts not delivered); every bound reply is "
         "held until they agree, and mail is unaffected", where, *drift)
     return drift
+
+
+@dataclass(frozen=True)
+class DelegationRuntime:
+    """One configured peer runtime (`delegation.runtimes[]`): its name, its
+    runtime address, its domains and its keys, as written (each key a
+    mapping of `key_id`, `public_key` and optional `not_before` /
+    `not_after`). The key gate is the plugin's, at activation."""
+    name: str
+    runtime: str
+    domains: Tuple[str, ...]
+    keys: Tuple[Mapping[str, str], ...]
+
+
+@dataclass(frozen=True)
+class DelegationConfig:
+    """`delegation` as configured (`_delegation`)."""
+    partition_verified: str
+    signing_key_path: str
+    signing_key_id: str
+    signing_public_key: str
+    runtimes: Tuple[DelegationRuntime, ...]
+    crypto_backend: str
+    openssl_path: Optional[str] = None
+    #: Every directory the signing key must not be inside: as configured and
+    #: as resolved (realpath) at load, compared by path components.
+    forbidden_roots: Tuple[str, ...] = ()
+
+    def crypto_settings(self) -> Dict[str, str]:
+        """The signer's and verifier's settings, exactly."""
+        out = {"crypto_backend": self.crypto_backend}
+        if self.openssl_path is not None:
+            out["openssl_path"] = self.openssl_path
+        return out
+
+    def key_table_input(self) -> List[Dict[str, Any]]:
+        """The peer table in the shape the plugin's key gate takes."""
+        return [{"name": r.name, "runtime": r.runtime, "domains": list(r.domains),
+                 "keys": [dict(k) for k in r.keys]} for r in self.runtimes]
+
+
+_DELEGATION_KEYS = frozenset({"partition_verified", "signing_key", "runtimes", "crypto"})
+_SIGNING_KEY_KEYS = frozenset({"path", "key_id", "public_key"})
+_RUNTIME_KEYS = frozenset({"name", "runtime", "domains", "keys"})
+_PEER_KEY_REQUIRED = frozenset({"key_id", "public_key"})
+_PEER_KEY_OPTIONAL = frozenset({"not_before", "not_after"})
+_HEX64_LOWER_RE = re.compile(r"[0-9a-f]{64}\Z")
+CRYPTO_BACKENDS = ("pyca", "openssl")
+
+
+def _normal_form_problem(path: Any) -> Optional[str]:
+    """Why `path` is not an absolute path in normal form, or None: no empty,
+    `.` or `..` component, no repeated or trailing `/`."""
+    if not isinstance(path, str) or not path:
+        return "not a non-empty string"
+    if not os.path.isabs(path):
+        return "not absolute"
+    if path != "/" and (path.endswith("/") or "//" in path):
+        return "a repeated or trailing '/'"
+    if any(c in (".", "..") for c in path.split("/")[1:]):
+        return "a '.' or '..' component"
+    if os.path.normpath(path) != path:
+        return "not in normal form"
+    return None
+
+
+def _components_within(path: str, root: str) -> bool:
+    """`path` is `root` or inside it, compared by path COMPONENTS."""
+    p, r = Path(path).parts, Path(root).parts
+    return len(p) >= len(r) and p[:len(r)] == r
+
+
+def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
+    """`delegation` (module docstring). Everything here is lexical: the key
+    file is opened, walked and proved at activation, not at load."""
+    where = "config.delegation"
+    if cfg.transport_plugin is None or cfg.hop is None:
+        raise ConfigError(f"{where}: requires config.transport_plugin and config.hop: "
+                          "a signed peer task travels over the hop")
+    raw = _require_object(raw_value, where)
+    if set(raw) != _DELEGATION_KEYS:
+        raise ConfigError(f"{where}: needs exactly {sorted(_DELEGATION_KEYS)}; got {sorted(raw)}")
+    partition = raw["partition_verified"]
+    if not (isinstance(partition, str) and partition.strip()):
+        raise ConfigError(f"{where}.partition_verified: the deploy's partition evidence is "
+                          "required (a non-empty string); without it delegation is refused")
+    sk = _require_object(raw["signing_key"], f"{where}.signing_key")
+    if set(sk) != _SIGNING_KEY_KEYS:
+        raise ConfigError(f"{where}.signing_key: needs exactly {sorted(_SIGNING_KEY_KEYS)}; "
+                          f"got {sorted(sk)}")
+    why = _normal_form_problem(sk["path"])
+    if why is not None:
+        raise ConfigError(f"{where}.signing_key.path: {why}")
+    if not isinstance(sk["key_id"], str) or not sk["key_id"]:
+        raise ConfigError(f"{where}.signing_key.key_id: expected a non-empty string")
+    if not (isinstance(sk["public_key"], str) and _HEX64_LOWER_RE.fullmatch(sk["public_key"])):
+        raise ConfigError(f"{where}.signing_key.public_key: expected 64 lower-case hex digits")
+    lexical = [str(cfg.state_dir), cfg.hop.root]
+    lexical += [str(r) for r in agent_reachable_roots(cfg.instances)]
+    if cfg.registry_dir is not None:
+        lexical.append(str(cfg.registry_dir))
+    if cfg.intake_dir is not None:
+        lexical.append(str(cfg.intake_dir))
+    roots = tuple(sorted(set(lexical) | {os.path.realpath(r) for r in lexical}))
+    for root in roots:
+        if _components_within(sk["path"], root):
+            raise ConfigError(f"{where}.signing_key.path ({sk['path']}) is inside {root}, "
+                              "which the signing key must stay outside")
+    from . import classify as classify_mod  # local: classify imports this module
+    runtimes = raw["runtimes"]
+    if not isinstance(runtimes, list):
+        raise ConfigError(f"{where}.runtimes: expected an array")
+    own = cfg.fleet_domain or ""
+    trusted = set(cfg.trusted_fleet_hosts)
+    parsed = []
+    for i, r in enumerate(runtimes):
+        rw = f"{where}.runtimes[{i}]"
+        if not isinstance(r, dict) or set(r) != _RUNTIME_KEYS:
+            raise ConfigError(f"{rw}: needs exactly {sorted(_RUNTIME_KEYS)} (key_malformed)")
+        if not isinstance(r["name"], str) or not _NAME_RE.fullmatch(r["name"]):
+            raise ConfigError(f"{rw}.name: not a name (key_malformed)")
+        domains = _canonical_list(r["domains"], f"{rw}.domains", classify_mod.canonical_host)
+        if not domains:
+            raise ConfigError(f"{rw}.domains: at least one domain")
+        for d in domains:
+            if d == own:
+                raise ConfigError(f"{rw}.domains: names this router's own domain {own!r}")
+            if d not in trusted:
+                raise ConfigError(f"{rw}.domains: {d!r} is not in config.trusted_fleet_hosts; "
+                                  "a runtime this router verifies for is a trusted fleet host")
+        rt = r["runtime"]
+        if not (isinstance(rt, str) and rt.startswith(ROUTER_LOCAL_PART + "@")
+                and rt.split("@", 1)[1] in domains):
+            raise ConfigError(f"{rw}.runtime: must be {ROUTER_LOCAL_PART}@<one of its domains>")
+        keys = r["keys"]
+        if not isinstance(keys, list):
+            raise ConfigError(f"{rw}.keys: expected an array (key_malformed)")
+        kept = []
+        for j, k in enumerate(keys):
+            if not (isinstance(k, dict) and _PEER_KEY_REQUIRED <= set(k)
+                    <= _PEER_KEY_REQUIRED | _PEER_KEY_OPTIONAL
+                    and all(isinstance(v, str) for v in k.values())):
+                raise ConfigError(f"{rw}.keys[{j}]: needs key_id and public_key, and may have "
+                                  "not_before and not_after, all strings (key_malformed)")
+            kept.append(MappingProxyType(dict(k)))
+        parsed.append(DelegationRuntime(name=r["name"], runtime=rt, domains=domains,
+                                        keys=tuple(kept)))
+    crypto = _require_object(raw["crypto"], f"{where}.crypto")
+    if not ({"crypto_backend"} <= set(crypto) <= {"crypto_backend", "openssl_path"}):
+        raise ConfigError(f"{where}.crypto: needs crypto_backend, and may have openssl_path")
+    backend = crypto["crypto_backend"]
+    if backend not in CRYPTO_BACKENDS:
+        raise ConfigError(f"{where}.crypto.crypto_backend: one of {list(CRYPTO_BACKENDS)}")
+    openssl = crypto.get("openssl_path")
+    if backend == "openssl" or openssl is not None:
+        why = _normal_form_problem(openssl)
+        if why is not None:
+            raise ConfigError(f"{where}.crypto.openssl_path: {why}")
+    return DelegationConfig(
+        partition_verified=partition, signing_key_path=sk["path"], signing_key_id=sk["key_id"],
+        signing_public_key=sk["public_key"], runtimes=tuple(parsed), crypto_backend=backend,
+        openssl_path=openssl, forbidden_roots=roots)
 
 
 _CLASSIFY_INSTANCE_KEYS = ("task_deny", "send_to", "remote_fleet")

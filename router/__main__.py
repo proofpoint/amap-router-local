@@ -191,9 +191,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ql = q_sub.add_parser("list", help="one line per item: NAME SOURCE GEN ID and its state")
     p_ql.add_argument("name", nargs="?", help="one instance (default: every instance)")
     p_qs = q_sub.add_parser("show", help="one item, as escaped JSON")
-    p_qs.add_argument("name", help="the instance, or - for a control entry")
-    p_qs.add_argument("source", choices=("ingress", "control"))
-    p_qs.add_argument("generation", help="the 32-hex generation, or - for a control entry")
+    p_qs.add_argument("name", help="the instance, or - for a host-intake entry")
+    p_qs.add_argument("source", choices=("ingress", "control", "unresolved"))
+    p_qs.add_argument("generation", help="the 32-hex generation, or - for a host-intake entry")
     p_qs.add_argument("id", help="the item id")
     for p in (p_ql, p_qs):
         p.add_argument("--control-dir", type=Path, default=None,
@@ -231,7 +231,17 @@ def _quarantine(cfg, args) -> int:
     control_dir = derived if derived is not None else args.control_dir
 
     def control():
-        return quarantine_mod.list_control(control_dir, days=cfg.ingress_quarantine_days)
+        return quarantine_mod.list_control(
+            control_dir, days=cfg.ingress_quarantine_days,
+            disposed_dir=quarantine_mod.disposed_dir_for(cfg, quarantine_mod.SOURCE_CONTROL))
+
+    unresolved_dir = quarantine_mod.intake_dir_for(cfg, quarantine_mod.SOURCE_UNRESOLVED)
+
+    def unresolved():
+        return quarantine_mod.list_control(
+            unresolved_dir, days=cfg.ingress_quarantine_days,
+            source=quarantine_mod.SOURCE_UNRESOLVED,
+            disposed_dir=quarantine_mod.disposed_dir_for(cfg, quarantine_mod.SOURCE_UNRESOLVED))
 
     try:
         if args.quarantine_command == "list":
@@ -239,6 +249,8 @@ def _quarantine(cfg, args) -> int:
             items = [i for n in names for i in ingress(n)]
             if control_dir is not None:
                 items += control()
+            if unresolved_dir is not None:
+                items += unresolved()
             for item in items:
                 print(quarantine_mod.render_line(item))
             return 0
@@ -248,6 +260,12 @@ def _quarantine(cfg, args) -> int:
                       "needs `hop` (or --control-dir without it)", file=sys.stderr)
                 return 1
             items = control()
+        elif args.source == "unresolved":
+            if args.name != "-" or args.generation != "-" or unresolved_dir is None:
+                print("router: quarantine show: an unresolved entry is NAME - and GEN -, and "
+                      "needs `hop`", file=sys.stderr)
+                return 1
+            items = unresolved()
         else:
             items = [i for i in ingress(args.name) if i.generation == args.generation]
     except KeyError as e:

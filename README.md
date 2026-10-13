@@ -73,8 +73,8 @@ other.
 
 | Class | Modules |
 |---|---|
-| **Public** — another repo may import these, and a later `amap-core` extraction lifts them | `attachments`, `binding`, `config`, `deliver`, `exposure`, `lock`, `outbound`, `peers`, `transport`, `validate` |
-| **Internal** — implementation; may change shape without notice | `__main__`, `aliases`, `audit`, `classify`, `console`, `fsops`, `generations`, `hoplink`, `inflight`, `ingress`, `outcomes`, `provision`, `quarantine`, `registry`, `reset`, `roster`, `service`, `status` |
+| **Public** — another repo may import these, and a later `amap-core` extraction lifts them | `attachments`, `binding`, `config`, `deliver`, `exposure`, `lock`, `outbound`, `peers`, `peerverify`, `transport`, `validate` |
+| **Internal** — implementation; may change shape without notice | `__main__`, `aliases`, `audit`, `classify`, `console`, `fsops`, `generations`, `hoplink`, `inflight`, `ingress`, `outcomes`, `peerlane`, `provision`, `quarantine`, `registry`, `reset`, `roster`, `service`, `status` |
 | **Unclassified** — no ruling yet; see `router/__init__.py` | `firstsight`, `util` |
 
 Public modules import with no side effects at all: nothing written, no

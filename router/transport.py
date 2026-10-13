@@ -111,10 +111,22 @@ MINOR change: adding an optional factory, with its object Protocol, its
 result vocabulary and the `HopFsOps` behaviour only that factory's objects
 rely on, is minor; adding a required factory, or changing anything a
 `(3, 0)` caller relies on, is major.
+
+API 3.3: THE PEER SEAM, for cross-host signed peer traffic (`router/
+peerlane.py`). Two more OPTIONAL factories, `make_peer_codec(settings)` (the
+peer header and statement codec and the key gate, `settings` exactly `{}`)
+and `make_peer_errors()` (the exact exception classes the peer layers
+raise, as a closed mapping). With `delegation` configured, `check_delegation`
+requires them, and `make_signer` and `make_verifier`, all callable at a
+PLUGIN_API of at least `DELEGATION_MINOR`, with the plugin's own
+`OPTIONAL_FACTORIES` declaring both new names at that minor or later; any
+shortfall is `delegation_capability_missing`. Without `delegation` nothing
+here is consulted, so an older compatible plugin still loads.
 """
 
 from __future__ import annotations
 
+import builtins
 import errno
 import hashlib
 import hmac
@@ -141,7 +153,7 @@ _logger = logging.getLogger("amap_router_local.transport")
 #: `UnsafeRead` attribute, so a `(1, x)` plugin is refused here and a
 #: `(2, x)` plugin by a `(1, x)` runtime, before any factory is called.
 #: `(3, 0)` is amendment E8 (module docstring, API 3.0).
-PLUGIN_API: Tuple[int, int] = (3, 1)
+PLUGIN_API: Tuple[int, int] = (3, 3)
 
 #: The lowest minor this runtime LOADS. Optional factories never raise it: a
 #: plugin with the same major and a minor of at least this loads, and the
@@ -150,10 +162,22 @@ REQUIRED_MINOR = 0
 
 #: Optional factories: name -> (the `(major, minor)` that introduces it, the
 #: port it receives). Below that minor the name is ignored; at or above it,
-#: absent is OFF, callable is ON, and anything else is `missing_factory`.
-OPTIONAL_FACTORIES: Mapping[str, Tuple[Tuple[int, int], str]] = {
+#: absent is OFF, callable is ON, and anything else is `missing_factory`. The
+#: port is `"HopFsOps"` (called with settings and this runtime's `HopFsOps`),
+#: `None` (called with settings only) or `NO_ARGUMENTS` (called with none).
+NO_ARGUMENTS = "()"
+OPTIONAL_FACTORIES: Mapping[str, Tuple[Tuple[int, int], Optional[str]]] = {
     "make_intake_remover": ((3, 1), "HopFsOps"),
+    "make_peer_codec": ((3, 3), None),
+    "make_peer_errors": ((3, 3), NO_ARGUMENTS),
 }
+
+#: The minor delegation needs, and the four factories it needs callable.
+DELEGATION_MINOR: Tuple[int, int] = (3, 3)
+DELEGATION_FACTORIES: Tuple[str, ...] = (
+    "make_signer", "make_verifier", "make_peer_codec", "make_peer_errors")
+#: `make_peer_errors()`'s keys, exactly.
+PEER_ERROR_NAMES: Tuple[str, ...] = ("CodecError", "KeyConfigError", "BackendError", "ConfigError")
 
 #: The factories this runtime calls. A plugin may define more; it must
 #: define these. `make_sender(settings, fsops) -> TransportPort`,
@@ -175,7 +199,7 @@ REFUSAL_REASONS = (
     "parent_owner", "parent_writable",
     "missing", "symlink", "not_regular", "owner", "mode", "too_large",
     "hash_mismatch", "exec_failed", "api_mismatch", "missing_factory",
-    "fsops_unavailable", "role_mismatch",
+    "fsops_unavailable", "role_mismatch", "delegation_capability_missing",
 )
 # `role_mismatch` is the sibling runtime's: its link role and its plugin pin
 # disagree, in either direction. This router has no link role and never
@@ -1137,7 +1161,7 @@ def load_plugin(
     api: Tuple[int, int] = PLUGIN_API,
     trusted_uids: Tuple[int, ...] = TRUSTED_UIDS,
     required_minor: int = REQUIRED_MINOR,
-    optional_factories: Mapping[str, Tuple[Tuple[int, int], str]] = OPTIONAL_FACTORIES,
+    optional_factories: Mapping[str, Tuple[Tuple[int, int], Optional[str]]] = OPTIONAL_FACTORIES,
 ) -> LoadedPlugin:
     """Load the plugin at `path`, whose bytes must hash to `sha256`
     (lowercase hex). Every check in the module docstring, in that order;
@@ -1181,3 +1205,68 @@ def load_plugin(
     return LoadedPlugin(path=str(p), sha256=digest, api=got,
                         namespace=types.MappingProxyType(namespace),
                         optional_capabilities=frozenset(capabilities))
+
+
+@dataclass(frozen=True)
+class DelegationCapabilities:
+    """What `check_delegation` proved a plugin offers: the four factories,
+    and the exact exception classes, validated, as a read-only mapping."""
+    make_signer: Callable[..., Any]
+    make_verifier: Callable[..., Any]
+    make_peer_codec: Callable[..., Any]
+    errors: Mapping[str, type]
+
+
+def _builtin_classes() -> frozenset:
+    return frozenset(v for v in vars(builtins).values() if isinstance(v, type))
+
+
+def check_delegation(plugin: "LoadedPlugin") -> DelegationCapabilities:
+    """The delegation load rule (module docstring, API 3.3), or
+    `PluginRefused("delegation_capability_missing")` naming the check that
+    failed. Called only with `delegation` configured. Calls
+    `make_peer_errors()`, with no arguments, exactly once."""
+    def refuse(why: str) -> PluginRefused:
+        return PluginRefused("delegation_capability_missing", why)
+
+    api = tuple(plugin.api)
+    if api < DELEGATION_MINOR:
+        raise refuse(f"PLUGIN_API {api} is below {DELEGATION_MINOR}")
+    ns = plugin.namespace
+    for name in DELEGATION_FACTORIES:
+        if not callable(ns.get(name)):
+            raise refuse(f"the plugin defines no callable {name!r}")
+    meta = ns.get("OPTIONAL_FACTORIES")
+    if type(meta) is not dict:
+        raise refuse("the plugin's OPTIONAL_FACTORIES is not a dict")
+    for name in ("make_peer_codec", "make_peer_errors"):
+        since = meta.get(name)
+        if not (type(since) is tuple and len(since) == 2
+                and all(type(x) is int for x in since)):
+            raise refuse(f"the plugin's OPTIONAL_FACTORIES does not declare {name!r} "
+                         "as a (major, minor) pair")
+        if since < DELEGATION_MINOR:
+            raise refuse(f"the plugin's OPTIONAL_FACTORIES declares {name!r} at {since}, "
+                         f"below {DELEGATION_MINOR}")
+    try:
+        errors = ns["make_peer_errors"]()
+    except Exception as e:  # noqa: BLE001 -- any failure is a refusal
+        raise refuse(f"make_peer_errors() raised {type(e).__name__}") from None
+    if not isinstance(errors, Mapping) or set(errors) != set(PEER_ERROR_NAMES):
+        raise refuse(f"make_peer_errors() does not return exactly {list(PEER_ERROR_NAMES)}")
+    classes = [errors[n] for n in PEER_ERROR_NAMES]
+    builtin = _builtin_classes()
+    for n, cls in zip(PEER_ERROR_NAMES, classes):
+        if not (isinstance(cls, type) and issubclass(cls, Exception)):
+            raise refuse(f"make_peer_errors()[{n!r}] is not an exception class")
+        if cls in builtin:
+            raise refuse(f"make_peer_errors()[{n!r}] is a built-in exception class")
+    for i, a in enumerate(classes):
+        for b in classes[i + 1:]:
+            if a is b or issubclass(a, b) or issubclass(b, a):
+                raise refuse("make_peer_errors()'s classes are not pairwise distinct and "
+                             "unrelated")
+    return DelegationCapabilities(
+        make_signer=ns["make_signer"], make_verifier=ns["make_verifier"],
+        make_peer_codec=ns["make_peer_codec"],
+        errors=types.MappingProxyType(dict(zip(PEER_ERROR_NAMES, classes))))
