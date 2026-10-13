@@ -25,6 +25,9 @@ TP = "router/transport.py"
 SV = "router/service.py"
 ST = "router.tests.test_transport.StartupTests."
 FS = "router/fsops.py"
+IG = "router/ingress.py"
+HL = "router/hoplink.py"
+RM = "router.tests.test_ingress_remover."
 MX = "router.tests.test_transport_e8b.MatrixTests."
 SF = "router.tests.test_transport_e8b.SurfaceTests."
 LD = "router.tests.test_transport.LoaderTests."
@@ -67,6 +70,32 @@ M = [
  ('E9 the warning whatever the uids', SV,
   '    if cfg.hop.peer_uid == os.geteuid():\n', '    if True:\n',
   [ST + "test_distinct_uids_give_no_such_warning"]),
+ # -- the remover in the ingress pass, and its construction ----------------------
+ ('G1 any remover return tombstones', IG,
+  '    if got not in transport_mod.REMOVE_RESULTS:\n', '    if False:\n',
+  [RM + "RemoverPassTests.test_an_unknown_return_is_a_protocol_hold_and_the_record_waits"]),
+ ('G2 a held remover falls to the interim rule', IG,
+  '        if st in WAITING_REMOVE and pump.remover_hold is not None:\n            continue                 # an offered remover is held: entries wait\n', '',
+  [RM + "RemoverPassTests.test_a_held_remover_leaves_entries_waiting_even_gone_past_the_horizon"]),
+ ('G3 a closed remover kept', IG,
+  '            hoplink_mod.evict_remover(pump.cfg, pump.logical_id, pump.gen)\n            pump.remover = None\n', '',
+  [RM + "RemoverPassTests.test_a_closed_remover_is_evicted"]),
+ ('G4 a too-large listing read as unexpected', IG,
+  '        if kind == "runtime" and detail == "listing_too_large":\n            why = HOLD_REMOVE_LISTING_TOO_LARGE\n        elif',
+  '        if',
+  [RM + "RemoverPassTests.test_each_exception_class_has_its_hold_and_the_record_waits"]),
+ ('G5 a remover built when not offered', HL,
+  '    if not remover_offered(runtime):\n        return None\n', '',
+  [RM + "RemoverForTests.test_not_offered_is_none_and_never_calls_the_factory"]),
+ ('G6 a refused remover not latched', HL,
+  '            _REMOVER_LATCHED[key] = hold\n', '            pass\n',
+  [RM + "RemoverForTests.test_refused_settings_latch_the_remover_only"]),
+ ('G7 the remover not called when present', IG,
+  '        if st in WAITING_REMOVE and pump.remover is not None:\n', '        if False:\n',
+  [RM + "RemoverPassTests.test_removed_and_absent_each_make_the_tombstone_at_once"]),
+ ('G8 the remover state not shown per generation', IG,
+  '            if rs is not None:\n                entry["remover"] = rs\n', '',
+  [RM + "RemoverStatusTests.test_status_names_the_remover_state"]),
  # -- HopFsOps: remove_pinned crash-resumable and bounded; stat_group_pinned --
  ('F1 the aside sweep skipped', FS,
   '        for aside in self._asides(dir_fd, name):\n', '        for aside in []:\n',

@@ -1463,9 +1463,13 @@ No ledger row of a record in `placing` or `placing_ambiguous` is ever
 pruned (nothing in this repository prunes the binding ledger).
 
 **Removal and the dedup horizon.** The plugin's remover is an optional
-capability no deployed plugin offers yet (`not_offered`). Until it is, a
-placed or quarantined entry's record waits (`*_waiting_remove`) and
-becomes its TOMBSTONE only when the horizon has passed AND the reader
+capability (`make_intake_remover`, at `PLUGIN_API` (3, 1)). When the loaded
+plugin offers it, a placed or quarantined entry's record (`*_waiting_remove`)
+is removed through it and becomes its TOMBSTONE on `removed` or `absent`;
+any other outcome leaves it waiting, with its reason (a retry is always safe)
+and status shows the remover `available`, or `held` with the construction
+failure. When it is not offered (`not_offered`), the record waits and
+becomes its tombstone only when the horizon has passed AND the reader
 reports the entry gone; a tombstone still dedups (a re-publication is a
 duplicate, never placed again) and is dropped only after another horizon.
 A held record is never dropped. `ingress_dedup_horizon_days` (default 30,
