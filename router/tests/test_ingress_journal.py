@@ -120,6 +120,31 @@ class StateMachineTests(_J):
                     refused += 1
         self.assertGreater(refused, 50, "control: the refusals were exercised")
 
+    def test_every_allowed_edge_is_walkable(self):
+        """Every edge in the table, from a record brought to its source state
+        by a shortest forward path, is accepted and lands in its target."""
+        paths = {ingress.HELD: [ingress.HELD], ingress.PREPARED: [ingress.PREPARED],
+                 ingress.QUARANTINED: [ingress.QUARANTINED]}
+        frontier = list(paths)
+        while frontier:
+            src = frontier.pop(0)
+            for dst in ingress.TRANSITIONS[src]:
+                if dst not in paths:
+                    paths[dst] = paths[src] + [dst]
+                    frontier.append(dst)
+        self.assertEqual(set(paths), set(ingress.STATES), "a state no path reaches")
+        walked = 0
+        for src, dsts in ingress.TRANSITIONS.items():
+            for dst in dsts:
+                with self.subTest(src=src, dst=dst):
+                    eid = f"walk:{src}->{dst}"
+                    for s in paths[src]:
+                        self.write(s, eid)
+                    self.write(dst, eid)
+                    self.assertEqual(self.read(eid)["state"], dst)
+                    walked += 1
+        self.assertEqual(walked, sum(len(v) for v in ingress.TRANSITIONS.values()))
+
     def test_members_carry_forward_and_first_seen_never_moves(self):
         first = self.write(ingress.PREPARED, notice_id="n" * 32, snapshot={"sha256": "a" * 64})
         later = self.write(ingress.PLACING)

@@ -68,15 +68,18 @@ TOMBSTONES = (COMPLETE, QUARANTINED_COMPLETE)
 INITIAL = (HELD, PREPARED, QUARANTINED)
 TRANSITIONS: Dict[str, tuple] = {
     HELD: (HELD, PREPARED, QUARANTINED),
-    PREPARED: (PLACING, QUARANTINED),
+    # quarantined: the late check before placing; held: snapshot_invalid, or a
+    # quarantine item conflict met on the way to quarantine.
+    PREPARED: (PLACING, QUARANTINED, HELD),
     # Recovery row 1 (published), rows 1/3 (terminal holds), row 2 when the
     # generation is no longer current and nothing was committed (quarantined).
     PLACING: (PUBLISHED, HELD, QUARANTINED),
     PUBLISHED: (PUBLISHED_WAITING_REMOVE,),
-    PUBLISHED_WAITING_REMOVE: (COMPLETE,),
+    # A re-listed duplicate whose projection differs, under the interim rule.
+    PUBLISHED_WAITING_REMOVE: (COMPLETE, DUPLICATE_DIFFERENT_HELD),
     COMPLETE: (PUBLISHED_WAITING_REMOVE, DUPLICATE_DIFFERENT_HELD),
     QUARANTINED: (QUARANTINED_WAITING_REMOVE,),
-    QUARANTINED_WAITING_REMOVE: (QUARANTINED_COMPLETE,),
+    QUARANTINED_WAITING_REMOVE: (QUARANTINED_COMPLETE, DUPLICATE_DIFFERENT_HELD),
     QUARANTINED_COMPLETE: (QUARANTINED_WAITING_REMOVE, DUPLICATE_DIFFERENT_HELD),
     DUPLICATE_DIFFERENT_HELD: (DUPLICATE_DIFFERENT_HELD,),
 }
