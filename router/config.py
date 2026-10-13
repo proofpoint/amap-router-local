@@ -575,6 +575,10 @@ HOP_CAPS = ("document", "request", "attachment", "total")
 HOP_CONTRACT_MAX = 2 ** 31 - 1
 
 
+#: The hop codec's link grammar, applied with `fullmatch`.
+HOP_LINK_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+
+
 @dataclass(frozen=True)
 class HopConfig:
     """`hop` as configured (module docstring). `root` is the string exactly
@@ -585,6 +589,10 @@ class HopConfig:
     peer_uid: int
     version_write: int
     caps: Tuple[Tuple[str, int], ...]
+    #: The inbound reader's link (PROVISIONAL, design delta v3.4 §2): the
+    #: journal key's `link` and admission's comparand. Absent, inbound is
+    #: disabled; the outbound leg does not read it.
+    link: Optional[str] = None
 
     def cap(self, name: str) -> int:
         return dict(self.caps)[name]
@@ -615,10 +623,15 @@ def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
             "config.hop: requires config.registry_dir: a handover names its sender by "
             "logical_id, and generations exist only under a registry")
     raw = _require_object(top["hop"], "config.hop")
-    if set(raw) != {"root", "peer_uid", "version_write", "caps"}:
+    required = {"root", "peer_uid", "version_write", "caps"}
+    if not (required <= set(raw) <= required | {"link"}):
         raise ConfigError(
-            "config.hop: needs exactly 'root', 'peer_uid', 'version_write' and 'caps'; "
-            f"got {sorted(raw)}")
+            "config.hop: needs exactly 'root', 'peer_uid', 'version_write' and 'caps', "
+            f"and may have 'link'; got {sorted(raw)}")
+    link = raw.get("link")
+    if "link" in raw and not (isinstance(link, str) and HOP_LINK_RE.fullmatch(link)):
+        raise ConfigError(
+            f"config.hop.link: {link!r} is not a link name ([a-z0-9][a-z0-9-]{{0,62}})")
     root = raw["root"]
     if not isinstance(root, str) or not os.path.isabs(root):
         raise ConfigError(f"config.hop.root: must be an absolute path, got {root!r}")
@@ -645,7 +658,8 @@ def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
         raise ConfigError(f"config.hop.caps: needs exactly {list(HOP_CAPS)}; got {sorted(caps)}")
     hop = HopConfig(
         root=root, peer_uid=peer_uid, version_write=version_write,
-        caps=tuple((k, _positive_int(caps[k], f"config.hop.caps.{k}")) for k in HOP_CAPS))
+        caps=tuple((k, _positive_int(caps[k], f"config.hop.caps.{k}")) for k in HOP_CAPS),
+        link=link)
     from .hoplink import document_floor  # local: hoplink is a leaf, kept out of load order
     count_cap, file_cap, total_cap = attachment_caps
     floor = document_floor(

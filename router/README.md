@@ -1324,8 +1324,14 @@ handover document, the request file, one decoded attachment, all of them.
 can make, computed exactly at load (`hoplink.document_floor`), or the
 config is refused. The floor counts the attachment caps (the smaller of
 the plugin's and this router's), so at this router's defaults it is about
-43.7 MiB. A reload that changes `hop` is refused, like one that
-changes the plugin. Every instance's address must be able to serve as a
+43.7 MiB. `link`, optional, names the inbound reader's link in the hop
+codec's link grammar (`[a-z0-9][a-z0-9-]{0,62}`): it keys the ingress
+journal and is what admission compares the facts' `admission_link` with.
+Without it inbound is DISABLED (nothing is listed, read or placed; the
+outbound leg is unaffected). It is rendered by the host adapter from the
+fleet policy that names the downstream runtime's link. PROVISIONAL, pending
+the owner's confirmation. A reload that changes `hop` is refused, like one
+that changes the plugin. Every instance's address must be able to serve as a
 handover's `from_address` (at most 254 octets, a local part of at most 64,
 the bare addr-spec pattern): one that cannot is refused at load, by the
 same check begin runs.

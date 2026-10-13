@@ -41,6 +41,14 @@ PL = "router.tests.test_ingress_place."
 KC = "router.tests.test_ingress_classify.ClassifyTests."
 
 M = [
+ # -- the inbound reader's link (config) ----------------------------------------
+ ('L1 any hop.link accepted', CF,
+  '    if "link" in raw and not (isinstance(link, str) and HOP_LINK_RE.fullmatch(link)):\n',
+  '    if False:\n',
+  [HC + "test_the_inbound_link_is_optional_and_in_the_link_grammar"]),
+ ('L2 hop.link not carried into the config', CF,
+  '        link=link)\n', '        link=None)\n',
+  [HC + "test_the_inbound_link_is_optional_and_in_the_link_grammar"]),
  # -- the facts version guard (driven directly at the guard unit) -------------
  ('G1 facts_version unchecked (presence selects version 2)', IG,
   '    if type(v) is int and v == 2:\n', '    if True:\n',
