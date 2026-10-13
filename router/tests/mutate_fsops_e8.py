@@ -78,7 +78,7 @@ M = [
   '    return value in (NOTICE_BUNDLE_SCHEMA, "amap-hop-notice-entry/1")\n',
   [E8 + "BundleSchemaTests.test_only_2_is_current"]),
  ('T10 the runtime stays at (2, 0)', TR,
-  'PLUGIN_API: Tuple[int, int] = (3, 0)\n', 'PLUGIN_API: Tuple[int, int] = (2, 0)\n',
+  'PLUGIN_API: Tuple[int, int] = (3, 1)\n', 'PLUGIN_API: Tuple[int, int] = (2, 1)\n',
   [LD + "test_an_older_major_plugin_is_refused_by_this_major_3_runtime"]),
  ('T13 OSError classified before a plugin .reason', TR,
   [('    reason = getattr(exc, "reason", None)\n'
@@ -161,8 +161,8 @@ M = [
     '                            f"more than {transport_mod.LIST_SCAN_MAX} names; the scan stopped")\n')],
   None, [FL + "ScanCapTests.test_the_cap_holds_whatever_after_and_limit_are"]),
  ('F11 a scan error read as an empty listing', FS,
-  '            with os.scandir(fd) as it:\n',
-  '            try:\n                it = os.scandir(fd)\n            except OSError:\n'
+  '            visited = 0\n            with os.scandir(fd) as it:\n',
+  '            visited = 0\n            try:\n                it = os.scandir(fd)\n            except OSError:\n'
   '                return [], False\n            with it:\n',
   [FL + "ArgumentAndBindingTests.test_an_error_raises_and_is_never_an_empty_listing"]),
 ]
