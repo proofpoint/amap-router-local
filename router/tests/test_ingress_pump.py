@@ -25,8 +25,19 @@ E3 = "1700000000-3"
 FLEET = ("fleet-a.example", "fleet-b.example")
 TRUSTED = ("fleet-a.example",)
 HORIZON = 30 * 86400
-LATER = datetime.now(timezone.utc) + timedelta(seconds=HORIZON + 60)
-MUCH_LATER = LATER + timedelta(seconds=HORIZON + 60)
+
+
+def later() -> datetime:
+    """Past the horizon for anything stamped before this call. Computed at
+    CALL time, never at import: a constant taken at import shrinks its own
+    margin by however long the run takes to reach the test, and a run slower
+    than the margin turned "past the horizon" into "not yet"."""
+    return datetime.now(timezone.utc) + timedelta(seconds=HORIZON + 60)
+
+
+def much_later() -> datetime:
+    """A whole horizon past `later()`, at call time too."""
+    return later() + timedelta(seconds=HORIZON + 60)
 
 
 def entry(eid, **kw):
@@ -313,7 +324,7 @@ class RemovalTests(_Pump):
 
     def test_an_entry_still_upstream_keeps_waiting_past_the_horizon(self):
         self.placed()
-        self.pump(now=LATER)
+        self.pump(now=later())
         self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
 
     def test_an_entry_gone_before_the_horizon_keeps_waiting(self):
@@ -325,18 +336,18 @@ class RemovalTests(_Pump):
     def test_gone_and_past_the_horizon_is_a_tombstone_that_still_dedups(self):
         self.placed()
         del self.port.entries[E1]
-        self.pump(now=LATER)
+        self.pump(now=later())
         self.assertEqual(self.state(E1), (ingress.COMPLETE, None))
         # Re-published within the tombstone's life: a duplicate, removed again.
         self.port.entries[E1] = entry(E1)
-        self.pump(now=LATER)
+        self.pump(now=later())
         self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
         self.assertEqual(len(self.notices()), 1)
 
     def test_a_tombstone_past_the_horizon_is_dropped_with_its_snapshot(self):
         self.placed()
         del self.port.entries[E1]
-        self.pump(now=LATER)
+        self.pump(now=later())
         self.assertEqual(self.snapshots(), [E1])
         # The tombstone was written at the real clock: its age runs from there.
         written = datetime.now(timezone.utc)
@@ -350,7 +361,7 @@ class RemovalTests(_Pump):
         self.port.entries[E1] = entry(E1, to=addr("charlie"))
         self.pump()
         del self.port.entries[E1]
-        self.pump(now=MUCH_LATER + timedelta(seconds=HORIZON))
+        self.pump(now=much_later() + timedelta(seconds=HORIZON))
         self.assertEqual(self.state(E1), (ingress.HELD, "recipient_not_this_identity"))
         with self.assertRaises(ingress.JournalError):
             ingress.drop_tombstone(self.state_dir, self.lid, self.gen, "notice",
@@ -360,7 +371,7 @@ class RemovalTests(_Pump):
         self.port.entries[E1] = "notice_invalid"
         self.pump()
         del self.port.entries[E1]
-        self.pump(now=LATER)
+        self.pump(now=later())
         self.assertEqual(self.state(E1), (ingress.QUARANTINED_COMPLETE, None))
 
     def test_an_old_first_seen_entry_warns_and_is_still_placed(self):
