@@ -1747,8 +1747,15 @@ class Pump:
     def __init__(self, cfg: Any, reader: Any, logical_id: str, gen: str, link: str, *,
                  report: Any, recipient: Optional[str], unresolved: Optional[str],
                  attachment_cap: int, runtime_classes: tuple = (),
-                 proven_unknown: bool = False):
+                 proven_unknown: bool = False, remover: Any = None,
+                 remover_hold: Optional[str] = None, runtime_roles: tuple = ()):
         self.cfg, self.reader, self.report = cfg, reader, report
+        # The optional remover (None: not offered, the interim rule applies),
+        # or why an offered one could not be constructed (entries then wait).
+        self.remover, self.remover_hold = remover, remover_hold
+        #: The runtime's own (class, role) pairs, for classifying what the
+        #: remover raises (`transport.classify`; never the verdict classes).
+        self.runtime_roles = runtime_roles
         # Proven unknown: the registry was read, valid, and the identity is absent or
         # retired. Every generation of it is then non-current.
         self.proven_unknown = proven_unknown
@@ -2042,8 +2049,65 @@ def _digests_of(parsed: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 REMOVER_NOT_OFFERED = "not_offered"
+REMOVER_AVAILABLE = "available"
+REMOVER_HELD = "held"
 WAITING_REMOVE = {PUBLISHED_WAITING_REMOVE: COMPLETE,
                   QUARANTINED_WAITING_REMOVE: QUARANTINED_COMPLETE}
+HOLD_REMOVE_PROTOCOL = "hop_remove_protocol"
+HOLD_REMOVE_LISTING_TOO_LARGE = "hop_remove_listing_too_large"
+HOLD_OBJECT_CLOSED = "hop_object_closed"
+HOLD_IO_ERROR = "hop_io_error"
+HOLD_UNEXPECTED = "hop_unexpected"
+
+
+def remove_one(pump: "Pump", entry_id: str, state: str) -> Optional[str]:
+    """One `remove_entry` call for a `*_waiting_remove` record, and its
+    outcome. `removed` / `absent` move the record to its tombstone; every
+    other outcome leaves it waiting (a retry is always safe: removal comes
+    after this router's decision) and returns the hold reason, logged. The
+    remover's exceptions are classified without the verdict classes."""
+    try:
+        got = pump.remover.remove_entry("notice", entry_id)
+    except Exception as e:  # noqa: BLE001 -- classified below, never escaped
+        kind, detail = transport_mod.classify(e, runtime=pump.runtime_roles)
+        if kind == "runtime" and detail == "listing_too_large":
+            why = HOLD_REMOVE_LISTING_TOO_LARGE
+        elif kind == "runtime" and detail == "unsafe_read":
+            why = f"hop_unsafe_read:{getattr(e, 'reason', None)}"
+        elif kind == "reason" and detail == "closed":
+            from . import hoplink as hoplink_mod
+            hoplink_mod.evict_remover(pump.cfg, pump.logical_id, pump.gen)
+            pump.remover = None
+            # The remover is rebuilt NEXT pass; for the rest of THIS one an
+            # offered remover's entries wait, never the not-offered rule.
+            pump.remover_hold = HOLD_OBJECT_CLOSED
+            why = HOLD_OBJECT_CLOSED
+        elif kind == "reason" and detail in ("layout", "owner"):
+            why = f"hop_remove_anomaly:{detail}"
+        elif kind == "oserror":
+            why = HOLD_IO_ERROR
+        else:
+            why = HOLD_UNEXPECTED
+        if why == HOLD_IO_ERROR:
+            logger.warning("ingress %s gen %s: removal of an entry failed (%s): %s",
+                           pump.logical_id, pump.gen, why, e)
+        elif why == HOLD_UNEXPECTED:
+            logger.exception("ingress %s gen %s: removal of an entry failed (%s)",
+                             pump.logical_id, pump.gen, why)
+        else:
+            logger.error("ingress %s gen %s: removal of an entry failed (%s): %s",
+                         pump.logical_id, pump.gen, why, e)
+        pump.count(why)
+        return why
+    if got not in transport_mod.REMOVE_RESULTS:
+        logger.error("ingress %s gen %s: the remover returned %r, outside %s (%s)",
+                     pump.logical_id, pump.gen, got, list(transport_mod.REMOVE_RESULTS),
+                     HOLD_REMOVE_PROTOCOL)
+        pump.count(HOLD_REMOVE_PROTOCOL)
+        return HOLD_REMOVE_PROTOCOL
+    pump.jw(entry_id, WAITING_REMOVE[state])
+    pump.count("tombstoned")
+    return None
 
 
 def _age_s(ts: Any, now: datetime) -> Optional[float]:
@@ -2075,14 +2139,21 @@ def drop_tombstone(state_dir: Path, logical_id: str, gen: str, kind: str, key: s
 
 
 def advance_removal(pump: "Pump", now: datetime, horizon_s: int) -> None:
-    """The interim rule over every waiting record, then the tombstone sweep.
-    Never concurrent with a listing or read of the generation: the pump is
+    """Every waiting record: through the remover when one is offered and
+    constructed (`remove_one`); left waiting when an offered remover is
+    held; else under the interim rule. Then the tombstone sweep. Never
+    concurrent with a listing or read of the generation: the pump is
     single-threaded per tree and runs this after its listing."""
     records = journal_records(pump.state_dir, pump.logical_id, pump.gen, "notice")
     for entry_id, info in sorted(records.items()):
         key = key_for("notice", pump.link, pump.gen, entry_id)
         rec = read(pump.state_dir, pump.logical_id, pump.gen, "notice", key)
         st = rec["state"]
+        if st in WAITING_REMOVE and pump.remover is not None:
+            remove_one(pump, entry_id, st)
+            continue
+        if st in WAITING_REMOVE and pump.remover_hold is not None:
+            continue                 # an offered remover is held: entries wait
         if st in WAITING_REMOVE:
             age = _age_s(rec.get("state_ts"), now)
             if age is None or age < horizon_s:
@@ -2310,6 +2381,9 @@ def pump_link(cfg: Any, logical_id: str, gen: str) -> Optional[str]:
     return link
 
 
+#: (state_dir, logical_id, gen) -> the remover's state at the last pass:
+#: "available", "held:<reason>" or "not_offered".
+REMOVER_STATE: Dict[tuple, str] = {}
 #: The state_dirs whose "inbound disabled, no hop.link" ERROR was logged.
 _LINK_UNSET_LOGGED: set = set()
 #: (state_dir, logical_id) -> the generation the last pass saw as current.
@@ -2337,6 +2411,10 @@ def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
         return out
     fsops = runtime.fsops
     runtime_classes = tuple(c for c in (getattr(fsops, "UnsafeRead", None),) if c)
+    try:
+        runtime_roles = tuple(transport_mod.check_fsops_classes(fsops))
+    except transport_mod.SeamRefused:
+        runtime_roles = ()
     too_large = getattr(fsops, "ListingTooLarge", ())
     for ident in identities(cfg, report):
         lid = ident["logical_id"]
@@ -2368,11 +2446,22 @@ def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
             except hoplink_mod.HopHold as e:
                 out[label] = {e.reason: 1}
                 continue
+            remover, remover_hold = None, None
+            try:
+                remover = hoplink_mod.remover_for(runtime, cfg, lid, gen)
+            except hoplink_mod.HopHold as e:
+                remover_hold = e.reason
+            REMOVER_STATE[(str(cfg.state_dir), lid, gen)] = (
+                REMOVER_AVAILABLE if remover is not None
+                else f"{REMOVER_HELD}:{remover_hold}" if remover_hold is not None
+                else REMOVER_NOT_OFFERED)
             pump = Pump(cfg, reader, lid, gen, link, report=report,
                         recipient=ident["recipient"], unresolved=ident["unresolved"],
                         attachment_cap=cfg.hop.cap("attachment"),
                         runtime_classes=runtime_classes,
-                        proven_unknown=ident["proven_unknown"])
+                        proven_unknown=ident["proven_unknown"],
+                        remover=remover, remover_hold=remover_hold,
+                        runtime_roles=runtime_roles)
             try:
                 out[label] = pump_generation(
                     pump, listing_too_large=too_large,
@@ -2393,8 +2482,12 @@ def status_doc(cfg: Any, last_pump: Optional[Dict[str, Dict[str, int]]] = None
     remover's state, the dedup horizon in seconds, and the last pump's
     counts. A damaged record is counted as such, never skipped."""
     state_dir = Path(cfg.state_dir)
+    states = [v for (sd, _l, _g), v in REMOVER_STATE.items() if sd == str(state_dir)]
+    summary = (REMOVER_AVAILABLE if REMOVER_AVAILABLE in states
+               else REMOVER_HELD if any(v.startswith(REMOVER_HELD) for v in states)
+               else REMOVER_NOT_OFFERED)
     out: Dict[str, Any] = {
-        "remover": REMOVER_NOT_OFFERED,
+        "remover": summary,
         "ingress_dedup_horizon_s": cfg.ingress_dedup_horizon_days * 86400,
         "inbound": "on" if (cfg.hop is not None and cfg.hop.link is not None) else "off",
         "generations": {}, "last_pump": dict(last_pump or {})}
@@ -2456,10 +2549,14 @@ def status_doc(cfg: Any, last_pump: Optional[Dict[str, Dict[str, int]]] = None
             latched = _LINK_LATCHED.get((str(state_dir), lid, gen))
             if latched:
                 entry["inbound_latched"] = latched
+            rs = REMOVER_STATE.get((str(state_dir), lid, gen))
+            if rs is not None:
+                entry["remover"] = rs
             high = LISTING_ENTRIES_HIGH.get((str(state_dir), lid, gen))
             if high is not None:
                 entry["listing_entries_high"] = {"count": high, "label": LISTING_PROXY_LABEL}
             if any(entry[k] for k in ("states", "quarantine", "snapshots", "damaged")) \
-                    or entry["link_pinned"] or latched or high is not None:
+                    or entry["link_pinned"] or latched or high is not None \
+                    or rs is not None:
                 out["generations"][f"{lid}/{gen}"] = entry
     return out

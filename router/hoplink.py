@@ -486,9 +486,13 @@ def forget_senders() -> None:
             port.close()
         except Exception:  # noqa: BLE001 -- close is cleanup
             logger.exception("closing a hop object failed")
+    for port in list(_REMOVERS.values()):
+        _close_quietly(port)
     _SENDERS.clear()
     _LATCHED.clear()
     _READERS.clear()
+    _REMOVERS.clear()
+    _REMOVER_LATCHED.clear()
     _READER_LATCHED.clear()
 
 
@@ -563,6 +567,66 @@ def _reader_construction_hold(e: BaseException) -> HopHold:
     if isinstance(e, transport_mod.SeamRefused):
         return HopHold(HOLD_READER_VOCABULARY, str(e), latched=True, scope="instance")
     return HopHold(f"{HOLD_READER_CONSTRUCT_FAILED}:{detail or kind}", str(e), latched=False)
+
+
+# --------------------------------------------------------------------------
+# The OPTIONAL intake remover (`transport.OPTIONAL_FACTORIES`, at (3, 1)):
+# one per (logical_id, generation) per process, constructed only when the
+# loaded plugin offers the capability. A refusal of its settings latches the
+# REMOVER only (`hop_settings_refused`): reading and placing go on, and the
+# entries wait. Anything else is retried next poll.
+# --------------------------------------------------------------------------
+
+REMOVER_FACTORY = "make_intake_remover"
+HOLD_REMOVER_SETTINGS_REFUSED = "hop_settings_refused"
+HOLD_REMOVER_CONSTRUCT_FAILED = "hop_remover_construct_failed"
+
+#: (runtime id, state_dir, logical_id, gen) -> the constructed remover.
+_REMOVERS: Dict[Tuple, Any] = {}
+#: Latched remover construction holds, by the same key.
+_REMOVER_LATCHED: Dict[Tuple, "HopHold"] = {}
+
+
+def remover_offered(runtime: Any) -> bool:
+    return REMOVER_FACTORY in getattr(runtime.plugin, "optional_capabilities", frozenset())
+
+
+def remover_for(runtime: Any, cfg: Any, logical_id: str, gen: str) -> Optional[Any]:
+    """The generation's remover, or None when the plugin does not offer one
+    (the interim rule then applies). Raises `HopHold`, and ONLY `HopHold`,
+    when one is offered but cannot be constructed."""
+    if not remover_offered(runtime):
+        return None
+    key = (id(runtime), str(cfg.state_dir), logical_id, gen)
+    remover = _REMOVERS.get(key)
+    if remover is not None:
+        return remover
+    if key in _REMOVER_LATCHED:
+        raise _REMOVER_LATCHED[key]
+    try:
+        remover = runtime.plugin.make_intake_remover(
+            reader_settings(cfg, logical_id, gen), runtime.fsops)
+    except Exception as e:  # noqa: BLE001 -- classified, never escaped
+        kind, detail = transport_mod.classify(e, runtime=tuple(_RUNTIME_CLASSES))
+        if kind == "reason" and detail == "settings_invalid":
+            hold = HopHold(HOLD_REMOVER_SETTINGS_REFUSED, str(e), latched=True)
+            _REMOVER_LATCHED[key] = hold
+        else:
+            hold = HopHold(f"{HOLD_REMOVER_CONSTRUCT_FAILED}:{detail or kind}", str(e),
+                           latched=False)
+        raise hold from e
+    _REMOVERS[key] = remover
+    return remover
+
+
+def evict_remover(cfg: Any, logical_id: str, gen: str) -> int:
+    """Close and drop the cached removers of one generation (a remover found
+    closed is rebuilt on the next poll)."""
+    state = str(cfg.state_dir)
+    keys = [k for k in _REMOVERS if k[1] == state and k[2] == logical_id and k[3] == gen]
+    for k in keys:
+        _close_quietly(_REMOVERS.pop(k))
+    return len(keys)
 
 
 def evict_readers(cfg: Any, logical_id: str, gen: Optional[str] = None) -> int:

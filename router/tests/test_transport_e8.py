@@ -25,7 +25,12 @@ def _methods(proto):
 class ShapeTests(unittest.TestCase):
 
     def test_the_version(self):
-        self.assertEqual(transport.PLUGIN_API, (3, 0))
+        self.assertEqual(transport.PLUGIN_API, (3, 1))
+        self.assertEqual(transport.REQUIRED_MINOR, 0)
+        self.assertEqual(dict(transport.OPTIONAL_FACTORIES),
+                         {"make_intake_remover": ((3, 1), "HopFsOps")})
+        for name, (since, _port) in transport.OPTIONAL_FACTORIES.items():
+            self.assertGreater(since[1], transport.REQUIRED_MINOR, name)
         self.assertEqual(transport.REQUIRED_FACTORIES,
                          ("make_sender", "make_intake_reader", "make_upstream_marker_store"))
         self.assertEqual(transport.FACTORY_PORTS["make_upstream_marker_store"], "HopFsOps")
@@ -100,8 +105,8 @@ class ShapeTests(unittest.TestCase):
                        "ORDER IS NEVER TAKEN FROM A LISTING",
                        "nothing may compare entry ids to page",
                        "`int(n)`, never its name",
-                       "PENDING THE OWNER'S DECISION: `make_intake_remover",
-                       "OPTIONAL factory at `(3, 1)`"):
+                       "API 3.1: THE OPTIONAL INTAKE REMOVER, by the owner's decision",
+                       "never in `REQUIRED_FACTORIES` or `FACTORY_PORTS`"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, mod)
         tp = " ".join(transport.TransportPort.__doc__.split())
@@ -140,12 +145,16 @@ class ShapeTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, fs)
 
-    def test_remove_entry_is_not_part_of_3_0(self):
-        """Pending a decision: absent until it lands as an optional factory."""
+    def test_remove_entry_is_optional_at_3_1(self):
+        """Decided (an optional factory): never required, never a 3.0 port's
+        method, present only in OPTIONAL_FACTORIES at (3, 1)."""
         self.assertNotIn("make_intake_remover", transport.FACTORY_PORTS)
         self.assertNotIn("make_intake_remover", transport.REQUIRED_FACTORIES)
+        self.assertEqual(transport.OPTIONAL_FACTORIES["make_intake_remover"][0], (3, 1))
         for proto in (transport.InboundPort, transport.TransportPort, transport.HopFsOps):
             self.assertNotIn("remove_entry", _methods(proto))
+        self.assertEqual(_methods(transport.IntakeRemover), {"remove_entry", "close"})
+        self.assertNotIn("PENDING", transport.__doc__)
 
     def test_the_null_plugin_and_the_loaded_plugin_have_the_store(self):
         self.assertIsNone(transport.NullTransport().make_upstream_marker_store({}, None))

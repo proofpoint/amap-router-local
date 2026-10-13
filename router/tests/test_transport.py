@@ -121,7 +121,7 @@ class LoaderTests(_PluginDir):
         MAJOR change: a plugin written for (2, x), or the (1, x) of E5's
         time, would call ports that differ from the ones it was written
         against, so it is refused before any factory runs."""
-        self.assertEqual(transport.PLUGIN_API, (3, 0))
+        self.assertEqual(transport.PLUGIN_API, (3, 1))
         for old in (b"(2, 0)", b"(2, 9)", b"(1, 9)"):
             with self.subTest(api=old):
                 marker, factory = self._calls_marker()
@@ -141,12 +141,25 @@ class LoaderTests(_PluginDir):
         self.write(GOOD.replace(b"PLUGIN_API = (3, 0)", b"PLUGIN_API = (4, 0)"))
         self.refused("api_mismatch")
 
-    def test_an_older_minor_is_refused(self):
-        self.refused("api_mismatch", api=(3, 1))
+    def test_a_minor_below_the_required_minor_is_refused(self):
+        """The minor is compared with REQUIRED_MINOR, never with PLUGIN_API's:
+        a runtime that required minor 1 would refuse this (3, 0) plugin."""
+        self.refused("api_mismatch", required_minor=1)
+
+    def test_an_older_minor_plugin_loads_under_this_3_1_runtime(self):
+        """REQUIRED_MINOR is 0: a (3, 0) plugin loads, and the optional
+        capabilities it predates are simply OFF."""
+        self.assertEqual(transport.REQUIRED_MINOR, 0)
+        try:
+            got = self.load()
+        except transport.PluginRefused as e:
+            self.fail(f"a (3, 0) plugin was refused: {e.reason}: {e}")
+        self.assertEqual(got.api, (3, 0))
+        self.assertEqual(got.optional_capabilities, frozenset())
 
     def test_a_newer_minor_is_accepted(self):
-        """(3, 1), for example the optional remover pending a decision,
-        loads under this (3, 0) runtime, which never calls it."""
+        """(3, 2) and later load under this (3, 1) runtime, which uses only
+        what it knows."""
         for newer in ((3, 1), (3, 7)):
             with self.subTest(api=newer):
                 self.write(GOOD.replace(b"PLUGIN_API = (3, 0)",
@@ -323,7 +336,7 @@ class NoPluginImportTests(unittest.TestCase):
     """The interface module imports no plugin and never imports by name."""
 
     ALLOWED = {"__future__", "errno", "hashlib", "hmac", "os", "stat", "types",
-               "dataclasses", "pathlib", "typing", "re", "datetime"}
+               "dataclasses", "pathlib", "typing", "re", "datetime", "logging"}
 
     def test_transport_imports_only_the_standard_modules_it_needs(self):
         tree = ast.parse(Path(transport.__file__).read_text(encoding="utf-8"))
@@ -515,14 +528,16 @@ class CanonicalPathTests(_PluginDir):
 class StartupTests(_PluginDir):
     """`service.start_transport`: loaded once, refusal stops startup."""
 
-    def _cfg(self, pin=None):
+    def _cfg(self, pin=None, peer_uid=None):
         base = helpers.RouterTestCase("run")
         base.setUp()
         self.addCleanup(base.tearDown)
         cfg = base.make_config({"alice": []})
         from dataclasses import replace
+        if peer_uid is None:
+            peer_uid = os.geteuid() + 1        # distinct from this router's uid
         hop = None if pin is None else config_mod.HopConfig(
-            root=str(base.tmp / "hop"), peer_uid=0, version_write=1,
+            root=str(base.tmp / "hop"), peer_uid=peer_uid, version_write=1,
             caps=tuple(helpers.TEST_HOP_CAPS.items()))
         return replace(cfg, transport_plugin=pin, hop=hop)
 
@@ -566,6 +581,21 @@ class StartupTests(_PluginDir):
         self.assertEqual(rt.plugin.namespace["LOADS"], ["executed"])
         log.info.assert_called()   # the activation is logged, naming the pin
         self.assertIn(self.sha, " ".join(map(str, log.info.call_args[0])))
+
+    def test_peer_uid_equal_to_this_router_s_uid_is_accepted_with_one_warning(self):
+        pin = config_mod.TransportPluginPin(str(self.path), self.sha)
+        with self._trusting_me(), self.assertLogs("amap_router_local", logging.WARNING) as logs:
+            self.assertIsInstance(service.start_transport(self._cfg(pin, peer_uid=os.geteuid())),
+                                  service.HopRuntime)
+        warned = [m for m in logs.output if "peer_uid" in m]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("owner checks cannot distinguish the two sides", warned[0])
+
+    def test_distinct_uids_give_no_such_warning(self):
+        pin = config_mod.TransportPluginPin(str(self.path), self.sha)
+        with self._trusting_me(), mock.patch.object(service, "logger") as log:
+            service.start_transport(self._cfg(pin))
+        log.warning.assert_not_called()
 
     def test_run_forever_refuses_to_start_and_never_polls(self):
         self.path.unlink()

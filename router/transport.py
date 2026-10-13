@@ -97,10 +97,20 @@ exceptions, and message text is not a contract. In order:
      still classified by its reason);
   5. anything else, including a missing or unknown `.reason`: no verdict.
 
-PENDING THE OWNER'S DECISION: `make_intake_remover(settings, fsops)` -> an object with exactly
-`remove_entry(kind, entry_id)` and `close()`. If confirmed it arrives as an
-OPTIONAL factory at `(3, 1)`, a minor change under the rule above; it is not
-part of `(3, 0)`, and nothing in `(3, 0)` depends on it.
+API 3.1: THE OPTIONAL INTAKE REMOVER, by the owner's decision (an optional
+factory, not a required one). `make_intake_remover(settings, fsops)` returns
+an `IntakeRemover`, whose `remove_entry(kind, entry_id)` removes one
+committed inbound entry, crash-resumably, sentinel first. It is listed in
+`OPTIONAL_FACTORIES` with the minor that introduces it, never in
+`REQUIRED_FACTORIES` or `FACTORY_PORTS`, and `HopFsOps.stat_group_pinned`
+(`HOPFSOPS_OPTIONAL_METHODS`) arrives with it, used by nothing else. A
+plugin below that minor has the name IGNORED whatever it is; at or above
+it, absent means the capability is OFF, callable means ON, and present but
+not callable is refused (`missing_factory`). The rule that makes this a
+MINOR change: adding an optional factory, with its object Protocol, its
+result vocabulary and the `HopFsOps` behaviour only that factory's objects
+rely on, is minor; adding a required factory, or changing anything a
+`(3, 0)` caller relies on, is major.
 """
 
 from __future__ import annotations
@@ -108,6 +118,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import hmac
+import logging
 import os
 import re
 import stat
@@ -117,6 +128,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import (Any, Callable, Iterable, List, Literal, Mapping, Optional, Protocol,
                     Sequence, Tuple, Union, runtime_checkable)
+
+_logger = logging.getLogger("amap_router_local.transport")
 
 #: `(major, minor)`. A plugin must have the same major and at least this
 #: minor. The MAJOR covers every interface in this module that crosses the
@@ -128,7 +141,19 @@ from typing import (Any, Callable, Iterable, List, Literal, Mapping, Optional, P
 #: `UnsafeRead` attribute, so a `(1, x)` plugin is refused here and a
 #: `(2, x)` plugin by a `(1, x)` runtime, before any factory is called.
 #: `(3, 0)` is amendment E8 (module docstring, API 3.0).
-PLUGIN_API: Tuple[int, int] = (3, 0)
+PLUGIN_API: Tuple[int, int] = (3, 1)
+
+#: The lowest minor this runtime LOADS. Optional factories never raise it: a
+#: plugin with the same major and a minor of at least this loads, and the
+#: runtime uses only what it and the plugin both know.
+REQUIRED_MINOR = 0
+
+#: Optional factories: name -> (the `(major, minor)` that introduces it, the
+#: port it receives). Below that minor the name is ignored; at or above it,
+#: absent is OFF, callable is ON, and anything else is `missing_factory`.
+OPTIONAL_FACTORIES: Mapping[str, Tuple[Tuple[int, int], str]] = {
+    "make_intake_remover": ((3, 1), "HopFsOps"),
+}
 
 #: The factories this runtime calls. A plugin may define more; it must
 #: define these. `make_sender(settings, fsops) -> TransportPort`,
@@ -330,6 +355,48 @@ class InboundPort(Protocol):
 
 #: The kinds an `InboundPort` serves.
 INBOUND_KINDS = ("notice", "candidate", "unresolved")
+
+
+RemoveResult = Literal["removed", "absent"]
+#: `IntakeRemover.remove_entry`'s results, exactly. `"absent"` is shared with
+#: `RETIRE_RESULTS` on purpose, with the same meaning: owner-checked, durably
+#: not there. Any other return is a protocol error to the caller.
+REMOVE_RESULTS: Tuple[str, ...] = ("removed", "absent")
+#: The most entries a per-item directory part may hold before removal refuses
+#: it (`layout`): `LIST_LIMIT_MAX`, far above any legitimate sidecar count.
+REMOVE_DIR_ENTRIES_MAX = 1024
+#: The kinds an `IntakeRemover` removes. Host intakes are never its.
+_REMOVE_KINDS = ("notice", "candidate")
+
+
+@runtime_checkable
+class IntakeRemover(Protocol):
+    """The OPTIONAL `(3, 1)` remover: one committed inbound entry of one
+    generation's tree, removed crash-resumably.
+
+    `remove_entry(kind, entry_id) -> RemoveResult`: `kind` is "notice" or
+    "candidate" (never a host intake's) and `entry_id` must pass that kind's grammar (a bare
+    `ValueError`, before any `HopFsOps` call, otherwise). The parts are
+    derived from the id ALONE, never from reading the entry, so an entry the
+    reader refused is still removable. The SENTINEL goes first (a notice's
+    `notices/notice-<id>.json`; a candidate's `candidates/<id>/candidate.json`),
+    then the other parts in order. Every required parent missing, or with
+    the wrong owner or kind, raises `HopAnomaly("layout")` / `("owner")`,
+    never "absent". A per-item directory part must be flat, owned by the peer,
+    group-writable and searchable, setgid, not sticky, with its parent's gid
+    and a setgid parent, all checked BEFORE anything is renamed.
+    `"removed"`: at least one part was observed present and removed;
+    `"absent"`: none was. Either way every part, and every aside of a
+    directory part, is durably gone on return. An `OSError`, `UnsafeRead` or
+    `ListingTooLarge` from a `HopFsOps` call propagates UNCHANGED; the parts
+    before it stay removed and nothing after it is attempted.
+
+    `close()`: as every `(3, 0)` object's (idempotent, never raises; any
+    call afterwards raises the closed `ValueError` before any `HopFsOps`
+    call)."""
+
+    def remove_entry(self, kind: str, entry_id: str) -> RemoveResult: ...
+    def close(self) -> None: ...
 #: `InboundPort`'s non-method members.
 INBOUNDPORT_ATTRIBUTES = ("NoticeRefused",)
 #: `InboundPort.NoticeRefused.reason`: exactly one of these.
@@ -668,7 +735,21 @@ class HopFsOps(Protocol):
     The scan visits at most `LIST_SCAN_MAX` names: on visiting one more it
     stops at once and raises this instance's `ListingTooLarge`, so no scan
     is longer than that whatever the directory holds. A failure raises; it
-    never returns an empty list for an error."""
+    never returns an empty list for an error.
+
+    OPTIONAL AT (3, 1), used only by the optional remover's objects
+    (`HOPFSOPS_OPTIONAL_METHODS`): `stat_group_pinned(dir_fd, name) -> (uid,
+    gid, mode, kind)`, EXACTLY `stat_owner_pinned`'s semantics (one
+    NON-following stat of `name` in the bound `dir_fd`, the stale-binding
+    check applying; `mode` the `S_IMODE`, so setuid, setgid and sticky are
+    included; `kind` "file" / "dir" / "other"; a missing name a raw
+    `FileNotFoundError`; any other failure its own `OSError`) plus that same
+    stat's `st_gid`. It is not in `HOPFSOPS_METHODS`, and adding it is minor:
+    only a `(3, 1)` runtime constructs a remover, handing it its own `(3, 1)`
+    filesystem port. The `(3, 1)` postcondition on `remove_pinned` travels
+    with it: before acting on `name` it sweeps every aside of THAT name (the
+    exact pattern its own rename-aside gives one), emptying each in place,
+    so a call that returns has left neither `name` nor any aside."""
 
     #: This implementation's "committed not yet" result (above).
     NOT_YET: object
@@ -712,6 +793,13 @@ HOPFSOPS_METHODS = (
 )
 #: `HopFsOps`'s non-method members.
 HOPFSOPS_ATTRIBUTES = ("NOT_YET", "UnsafeRead", "ListingTooLarge")
+#: `HopFsOps` methods an optional factory's objects rely on, with the minor
+#: that introduces each. `HOPFSOPS_METHODS` (the `(3, 0)` set) is unchanged.
+#: `stat_group_pinned(dir_fd, name) -> (uid, gid, mode, kind)`: exactly
+#: `stat_owner_pinned`'s semantics (one NON-following stat of `name` in the
+#: bound `dir_fd`, `mode` the `S_IMODE`, `kind` "file" / "dir" / "other", a
+#: missing name a raw `FileNotFoundError`), plus that same stat's `st_gid`.
+HOPFSOPS_OPTIONAL_METHODS: Mapping[str, Tuple[int, int]] = {"stat_group_pinned": (3, 1)}
 
 
 @runtime_checkable
@@ -791,6 +879,8 @@ class NullTransport:
     path: Optional[str] = None
     sha256: Optional[str] = None
     api: Tuple[int, int] = PLUGIN_API
+    #: No optional capability: a null transport removes nothing.
+    optional_capabilities: frozenset = frozenset()
 
     def make_sender(self, settings: Settings, fsops: Optional[HopFsOps]) -> None:
         return None
@@ -812,9 +902,18 @@ class LoadedPlugin:
     sha256: str
     api: Tuple[int, int]
     namespace: Mapping[str, Any]
+    #: The optional factories this plugin offers and this runtime will call.
+    optional_capabilities: frozenset = frozenset()
 
     def _factory(self, name: str) -> Callable[..., Any]:
         return self.namespace[name]
+
+    def make_intake_remover(self, settings: Settings, fsops: HopFsOps) -> "IntakeRemover":
+        """The optional remover. Raises `AttributeError` when the capability
+        is off: the plugin is below `(3, 1)`, or does not define it."""
+        if "make_intake_remover" not in self.optional_capabilities:
+            raise AttributeError("the transport plugin offers no make_intake_remover")
+        return self._factory("make_intake_remover")(settings, fsops)
 
     def make_sender(self, settings: Settings, fsops: HopFsOps) -> TransportPort:
         return self._factory("make_sender")(settings, fsops)
@@ -1037,6 +1136,8 @@ def load_plugin(
     required_factories: Sequence[str] = REQUIRED_FACTORIES,
     api: Tuple[int, int] = PLUGIN_API,
     trusted_uids: Tuple[int, ...] = TRUSTED_UIDS,
+    required_minor: int = REQUIRED_MINOR,
+    optional_factories: Mapping[str, Tuple[Tuple[int, int], str]] = OPTIONAL_FACTORIES,
 ) -> LoadedPlugin:
     """Load the plugin at `path`, whose bytes must hash to `sha256`
     (lowercase hex). Every check in the module docstring, in that order;
@@ -1057,10 +1158,26 @@ def load_plugin(
     if not (isinstance(got, tuple) and len(got) == 2
             and all(isinstance(x, int) and not isinstance(x, bool) for x in got)):
         raise PluginRefused("api_mismatch", f"PLUGIN_API is {got!r}, not a (major, minor) pair")
-    if got[0] != api[0] or got[1] < api[1]:
-        raise PluginRefused("api_mismatch", f"PLUGIN_API {got} is incompatible with {api}")
+    if got[0] != api[0] or got[1] < required_minor:
+        raise PluginRefused("api_mismatch", f"PLUGIN_API {got} is incompatible with {api} "
+                                            f"(major {api[0]}, minor at least {required_minor})")
     for name in required_factories:
         if not callable(namespace.get(name)):
             raise PluginRefused("missing_factory", f"the plugin defines no callable {name!r}")
+    capabilities = set()
+    for name, (since, _port) in sorted(optional_factories.items()):
+        if got < since:
+            # Below the factory's minor the name is IGNORED, whatever it is:
+            # never type-checked and never called.
+            if name in namespace:
+                _logger.info("transport plugin: %s is ignored below PLUGIN_API %s (the "
+                            "plugin is %s)", name, since, got)
+            continue
+        if name not in namespace:
+            continue
+        if not callable(namespace[name]):
+            raise PluginRefused("missing_factory", f"the plugin's {name!r} is not callable")
+        capabilities.add(name)
     return LoadedPlugin(path=str(p), sha256=digest, api=got,
-                        namespace=types.MappingProxyType(namespace))
+                        namespace=types.MappingProxyType(namespace),
+                        optional_capabilities=frozenset(capabilities))
