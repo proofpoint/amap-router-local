@@ -140,7 +140,7 @@ M = [
  ('U9 the refusal precedence inverted (late before the refusal)', IG,
   '            if refusal == HELD_NOTICE_INVALID:\n                return self.quarantine_refused(entry_id, rec)\n            return None\n        try:',
   '            if refusal == HELD_NOTICE_INVALID:\n                if generation_is_current(self.state_dir, self.logical_id, self.gen) is False:\n                    write_quarantine_item(self.state_dir, self.logical_id, self.gen, "notice", self.link, entry_id, quarantine_mod.CAUSE_LATE_INBOUND)\n                    return "quarantined"\n                return self.quarantine_refused(entry_id, rec)\n            return None\n        try:',
-  [PU + "LateTests.test_refused_and_late_is_notice_invalid_e17_precedence"]),
+  [PU + "LateTests.test_refusal_precedes_lateness"]),
  # -- removal (interim rule) and the dedup horizon -------------------------------
  ('V1 a waiting record tombstoned while still upstream', IG,
   '            if raw is GONE:\n', '            if True:\n',

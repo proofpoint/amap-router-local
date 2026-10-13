@@ -108,7 +108,7 @@ class DispatchTests(_Pump):
         self.pump()
         self.assertEqual(len(self.notices()), 1)
 
-    def test_first_sight_invalid_is_quarantined_once_e17(self):
+    def test_first_sight_invalid_is_quarantined_once(self):
         self.port.entries[E1] = "notice_invalid"
         self.pump()
         self.pump()
@@ -580,7 +580,7 @@ class LateTests(_Pump):
         st = ingress.journal_state(self.state_dir, self.lid, old, "notice", LINK, E1)
         self.assertIsNone(st["notice_id"])
 
-    def test_refused_and_late_is_notice_invalid_e17_precedence(self):
+    def test_refusal_precedes_lateness(self):
         old = self.mint()
         self.port.entries[E1] = "notice_invalid"
         self.pump(gen=old)
