@@ -262,6 +262,17 @@ class RecoveryTests(_Placement):
                 self.assertEqual(self.recover(), ingress.HELD)
                 self.assertEqual(self.state(), (ingress.HELD, ingress.HELD_SURVIVOR_MISMATCH))
 
+    def test_the_generic_pending_replay_never_touches_an_ingress_record(self):
+        from router import outbound
+        self.crash_at("spool")
+        key = ingress.key_for("notice", LINK, self.gen, EID)
+        path = ingress.record_path(self.state_dir, self.lid, self.gen, "notice", key)
+        before = path.read_bytes()
+        self.poll()          # an ordinary poll: drains and the pending replay
+        self.assertEqual(path.read_bytes(), before, "a poll moved an ingress record")
+        self.assertEqual(self.notices(), [])
+        self.assertEqual(outbound._pending_ids(keyed_for_poll(self.cfg), "bravo"), [])
+
     def test_row_1_a_corrupt_survivor_holds(self):
         self.crash_at("published")
         side = self.tree() / "notices" / attachments_mod.sidecar_dir_name(self.nid())

@@ -372,6 +372,22 @@ class PumpAllTests(_Pump):
         self.assertIn({"hop_root": str(self.tmp / "hop"), "logical_id": self.lid,
                        "generation": self.gen, "peer_uid": 0}, self.plugin.made)
 
+    def test_a_fence_evicts_the_old_generation_s_reader_once(self):
+        self.addCleanup(ingress._LAST_CURRENT.clear)
+        cfg = self.with_link(LINK)
+        ingress.pump_all(cfg, self.rt, self.report)
+        built = len(self.plugin.made)
+        ingress.pump_all(cfg, self.rt, self.report)
+        self.assertEqual(len(self.plugin.made), built, "control: the reader is cached")
+        old = self.mint()
+        cfg = self.with_link(LINK)
+        ingress.pump_all(cfg, self.rt, self.report)
+        rebuilt = [m for m in self.plugin.made[built:] if m["generation"] == old]
+        self.assertEqual(len(rebuilt), 1, "the fenced generation's reader was not rebuilt")
+        n = len(self.plugin.made)
+        ingress.pump_all(cfg, self.rt, self.report)
+        self.assertEqual(len(self.plugin.made), n, "evicted again without a new fence")
+
     def test_without_hop_link_nothing_is_listed_read_or_constructed(self):
         self.port.entries[E1] = entry(E1)
         self.assertEqual(ingress.pump_all(self.with_link(None), self.rt, self.report), {})

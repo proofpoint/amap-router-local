@@ -2205,6 +2205,10 @@ def pump_link(cfg: Any, logical_id: str, gen: str) -> Optional[str]:
     return link
 
 
+#: (state_dir, logical_id) -> the generation the last pass saw as current.
+_LAST_CURRENT: Dict[tuple, str] = {}
+
+
 def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
     """One poll's inbound pass, under the drain lock: every identity
     (`identities`), every generation of it with a recorded tree, through
@@ -2228,6 +2232,15 @@ def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
             continue
         if doc is None:
             continue
+        # EVICTION ON FENCE (v3 §13): a cached reader pins its tree's
+        # descriptor, so the generation this process last saw as current is
+        # evicted once when another becomes current; the next pass
+        # constructs a fresh reader for it (a fenced tree is still read).
+        seen = (str(cfg.state_dir), lid)
+        last = _LAST_CURRENT.get(seen)
+        if last is not None and last != doc["current"]:
+            hoplink_mod.evict_readers(cfg, lid, last)
+        _LAST_CURRENT[seen] = doc["current"]
         for g in doc["gens"]:
             gen = g["gen"]
             label = f"{lid}/{gen}"

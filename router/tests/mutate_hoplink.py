@@ -43,6 +43,8 @@ FC = "router.tests.test_ingress_facts_check.FactsCheckTests."
 LK = "router.tests.test_ingress_link_pin.LinkPinTests."
 RC = "router.tests.test_ingress_recipient.RecipientTests."
 PU = "router.tests.test_ingress_pump."
+CM = "router.tests.test_ingress_crash_model.CrashModelTests."
+DV = "router/deliver.py"
 
 M = [
  # -- the inbound reader's link (config) ----------------------------------------
@@ -159,6 +161,22 @@ M = [
   '    if cfg.hop is None or cfg.hop.link is None:\n        return out\n',
   '    if cfg.hop is None:\n        return out\n',
   [PU + "PumpAllTests.test_without_hop_link_nothing_is_listed_read_or_constructed"]),
+ ('Y7 no eviction on fence', IG,
+  '        if last is not None and last != doc["current"]:\n            hoplink_mod.evict_readers(cfg, lid, last)\n', '',
+  [PU + "PumpAllTests.test_a_fence_evicts_the_old_generation_s_reader_once"]),
+ ('Y8 the ledger made durable after the notice', DV,
+  [('    atomic_write(ledger_path, ledger_bytes)\n',
+    '    from . import util as _u\n    _keep, _u.fsync_dir = _u.fsync_dir, (lambda p: None)\n'
+    '    try:\n        atomic_write(ledger_path, ledger_bytes)\n    finally:\n        _u.fsync_dir = _keep\n'),
+   ('        root, notice_path, json.dumps(notice_doc, sort_keys=True).encode("utf-8"),\n        expect_root=expect_root,\n    )\n',
+    '        root, notice_path, json.dumps(notice_doc, sort_keys=True).encode("utf-8"),\n        expect_root=expect_root,\n    )\n    _u.fsync_dir(ledger_path.parent)\n')],
+  None,
+  [CM + "test_at_most_one_notice_at_every_crash_point"]),
+ # -- the generic replay never re-places an ingress record ----------------------
+ ('Y6 the pending replay scanning ingress/', OB,
+  '    d = gen_state_dir(cfg, name) / PENDING_DIR\n    try:\n        return [p.name',
+  '    d = gen_state_dir(cfg, name) / "ingress" / "notice"\n    try:\n        return [p.name',
+  [PL + "RecoveryTests.test_the_generic_pending_replay_never_touches_an_ingress_record"]),
  # -- the facts version guard (driven directly at the guard unit) -------------
  ('G1 facts_version unchecked (presence selects version 2)', IG,
   '    if type(v) is int and v == 2:\n', '    if True:\n',
