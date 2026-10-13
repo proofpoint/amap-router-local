@@ -1413,9 +1413,14 @@ M = [
   '    if True:\n',
   [BR + "BeginTests.test_a_trusted_host_counterparty_with_open_admission_is_decided_by_egress"]),
  ('BD36 a custom policy\'s answer taken unchecked', OB,
-  '        return _remote_decision(cfg, name, draft, remote, cold_policy)\n',
-  '        return cold_policy(cfg, name, draft) if cold_policy else _remote_decision(cfg, name, draft, remote, cold_policy)\n',
+  '        decided = _remote_decision(cfg, name, draft, remote, cold_policy)\n',
+  '        decided = cold_policy(cfg, name, draft) if cold_policy else _remote_decision(cfg, name, draft, remote, cold_policy)\n',
   [BR + "BeginTests.test_a_policy_routing_a_bound_reply_to_the_peer_lane_is_never_sent"]),
+ ('BD37 a bound route accepted as a subset (empty or repeated)', OB,
+  '        if isinstance(decided, ExternalRoute) and not (\n',
+  '        if isinstance(decided, ExternalRoute) and False and not (\n',
+  [BR + "BeginTests.test_a_policy_route_other_than_exactly_the_counterparty_is_never_sent",
+   BR + "PublicationRecheckTests.test_a_policy_route_other_than_exactly_the_counterparty_refuses_publication"]),
 ]
 
 

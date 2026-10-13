@@ -239,6 +239,22 @@ class BeginTests(_Case):
         self.nothing_allocated(cfg)
         self.assertFalse((self.tmp / "instances" / "bob" / "peer").exists())
 
+    def test_a_policy_route_other_than_exactly_the_counterparty_is_never_sent(self):
+        """An empty route, the counterparty twice, or another address: each
+        is a transport anomaly at begin, with nothing allocated."""
+        for route in ((), (TRUSTED, TRUSTED), (f"x@{T1}",)):
+            with self.subTest(route=route):
+                self.tearDown()
+                self.setUp()
+                cfg = self.cfg()
+                nid = self.ledger(cfg, counterparty=TRUSTED, admission="open")
+                write_request(cfg, "alice", "00000001", to=[TRUSTED], in_reply_to=nid)
+                self.drain(cfg, cold_policy=lambda c, s, d, r=route: outbound.ExternalRoute(r))
+                r = self.answered(cfg)
+                self.assertEqual((r["outcome"], r["reason_code"]),
+                                 ("queued_for_human", "transport_anomaly"))
+                self.nothing_allocated(cfg)
+
     def test_a_record_without_a_tree_is_unresolved(self):
         """Mail placed from the hop leg always records its tree; a record
         without one is not taken for mail."""
@@ -405,6 +421,20 @@ class PublicationRecheckTests(_Case):
         self.assertEqual(self.port.writes, [])
         self.drain(cfg)
         self.assertEqual(self.port.writes, ["00000001"])
+
+    def test_a_policy_route_other_than_exactly_the_counterparty_refuses_publication(self):
+        permit = lambda c, s, d: outbound.ExternalRoute((TRUSTED,))  # noqa: E731
+        for route in ((), (TRUSTED, TRUSTED), (f"x@{T1}",)):
+            with self.subTest(route=route):
+                self.tearDown()
+                self.setUp()
+                cfg = self.cfg()
+                nid = self.ledger(cfg, counterparty=TRUSTED, admission="open")
+                write_request(cfg, "alice", "00000001", to=[TRUSTED], in_reply_to=nid)
+                self.drain(dataclasses.replace(cfg, reload_failed=True), cold_policy=permit)
+                self.assertEqual(inflight.list_records(cfg, "alice"), ["00000001"])
+                self.drain(cfg, cold_policy=lambda c, s, d, r=route: outbound.ExternalRoute(r))
+                self.refused(cfg, "now transport_anomaly")
 
     def test_expiry_passing_after_begin_still_publishes(self):
         cfg = self.cfg()

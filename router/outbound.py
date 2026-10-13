@@ -954,17 +954,28 @@ def _bound_egress(
     recipient is the counterparty, decided as mail to a fleet host, and the
     answer is only ever a refusal or a hand-over of exactly that recipient.
 
-    A custom cold policy decides through `_remote_decision`, which accepts
-    nothing but a refusal or an external route naming this recipient: a
-    policy that routes it anywhere else (the peer lane included) is
-    `transport_anomaly`, never sent. Without one, a plain fleet host gets the
+    A custom cold policy decides through `_remote_decision`, and only a
+    refusal or an external route naming exactly this one recipient, once, is
+    accepted: an empty, repeated or different route, or any other answer
+    (the peer lane included), is `transport_anomaly`, never sent. Without one, a plain fleet host gets the
     default rule through the same path. A trusted host is decided by the
     default fleet-host rule DIRECTLY, never by the cold classification that
     would make it a peer task: `remote_fleet` cannot name a trusted host, so
     the default answer is `queued_for_human`/`recipient_not_allowlisted`."""
     remote = classify_mod.Remote(classify_mod.CLASS_FLEET, (counterparty,), (counterparty,))
     if klass == classify_mod.CLASS_FLEET or cold_policy is not None:
-        return _remote_decision(cfg, name, draft, remote, cold_policy)
+        decided = _remote_decision(cfg, name, draft, remote, cold_policy)
+        # `_remote_decision` checks only that every named recipient is in the
+        # request's set, which an empty route or a repeated one passes. A
+        # bound reply has exactly one recipient: anything but that one,
+        # named once, is refused.
+        if isinstance(decided, ExternalRoute) and not (
+                len(decided.recipients) == 1
+                and _canonical_or_none(decided.recipients[0]) == counterparty):
+            return ColdRefusal("queued_for_human", REASON_TRANSPORT_ANOMALY,
+                               detail="the cold policy did not route the bound reply to "
+                                      "exactly its counterparty; nothing was sent")
+        return decided
     d = classify_mod.remote_rule(cfg, name, remote)
     if isinstance(d, classify_mod.Refuse):
         return ColdRefusal(d.outcome, d.reason_code, detail=d.detail, hold=d.hold)
