@@ -83,6 +83,9 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
     after an inbound hop mail is placed its recipient may reply to it as a
     bound reply (`router/ingress.py`'s mail binding, fixed when the entry is
     prepared, so a later change never moves a recorded binding).
+  - `delivered_domains_file` — optional absolute path to the delivered-domain
+    file (`_delivered_domains`); while its set differs from `fleet_hosts`,
+    every bound reply is held and mail is unaffected.
   - `intake_dir` — the parent of the cross-host intake spool
     (`<intake_dir>/<instance>/`, created by `provision`). Same containment
     rules as `state_dir`. Nothing in this repo reads it yet: it exists so the
@@ -124,9 +127,13 @@ caller that declares, say, `"quota"` owns both its meaning and its validation.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
+import logging
 import os
 import re
+import stat
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -222,7 +229,7 @@ _TOP_KEYS = {
     "peer_senders", "peers",
     "transport_plugin", "registry_dir", "aliases", "hop",
     "trusted_fleet_hosts", "fleet_hosts", "egress", "ingress_quarantine_days",
-    "ingress_dedup_horizon_days",
+    "ingress_dedup_horizon_days", "delivered_domains_file",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders",
                   "task_deny", "send_to", "remote_fleet"}
@@ -335,9 +342,8 @@ SENDER_EXPOSURE_WINDOW_SECONDS_DEFAULT = 86400
 #: reverse-edge reply window (seconds) — see `router/outbound.py`.
 PEER_REPLY_WINDOW_SECONDS_DEFAULT = 604800
 #: The mail-reply binding window (seconds): a placed inbound hop mail may be
-#: replied to as a bound reply until its recorded `expires_at`. PROVISIONAL
-#: (the owner confirms the default); bounded, so no binding is practically
-#: permanent.
+#: replied to as a bound reply until its recorded `expires_at`. Bounded, so
+#: no binding is practically permanent.
 MAIL_REPLY_WINDOW_SECONDS_DEFAULT = 604800
 MAIL_REPLY_WINDOW_SECONDS_MAX = 90 * 86400
 
@@ -570,6 +576,12 @@ class RouterConfig:
     #: tombstone is kept at least this long. It must exceed the longest time
     #: the downstream runtime can be down after a crash.
     ingress_dedup_horizon_days: int = INGRESS_DEDUP_HORIZON_DAYS_DEFAULT
+    #: `delivered_domains_file` (`_delivered_domains`): its path, or None.
+    delivered_domains_file: Optional[Path] = None
+    #: When the artifact's delivered set differs from `fleet_hosts`: the two
+    #: COUNTS (delivered but not in `fleet_hosts`, in `fleet_hosts` but not
+    #: delivered). Every bound reply is held while it is set; nothing else is.
+    delivered_drift: Optional[Tuple[int, int]] = None
     #: PROCESS state, never read from a file: the last reload of the config
     #: failed or was refused (`service.reload_config`), and this is the last
     #: good config kept in its place. While it is set the external leg fails
@@ -614,8 +626,8 @@ class HopConfig:
     peer_uid: int
     version_write: int
     caps: Tuple[Tuple[str, int], ...]
-    #: The inbound reader's link (PROVISIONAL, pending the owner's confirmation): the
-    #: journal key's `link` and admission's comparand. Absent, inbound is
+    #: The inbound reader's link: the journal key's `link` and admission's
+    #: comparand. Absent, inbound is
     #: disabled; the outbound leg does not read it.
     link: Optional[str] = None
 
@@ -1729,6 +1741,16 @@ def load_obj(
         hop=hop,
         aliases=_aliases(top, registry_dir, fleet_domain),
     )
+    if "delivered_domains_file" in top:
+        artifact = _require_absolute(top["delivered_domains_file"],
+                                     "config.delivered_domains_file")
+        for root in agent_reachable_roots(instances):
+            if _is_within(artifact, root):
+                raise ConfigError(
+                    f"config.delivered_domains_file ({artifact}) is inside {root}, which "
+                    "an agent can reach")
+        cfg = replace(cfg, delivered_domains_file=artifact,
+                      delivered_drift=_delivered_domains(artifact, fleet_hosts))
 
     # The two lanes are DISJOINT per ordered pair. A pair that is both a
     # declared edge (peer lane) and a mutual mail pair (mail lane) would let
@@ -1747,6 +1769,83 @@ def load_obj(
                     f"per ordered pair, or the sender could choose its lane"
                 )
     return cfg
+
+
+logger = logging.getLogger("amap_router_local.config")
+
+#: The largest delivered-domain artifact read; a larger one is refused unread.
+DELIVERED_DOMAINS_MAX_BYTES = 1 << 20
+
+
+def _delivered_domains_uids() -> Tuple[int, ...]:
+    """Who may own the delivered-domain artifact: root, or this process."""
+    return (0, os.geteuid())
+
+
+def delivered_domains_hash(domains: Iterable[str]) -> str:
+    """The artifact's `sha256`: the hex digest of its domains lowercased,
+    sorted, each followed by a newline."""
+    text = "".join(d + "\n" for d in sorted(d.lower() for d in domains))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _delivered_domains(path: Path, fleet_hosts: Iterable[str]) -> Optional[Tuple[int, int]]:
+    """Read the delivered-domain artifact the hub link delivers to, and
+    compare its set with `fleet_hosts`. The artifact is the deployment's:
+    `{"delivered_domains": [...], "sha256": delivered_domains_hash(...), "attestation":
+    {...}}`, and `attestation` is not read. PROVISIONAL: the deployment's
+    layout for it is not yet frozen.
+
+    Refused (`ConfigError`): a path that is a symlink, not a regular file,
+    owned by anyone but root or this process, writable by group or others,
+    over `DELIVERED_DOMAINS_MAX_BYTES`, not the JSON object above, or whose hash
+    does not match its own domains. A set that differs is NOT a refusal:
+    mail keeps flowing, every bound reply is held, and the counts are
+    returned (None when the sets agree) and logged as an ERROR, never the
+    domains."""
+    where = f"config.delivered_domains_file ({path})"
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:
+        why = "is a symlink" if e.errno == errno.ELOOP else (e.strerror or str(e))
+        raise ConfigError(f"{where}: {why}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ConfigError(f"{where}: not a regular file")
+        if st.st_uid not in _delivered_domains_uids():
+            raise ConfigError(f"{where}: owned by uid {st.st_uid}, not root or this process")
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            raise ConfigError(f"{where}: writable by group or others "
+                              f"(mode {oct(stat.S_IMODE(st.st_mode))})")
+        raw = os.read(fd, DELIVERED_DOMAINS_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > DELIVERED_DOMAINS_MAX_BYTES:
+        raise ConfigError(f"{where}: over {DELIVERED_DOMAINS_MAX_BYTES} bytes")
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ConfigError(f"{where}: not JSON ({e})") from None
+    domains = doc.get("delivered_domains") if isinstance(doc, dict) else None
+    if not (isinstance(domains, list) and all(isinstance(d, str) and d for d in domains)):
+        raise ConfigError(f"{where}: delivered_domains is not a list of non-empty strings")
+    claimed = doc.get("sha256")
+    if not (isinstance(claimed, str) and _SHA256_HEX_RE.fullmatch(claimed)):
+        raise ConfigError(f"{where}: sha256 is not 64 lowercase hex")
+    if delivered_domains_hash(domains) != claimed:
+        raise ConfigError(f"{where}: sha256 does not match its delivered_domains")
+    delivered = {d.lower() for d in domains}
+    ours = {h.lower() for h in fleet_hosts}
+    if delivered == ours:
+        return None
+    drift = (len(delivered - ours), len(ours - delivered))
+    logger.error(
+        "%s: the delivered-domain set differs from config.fleet_hosts (%d delivered "
+        "but not a fleet host, %d fleet hosts not delivered); every bound reply is "
+        "held until they agree, and mail is unaffected", where, *drift)
+    return drift
 
 
 _CLASSIFY_INSTANCE_KEYS = ("task_deny", "send_to", "remote_fleet")

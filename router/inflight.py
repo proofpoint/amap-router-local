@@ -565,7 +565,12 @@ _RECORD_KEYS = {
     "digest": False, "transport_req_id": True, "recipients": True, "request": True,
     "written_ts": True, "policy_digest": False, "route": False,
     "revocation_unenforceable": False, "from_address": False, "attachments": False,
+    "bound_reply": False,
 }
+#: A bound reply's pin (`begin`'s `bound_reply`): the ledger record's notice
+#: id, the binding members as that record carried them at begin, and the
+#: `bound` object every hand-over carries.
+_BOUND_REPLY_KEYS = frozenset({"notice_id", "binding", "bound"})
 _ROUTES = ("fleet_host", "internet")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -601,7 +606,26 @@ def check_record(doc: Any) -> Dict[str, Any]:
         raise RecordDamaged("route is not a known route")
     if "attachments" in doc:
         _check_record_attachments(doc)
+    if "bound_reply" in doc:
+        _check_record_bound_reply(doc)
     return doc
+
+
+def _check_record_bound_reply(doc: Dict[str, Any]) -> None:
+    """The record's `bound_reply` pin. Its `bound` must make a valid
+    envelope, and name exactly the one evaluated recipient, which is its
+    counterparty: a record that would hand over anything else is damaged."""
+    pin = doc["bound_reply"]
+    if not (isinstance(pin, dict) and set(pin) == _BOUND_REPLY_KEYS
+            and isinstance(pin["notice_id"], str) and isinstance(pin["binding"], dict)):
+        raise RecordDamaged(f"bound_reply is not {sorted(_BOUND_REPLY_KEYS)}")
+    why = hoplink.bound_problem(pin["bound"])
+    if why is not None:
+        raise RecordDamaged(f"bound_reply.bound: {why}")
+    if doc["recipients"] != [pin["bound"]["bound_address"]]:
+        raise RecordDamaged("bound_reply.bound names a recipient other than the evaluated one")
+    if doc.get("policy_digest") != pin["bound"]["policy_digest"]:
+        raise RecordDamaged("bound_reply.bound.policy_digest is not the record's")
 
 
 def _check_record_attachments(doc: Dict[str, Any]) -> None:
@@ -672,6 +696,7 @@ def begin(
     *, digest: Optional[str], request_doc: Dict[str, Any], recipients: List[str],
     policy_digest: Optional[str] = None, route: Optional[str] = None,
     from_address: Optional[str] = None, attachments: Optional[List[Any]] = None,
+    bound_reply: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Put `req_id` in flight: allocate its transport id, then write the
     record. Returns the record. A crash between the two burns the id; the
@@ -680,7 +705,9 @@ def begin(
     are the sender's policy digest and the request's class when it was
     classified (`router/classify.py`), recorded BEFORE anything is handed
     over. `attachments` (ingest's verified attachments) are snapshotted
-    BEFORE the record is written, and the record names them."""
+    BEFORE the record is written, and the record names them. `bound_reply`
+    is a bound reply's pin, written once, here: every hand-over's `bound`
+    comes from it and from nothing read later."""
     n = allocate_transport_req_id(cfg, name)
     snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None
     record: Dict[str, Any] = {
@@ -700,6 +727,8 @@ def begin(
         record["from_address"] = from_address
     if snapshot is not None:
         record["attachments"] = snapshot
+    if bound_reply is not None:
+        record["bound_reply"] = bound_reply
     check_record(record)
     _write_record(cfg, name, req_id, record, "record")
     return record
@@ -808,10 +837,15 @@ def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]
     if record.get("attachments"):
         rid = req_id if req_id is not None else record["request"].get("req_id")
         blobs = read_snapshot(cfg, name, rid, record["attachments"])
+    # A bound reply's `bound` is the RECORD's pin, never re-read from the
+    # ledger: identical on every retry of the same id.
+    bound = record["bound_reply"]["bound"] if "bound_reply" in record else None
     return hoplink.build_handover(
         doc, from_address=record["from_address"], version_write=version_write,
         attachments=[base64.b64encode(b).decode("ascii") for b in blobs],
-        settled_through=frontier)
+        settled_through=frontier,
+        kind=hoplink.BOUND_REPLY_KIND if bound is not None else hoplink.MAIL_KIND,
+        bound=bound)
 
 
 class RecipientSetMismatch(Exception):
