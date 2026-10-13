@@ -224,8 +224,8 @@ M = [
   '        "task_deny": canonical_entries(task_deny),\n', '        "task_deny": [],\n',
   [D + 'ConfigDigestTests.test_the_digest_covers_exactly_the_policy_inputs']),
  ('DG10 the record carries no digest or route', OB,
-  '        policy_digest=classify_mod.policy_digest(cfg, name), route=klass,\n',
-  '        policy_digest=None, route=None,\n',
+  '                       else classify_mod.policy_digest(cfg, name)),\n        route=klass, from_address=',
+  '                       else None),\n        route=None, from_address=',
   [C + 'FleetAndInternetTests.test_the_route_and_digest_are_recorded_before_anything_is_handed']),
  # -- item 3: load-time refusals ----------------------------------------------
  ('LD1 the own domain may be a fleet host', CF,
