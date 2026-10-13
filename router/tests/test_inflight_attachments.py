@@ -421,17 +421,24 @@ class ModeTests(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # POWER LOSS. A process crash keeps everything the kernel did; a power loss
-# can also lose a namespace change whose DIRECTORY was never fsynced. The
-# model (`PowerLog`): every unlink, rmdir, rename, replace and mkdir (the
-# dir_fd forms included) is a change of an entry in its parent directory,
-# durable once that directory is fsynced (`os.fsync` on a directory fd,
-# whichever helper issued it). At a power loss after event k, an entry's
-# state is the last one made durable by event k. An entry is present only if
-# every directory above it is present (a non-durable mkdir, or a durable
-# rmdir, takes the subtree with it; a non-durable rmdir restores the
-# directory with every child whose unlink is not itself durable). File
-# content: every file on these paths is fsynced before its rename, so the
-# content of a present entry is the content written.
+# can also lose a namespace change whose DIRECTORY was never fsynced. A
+# directory's entries become durable exactly when that directory is fsynced,
+# so the model (`PowerLog`) records, at every `os.fsync` of a directory fd
+# (whichever helper issued it), that directory's ACTUAL listing. After a
+# power loss at any point, a directory holds its LAST FSYNCED listing (its
+# listing at the start, if it existed then and was never fsynced since; none
+# at all, if it is new and never fsynced). An entry survives only if every
+# directory above it survives: a non-durable mkdir, or a durable rmdir, takes
+# the subtree with it, and a non-durable rmdir restores the directory with
+# its children as last fsynced. Points between two fsyncs share one durable
+# state, so enumerating the point after EVERY directory fsync is exhaustive.
+#
+# Reading listings at the barrier, rather than intercepting unlink, rename
+# and mkdir, sees a change however it was made: Python 3.9's pathlib calls
+# `os.unlink` through an accessor captured at import (`_NormalAccessor`), so
+# a patched `os.unlink` never sees `Path.unlink` there, and a model built on
+# interception would miss the record's own unlink on 3.9 alone.
+# File content: every file on these paths is fsynced before its rename.
 # ---------------------------------------------------------------------------
 
 def _fd_path(fd):
@@ -440,86 +447,55 @@ def _fd_path(fd):
 
 class PowerLog:
 
-    def __init__(self):
-        self.events = []      # ("ns", dir, name, present) | ("sync", dir)
-
-    def _where(self, path, dir_fd):
-        path = os.fsdecode(path)
-        if dir_fd is not None:
-            return _fd_path(dir_fd), path
-        a = os.path.abspath(path)
-        return os.path.dirname(a), os.path.basename(a)
+    def __init__(self, root):
+        self.syncs = []            # [(dir, frozenset(names))], in order
+        self.initial = {}          # dir -> frozenset(names), at the start
+        for base, dirs, files in os.walk(root):
+            self.initial[os.path.abspath(base)] = frozenset(dirs + files)
 
     def patches(self):
-        real = {n: getattr(os, n) for n in ("unlink", "rmdir", "rename", "replace", "mkdir", "fsync")}
+        real = os.fsync
         log = self
 
-        def unlink(path, *, dir_fd=None):
-            real["unlink"](path, dir_fd=dir_fd)
-            log.events.append(("ns",) + log._where(path, dir_fd) + (False,))
-
-        def rmdir(path, *, dir_fd=None):
-            real["rmdir"](path, dir_fd=dir_fd)
-            log.events.append(("ns",) + log._where(path, dir_fd) + (False,))
-
-        def mkdir(path, mode=0o777, *, dir_fd=None):
-            real["mkdir"](path, mode, dir_fd=dir_fd)
-            log.events.append(("ns",) + log._where(path, dir_fd) + (True,))
-
-        def _mv(kind):
-            def mv(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
-                real[kind](src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
-                log.events.append(("ns",) + log._where(src, src_dir_fd) + (False,))
-                log.events.append(("ns",) + log._where(dst, dst_dir_fd) + (True,))
-            return mv
-
         def fsync(fd):
-            real["fsync"](fd)
+            real(fd)
             if stat.S_ISDIR(os.fstat(fd).st_mode):
-                log.events.append(("sync", _fd_path(fd)))
+                log.syncs.append((_fd_path(fd), frozenset(os.listdir(fd))))
+        return [mock.patch.object(os, "fsync", fsync)]
 
-        return [mock.patch.object(os, "unlink", unlink), mock.patch.object(os, "rmdir", rmdir),
-                mock.patch.object(os, "mkdir", mkdir), mock.patch.object(os, "rename", _mv("rename")),
-                mock.patch.object(os, "replace", _mv("replace")),
-                mock.patch.object(os, "fsync", fsync)]
+    def listing(self, k, d):
+        """`d`'s durable listing after a power loss following the k-th
+        directory fsync (0: before any)."""
+        last = None
+        for sd, names in self.syncs[:k]:
+            if sd == d:
+                last = names
+        if last is not None:
+            return last
+        return self.initial.get(d, frozenset())
 
-    def present_after(self, k, initial, path):
-        """Whether `path` exists after a power loss following event k (0 =
-        before any event), `initial` being the paths present at the start."""
-        p = os.path.abspath(path)
-        parts = [p]
-        while os.path.dirname(parts[-1]) != parts[-1]:
-            parts.append(os.path.dirname(parts[-1]))
-        for q in parts[:-1]:
-            if not self._entry_durable(k, initial, os.path.dirname(q), os.path.basename(q)):
+    def present_after(self, k, path):
+        p = os.path.realpath(path)
+        chain = []
+        while os.path.dirname(p) != p:
+            chain.append((os.path.dirname(p), os.path.basename(p)))
+            p = os.path.dirname(p)
+        for d, name in chain:
+            if d not in self.initial and not any(sd == d for sd, _ in self.syncs) \
+                    and os.path.realpath(d) == d and self._outside(d):
+                continue          # above the logged tree: durable by assumption
+            if name not in self.listing(k, d):
                 return False
         return True
 
-    def _entry_durable(self, k, initial, d, name):
-        durable = os.path.join(d, name) in initial or not any(
-            e[0] == "ns" and e[1] == d and e[2] == name for e in self.events)
-        pending = durable
-        for e in self.events[:k]:
-            if e[0] == "ns" and e[1] == d and e[2] == name:
-                pending = e[3]
-            elif e[0] == "sync" and e[1] == d:
-                durable = pending
-        return durable
-
-
-def _tree(root):
-    out = set()
-    for base, dirs, files in os.walk(root):
-        for n in dirs + files:
-            out.add(os.path.abspath(os.path.join(base, n)))
-    return out
+    def _outside(self, d):
+        return not any(d == r or d.startswith(r + os.sep) for r in self.initial)
 
 
 class PowerLossTests(_Att):
 
     def run_logged(self, fn):
-        log = PowerLog()
-        initial = _tree(self.cfg.state_dir) | {os.path.abspath(self.cfg.state_dir)}
+        log = PowerLog(os.path.realpath(self.cfg.state_dir))
         ps = log.patches()
         for p in ps:
             p.start()
@@ -528,18 +504,18 @@ class PowerLossTests(_Att):
         finally:
             for p in reversed(ps):
                 p.stop()
-        return log, initial
+        return log
 
-    def assert_never_a_record_without_its_snapshot(self, log, initial, record, snap):
-        points = range(len(log.events) + 1)
-        self.assertGreater(len(log.events), 4, "control: the sequence was logged")
+    def assert_never_a_record_without_its_snapshot(self, log, record, snap):
+        self.assertGreater(len(log.syncs), 2, "control: the barriers were logged")
         seen_record = False
-        for k in points:
-            rec = log.present_after(k, initial, record)
+        for k in range(len(log.syncs) + 1):
+            rec = log.present_after(k, record)
             seen_record |= rec
             if rec:
-                self.assertTrue(log.present_after(k, initial, snap),
-                                f"power loss after event {k} ({log.events[k - 1] if k else '-'}): "
+                self.assertTrue(log.present_after(k, snap),
+                                f"power loss after directory fsync {k} "
+                                f"({log.syncs[k - 1][0] if k else '-'}): "
                                 f"a durable record without its snapshot")
         return seen_record
 
@@ -549,11 +525,13 @@ class PowerLossTests(_Att):
         record = inflight.record_path(self.cfg, "alice", "00000001")
         handed = inflight.handed_path(self.cfg, "alice", "00000001")
         self.assertTrue(record.exists() and self.snap().exists(), "control")
-        log, initial = self.run_logged(lambda: inflight._cleanup(record, handed))
-        self.assertTrue(self.assert_never_a_record_without_its_snapshot(
-            log, initial, record, self.snap()), "control: the record was durable at some point")
-        self.assertFalse(log.present_after(len(log.events), initial, record))
-        self.assertFalse(log.present_after(len(log.events), initial, self.snap()))
+        log = self.run_logged(lambda: inflight._cleanup(record, handed))
+        self.assertTrue(log.present_after(0, record) and log.present_after(0, self.snap()),
+                        "control: both durable before cleanup")
+        self.assert_never_a_record_without_its_snapshot(log, record, self.snap())
+        last = len(log.syncs)
+        self.assertFalse(log.present_after(last, record), "control: the record durably gone")
+        self.assertFalse(log.present_after(last, self.snap()), "control: the snapshot durably gone")
 
     def test_begin_power_loss_at_every_point_keeps_record_and_snapshot_together_nonregression(self):
         """From no inflight-snapshots/ at all. A NON-REGRESSION guard: the
@@ -561,10 +539,44 @@ class PowerLossTests(_Att):
         mutant reaches it; it reddens if the record writer ever drops that."""
         self.assertFalse((self.gen() / inflight.SNAPSHOT_DIR).exists())
         self.submit([b"a"])
-        log, initial = self.run_logged(self.drain)
+        log = self.run_logged(self.drain)
         record = inflight.record_path(self.cfg, "alice", "00000001")
-        self.assertTrue(self.assert_never_a_record_without_its_snapshot(
-            log, initial, record, self.snap()), "control: the record became durable")
+        self.assertTrue(self.assert_never_a_record_without_its_snapshot(log, record, self.snap()),
+                        "control: the record became durable")
+
+    def test_the_model_sees_a_change_however_it_was_made(self):
+        """The model reads listings at the barrier, so a change made through
+        ANY entry point is seen: here an unlink made through a reference to
+        `os.unlink` captured BEFORE the model's patches, exactly as Python
+        3.9's pathlib accessor holds one (the 3.9-only CI failure this
+        replaced). Not durable until its directory is fsynced; durable
+        after."""
+        d = Path(os.path.realpath(self.tmp)) / "pl"
+        d.mkdir()
+        f = d / "x"
+        f.write_bytes(b"1")
+        captured_unlink = os.unlink
+        log = PowerLog(str(d.parent))
+        ps = log.patches()
+        for p in ps:
+            p.start()
+        try:
+            captured_unlink(str(f))
+            pfd = os.open(str(d.parent), os.O_RDONLY | os.O_DIRECTORY)   # another dir
+            try:
+                os.fsync(pfd)
+            finally:
+                os.close(pfd)
+            fd = os.open(str(d), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        finally:
+            for p in reversed(ps):
+                p.stop()
+        self.assertTrue(log.present_after(1, f), "an unsynced unlink counted as durable")
+        self.assertFalse(log.present_after(2, f), "a synced unlink not seen")
 
 
 if __name__ == "__main__":
