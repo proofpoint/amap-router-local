@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import aliases as aliases_mod
+from . import ingress as ingress_mod
 from . import inflight as inflight_mod, quarantine as quarantine_mod
 from . import generations, hoplink, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
 from .config import RouterConfig
@@ -43,6 +44,10 @@ from .status import StatusTracker, render_discovery
 from .util import parse_utc_ts, utc_ts
 
 logger = logging.getLogger("amap_router_local")
+
+#: The last poll's inbound counts (`ingress.pump_all`), for status: process
+#: state, replaced each poll that pumped.
+LAST_INGRESS: Dict[str, Dict[str, int]] = {}
 
 
 #: `run_once`'s default: load the configured plugin for this one call.
@@ -237,6 +242,18 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
         # the `accepted=2` tokens the `status` renderer emits — those are a
         # different surface that nobody outside this repo reads.
         logger.info("drained %s: %s", name, result)
+    # The inbound pass, after every drain and under the same lock. Its
+    # counts go to its own log line and to status, NEVER into `summary`
+    # (whose key names are a cross-repo surface, above).
+    if hoplink.is_runtime(transport) and report.state != "off":
+        try:
+            pumped = ingress_mod.pump_all(cfg, transport, report)
+            if pumped:
+                logger.info("ingress: %s", pumped)
+                LAST_INGRESS.clear()
+                LAST_INGRESS.update(pumped)
+        except Exception:
+            logger.exception("error in the inbound pass — isolated")
     return summary
 
 
@@ -279,7 +296,12 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
             logger.exception("error reading the cross-host state for status — isolated")
         if hoplink.is_runtime(transport):
             try:
-                tracker.record_hop(hoplink.status_doc(keyed_cfg, keyed_cfg.instances))
+                hop_doc = hoplink.status_doc(keyed_cfg, keyed_cfg.instances)
+                try:
+                    hop_doc["ingress"] = ingress_mod.status_doc(keyed_cfg, LAST_INGRESS)
+                except Exception:
+                    logger.exception("error reading the ingress state for status — isolated")
+                tracker.record_hop(hop_doc)
             except Exception:
                 logger.exception("error reading the hop state for status — isolated")
         if report.state != "off":

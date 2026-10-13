@@ -2,9 +2,11 @@
 read-only inspection (`router quarantine list|show`).
 
 OWNERSHIP IS SPLIT, deliberately. This module FREEZES the format and READS
-it. The WRITER (cross-host inbound held in a generation's quarantine) and
-the expiry SWEEP are a later step's, and that step must write exactly this
-format. Nothing here creates, moves or deletes anything.
+it. The WRITER (cross-host inbound held in a generation's quarantine) is
+`ingress.write_quarantine_item`, which checks every item against this
+module's rules before writing it, and the expiry SWEEP is
+`ingress.sweep_quarantine`, run after each generation's inbound pass.
+Nothing here creates, moves or deletes anything.
 
 WHERE: `state_dir/<logical_id>/gen-<g>/ingress-quarantine/<id>.json`, one
 file per item, in every generation of the identity (late inbound for a
@@ -21,12 +23,17 @@ THE ITEM, a JSON object with exactly these members:
      "causes": ["<cause>", ...],          # non-empty, no duplicates, CAUSES
      "evidence": {"<key>": <value>, ...}} # see below
 
-`causes` is drawn from a CLOSED vocabulary. Today it holds one cause,
-`cold_fleet_mail`, for cold traffic from a trusted fleet host. The
+`causes` is drawn from a CLOSED vocabulary. Today it holds three causes:
+`cold_fleet_mail`, for cold traffic from a trusted fleet host;
+`late_inbound`, for an entry that arrived for a generation that is no longer
+current (fenced or retired) and is held in THAT generation, never placed
+into a later one; and `notice_invalid`, for an entry the transport's reader
+refused as invalid on this router's first sight of it (its evidence carries
+the refusal's reason and nothing read from the refused bytes). The
 peer-origin profile's §5 causes join it when the profile revision that
 defines them is published: until then they are not this public
-repository's to copy, and an item naming one is DAMAGED. No writer exists
-yet, so nothing that could be written is lost meanwhile.
+repository's to copy, and an item naming one is DAMAGED. The writer refuses
+a cause outside the vocabulary before writing anything.
 
 `evidence` is HOSTILE INPUT: what arrived, described by the writer from
 what the sender controlled. At most 32 members; each key 1-64 printable
@@ -96,7 +103,19 @@ SOURCES = (SOURCE_INGRESS, SOURCE_CONTROL)
 #: This router's own cause for cold trusted-host traffic. The profile's §5
 #: causes are added beside it once published (module docstring).
 CAUSE_COLD_FLEET_MAIL = "cold_fleet_mail"
-CAUSES = (CAUSE_COLD_FLEET_MAIL,)
+#: An inbound entry attributed to a generation that is
+#: no longer current when this router FIRST observes it (its own observation,
+#: never the writer's timing) is quarantined to that generation, never placed.
+CAUSE_LATE_INBOUND = "late_inbound"
+#: An entry the transport's reader refuses as `notice_invalid` on this
+#: router's FIRST sight of it (no journal record for its key, a tombstone
+#: included) is quarantined, one item per key, then removed upstream through
+#: the plugin's remover when one is offered, else retained under the interim
+#: rule until the dedup horizon has passed and the reader reports it gone. Named
+#: after the transport's own refusal reason (`transport.NOTICE_REFUSAL_REASONS`),
+#: so it adds no wire vocabulary.
+CAUSE_NOTICE_INVALID = "notice_invalid"
+CAUSES = (CAUSE_COLD_FLEET_MAIL, CAUSE_LATE_INBOUND, CAUSE_NOTICE_INVALID)
 
 ITEM_MAX_BYTES = 64 * 1024
 CANDIDATE_MAX_BYTES = 1024 * 1024

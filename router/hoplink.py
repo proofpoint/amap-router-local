@@ -62,11 +62,40 @@ class Refused(Exception):
         self.outcome, self.reason_code, self.detail = outcome, reason_code, detail
 
 
+#: Why `canonical` refuses a value: the reason vocabulary shared with the
+#: hop plugin's own canonical encoder, so both refuse the same inputs for the
+#: same reason (the projection's shared encoding vectors).
+REFUSE_FLOAT = "float_not_allowed"
+REFUSE_NOT_JSON = "not_json"
+REFUSE_SURROGATE = "unpaired_surrogate"
+CANONICAL_REFUSALS = (REFUSE_FLOAT, REFUSE_NOT_JSON, REFUSE_SURROGATE)
+
+
+class CanonicalRefused(ValueError):
+    """`canonical` refused `value`. `.reason` is one of `CANONICAL_REFUSALS`."""
+
+    def __init__(self, reason: str, detail: str):
+        assert reason in CANONICAL_REFUSALS, reason
+        super().__init__(f"{detail} ({reason})")
+        self.reason = reason
+
+
+def _has_surrogate(s: str) -> bool:
+    return any(0xD800 <= ord(c) <= 0xDFFF for c in s)
+
+
 def _check_integers_only(value: Any, where: str = "$") -> None:
-    if isinstance(value, bool) or value is None or isinstance(value, (str, int)):
+    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return
+    if isinstance(value, str):
+        if _has_surrogate(value):
+            raise CanonicalRefused(REFUSE_SURROGATE, f"{where}: an unpaired surrogate")
         return
     if isinstance(value, float):
-        raise ValueError(f"{where}: a non-integer number is not representable")
+        if value != value or value in (float("inf"), float("-inf")):
+            # NaN and the infinities are not JSON numbers at all.
+            raise CanonicalRefused(REFUSE_NOT_JSON, f"{where}: {value!r} is not a JSON number")
+        raise CanonicalRefused(REFUSE_FLOAT, f"{where}: a non-integer number is not representable")
     if isinstance(value, list):
         for i, v in enumerate(value):
             _check_integers_only(v, f"{where}[{i}]")
@@ -74,23 +103,24 @@ def _check_integers_only(value: Any, where: str = "$") -> None:
     if isinstance(value, dict):
         for k, v in value.items():
             if not isinstance(k, str):
-                raise ValueError(f"{where}: a non-string key")
+                raise CanonicalRefused(REFUSE_NOT_JSON, f"{where}: a non-string key")
+            if _has_surrogate(k):
+                raise CanonicalRefused(REFUSE_SURROGATE, f"{where}: an unpaired surrogate in a key")
             _check_integers_only(v, f"{where}.{k}")
         return
-    raise ValueError(f"{where}: a {type(value).__name__} is not JSON")
+    raise CanonicalRefused(REFUSE_NOT_JSON, f"{where}: a {type(value).__name__} is not JSON")
 
 
 def canonical(value: Any) -> bytes:
-    """`value` in the handover's canonical encoding, or `ValueError` for
-    anything that encoding refuses: a non-integer number, a non-string key,
-    a lone surrogate (it cannot be UTF-8)."""
+    """`value` in the handover's canonical encoding, or `CanonicalRefused`
+    (a `ValueError`, `.reason` one of `CANONICAL_REFUSALS`) for anything that
+    encoding refuses: a non-integer number (`float_not_allowed`); NaN, an
+    infinity, a non-string key or a non-JSON type (`not_json`); a lone
+    surrogate in a string or a key (`unpaired_surrogate`)."""
     _check_integers_only(value)
     text = json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
-    try:
-        return text.encode("utf-8")
-    except UnicodeEncodeError as e:
-        raise ValueError(f"not encodable as UTF-8 ({e.reason})") from None
+    return text.encode("utf-8")
 
 
 def address_octets_problem(address: Any) -> Optional[str]:
@@ -449,14 +479,109 @@ def _construction_hold(e: BaseException) -> HopHold:
 
 
 def forget_senders() -> None:
-    """Drop the cache, closing each sender (tests, and a process ending)."""
-    for port in list(_SENDERS.values()):
+    """Drop the caches, closing each sender and reader (tests, and a process
+    ending)."""
+    for port in list(_SENDERS.values()) + [r.port for r in _READERS.values()]:
         try:
             port.close()
         except Exception:  # noqa: BLE001 -- close is cleanup
-            logger.exception("closing a hop sender failed")
+            logger.exception("closing a hop object failed")
     _SENDERS.clear()
     _LATCHED.clear()
+    _READERS.clear()
+    _READER_LATCHED.clear()
+
+
+# ---------------------------------------------------------------------------
+# Intake readers: one per (logical_id, generation), current or fenced.
+# Reading never admits, so a fenced generation's tree may be read; its
+# entries are late.
+# ---------------------------------------------------------------------------
+
+HOLD_READER_CONSTRUCT_FAILED = "hop_reader_construct_failed"   # retried next poll
+HOLD_READER_SETTINGS_REFUSED = "hop_reader_settings_refused"
+HOLD_READER_VOCABULARY = "hop_reader_vocabulary"               # the whole instance
+
+
+class Reader:
+    """A constructed intake reader and its refusal class, captured ONCE at
+    construction (`transport.capture_verdict_class`): later dispatch uses
+    `notice_refused`, never a fresh attribute lookup."""
+
+    def __init__(self, port: Any, notice_refused: type):
+        self.port, self.notice_refused = port, notice_refused
+
+
+#: (runtime id, state_dir, logical_id, gen) -> Reader. Filled only after a
+#: construction and its class capture both succeeded.
+_READERS: Dict[Tuple, Reader] = {}
+#: Latched reader construction holds, by the same key.
+_READER_LATCHED: Dict[Tuple, "HopHold"] = {}
+
+
+def reader_settings(cfg: Any, logical_id: str, gen: str) -> Dict[str, Any]:
+    """A tree reader's settings: exactly the four-key core."""
+    return {"hop_root": cfg.hop.root, "logical_id": logical_id, "generation": gen,
+            "peer_uid": cfg.hop.peer_uid}
+
+
+def reader_for(runtime: Any, cfg: Any, logical_id: str, gen: str) -> Reader:
+    """The intake reader for generation `gen` of `logical_id`, constructed
+    once per process. Raises `HopHold`, and ONLY `HopHold`: settings and
+    vocabulary refusals latch; anything else is retried next poll."""
+    key = (id(runtime), str(cfg.state_dir), logical_id, gen)
+    reader = _READERS.get(key)
+    if reader is not None:
+        return reader
+    if key in _READER_LATCHED:
+        raise _READER_LATCHED[key]
+    try:
+        port = runtime.plugin.make_intake_reader(reader_settings(cfg, logical_id, gen),
+                                                 runtime.fsops)
+    except Exception as e:  # noqa: BLE001 -- classified, never escaped
+        hold = _reader_construction_hold(e)
+        if hold.latched:
+            _READER_LATCHED[key] = hold
+        raise hold from e
+    try:
+        refused = transport_mod.capture_verdict_class(port, "NoticeRefused", runtime.fsops,
+                                                      "reader_vocabulary")
+    except transport_mod.SeamRefused as e:
+        _close_quietly(port)
+        hold = HopHold(HOLD_READER_VOCABULARY, str(e), latched=True, scope="instance")
+        _READER_LATCHED[key] = hold
+        raise hold from e
+    reader = Reader(port, refused)
+    _READERS[key] = reader
+    return reader
+
+
+def _reader_construction_hold(e: BaseException) -> HopHold:
+    kind, detail = transport_mod.classify(e, runtime=tuple(_RUNTIME_CLASSES))
+    if kind == "reason" and detail == "settings_invalid":
+        return HopHold(HOLD_READER_SETTINGS_REFUSED, str(e), latched=True)
+    if isinstance(e, transport_mod.SeamRefused):
+        return HopHold(HOLD_READER_VOCABULARY, str(e), latched=True, scope="instance")
+    return HopHold(f"{HOLD_READER_CONSTRUCT_FAILED}:{detail or kind}", str(e), latched=False)
+
+
+def evict_readers(cfg: Any, logical_id: str, gen: Optional[str] = None) -> int:
+    """Close and drop the cached readers of `logical_id` (one generation, or
+    all): a cached reader pins its tree, so a fence must not leave it
+    reading the old directory. Returns how many were evicted."""
+    state = str(cfg.state_dir)
+    keys = [k for k in _READERS if k[1] == state and k[2] == logical_id
+            and (gen is None or k[3] == gen)]
+    for k in keys:
+        _close_quietly(_READERS.pop(k).port)
+    return len(keys)
+
+
+def _close_quietly(port: Any) -> None:
+    try:
+        port.close()
+    except Exception:  # noqa: BLE001 -- close is cleanup
+        logger.exception("closing a hop object failed")
 
 
 class Held:

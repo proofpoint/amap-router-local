@@ -1324,8 +1324,14 @@ handover document, the request file, one decoded attachment, all of them.
 can make, computed exactly at load (`hoplink.document_floor`), or the
 config is refused. The floor counts the attachment caps (the smaller of
 the plugin's and this router's), so at this router's defaults it is about
-43.7 MiB. A reload that changes `hop` is refused, like one that
-changes the plugin. Every instance's address must be able to serve as a
+43.7 MiB. `link`, optional, names the inbound reader's link in the hop
+codec's link grammar (`[a-z0-9][a-z0-9-]{0,62}`): it keys the ingress
+journal and is what admission compares the facts' `admission_link` with.
+Without it inbound is DISABLED (nothing is listed, read or placed; the
+outbound leg is unaffected). It is rendered by the host adapter from the
+fleet policy that names the downstream runtime's link. PROVISIONAL, pending
+the owner's confirmation. A reload that changes `hop` is refused, like one
+that changes the plugin. Every instance's address must be able to serve as a
 handover's `from_address` (at most 254 octets, a local part of at most 64,
 the bare addr-spec pattern): one that cannot is refused at load, by the
 same check begin runs.
@@ -1408,18 +1414,105 @@ per instance the sender hold, the latched hand-over hold and the current
 retry, each with its first sighting and age, and the senders this process
 holds open.
 
+## The ingress journal (`router/ingress.py`)
+
+Inbound from the external leg arrives through the plugin's intake reader
+(`hoplink.reader_for`, one per identity and generation) and goes through
+ONE durable journal record per entry, per kind, per generation:
+`state_dir/<logical_id>/gen-<g>/ingress/<kind>/<key>.json`, the key the
+sha256 of the canonical `{kind, link, gen, entry_id}`. The entry id is
+opaque and never a path component.
+
+**Inbound is OFF without `hop.link`.** With it, each generation PINS the
+link at its first inbound use (`ingress/link.json`), and every later pump
+compares the config against the pin before listing anything. A difference
+latches that generation's inbound off with one ERROR: the link is inside
+every key, so a changed value must never re-key (re-keying would place
+entries again). To change the link, begin a new generation.
+
+**The order, per generation, per poll, under the drain lock**: recovery of
+`placing` and `prepared` records first; one listing page; then for each
+listed id the key lookup BEFORE any read (a placed or quarantined key is a
+duplicate, compared whole-bundle with its snapshot and never placed or
+quarantined again); the read (`notice_incomplete` held;
+`notice_invalid` on first sight QUARANTINED); the
+bundle and the facts checked as hostile input (this router's own check is
+additional to the reader's and verdict-identical with it); a generation
+no longer current gets `late_inbound`; the recipient cross-check (the
+tree binds the entry to this identity, and mail whose named To/Cc
+recipients resolve only to ANOTHER identity, by name or through an active
+alias, is held `recipient_not_this_identity`; an address resolving to
+nobody, as for a Bcc'd or list-delivered recipient or a truncated header,
+never refuses); the admission order; then snapshot, `prepared` and
+placement.
+
+**Untrusted fleet mail is the only class this router places, and that set
+is EMPTY in every deployment today.** Everything else is held for the unit
+that owns it, or quarantined (`cold_fleet_mail` for a trusted host).
+
+**The guarantee: AT MOST ONCE per upstream entry id.** At most one
+agent-visible notice is ever placed for an entry id. Placement writes the
+RECORDED bytes (minted identity, digests journaled at `prepared`) through
+`deliver`'s commit routine, after a generation check immediately before the
+first byte. It rests on the ledger row being durable before the notice is
+committed, which `deliver._commit` guarantees. A crash between the ledger
+write and the notice, with no delivery evidence, is a TERMINAL, VISIBLE hold
+(`placing_ambiguous`), delivered to nobody until an operator acts. It is
+per entry id, never per message: two ids for one message are two entries.
+No ledger row of a record in `placing` or `placing_ambiguous` is ever
+pruned (nothing in this repository prunes the binding ledger).
+
+**Removal and the dedup horizon.** The plugin's remover is an optional
+capability no deployed plugin offers yet (`not_offered`). Until it is, a
+placed or quarantined entry's record waits (`*_waiting_remove`) and
+becomes its TOMBSTONE only when the horizon has passed AND the reader
+reports the entry gone; a tombstone still dedups (a re-publication is a
+duplicate, never placed again) and is dropped only after another horizon.
+A held record is never dropped. `ingress_dedup_horizon_days` (default 30,
+1-3650) is the horizon, and it MUST EXCEED THE LONGEST TIME THE
+DOWNSTREAM RUNTIME CAN BE DOWN AFTER A CRASH. A first-seen entry whose
+spool date predates it logs `hop_republished_after_horizon` (a WARNING,
+best-effort; it is still placed).
+
+**Residuals, stated and accepted with the guarantee**: the dedup horizon
+must exceed the longest time the downstream runtime can be down after a
+crash, or ONE duplicate placement is possible (never a loss); and a mailbox
+UIDVALIDITY reset upstream mints new ids, so each message still present is
+placed once more, visibly, in the duplicate direction.
+
+**Holds.** A re-read hold (`notice_incomplete`, `bundle_schema`,
+`entry_id_mismatch`, `bundle_invalid`) takes no snapshot and is read again
+every pump. A snapshot hold (the admission holds and
+`recipient_not_this_identity`) is re-evaluated from what was READ and
+never re-read. The TERMINAL holds are never re-evaluated by a pump:
+`placing_ambiguous`, `placing_survivor_mismatch`, `exists_different`,
+`snapshot_invalid:<what>`, `quarantine_item_conflict`,
+`duplicate_different_held`, and `notice_invalid` on an entry that already
+had a record. The operator verbs that release them are OWED by the first
+unit that adds ingress verbs; they must also cover
+`recipient_not_this_identity`, and the verb that releases
+`placing_ambiguous` MUST warn that releasing is AT-LEAST-ONCE: it may
+deliver a notice the agent already consumed.
+
 ## The ingress quarantine (`router/quarantine.py`)
 
 Cross-host inbound that is not placed is held in the generation it arrived
 for, at `state_dir/<logical_id>/gen-<g>/ingress-quarantine/<id>.json`. This
-router FREEZES the item format and inspects it read-only; the writer and
-the expiry sweep are a later step's, which must write exactly this format.
+router FREEZES the item format and inspects it read-only (`quarantine`); the
+writer is `ingress.write_quarantine_item`, which checks each item against
+those rules before writing it, one item per journal key, create-if-absent.
+The expiry sweep is `ingress.sweep_quarantine`: after each generation's
+inbound pass it removes the well-formed items older than
+`ingress_quarantine_days`, logging each sweep that removed any, and keeps a
+damaged item for the operator.
 
 An item has exactly `schema` (`amap-router-local.ingress-quarantine/1`),
 `id` (32 hex, the filename stem), `generation` (32 hex, the directory's),
 `arrival_ts`, `causes` (non-empty, no duplicates, from a closed
-vocabulary: `cold_fleet_mail` today; the peer-origin profile's §5 causes are
-added once the revision defining them is published) and
+vocabulary: `cold_fleet_mail`, `late_inbound` (an entry for a fenced or
+retired generation, held there) and `notice_invalid` (an entry the
+transport's reader refused as invalid on first sight) today; the peer-origin profile's §5 causes
+are added once the revision defining them is published) and
 `evidence` (at most 32 members; keys 1-64 printable ASCII; values strings of
 at most 1024 characters or integers, never booleans, of magnitude below
 2^53; at most 16 KiB). Evidence is hostile input and is printed

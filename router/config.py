@@ -217,6 +217,7 @@ _TOP_KEYS = {
     "peer_senders", "peers",
     "transport_plugin", "registry_dir", "aliases", "hop",
     "trusted_fleet_hosts", "fleet_hosts", "egress", "ingress_quarantine_days",
+    "ingress_dedup_horizon_days",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders",
                   "task_deny", "send_to", "remote_fleet"}
@@ -352,6 +353,9 @@ ATTACHMENT_MAX_TOTAL_BYTES_DEFAULT = 32 * 1024 * 1024  # per-request combined ca
 #: (`router/quarantine.py`). Defined here; the writer reads it.
 INGRESS_QUARANTINE_DAYS_DEFAULT = 14
 INGRESS_QUARANTINE_DAYS_MAX = 365
+#: The ingress dedup horizon: default 30 days, at most ten years.
+INGRESS_DEDUP_HORIZON_DAYS_DEFAULT = 30
+INGRESS_DEDUP_HORIZON_DAYS_MAX = 3650
 
 # Which config key maps to which mode, and the leaf names it derives.
 _ROOT_KEY_MODE = {"handoff_dir": MODE_HANDOFF, "namespace": MODE_NAMESPACE}
@@ -550,6 +554,10 @@ class RouterConfig:
     fleet_hosts: Tuple[str, ...] = ()
     egress: bool = False
     ingress_quarantine_days: int = INGRESS_QUARANTINE_DAYS_DEFAULT
+    #: The ingress dedup horizon (`router/ingress.py`): a completed entry's
+    #: tombstone is kept at least this long. It must exceed the longest time
+    #: the downstream runtime can be down after a crash.
+    ingress_dedup_horizon_days: int = INGRESS_DEDUP_HORIZON_DAYS_DEFAULT
     #: PROCESS state, never read from a file: the last reload of the config
     #: failed or was refused (`service.reload_config`), and this is the last
     #: good config kept in its place. While it is set the external leg fails
@@ -575,6 +583,10 @@ HOP_CAPS = ("document", "request", "attachment", "total")
 HOP_CONTRACT_MAX = 2 ** 31 - 1
 
 
+#: The hop codec's link grammar, applied with `fullmatch`.
+HOP_LINK_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+
+
 @dataclass(frozen=True)
 class HopConfig:
     """`hop` as configured (module docstring). `root` is the string exactly
@@ -585,6 +597,10 @@ class HopConfig:
     peer_uid: int
     version_write: int
     caps: Tuple[Tuple[str, int], ...]
+    #: The inbound reader's link (PROVISIONAL, pending the owner's confirmation): the
+    #: journal key's `link` and admission's comparand. Absent, inbound is
+    #: disabled; the outbound leg does not read it.
+    link: Optional[str] = None
 
     def cap(self, name: str) -> int:
         return dict(self.caps)[name]
@@ -615,10 +631,15 @@ def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
             "config.hop: requires config.registry_dir: a handover names its sender by "
             "logical_id, and generations exist only under a registry")
     raw = _require_object(top["hop"], "config.hop")
-    if set(raw) != {"root", "peer_uid", "version_write", "caps"}:
+    required = {"root", "peer_uid", "version_write", "caps"}
+    if not (required <= set(raw) <= required | {"link"}):
         raise ConfigError(
-            "config.hop: needs exactly 'root', 'peer_uid', 'version_write' and 'caps'; "
-            f"got {sorted(raw)}")
+            "config.hop: needs exactly 'root', 'peer_uid', 'version_write' and 'caps', "
+            f"and may have 'link'; got {sorted(raw)}")
+    link = raw.get("link")
+    if "link" in raw and not (isinstance(link, str) and HOP_LINK_RE.fullmatch(link)):
+        raise ConfigError(
+            f"config.hop.link: {link!r} is not a link name ([a-z0-9][a-z0-9-]{{0,62}})")
     root = raw["root"]
     if not isinstance(root, str) or not os.path.isabs(root):
         raise ConfigError(f"config.hop.root: must be an absolute path, got {root!r}")
@@ -645,7 +666,8 @@ def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
         raise ConfigError(f"config.hop.caps: needs exactly {list(HOP_CAPS)}; got {sorted(caps)}")
     hop = HopConfig(
         root=root, peer_uid=peer_uid, version_write=version_write,
-        caps=tuple((k, _positive_int(caps[k], f"config.hop.caps.{k}")) for k in HOP_CAPS))
+        caps=tuple((k, _positive_int(caps[k], f"config.hop.caps.{k}")) for k in HOP_CAPS),
+        link=link)
     from .hoplink import document_floor  # local: hoplink is a leaf, kept out of load order
     count_cap, file_cap, total_cap = attachment_caps
     floor = document_floor(
@@ -1645,6 +1667,9 @@ def load_obj(
         state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
         trusted_fleet_hosts=trusted, fleet_hosts=fleet_hosts, egress=egress,
         ingress_quarantine_days=_ingress_quarantine_days(top),
+        ingress_dedup_horizon_days=_days(top, "ingress_dedup_horizon_days",
+                                         INGRESS_DEDUP_HORIZON_DAYS_DEFAULT,
+                                         INGRESS_DEDUP_HORIZON_DAYS_MAX),
         attachment_max_bytes=attachment_max_bytes,
         attachment_max_count=attachment_max_count,
         attachment_max_total_bytes=attachment_max_total_bytes,
@@ -1680,6 +1705,15 @@ def load_obj(
 
 
 _CLASSIFY_INSTANCE_KEYS = ("task_deny", "send_to", "remote_fleet")
+
+
+def _days(top: Dict[str, Any], key: str, default: int, maximum: int) -> int:
+    if key not in top:
+        return default
+    v = top[key]
+    if isinstance(v, bool) or not isinstance(v, int) or not (1 <= v <= maximum):
+        raise ConfigError(f"config.{key}: expected an integer from 1 to {maximum}, got {v!r}")
+    return v
 
 
 def _ingress_quarantine_days(top: Dict[str, Any]) -> int:

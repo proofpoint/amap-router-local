@@ -619,7 +619,8 @@ def content_ref_for(notice_id: str, index: int) -> str:
 
 
 def publish_attachment_blobs(
-    root: Path, tree_root: Path, notice_id: str, attachments: List[VerifiedAttachment],
+    root: Path, tree_root: Path, notice_id: str,
+    attachments: List[Optional[VerifiedAttachment]],
     *, expect_root: Optional[Tuple[int, int]] = None,
 ) -> None:
     """§5 inbound publication. Writes every verified attachment's bytes to
@@ -631,8 +632,14 @@ def publish_attachment_blobs(
     empty set means an absent sidecar dir). Called BEFORE the message
     spool write (`deliver.py`'s commit-sentinel ordering: all blobs ->
     message spool -> ledger -> notice LAST) — bytes always precede the
-    notice that announces them."""
-    if not attachments:
+    notice that announces them.
+
+    A `None` entry is a positional GAP: index `i` gets no blob, and every
+    later index keeps its own number (an inbound notice whose descriptor `i`
+    carries no `content_ref`, AMAP binding a sidecar to its array index).
+    Every outbound caller passes no `None`; a list of gaps only is the empty
+    case (no directory)."""
+    if not any(att is not None for att in attachments):
         return
     # `notices/`, not `messages/`, and on EVERY tree -- `tree_root` is the
     # mail lane's `inbox_root` or the peer lane's `peer_root` depending on
@@ -650,7 +657,8 @@ def publish_attachment_blobs(
             side_fd = _mkdir_and_pin(notices_fd, side_dir_name)
             try:
                 for i, att in enumerate(attachments):
-                    _write_blob_pinned(side_fd, i, att.data)
+                    if att is not None:
+                        _write_blob_pinned(side_fd, i, att.data)
             finally:
                 os.close(side_fd)
         finally:

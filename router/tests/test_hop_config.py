@@ -96,6 +96,15 @@ class HopConfigTests(helpers.RouterTestCase):
                     doc["hop"]["caps"][cap] = bad
                     self.refused(doc, f"config.hop.caps.{cap}")
 
+    def test_the_inbound_link_is_optional_and_in_the_link_grammar(self):
+        self.assertIsNone(config_mod.load_obj(self.doc()).hop.link)
+        for good in ("hub", "a", "a" * 63, "hub-1", "0link"):
+            with self.subTest(link=good):
+                self.assertEqual(config_mod.load_obj(self.doc(link=good)).hop.link, good)
+        for bad in ("", "Hub", "-hub", "a" * 64, "hub\n", "hub_1", "hub.x", 7, None, True):
+            with self.subTest(link=bad):
+                self.refused(self.doc(link=bad), "config.hop.link")
+
     def test_version_write_is_at_most_the_envelopes_maximum(self):
         top = config_mod.HOP_CONTRACT_MAX
         self.assertEqual(config_mod.load_obj(self.doc(version_write=top)).hop.version_write, top)
