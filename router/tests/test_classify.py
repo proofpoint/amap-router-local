@@ -357,6 +357,15 @@ class ConfigTests(helpers.RouterTestCase):
         self.refused("egress", top={"egress": "yes"})
         self.refused("egress", top={"egress": 1})
 
+    def test_ingress_dedup_horizon_days(self):
+        self.assertEqual(self.make_config({"alice": []}).ingress_dedup_horizon_days, 30)
+        cfg = make_cfg(self, top={"ingress_dedup_horizon_days": 3650})
+        self.assertEqual(cfg.ingress_dedup_horizon_days, 3650)
+        for bad in (0, 3651, True, "30", 1.5):
+            with self.subTest(bad):
+                self.refused("ingress_dedup_horizon_days",
+                             top={"ingress_dedup_horizon_days": bad})
+
     def test_ingress_quarantine_days_bounds(self):
         for bad in (0, 366, True, "14", 1.5):
             with self.subTest(bad):

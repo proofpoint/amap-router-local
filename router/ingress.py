@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64 as _base64
 import binascii as _binascii
+import email.utils
 import hashlib
 import json
 import logging
@@ -36,6 +37,7 @@ import re
 import secrets
 import shutil
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -49,7 +51,7 @@ from . import generations as generations_mod
 from . import quarantine as quarantine_mod
 from . import transport as transport_mod
 from .hoplink import canonical
-from .util import _mkdir_durable, atomic_write, fsync_dir, mint_notice_id, utc_ts
+from .util import _mkdir_durable, atomic_write, fsync_dir, mint_notice_id, parse_utc_ts, utc_ts
 
 logger = logging.getLogger("amap_router_local.ingress")
 
@@ -1733,6 +1735,8 @@ class Pump:
         self.attachment_cap = attachment_cap
         self.runtime_classes = runtime_classes
         self.counts: Dict[str, int] = {}
+        self.horizon_s = 30 * 86400
+        self.now = datetime.now(timezone.utc)
 
     @property
     def state_dir(self) -> Path:
@@ -1785,13 +1789,16 @@ class Pump:
                 return self.from_snapshot(entry_id, rec)
         return self.first_read(entry_id, rec)
 
-    def _read(self, entry_id: str):
+    def _read(self, entry_id: str, *, missing_is_gone: bool = False):
         """`(bytes, None)`, `(None, refusal_reason)`, or `(None, None)` for no
-        decision this pump."""
+        decision this pump. With `missing_is_gone`, an entry `read_entry`
+        reports absent (FileNotFoundError, and only that) is `(GONE, None)`."""
         try:
             return self.reader.port.read_entry("notice", entry_id), None
         except self.reader.notice_refused as e:
             return None, getattr(e, "reason", None)
+        except FileNotFoundError:
+            return (GONE if missing_is_gone else None), None
         except (OSError,) + tuple(self.runtime_classes):
             return None, None
 
@@ -1812,7 +1819,26 @@ class Pump:
             return "held"
         except FactsInvalid:
             return self.quarantine_refused(entry_id, rec)
+        if rec is None:
+            self.warn_if_republished_after_horizon(entry_id, parsed["spool"])
         return self.decide(entry_id, parsed, rec=rec)
+
+    def warn_if_republished_after_horizon(self, entry_id: str, spool: Dict[str, Any]) -> None:
+        """BEST-EFFORT, and gating nothing: a first-seen id whose spool `date`
+        predates the dedup horizon may be a re-publication whose tombstone
+        was already dropped. WARNING `hop_republished_after_horizon`; the
+        entry is still placed. An unparseable or empty date gives none."""
+        try:
+            sent = email.utils.parsedate_to_datetime(spool.get("date") or "")
+        except (TypeError, ValueError, IndexError):
+            return
+        if sent is None or sent.tzinfo is None:
+            return
+        if (self.now - sent).total_seconds() > self.horizon_s:
+            self.count("hop_republished_after_horizon")
+            logger.warning("ingress %s gen %s: entry %s first seen now but dated before the "
+                           "dedup horizon (hop_republished_after_horizon); placed",
+                           self.logical_id, self.gen, entry_id)
 
     def quarantine_refused(self, entry_id: str, rec: Optional[Dict[str, Any]]) -> str:
         """notice_invalid. On FIRST sight (no record for the key) it is
@@ -1974,6 +2000,80 @@ def _digests_of(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Removal and the dedup horizon (v2 §4, §8; RL-E8b's interim rule).
+#
+# THE REMOVER is RL-E8b's optional capability, and this router has no
+# plugin that offers it yet: `remover` is NOT_OFFERED, and the interim rule
+# is the live path. A `*_waiting_remove` record becomes its tombstone only
+# when BOTH the horizon has passed since it began waiting AND `read_entry`
+# reports the entry gone (FileNotFoundError); until then the entry stays
+# upstream and its record keeps the key. A TOMBSTONE (`complete`,
+# `quarantined_complete`) is kept at least the horizon, then dropped
+# (snapshot first, then the record). A held record is never dropped.
+# ---------------------------------------------------------------------------
+
+REMOVER_NOT_OFFERED = "not_offered"
+WAITING_REMOVE = {PUBLISHED_WAITING_REMOVE: COMPLETE,
+                  QUARANTINED_WAITING_REMOVE: QUARANTINED_COMPLETE}
+
+
+def _age_s(ts: Any, now: datetime) -> Optional[float]:
+    dt = parse_utc_ts(ts)
+    return None if dt is None else (now - dt).total_seconds()
+
+
+def drop_tombstone(state_dir: Path, logical_id: str, gen: str, kind: str, key: str) -> None:
+    """Delete a tombstone's snapshot directory, then its record, each made
+    durable. Refuses (`JournalError`) a record that is not a tombstone."""
+    rec = read(state_dir, logical_id, gen, kind, key)
+    if rec is None:
+        return
+    if rec["state"] not in TOMBSTONES:
+        raise JournalError(f"{rec['state']!r} is not a tombstone; never dropped")
+    snap = snapshot_dir(state_dir, logical_id, gen, kind, key)
+    try:
+        st = os.lstat(snap)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISDIR(st.st_mode):
+            raise JournalError(f"{snap}: not a directory; left for an operator")
+        shutil.rmtree(snap)
+        fsync_dir(snap.parent)
+    path = record_path(state_dir, logical_id, gen, kind, key)
+    os.unlink(path)
+    fsync_dir(path.parent)
+
+
+def advance_removal(pump: "Pump", now: datetime, horizon_s: int) -> None:
+    """The interim rule over every waiting record, then the tombstone sweep.
+    Never concurrent with a listing or read of the generation: the pump is
+    single-threaded per tree and runs this after its listing."""
+    records = journal_records(pump.state_dir, pump.logical_id, pump.gen, "notice")
+    for entry_id, info in sorted(records.items()):
+        key = key_for("notice", pump.link, pump.gen, entry_id)
+        rec = read(pump.state_dir, pump.logical_id, pump.gen, "notice", key)
+        st = rec["state"]
+        if st in WAITING_REMOVE:
+            age = _age_s(rec.get("state_ts"), now)
+            if age is None or age < horizon_s:
+                continue
+            raw, refusal = pump._read(entry_id, missing_is_gone=True)
+            if raw is GONE:
+                pump.jw(entry_id, WAITING_REMOVE[st])
+                pump.count("tombstoned")
+        elif st in TOMBSTONES:
+            age = _age_s(rec.get("state_ts"), now)
+            if age is not None and age >= horizon_s:
+                drop_tombstone(pump.state_dir, pump.logical_id, pump.gen, "notice", key)
+                pump.count("tombstone_dropped")
+
+
+#: `Pump._read`'s answer for an entry `read_entry` reports absent.
+GONE = object()
+
+
+# ---------------------------------------------------------------------------
 # Driving the pump: one listing page per reader per poll.
 # ---------------------------------------------------------------------------
 
@@ -1988,12 +2088,16 @@ _LINK_LATCHED: Dict[tuple, str] = {}
 
 
 def pump_generation(pump: Pump, *, listing_too_large: Any = (),
-                    limit: int = transport_mod.LIST_LIMIT_MAX) -> Dict[str, int]:
+                    limit: int = transport_mod.LIST_LIMIT_MAX,
+                    horizon_s: int = 30 * 86400,
+                    now: Optional[datetime] = None) -> Dict[str, int]:
     """Step 0, then one listing page and each listed entry through
     `Pump.dispatch`. A `listing_too_large` (the runtime's class) is a
     self-clearing hold for this generation, counted; nothing is listed or
     read past it this pump. `pump.link` must be the generation's PIN
     (`pinned_link`), never the live config value."""
+    pump.horizon_s = horizon_s
+    pump.now = now or _utcnow()
     pump.recover()
     key = (str(pump.state_dir), pump.logical_id, pump.gen)
     try:
@@ -2015,7 +2119,12 @@ def pump_generation(pump: Pump, *, listing_too_large: Any = (),
                              pump.logical_id, pump.gen)
             what = "journal_damaged"
         pump.count(what or "undecided")
+    advance_removal(pump, pump.now, horizon_s)
     return pump.counts
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def identities(cfg: Any, report: Any) -> List[Dict[str, Any]]:
@@ -2111,7 +2220,9 @@ def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
                         runtime_classes=runtime_classes,
                         proven_unknown=ident["proven_unknown"])
             try:
-                out[label] = pump_generation(pump, listing_too_large=too_large)
+                out[label] = pump_generation(
+                    pump, listing_too_large=too_large,
+                    horizon_s=cfg.ingress_dedup_horizon_days * 86400)
             except Exception:  # noqa: BLE001 -- isolated per generation
                 logger.exception("ingress %s: pump failed; isolated", label)
                 out[label] = {"pump_errored": 1}

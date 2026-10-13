@@ -1459,6 +1459,18 @@ per entry id, never per message: two ids for one message are two entries.
 No ledger row of a record in `placing` or `placing_ambiguous` is ever
 pruned (nothing in this repository prunes the binding ledger).
 
+**Removal and the dedup horizon.** The plugin's remover is an optional
+capability no deployed plugin offers yet (`not_offered`). Until it is, a
+placed or quarantined entry's record waits (`*_waiting_remove`) and
+becomes its TOMBSTONE only when the horizon has passed AND the reader
+reports the entry gone; a tombstone still dedups (a re-publication is a
+duplicate, never placed again) and is dropped only after another horizon.
+A held record is never dropped. `ingress_dedup_horizon_days` (default 30,
+1-3650) is the horizon, and it MUST EXCEED THE LONGEST TIME THE
+DOWNSTREAM RUNTIME CAN BE DOWN AFTER A CRASH. A first-seen entry whose
+spool date predates it logs `hop_republished_after_horizon` (a WARNING,
+best-effort; it is still placed).
+
 **Residuals, stated and accepted with the guarantee**: the dedup horizon
 must exceed the longest time the downstream runtime can be down after a
 crash, or ONE duplicate placement is possible (never a loss); and a mailbox

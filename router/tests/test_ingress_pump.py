@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from router import generations, ingress, registry
@@ -22,6 +23,9 @@ E2 = "1700000000-2"
 E3 = "1700000000-3"
 FLEET = ("fleet-a.example", "fleet-b.example")
 TRUSTED = ("fleet-a.example",)
+HORIZON = 30 * 86400
+LATER = datetime.now(timezone.utc) + timedelta(seconds=HORIZON + 60)
+MUCH_LATER = LATER + timedelta(seconds=HORIZON + 60)
 
 
 def entry(eid, **kw):
@@ -45,11 +49,13 @@ class _Pump(_Fleet):
         self.report = registry.report_for(self.cfg.registry_dir, self.state_dir,
                                           self.cfg.instances, persist=False)
 
-    def pump(self, gen=None, recipient="bravo", limit=1024, proven_unknown=False):
+    def pump(self, gen=None, recipient="bravo", limit=1024, proven_unknown=False,
+             now=None, horizon_s=HORIZON):
         p = ingress.Pump(self.keyed, DoubleReader(self.port), self.lid, gen or self.gen, LINK,
                          report=self.report, recipient=recipient, unresolved=None,
                          attachment_cap=CAP, proven_unknown=proven_unknown)
-        return ingress.pump_generation(p, listing_too_large=ListingTooLarge, limit=limit)
+        return ingress.pump_generation(p, listing_too_large=ListingTooLarge, limit=limit,
+                                       horizon_s=horizon_s, now=now)
 
     def state(self, eid, gen=None):
         st = ingress.journal_state(self.state_dir, self.lid, gen or self.gen, "notice", LINK,
@@ -210,6 +216,94 @@ class DispatchTests(_Pump):
         counts = self.pump()
         self.assertEqual(counts.get("hop_listing_too_large"), 1)
         self.assertEqual(self.port.reads, [])
+
+
+class RemovalTests(_Pump):
+    """RL-E8b's interim rule (the remover not offered): a waiting record
+    becomes its tombstone only when the horizon has passed AND the entry is
+    gone upstream; a tombstone is kept at least the horizon."""
+
+    def placed(self):
+        self.port.entries[E1] = entry(E1)
+        self.pump()
+        self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
+
+    def test_an_entry_still_upstream_keeps_waiting_past_the_horizon(self):
+        self.placed()
+        self.pump(now=LATER)
+        self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
+
+    def test_an_entry_gone_before_the_horizon_keeps_waiting(self):
+        self.placed()
+        del self.port.entries[E1]
+        self.pump()
+        self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
+
+    def test_gone_and_past_the_horizon_is_a_tombstone_that_still_dedups(self):
+        self.placed()
+        del self.port.entries[E1]
+        self.pump(now=LATER)
+        self.assertEqual(self.state(E1), (ingress.COMPLETE, None))
+        # Re-published within the tombstone's life: a duplicate, removed again.
+        self.port.entries[E1] = entry(E1)
+        self.pump(now=LATER)
+        self.assertEqual(self.state(E1), (ingress.PUBLISHED_WAITING_REMOVE, None))
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_a_tombstone_past_the_horizon_is_dropped_with_its_snapshot(self):
+        self.placed()
+        del self.port.entries[E1]
+        self.pump(now=LATER)
+        self.assertEqual(self.snapshots(), [E1])
+        # The tombstone was written at the real clock: its age runs from there.
+        written = datetime.now(timezone.utc)
+        self.pump(now=written + timedelta(seconds=HORIZON - 60))
+        self.assertEqual(self.state(E1), (ingress.COMPLETE, None), "dropped too early")
+        self.pump(now=written + timedelta(seconds=HORIZON + 60))
+        self.assertIsNone(self.state(E1))
+        self.assertEqual(self.snapshots(), [])
+
+    def test_a_held_record_is_never_dropped(self):
+        self.port.entries[E1] = entry(E1, to=addr("charlie"))
+        self.pump()
+        del self.port.entries[E1]
+        self.pump(now=MUCH_LATER + timedelta(seconds=HORIZON))
+        self.assertEqual(self.state(E1), (ingress.HELD, "recipient_not_this_identity"))
+        with self.assertRaises(ingress.JournalError):
+            ingress.drop_tombstone(self.state_dir, self.lid, self.gen, "notice",
+                                   ingress.key_for("notice", LINK, self.gen, E1))
+
+    def test_a_quarantined_entry_follows_the_same_rule(self):
+        self.port.entries[E1] = "notice_invalid"
+        self.pump()
+        del self.port.entries[E1]
+        self.pump(now=LATER)
+        self.assertEqual(self.state(E1), (ingress.QUARANTINED_COMPLETE, None))
+
+    def test_an_old_first_seen_entry_warns_and_is_still_placed(self):
+        old = "Mon, 01 Jan 2024 00:00:00 +0000"
+        b = make(nid=E1, to=addr("bravo"))
+        sp = json.loads(base64.b64decode(b["spool"]))
+        sp["date"] = old
+        b["spool"] = base64.b64encode(json.dumps(sp).encode()).decode()
+        self.port.entries[E1] = enc(b)
+        with self.assertLogs("amap_router_local.ingress", "WARNING") as logs:
+            counts = self.pump()
+        self.assertEqual(counts.get("hop_republished_after_horizon"), 1)
+        self.assertIn("hop_republished_after_horizon", logs.output[0])
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_a_recent_or_unparseable_date_does_not_warn(self):
+        for date in ("garbage", ""):
+            with self.subTest(date=date):
+                eid = E2 if date else E3
+                b = make(nid=eid, to=addr("bravo"))
+                sp = json.loads(base64.b64decode(b["spool"]))
+                sp["date"] = date
+                b["spool"] = base64.b64encode(json.dumps(sp).encode()).decode()
+                self.port.entries[eid] = enc(b)
+                counts = self.pump()
+                self.assertNotIn("hop_republished_after_horizon", counts)
 
 
 class LateTests(_Pump):
