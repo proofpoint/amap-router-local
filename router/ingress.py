@@ -26,16 +26,21 @@ the state directory as its durable root).
 
 from __future__ import annotations
 
+import base64 as _base64
+import binascii as _binascii
 import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import generations as generations_mod
+from . import transport as transport_mod
 from .hoplink import canonical
-from .util import atomic_write, utc_ts
+from .util import _mkdir_durable, atomic_write, fsync_dir, utc_ts
 
 SCHEMA = "amap-router-local.ingress-journal/1"
 DIR_NAME = "ingress"
@@ -261,11 +266,6 @@ def facts_version(facts: Any) -> int:
 # The notice bundle, validated as HOSTILE input before anything is kept.
 # ---------------------------------------------------------------------------
 
-import base64 as _base64  # noqa: E402
-import binascii as _binascii  # noqa: E402
-
-from . import transport as transport_mod  # noqa: E402
-
 #: The decoded cap on the notice and on the spool document, each.
 DOC_CAP = 1 << 20
 
@@ -274,7 +274,8 @@ BUNDLE_MEMBERS = ("attachments", "hop", "notice", "schema", "spool")
 
 class BundleRefused(Exception):
     """The bundle is not one this router keeps. `.reason` names why:
-    `bundle_schema` (not the current bundle version) or `bundle_invalid`
+    `bundle_schema` (not the current bundle version), `entry_id_mismatch`
+    (the notice's `notice_id` is not the listed entry) or `bundle_invalid`
     (anything else about its shape, encoding, caps or digests)."""
 
     def __init__(self, reason: str, detail: str):
@@ -372,3 +373,242 @@ def parse_bundle(raw: bytes, entry_id: str, *, attachment_cap: int) -> Dict[str,
     return {"notice": notice, "spool": spool, "facts": facts,
             "raw": {"notice": notice_raw, "spool": spool_raw, "facts": facts_raw},
             "attachments": blobs}
+
+
+# ---------------------------------------------------------------------------
+# Snapshots: the validated bundle's bytes, kept beside the record so that
+# placement and every later re-evaluation work from what was READ, never from
+# a second read upstream.
+#
+# `<kind dir>/<key>.snap/`, mode 0700, holding mode-0600 regular files:
+# `id` (the canonical {kind, link, gen, entry_id}, which re-derives the key),
+# `notice`, `spool`, `hop`, and `att-<k>` for each attachment k with bytes.
+# Every file is fsynced, then the directory, then its parent, before
+# `take_snapshot` returns the digests the caller journals (`prepared`, or a
+# hold that keeps its snapshot). `verify_snapshot` checks the whole directory
+# against those digests and fails closed on any difference.
+# ---------------------------------------------------------------------------
+
+SNAP_SUFFIX = ".snap"
+SNAP_PARTS = ("notice", "spool", "hop")
+
+
+class SnapshotInvalid(Exception):
+    """A kept snapshot that does not match its journalled digests. `.what`
+    names the defect; the record is held as `snapshot_invalid:<what>`."""
+
+    def __init__(self, what: str, detail: str):
+        super().__init__(f"snapshot_invalid:{what}: {detail}")
+        self.what = what
+
+    @property
+    def reason(self) -> str:
+        return f"snapshot_invalid:{self.what}"
+
+
+def snapshot_dir(state_dir: Path, logical_id: str, gen: str, kind: str, key: str) -> Path:
+    if not _KEY_RE.fullmatch(key):
+        raise ValueError(f"not a journal key: {key!r}")
+    return kind_dir(state_dir, logical_id, gen, kind) / f"{key}{SNAP_SUFFIX}"
+
+
+def _id_bytes(kind: str, link: str, gen: str, entry_id: str) -> bytes:
+    return canonical({"kind": kind, "link": link, "gen": gen, "entry_id": entry_id})
+
+
+def _write_new(dir_fd: int, name: str, data: bytes) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                 dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _discard_uncommitted(path: Path) -> None:
+    """Remove a snapshot directory no record references: what a crash between
+    its first file and the journal write left. Only a real directory is
+    removed; anything else at that name is damage and raises."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        raise SnapshotInvalid("not_a_directory", f"{path} exists and is not a directory")
+    shutil.rmtree(path)
+    fsync_dir(path.parent)
+
+
+def take_snapshot(state_dir: Path, logical_id: str, gen: str, kind: str, link: str,
+                  entry_id: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep `parsed` (what `parse_bundle` returned) durably, and return the
+    digests to journal: `{"notice", "spool", "hop": sha256,
+    "attachments": [sha256 | None]}`. Call it only while the entry's record
+    references NO snapshot: a directory found already is an uncommitted
+    leftover and is replaced."""
+    key = key_for(kind, link, gen, entry_id)
+    path = snapshot_dir(state_dir, logical_id, gen, kind, key)
+    _mkdir_durable(path.parent, Path(state_dir))
+    _discard_uncommitted(path)
+    os.mkdir(path, 0o700)
+    os.chmod(path, 0o700)
+    raw = parsed["raw"]
+    files = [("id", _id_bytes(kind, link, gen, entry_id))]
+    files += [(part, raw[{"hop": "facts"}.get(part, part)]) for part in SNAP_PARTS]
+    files += [(f"att-{k}", blob) for k, blob in enumerate(parsed["attachments"])
+              if blob is not None]
+    dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name, data in files:
+            _write_new(dfd, name, data)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    fsync_dir(path.parent)
+    digests: Dict[str, Any] = {part: hashlib.sha256(raw[{"hop": "facts"}.get(part, part)])
+                               .hexdigest() for part in SNAP_PARTS}
+    digests["attachments"] = [None if b is None else hashlib.sha256(b).hexdigest()
+                              for b in parsed["attachments"]]
+    return digests
+
+
+def _cap_for(name: str, attachment_cap: int) -> int:
+    if name == "id":
+        return RECORD_MAX
+    if name == "hop":
+        return transport_mod.HOP_FACTS_MAX
+    if name in ("notice", "spool"):
+        return DOC_CAP
+    return attachment_cap
+
+
+def verify_snapshot(state_dir: Path, logical_id: str, gen: str, kind: str, link: str,
+                    entry_id: str, digests: Any, *,
+                    attachment_cap: int) -> Dict[str, Any]:
+    """The kept bytes, `{"notice", "spool", "hop": bytes, "attachments":
+    [bytes | None]}`, after checking the whole directory against `digests`
+    (the journalled ones). Raises `SnapshotInvalid` naming the first defect:
+    `digests` (absent or malformed in the record), `missing` (no directory,
+    or a member absent), `not_a_directory`, `mode`, `symlink`, `not_regular`,
+    `links` (a link count other than 1), `unexpected` (a member the digests
+    do not name), `over_cap`, `identity` (the `id` member is not this entry)
+    or `hash`."""
+    if not (isinstance(digests, dict) and set(digests) == set(SNAP_PARTS) | {"attachments"}
+            and all(isinstance(digests[p], str) and _KEY_RE.fullmatch(digests[p])
+                    for p in SNAP_PARTS)
+            and isinstance(digests["attachments"], list)
+            and all(d is None or (isinstance(d, str) and _KEY_RE.fullmatch(d))
+                    for d in digests["attachments"])):
+        raise SnapshotInvalid("digests", "the record carries no well-formed snapshot digests")
+    key = key_for(kind, link, gen, entry_id)
+    path = snapshot_dir(state_dir, logical_id, gen, kind, key)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        raise SnapshotInvalid("missing", f"{path} is absent") from None
+    if stat.S_ISLNK(st.st_mode):
+        raise SnapshotInvalid("symlink", f"{path} is a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise SnapshotInvalid("not_a_directory", f"{path} is not a directory")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        raise SnapshotInvalid("mode", f"{path} is mode {stat.S_IMODE(st.st_mode):o}, not 700")
+    expected = {"id": None}
+    expected.update({p: digests[p] for p in SNAP_PARTS})
+    expected.update({f"att-{k}": d for k, d in enumerate(digests["attachments"])
+                     if d is not None})
+    dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        present = sorted(os.listdir(dfd))
+        extra = sorted(set(present) - set(expected))
+        if extra:
+            raise SnapshotInvalid("unexpected", f"{path}: members {extra}")
+        got: Dict[str, bytes] = {}
+        for name in sorted(expected):
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except FileNotFoundError:
+                raise SnapshotInvalid("missing", f"{path}: no member {name}") from None
+            except OSError as e:
+                if stat.S_ISLNK(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode):
+                    raise SnapshotInvalid("symlink", f"{path}/{name} is a symlink") from None
+                raise SnapshotInvalid("not_regular", f"{path}/{name}: {e.strerror}") from None
+            try:
+                fst = os.fstat(fd)
+                if not stat.S_ISREG(fst.st_mode):
+                    raise SnapshotInvalid("not_regular", f"{path}/{name} is not a regular file")
+                if fst.st_nlink != 1:
+                    raise SnapshotInvalid("links", f"{path}/{name} has {fst.st_nlink} links")
+                if stat.S_IMODE(fst.st_mode) != 0o600:
+                    raise SnapshotInvalid(
+                        "mode", f"{path}/{name} is mode {stat.S_IMODE(fst.st_mode):o}, not 600")
+                cap = _cap_for(name, attachment_cap)
+                data = b""
+                while len(data) <= cap:
+                    chunk = os.read(fd, cap + 1 - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                os.close(fd)
+            if len(data) > cap:
+                raise SnapshotInvalid("over_cap", f"{path}/{name} is over {cap} bytes")
+            got[name] = data
+    finally:
+        os.close(dfd)
+    if got["id"] != _id_bytes(kind, link, gen, entry_id):
+        raise SnapshotInvalid("identity", f"{path}: the id member is not this entry")
+    for name, want in expected.items():
+        if want is not None and hashlib.sha256(got[name]).hexdigest() != want:
+            raise SnapshotInvalid("hash", f"{path}/{name}: sha256 differs from the journal")
+    return {"notice": got["notice"], "spool": got["spool"], "hop": got["hop"],
+            "attachments": [None if d is None else got[f"att-{k}"]
+                            for k, d in enumerate(digests["attachments"])]}
+
+
+def snapshots(state_dir: Path, logical_id: str, gen: str, kind: str) -> List[str]:
+    """Read-only enumeration: the `entry_id` of every snapshot directory of
+    one kind in one generation, from each directory's own `id` member. A
+    directory whose name is not a key, or whose `id` is unreadable or does not
+    re-derive its key, raises `SnapshotInvalid`: an enumeration that skipped
+    one could prove a false absence."""
+    d = kind_dir(state_dir, logical_id, gen, kind)
+    try:
+        names = sorted(os.listdir(d))
+    except FileNotFoundError:
+        return []
+    out = []
+    for name in names:
+        if not name.endswith(SNAP_SUFFIX):
+            continue
+        key = name[:-len(SNAP_SUFFIX)]
+        if not _KEY_RE.fullmatch(key):
+            raise SnapshotInvalid("identity", f"{d / name}: not a snapshot name")
+        try:
+            dfd = os.open(d / name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                fd = os.open("id", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            raise SnapshotInvalid("missing", f"{d / name}: no readable id ({e.strerror})") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise SnapshotInvalid("not_regular", f"{d / name}/id is not a regular file")
+            raw = os.read(fd, RECORD_MAX + 1)
+        finally:
+            os.close(fd)
+        try:
+            ident = json.loads(raw.decode("utf-8"))
+            ok = (isinstance(ident, dict) and ident.get("kind") == kind
+                  and ident.get("gen") == gen
+                  and key_for(kind, ident.get("link"), gen, ident.get("entry_id")) == key)
+        except (UnicodeDecodeError, ValueError):
+            ok = False
+        if not ok:
+            raise SnapshotInvalid("identity", f"{d / name}: its id does not match its name")
+        out.append(ident["entry_id"])
+    return out
