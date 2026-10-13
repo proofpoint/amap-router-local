@@ -88,6 +88,9 @@ NAME_MAX = 255
 
 #: The host intakes under the hop root (contract §4.1).
 INTAKES = (".unresolved", ".control")
+#: This router's own disposal-tombstone directories, one per host intake,
+#: under the hop root (`.disposed/<intake>/`), created by the deploy.
+DISPOSED_DIR = ".disposed"
 #: The runtime control tree's generations (logical_id "runtime": this
 #: router's control transport) live under this name instead of a logical_id.
 RUNTIME_DIR = ".runtime"
@@ -239,6 +242,7 @@ HOP_ROOT = "hop-root"            # the hop root itself, and `<logical_id>/` dirs
 GENERATION = "generation"        # a generation tree, published or staging
 INTAKE = "intake"                # a host intake
 PRIVATE = "private"              # one of this writer's private roots
+DISPOSED = "disposed"            # `.disposed/` and its per-intake directories: this writer's
 
 
 @dataclass(frozen=True)
@@ -263,12 +267,14 @@ class Binding:
             return self.rel in (("up", "stage"), ("down", "stage"))
         if self.kind in (INTAKE, PRIVATE):
             return self.rel == (".stage",)
+        if self.kind == DISPOSED:
+            return len(self.rel) == 3 and self.rel[2] == ".stage"
         return False
 
     @property
     def trusted_links(self) -> bool:
         """Whether a link count of 2 is a commit in flight (NOT_YET) here."""
-        return self.kind in (GENERATION, INTAKE)
+        return self.kind in (GENERATION, INTAKE, DISPOSED)
 
 
 #: What a destination-tag component may contain (the Protocol's tag grammar).
@@ -455,6 +461,10 @@ class FsOps:
             return HOP_ROOT, idents[0], ()
         if parts[0] in INTAKES:
             return INTAKE, idents[1], parts[1:]
+        if parts[0] == DISPOSED_DIR:
+            if len(parts) >= 2 and parts[1] not in INTAKES:
+                raise BindingError(f"{DISPOSED_DIR}/ holds only {list(INTAKES)}")
+            return DISPOSED, idents[0], parts
         if len(parts) == 1:
             return HOP_ROOT, idents[0], parts
         return GENERATION, idents[2], parts[2:]
@@ -467,10 +477,70 @@ class FsOps:
             parts = parent.rel + (name,)
             if parts[0] in INTAKES and len(parts) == 1:
                 return self._register(fd, INTAKE, here, ())
+            if parts == (DISPOSED_DIR,):
+                return self._register_disposed(fd, parent.tree, parts)
             if len(parts) == 1:
                 return self._register(fd, HOP_ROOT, parent.tree, parts)
             return self._register(fd, GENERATION, here, ())
+        if parent.kind == DISPOSED:
+            rel = parent.rel + (name,)
+            if len(rel) == 2 and name not in INTAKES:
+                raise BindingError(f"{DISPOSED_DIR}/ holds only {list(INTAKES)}")
+            return self._register_disposed(fd, parent.tree, rel)
         return self._register(fd, parent.kind, parent.tree, parent.rel + (name,))
+
+    def _register_disposed(self, fd: int, tree: Tuple[int, int],
+                           rel: Tuple[str, ...]) -> Binding:
+        """A `.disposed/` binding: this writer's own directories, so each one
+        must be owned by this process. The tree is the hop root's, so a
+        tombstone's destination tag is that of `.disposed/<intake>` rooted at
+        the hop root (`9-.disposed.8-.control`)."""
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise BindingError(f"{'/'.join(rel)} is owned by uid {st.st_uid}, not this writer")
+        return self._register(fd, DISPOSED, tree, rel)
+
+    def open_disposed_stage_dir(self, intake_fd: int) -> int:
+        """The writer-private 0700 `.stage/` of a `.disposed/<intake>/`
+        directory, created durably if missing, validated otherwise and never
+        repaired, pinned once. NOT part of `transport.HopFsOps`: only this
+        router writes tombstones."""
+        tree = self.binding(intake_fd)
+        if tree.kind != DISPOSED or len(tree.rel) != 2:
+            raise ValueError(f"open_disposed_stage_dir needs a {DISPOSED_DIR}/<intake> directory")
+        key = (tree.tree, "disposed", tree.rel)
+        with self._lock:
+            cached = self._stage_cache.get(key)
+        if cached is not None:
+            try:
+                self.binding(cached)
+                return cached
+            except BindingError:
+                pass
+        try:
+            os.mkdir(".stage", 0o700, dir_fd=intake_fd)
+            created = True
+        except FileExistsError:
+            created = False
+        fd = os.open(".stage", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=intake_fd)
+        try:
+            if created:
+                os.fchmod(fd, 0o700)
+            st = os.fstat(fd)
+            if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
+                raise BindingError(
+                    f"tombstone stage directory is not this writer's 0700 directory "
+                    f"(uid {st.st_uid}, mode {oct(stat.S_IMODE(st.st_mode))}); "
+                    "refusing, never repairing")
+            os.fsync(intake_fd)
+            self._register(fd, DISPOSED, tree.tree, tree.rel + (".stage",))
+        except BaseException:
+            os.close(fd)
+            raise
+        with self._lock:
+            self._stage_cache[key] = fd
+            self._validated_stages.add((st.st_dev, st.st_ino))
+        return fd
 
     # -- opening ------------------------------------------------------------
 
@@ -1240,6 +1310,8 @@ def _inside_stage(b: Binding) -> bool:
         return b.rel[:2] in (("up", "stage"), ("down", "stage"))
     if b.kind in (INTAKE, PRIVATE):
         return b.rel[:1] == (".stage",)
+    if b.kind == DISPOSED:
+        return b.rel[2:3] == (".stage",)
     return False
 
 

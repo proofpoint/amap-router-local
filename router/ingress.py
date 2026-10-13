@@ -2977,18 +2977,26 @@ def status_doc(cfg: Any, last_pump: Optional[Dict[str, Dict[str, int]]] = None
         "ingress_dedup_horizon_s": cfg.ingress_dedup_horizon_days * 86400,
         "inbound": "on" if (cfg.hop is not None and cfg.hop.link is not None) else "off",
         "generations": {}, "last_pump": dict(last_pump or {})}
-    control = quarantine_mod.control_dir_for(cfg)
-    if control is not None:
+    for source in (quarantine_mod.SOURCE_CONTROL, quarantine_mod.SOURCE_UNRESOLVED):
+        intake = quarantine_mod.intake_dir_for(cfg, source)
+        if intake is None:
+            continue
         # COUNT-ONLY: the downstream runtime's items, listed read-only;
-        # "expired" is past this router's report threshold (its owner sweeps).
-        items = quarantine_mod.list_control(control, days=cfg.ingress_quarantine_days)
+        # "expired" is past this router's report threshold. An entry this
+        # router has disposed of (its tombstone) is counted apart: it waits
+        # only for its owner's removal, never counted as an item or expired.
+        listed = quarantine_mod.list_control(
+            intake, days=cfg.ingress_quarantine_days, source=source,
+            disposed_dir=quarantine_mod.disposed_dir_for(cfg, source))
+        items = [i for i in listed if not i.meta.get("disposed")]
         ages = [i.age_s for i in items if i.age_s is not None]
-        out["control"] = {
+        out[source] = {
             "items": len(items),
             "expired": sum(1 for i in items if i.expires_in_s is not None
                            and i.expires_in_s <= 0),
             "in_flight": sum(1 for i in items if i.meta.get("in_flight")),
             "damaged": sum(1 for i in items if i.damaged is not None),
+            "disposed_pending_removal": len(listed) - len(items),
             "oldest_age_s": max(ages) if ages else None,
             "report_threshold_s": cfg.ingress_quarantine_days * 86400}
     try:

@@ -25,10 +25,12 @@ def _methods(proto):
 class ShapeTests(unittest.TestCase):
 
     def test_the_version(self):
-        self.assertEqual(transport.PLUGIN_API, (3, 1))
+        self.assertEqual(transport.PLUGIN_API, (3, 3))
         self.assertEqual(transport.REQUIRED_MINOR, 0)
         self.assertEqual(dict(transport.OPTIONAL_FACTORIES),
-                         {"make_intake_remover": ((3, 1), "HopFsOps")})
+                         {"make_intake_remover": ((3, 1), "HopFsOps"),
+                          "make_peer_codec": ((3, 3), None),
+                          "make_peer_errors": ((3, 3), transport.NO_ARGUMENTS)})
         for name, (since, _port) in transport.OPTIONAL_FACTORIES.items():
             self.assertGreater(since[1], transport.REQUIRED_MINOR, name)
         self.assertEqual(transport.REQUIRED_FACTORIES,

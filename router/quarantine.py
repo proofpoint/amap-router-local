@@ -84,6 +84,7 @@ import json
 import os
 import re
 import stat
+from types import MappingProxyType
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,7 +103,17 @@ GEN_PREFIX = "gen-"
 
 SOURCE_INGRESS = "ingress"
 SOURCE_CONTROL = "control"
-SOURCES = (SOURCE_INGRESS, SOURCE_CONTROL)
+SOURCE_UNRESOLVED = "unresolved"
+SOURCES = (SOURCE_INGRESS, SOURCE_CONTROL, SOURCE_UNRESOLVED)
+#: The two host intakes under `hop.root`, by source. Both are the downstream
+#: runtime's, listed read-only with the same rules and the same age clock.
+INTAKES = MappingProxyType({SOURCE_CONTROL: ".control", SOURCE_UNRESOLVED: ".unresolved"})
+#: Where this router's disposal tombstones for them live, under `hop.root`.
+DISPOSED_DIR = ".disposed"
+TOMBSTONE_MAX_BYTES = 4096
+_TOMBSTONE_KEYS = frozenset({"v", "intake", "id", "candidate_sha256", "disposition",
+                             "disposed_at"})
+_DISPOSITIONS = frozenset({"placed", "mail", "dropped", "refused", "demoted"})
 
 #: This router's own cause for cold trusted-host traffic. The profile's §5
 #: causes are added beside it once published (module docstring).
@@ -374,17 +385,32 @@ def _list_generation(lid_fd: int, gen_name: str, gen: str, name: str, days: int,
 def control_dir_for(cfg: Any) -> Optional[Path]:
     """The `.control/` intake: `<hop.root>/.control/` when `hop` is
     configured, else None (module docstring)."""
+    return intake_dir_for(cfg, SOURCE_CONTROL)
+
+
+def intake_dir_for(cfg: Any, source: str) -> Optional[Path]:
+    """A host intake (`INTAKES`) under `hop.root`, or None without `hop`."""
     hop = getattr(cfg, "hop", None)
-    return None if hop is None else Path(hop.root) / ".control"
+    return None if hop is None else Path(hop.root) / INTAKES[source]
+
+
+def disposed_dir_for(cfg: Any, source: str) -> Optional[Path]:
+    """This router's tombstone directory for a host intake, or None."""
+    hop = getattr(cfg, "hop", None)
+    return None if hop is None else Path(hop.root) / DISPOSED_DIR / INTAKES[source]
 
 
 def list_control(control_dir: Path, *, now: Optional[str] = None,
-                 days: Optional[int] = None) -> List[Item]:
-    """Every entry in the `.control/` intake, metadata only (module
-    docstring). Never moves, opens for writing, or deletes anything. With
-    `days` (the report threshold), each item's `expires_in_s` is how long
-    until it counts as expired; at or below zero it IS expired, reported and
-    left for its owner's sweep."""
+                 days: Optional[int] = None, source: str = SOURCE_CONTROL,
+                 disposed_dir: Optional[Path] = None) -> List[Item]:
+    """Every entry in a host intake (`.control/` by default, `.unresolved/`
+    with `source=SOURCE_UNRESOLVED`), metadata only (module docstring).
+    Never moves, opens for writing, or deletes anything. With `days` (the
+    report threshold), each item's `expires_in_s` is how long until it
+    counts as expired; at or below zero it IS expired, reported and left for
+    its owner. With `disposed_dir`, an entry this router has DISPOSED of (a
+    valid tombstone naming it and its candidate's digest) is marked
+    `disposed` and given no expiry: it waits only for its owner's removal."""
     now_dt = _now(now)
     try:
         c_fd = _open_dir(str(control_dir))
@@ -395,8 +421,13 @@ def list_control(control_dir: Path, *, now: Optional[str] = None,
         for entry in sorted(os.listdir(c_fd)):
             if entry == STAGE_NAME:
                 continue    # the writer's own stage, never an item
-            item = _control_item(c_fd, entry, now_dt)
-            if days is not None and item.age_s is not None:
+            item = _control_item(c_fd, entry, now_dt, source)
+            if (disposed_dir is not None and item.damaged is None
+                    and "candidate_sha256" in item.meta
+                    and tombstone_valid(disposed_dir, INTAKES[source], entry,
+                                        item.meta["candidate_sha256"])):
+                item.meta["disposed"] = True
+            elif days is not None and item.age_s is not None:
                 item.expires_in_s = days * 86400 - item.age_s
             out.append(item)
         return out
@@ -404,35 +435,64 @@ def list_control(control_dir: Path, *, now: Optional[str] = None,
         os.close(c_fd)
 
 
-def _control_item(c_fd: int, entry: str, now: datetime) -> Item:
+def tombstone_valid(disposed_dir: Path, intake: str, ident: str, candidate_sha256: str) -> bool:
+    """True only when this router's tombstone for `ident` exists and every
+    rule holds: read with no symlink followed, a regular file at ONE link
+    (two is a commit in progress: not yet), owned by this process, at most
+    0640, strict JSON with exactly the closed members, `v` 1, naming this
+    intake and id, and carrying this candidate's digest."""
+    try:
+        d_fd = _open_dir(str(disposed_dir))
+    except OSError:
+        return False
+    try:
+        raw, st = read_pinned(d_fd, ident, TOMBSTONE_MAX_BYTES)
+    except Damaged:
+        return False
+    finally:
+        os.close(d_fd)
+    if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & ~0o640:
+        return False
+    try:
+        doc = _strict_json(raw)
+    except Damaged:
+        return False
+    return (isinstance(doc, dict) and set(doc) == _TOMBSTONE_KEYS and doc["v"] == 1
+            and type(doc["v"]) is int and doc["intake"] == intake and doc["id"] == ident
+            and doc["candidate_sha256"] == candidate_sha256
+            and doc["disposition"] in _DISPOSITIONS
+            and isinstance(doc["disposed_at"], str) and bool(_TS.fullmatch(doc["disposed_at"])))
+
+
+def _control_item(c_fd: int, entry: str, now: datetime, source: str = SOURCE_CONTROL) -> Item:
     if not _HEX32.fullmatch(entry):
-        return Item(SOURCE_CONTROL, "-", "-", display(entry), damaged="an unexpected name")
+        return Item(source, "-", "-", display(entry), damaged="an unexpected name")
     try:
         d_fd = _open_dir(entry, c_fd)
     except OSError:
-        return Item(SOURCE_CONTROL, "-", "-", entry,
+        return Item(source, "-", "-", entry,
                     damaged="not a directory reachable without a link")
     try:
         raw, st = read_pinned(d_fd, "candidate.json", CANDIDATE_MAX_BYTES)
     except Missing:
         # Its writer commits candidate.json LAST: a directory without one is
         # not yet an item, listed in flight, and nothing in it is read.
-        return Item(SOURCE_CONTROL, "-", "-", entry,
+        return Item(source, "-", "-", entry,
                     meta={"in_flight": True, "why": IN_FLIGHT_NO_SENTINEL})
     except Linked as e:
         if e.nlink == 2:
             # Its writer commits candidate.json by link, then removes the
             # staged name: two links is a commit caught in progress, listed
             # as such and never read. Anything else stays DAMAGED.
-            return Item(SOURCE_CONTROL, "-", "-", entry,
+            return Item(source, "-", "-", entry,
                         meta={"in_flight": True, "why": IN_FLIGHT_COMMITTING})
-        return Item(SOURCE_CONTROL, "-", "-", entry, damaged=f"candidate.json: {e}")
+        return Item(source, "-", "-", entry, damaged=f"candidate.json: {e}")
     except Damaged as e:
-        return Item(SOURCE_CONTROL, "-", "-", entry, damaged=f"candidate.json: {e}")
+        return Item(source, "-", "-", entry, damaged=f"candidate.json: {e}")
     finally:
         os.close(d_fd)
     mtime = datetime.fromtimestamp(int(st.st_mtime), tz=timezone.utc)
-    return Item(SOURCE_CONTROL, "-", "-", entry, age_s=int((now - mtime).total_seconds()),
+    return Item(source, "-", "-", entry, age_s=int((now - mtime).total_seconds()),
                 meta={"candidate_bytes": len(raw),
                       "candidate_sha256": hashlib.sha256(raw).hexdigest(),
                       "candidate_mtime": mtime.strftime("%Y-%m-%dT%H:%M:%SZ")})
@@ -443,9 +503,12 @@ def _control_item(c_fd: int, entry: str, now: datetime) -> Item:
 def render_line(item: Item) -> str:
     if item.damaged is not None:
         return f"{item.key()} DAMAGED {display(item.damaged)}"
-    if item.source == SOURCE_CONTROL and item.meta.get("in_flight"):
+    if item.source in INTAKES and item.meta.get("in_flight"):
         return f"{item.key()} IN FLIGHT ({item.meta['why']})"
-    if item.source == SOURCE_CONTROL:
+    if item.source in INTAKES and item.meta.get("disposed"):
+        return (f"{item.key()} candidate age={item.age_s}s bytes={item.meta['candidate_bytes']}"
+                " disposed (its writer removes it)")
+    if item.source in INTAKES:
         line = f"{item.key()} candidate age={item.age_s}s bytes={item.meta['candidate_bytes']}"
         if item.expires_in_s is not None:
             line += (f" expires_in={item.expires_in_s}s" if item.expires_in_s > 0
@@ -465,11 +528,11 @@ def render_show(item: Item) -> str:
     if item.damaged is not None:
         doc["status"] = "damaged"
         doc["reason"] = item.damaged
-    elif item.source == SOURCE_CONTROL and item.meta.get("in_flight"):
+    elif item.source in INTAKES and item.meta.get("in_flight"):
         doc["status"] = "in_flight"
         doc["why"] = item.meta["why"]
-    elif item.source == SOURCE_CONTROL:
-        doc["status"] = "candidate"
+    elif item.source in INTAKES:
+        doc["status"] = "disposed" if item.meta.get("disposed") else "candidate"
         doc.update(item.meta)
         doc["age_s"] = item.age_s
     else:

@@ -246,6 +246,7 @@ from . import audit as audit_mod
 from . import generations as generations_mod
 from . import inflight as inflight_mod
 from . import lock as lock_mod
+from .peerlane import PEER_LEDGER_DIR
 from . import registry as registry_mod
 from .config import RouterConfig, instance_state_dir, state_key
 from .util import (
@@ -278,8 +279,12 @@ _OUTCOMES = "outcomes"
 # The `state_dir/<name>` entries a reset preserves (module docstring): the
 # audit log, and the transport req_id counter, which must never restart —
 # the ids it already handed to the external leg must not be reused
-# (`router/inflight.py`). In-flight RECORDS are not preserved.
-_STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR)
+# (`router/inflight.py`). In-flight RECORDS are not preserved. And the peer
+# ledger (`router/peerlane.py`): under a registry a reset FENCES the current
+# generation and keeps it, its in-flight peer tasks can still be handed over
+# AFTER the reset, and a reply or control notice to one of them must still
+# resolve. Only the retention overlay ever prunes it.
+_STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR, PEER_LEDGER_DIR)
 
 
 def _kept(cfg: RouterConfig, entry_name: str, *, blocker: bool = False) -> bool:

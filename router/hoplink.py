@@ -39,6 +39,11 @@ MAIL_KIND = "mail"
 #: The envelope kind of a reply bound to a placed hop mail (`bound`, below):
 #: begun only from this router's own ledger record of that mail.
 BOUND_REPLY_KIND = "bound_reply"
+#: The two SIGNED kinds (`router/peerlane.py`): their envelope carries `peer`
+#: (`peer_problem`), never `bound`.
+PEER_KIND = "peer"
+CONTROL_KIND = "control"
+SIGNED_KINDS = (PEER_KIND, CONTROL_KIND)
 #: The most raw `to` + `cc` (+ `bcc`) entries one request may name,
 #: duplicates counted (`too_many_recipients`).
 MAX_RECIPIENTS = 100
@@ -247,21 +252,33 @@ def document_floor(*, request_cap: int, count_cap: int, file_cap: int, total_cap
 
 def build_handover(request: Dict[str, Any], *, from_address: str, version_write: int,
                    attachments: Iterable[str], settled_through: int,
-                   kind: str = MAIL_KIND, bound: Optional[Dict[str, Any]] = None) -> bytes:
+                   kind: str = MAIL_KIND, bound: Optional[Dict[str, Any]] = None,
+                   peer: Optional[Dict[str, Any]] = None) -> bytes:
     """The handover document's canonical bytes. `attachments` are standard
     base64 strings in descriptor order. `kind` is `MAIL_KIND`, with no
     `bound`, or `BOUND_REPLY_KIND`, whose envelope carries `bound` (which
-    must pass `bound_problem`). `ValueError` for anything the encoding
-    refuses, or for any other combination."""
+    must pass `bound_problem`), or `PEER_KIND` / `CONTROL_KIND`, whose
+    envelope carries `peer` (`peer_problem`). `ValueError` for anything the
+    encoding refuses, or for any other combination."""
     envelope: Dict[str, Any] = {"from_address": from_address, "hop_contract": version_write,
                                 "kind": kind}
     if kind == BOUND_REPLY_KIND:
+        if peer is not None:
+            raise ValueError("a bound reply carries no peer object")
         why = bound_problem(bound)
         if why is not None:
             raise ValueError(f"bound: {why}")
         envelope["bound"] = bound
-    elif kind != MAIL_KIND or bound is not None:
-        raise ValueError(f"kind {kind!r} with bound {'present' if bound else 'absent'}")
+    elif kind in SIGNED_KINDS:
+        if bound is not None:
+            raise ValueError(f"kind {kind!r} carries no bound object")
+        why = peer_problem(peer, from_address)
+        if why is not None:
+            raise ValueError(f"peer: {why}")
+        envelope["peer"] = peer
+    elif kind != MAIL_KIND or bound is not None or peer is not None:
+        raise ValueError(f"kind {kind!r} with bound {'present' if bound else 'absent'} and "
+                         f"peer {'present' if peer else 'absent'}")
     return canonical({
         "attachments": list(attachments),
         "envelope": envelope,
@@ -317,9 +334,57 @@ def bound_problem(bound: Any) -> Optional[str]:
     return None
 
 
+# The signed kinds' `peer` object: the hop codec's grammar for each member.
+#: The unfolded header value: the tag alphabet, no leading or trailing space.
+STATEMENT_HEADER_RE = re.compile(r"[A-Za-z0-9_=;.-](?:[A-Za-z0-9_=; .-]*[A-Za-z0-9_=;.-])?\Z")
+STATEMENT_HEADER_MAX = 11776
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]"
+_DOT_ATOM = rf"{_ATEXT}+(?:\.{_ATEXT}+)*"
+MSG_ID_RE = re.compile(rf"<{_DOT_ATOM}@({_DOT_ATOM})>\Z")
+MSG_ID_MAX = 250
+REFERENCES_MAX = 20
+PEER_MEMBERS = ("statement_header", "message_id", "in_reply_to", "references")
+
+
+def _msg_id_problem(value: Any, what: str) -> Optional[str]:
+    if not (isinstance(value, str) and len(value) <= MSG_ID_MAX and MSG_ID_RE.fullmatch(value)):
+        return f"{what} is not a msg-id"
+    return None
+
+
+def peer_problem(peer: Any, from_address: str) -> Optional[str]:
+    """Why `peer` is not a signed kind's `peer` object for an envelope from
+    `from_address`, or None. Q9: `message_id`'s domain is `from_address`'s."""
+    if not isinstance(peer, dict) or set(peer) != set(PEER_MEMBERS):
+        return f"not an object with exactly {list(PEER_MEMBERS)}"
+    header = peer["statement_header"]
+    if not (isinstance(header, str) and len(header) <= STATEMENT_HEADER_MAX
+            and STATEMENT_HEADER_RE.fullmatch(header)):
+        return "statement_header is outside its grammar"
+    why = _msg_id_problem(peer["message_id"], "message_id")
+    if why is not None:
+        return why
+    domain = MSG_ID_RE.fullmatch(peer["message_id"]).group(1)
+    if domain != str(from_address).rpartition("@")[2]:
+        return "message_id's domain is not from_address's"
+    if peer["in_reply_to"] is not None:
+        why = _msg_id_problem(peer["in_reply_to"], "in_reply_to")
+        if why is not None:
+            return why
+    refs = peer["references"]
+    if not (isinstance(refs, list) and len(refs) <= REFERENCES_MAX):
+        return f"references is not a list of at most {REFERENCES_MAX}"
+    for i, r in enumerate(refs):
+        why = _msg_id_problem(r, f"references[{i}]")
+        if why is not None:
+            return why
+    return None
+
+
 def handover_len_max(request: Dict[str, Any], *, from_address: str, version_write: int,
                      attachment_sizes: Iterable[int], kind: str = MAIL_KIND,
-                     bound: Optional[Dict[str, Any]] = None) -> int:
+                     bound: Optional[Dict[str, Any]] = None,
+                     peer: Optional[Dict[str, Any]] = None) -> int:
     """The largest the handover for `request` can be: the transport id and
     `settled_through` at their most digits, and each attachment as the
     standard base64 of its size. Computed, not built: no attachment bytes
@@ -328,7 +393,7 @@ def handover_len_max(request: Dict[str, Any], *, from_address: str, version_writ
     probe = dict(request, req_id="9" * TRANSPORT_ID_MAX_DIGITS)
     skeleton = build_handover(probe, from_address=from_address, version_write=version_write,
                               attachments=(), settled_through=10 ** TRANSPORT_ID_MAX_DIGITS - 1,
-                              kind=kind, bound=bound)
+                              kind=kind, bound=bound, peer=peer)
     if not sizes:
         return len(skeleton)
     return len(skeleton) + sum(4 * math.ceil(n / 3) + 2 for n in sizes) + len(sizes) - 1
@@ -605,7 +670,8 @@ PROCESS_STATE: Dict[str, Tuple[str, ...]] = {
     "ingress": ("_CURSORS", "_CYCLE", "LISTING_ENTRIES_HIGH", "_CURSOR_PORT", "_LINK_LATCHED",
                 "REMOVER_STATE", "_LINK_UNSET_LOGGED", "_LAST_CURRENT", "READ_REFUSALS"),
     "outbound": ("_STALE_WARNED",),
-    "service": ("LAST_INGRESS", "_REGISTRY_LOGGED"),
+    "service": ("LAST_INGRESS", "_REGISTRY_LOGGED", "_RELOAD_FAILURE"),
+    "peerlane": ("_ACTIVE",),
     "aliases": ("LAST_TOMBSTONE_ERRORS",),
 }
 

@@ -176,12 +176,12 @@ change.
 
 #: What another repo may import. Held to a no-side-effect bare import.
 PUBLIC_MODULES = ("attachments", "binding", "config", "deliver", "exposure",
-                  "lock", "outbound", "peers", "transport", "validate")
+                  "lock", "outbound", "peers", "peerverify", "transport", "validate")
 
 #: Implementation. May change shape without notice.
 INTERNAL_MODULES = ("__main__", "aliases", "audit", "classify", "console", "fsops",
-                    "generations", "hoplink", "inflight", "ingress", "outcomes", "provision",
-                    "quarantine",
+                    "generations", "hoplink", "inflight", "ingress", "outcomes", "peerlane",
+                    "provision", "quarantine",
                     "registry", "reset", "roster", "service", "status")
 
 #: Named by no ruling yet. Absent from the plan's table, not assigned by it.

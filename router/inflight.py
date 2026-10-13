@@ -565,13 +565,20 @@ _RECORD_KEYS = {
     "digest": False, "transport_req_id": True, "recipients": True, "request": True,
     "written_ts": True, "policy_digest": False, "route": False,
     "revocation_unenforceable": False, "from_address": False, "attachments": False,
-    "bound_reply": False,
+    "bound_reply": False, "peer": False,
 }
+#: A signed kind's pin (`begin`'s `peer`): the statement, its signature and
+#: header, and the envelope's `peer` members, exactly as signed at begin.
+_PEER_KEYS = frozenset({"kind", "id", "message_id", "key_id", "statement", "signature",
+                        "statement_header", "in_reply_to", "references"})
+#: The signed kinds a PRODUCTION path begins. Control notices have no
+#: producer yet, so a record pinning one is damaged, never handed over.
+PRODUCED_SIGNED_KINDS = ("peer",)
 #: A bound reply's pin (`begin`'s `bound_reply`): the ledger record's notice
 #: id, the binding members as that record carried them at begin, and the
 #: `bound` object every hand-over carries.
 _BOUND_REPLY_KEYS = frozenset({"notice_id", "binding", "bound"})
-_ROUTES = ("fleet_host", "internet")
+_ROUTES = ("fleet_host", "internet", "trusted_fleet_host")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -608,7 +615,47 @@ def check_record(doc: Any) -> Dict[str, Any]:
         _check_record_attachments(doc)
     if "bound_reply" in doc:
         _check_record_bound_reply(doc)
+    if "peer" in doc:
+        _check_record_peer(doc)
     return doc
+
+
+def _b64(value: Any, what: str) -> bytes:
+    try:
+        return base64.b64decode(value.encode("ascii"), validate=True)
+    except (AttributeError, ValueError, UnicodeEncodeError):
+        raise RecordDamaged(f"peer.{what} is not standard base64") from None
+
+
+def _check_record_peer(doc: Dict[str, Any]) -> None:
+    """The record's `peer` pin. The statement it pins must name the pinned
+    id, key id and the ONE evaluated recipient, and its kind must have a
+    production producer; the header's agreement with the statement and
+    signature is checked through the codec at every hand-over."""
+    pin = doc["peer"]
+    if not (isinstance(pin, dict) and set(pin) == _PEER_KEYS):
+        raise RecordDamaged(f"peer is not {sorted(_PEER_KEYS)}")
+    if pin["kind"] not in PRODUCED_SIGNED_KINDS:
+        raise RecordDamaged(f"peer.kind {pin['kind']!r} has no production producer")
+    if "bound_reply" in doc:
+        raise RecordDamaged("a record pins both a bound reply and a peer statement")
+    statement = _b64(pin["statement"], "statement")
+    if len(_b64(pin["signature"], "signature")) != 64:
+        raise RecordDamaged("peer.signature is not 64 bytes")
+    try:
+        sdoc = json.loads(statement.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise RecordDamaged("peer.statement is not JSON") from None
+    if not isinstance(sdoc, dict) or sdoc.get("kind") != pin["kind"]:
+        raise RecordDamaged("peer.statement's kind is not the pin's")
+    if sdoc.get("id") != pin["id"] or sdoc.get("key_id") != pin["key_id"]:
+        raise RecordDamaged("peer.statement's id or key_id is not the pin's")
+    if doc["recipients"] != [sdoc.get("to")]:
+        raise RecordDamaged("peer.statement names a recipient other than the evaluated one")
+    for key in ("statement_header", "message_id"):
+        if not isinstance(pin[key], str):
+            raise RecordDamaged(f"peer.{key} is not a string")
+
 
 
 def _check_record_bound_reply(doc: Dict[str, Any]) -> None:
@@ -697,6 +744,8 @@ def begin(
     policy_digest: Optional[str] = None, route: Optional[str] = None,
     from_address: Optional[str] = None, attachments: Optional[List[Any]] = None,
     bound_reply: Optional[Dict[str, Any]] = None,
+    peer: Optional[Dict[str, Any]] = None,
+    before_record: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Put `req_id` in flight: allocate its transport id, then write the
     record. Returns the record. A crash between the two burns the id; the
@@ -707,7 +756,9 @@ def begin(
     over. `attachments` (ingest's verified attachments) are snapshotted
     BEFORE the record is written, and the record names them. `bound_reply`
     is a bound reply's pin, written once, here: every hand-over's `bound`
-    comes from it and from nothing read later."""
+    comes from it and from nothing read later. `peer` is a signed kind's
+    pin, likewise. `before_record` runs after the snapshot and before the
+    record is written (the peer ledger's `issued` record, durable first)."""
     n = allocate_transport_req_id(cfg, name)
     snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None
     record: Dict[str, Any] = {
@@ -729,7 +780,11 @@ def begin(
         record["attachments"] = snapshot
     if bound_reply is not None:
         record["bound_reply"] = bound_reply
+    if peer is not None:
+        record["peer"] = peer
     check_record(record)
+    if before_record is not None:
+        _effect("ledger", before_record)
     _write_record(cfg, name, req_id, record, "record")
     return record
 
@@ -748,6 +803,13 @@ class FrontierUndecidable(Exception):
     (an unreadable, damaged, non-regular or symlinked record, or a failed
     listing), so `settled_through` cannot be computed: nothing is handed
     over for this generation this poll."""
+
+
+class HandoverDeferred(Exception):
+    """A signed kind's record cannot be handed over THIS poll (delegation is
+    not active): nothing is published and nothing is latched; the next poll
+    tries again. The re-check settles such a record first, so this is a
+    guard, never a route."""
 
 
 class HandoverUnavailable(Exception):
@@ -840,12 +902,42 @@ def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]
     # A bound reply's `bound` is the RECORD's pin, never re-read from the
     # ledger: identical on every retry of the same id.
     bound = record["bound_reply"]["bound"] if "bound_reply" in record else None
+    if "peer" in record:
+        pin = record["peer"]
+        _check_peer_header(cfg, pin)
+        return hoplink.build_handover(
+            doc, from_address=record["from_address"], version_write=version_write,
+            attachments=[base64.b64encode(b).decode("ascii") for b in blobs],
+            settled_through=frontier, kind=pin["kind"],
+            peer={"statement_header": pin["statement_header"], "message_id": pin["message_id"],
+                  "in_reply_to": pin["in_reply_to"], "references": list(pin["references"])})
     return hoplink.build_handover(
         doc, from_address=record["from_address"], version_write=version_write,
         attachments=[base64.b64encode(b).decode("ascii") for b in blobs],
         settled_through=frontier,
         kind=hoplink.BOUND_REPLY_KIND if bound is not None else hoplink.MAIL_KIND,
         bound=bound)
+
+
+def _check_peer_header(cfg: RouterConfig, pin: Dict[str, Any]) -> None:
+    """The pinned header re-parses, through the codec's check 1, to exactly
+    the pinned statement and signature, or `HandoverUnavailable`: a record
+    that would hand over anything else is never handed over."""
+    from . import peerlane   # local: peerlane imports this module's neighbours
+    delegation = peerlane.active(cfg)
+    if delegation is None:
+        raise HandoverDeferred("delegation is not active")
+    try:
+        kind, k, statement, signature = delegation.codec.check1(
+            [(peerlane.STATEMENT_FIELD, pin["statement_header"])])
+    except Exception as e:  # noqa: BLE001 -- classified exactly
+        if peerlane.error_kind(delegation, e) == "CodecError":
+            raise HandoverUnavailable(f"the pinned header fails check 1: {e.reason}") from None
+        raise
+    if (k != pin["key_id"] or statement != base64.b64decode(pin["statement"])
+            or signature != base64.b64decode(pin["signature"])):
+        raise HandoverUnavailable("the pinned header does not carry the pinned statement")
+
 
 
 class RecipientSetMismatch(Exception):
@@ -1177,6 +1269,10 @@ def _advance(
         return BLOCKED
     try:
         data = transport_request_bytes(cfg, name, record, req_id=req_id)
+    except HandoverDeferred as e:
+        logger.error("instance %r req %r: NOT handed over this poll: %s; retried next poll",
+                     name, req_id, e)
+        return BLOCKED
     except SnapshotDamaged as e:
         # This router's own state damage, decided BEFORE the handed marker
         # is written for this attempt. Handed over before: the request may

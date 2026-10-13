@@ -329,17 +329,53 @@ Decision = Union[Refuse, Local, Remote, PeerRemote]
 
 
 def peer_lane_available(cfg: "config_mod.RouterConfig") -> bool:
-    """Item 5e: can this router sign a cross-host peer statement? Not before
-    its signing step exists, so never, today. A seam, not a setting."""
-    return False
+    """Item 5e: can this router sign a cross-host peer statement? Only with
+    `delegation` configured AND activated (`router/peerlane.py`)."""
+    from . import peerlane   # late: peerlane is the signing side
+    return peerlane.active(cfg) is not None
+
+
+def sender_since(cfg: "config_mod.RouterConfig", sender: str) -> Optional[str]:
+    """The sender's registry `first_registered_ts`, as this poll read it, or
+    None: the statement's `sender_since`."""
+    entry = (getattr(cfg.registry_report, "entries", None) or {}).get(sender)
+    value = getattr(entry, "first_registered_ts", None)
+    return value if isinstance(value, str) else None
+
+
+def peer_statement(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str, Any],
+                   recipient: str, exposure: Dict[str, Any], delegation: Any, *,
+                   peer_id: str, ts: str) -> bytes:
+    """The statement `draft` makes from `sender` to `recipient`, with
+    `peer_id` and `ts` (`peerlane.build_statement`). `StatementRefused` for
+    a draft the encoding refuses."""
+    from . import peerlane
+    return peerlane.build_statement(
+        key_id=delegation.key_id, peer_id=peer_id,
+        from_address=config_mod.address_for(sender, cfg.fleet_domain), to_address=recipient,
+        ts=ts, subject=draft.get("subject") or "", body_text=draft.get("body_text") or "",
+        attachments=draft.get("attachments") or [], sender_exposure=exposure,
+        sender_since=sender_since(cfg, sender))
 
 
 def statement_size(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str, Any],
-                   exposure: Dict[str, Any]) -> int:
-    """Item 5f: the size of the signed statement this draft would make. The
-    signing step supplies it; until then this raises, and item 5e makes it
-    unreachable (module docstring)."""
-    raise NotImplementedError("no cross-host peer statement can be built on this router")
+                   exposure: Dict[str, Any], recipient: str = "") -> int:
+    """Item 5f: the EXACT size of the signed statement this draft makes. The
+    minted id and the `ts` have fixed lengths, so building it with stand-ins
+    of those lengths gives the size of the statement signed later.
+    `Malformed` for a draft the encoding refuses."""
+    from . import peerlane
+    try:
+        return len(peer_statement(cfg, sender, draft, recipient, exposure,
+                                  peerlane.active(cfg), peer_id=peerlane.SIZE_ID,
+                                  ts=peerlane.SIZE_TS))
+    except peerlane.StatementRefused as e:
+        raise Malformed(str(e)) from None
+
+
+def task_denied(cfg: "config_mod.RouterConfig", sender: str, addr: "Address") -> bool:
+    """Item 5b: `sender`'s `task_deny` removes the edge to `addr`."""
+    return _denied(cfg.instances[sender].task_deny, addr)
 
 
 def address_class(cfg: "config_mod.RouterConfig", raw: Any) -> Tuple[str, Address]:
@@ -472,7 +508,11 @@ def _trusted(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str, Any],
     if not peer_lane_available(cfg):
         return Refuse("rejected", REASON_RECIPIENT_UNKNOWN,
                       detail="the cross-host peer lane is not available on this router")
-    if statement_size(cfg, sender, draft, stamp) > STATEMENT_MAX_BYTES:
+    try:
+        size = statement_size(cfg, sender, draft, stamp, addr.canonical())
+    except Malformed as e:
+        return Refuse("rejected", REASON_MALFORMED, detail=str(e))
+    if size > STATEMENT_MAX_BYTES:
         return Refuse("rejected", REASON_STATEMENT_TOO_LARGE)
     return PeerRemote(addr.canonical(), stamp)
 

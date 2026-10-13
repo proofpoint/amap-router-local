@@ -78,7 +78,7 @@ M = [
   '    return value in (NOTICE_BUNDLE_SCHEMA, "amap-hop-notice-entry/1")\n',
   [E8 + "BundleSchemaTests.test_only_2_is_current"]),
  ('T10 the runtime stays at (2, 0)', TR,
-  'PLUGIN_API: Tuple[int, int] = (3, 1)\n', 'PLUGIN_API: Tuple[int, int] = (2, 1)\n',
+  'PLUGIN_API: Tuple[int, int] = (3, 3)\n', 'PLUGIN_API: Tuple[int, int] = (2, 3)\n',
   [LD + "test_an_older_major_plugin_is_refused_by_this_major_3_runtime"]),
  ('T13 OSError classified before a plugin .reason', TR,
   [('    reason = getattr(exc, "reason", None)\n'

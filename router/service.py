@@ -31,7 +31,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+import dataclasses
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -288,7 +290,9 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
         logger.error(
             "the config reload is failing: running on the last good config, and the "
             "external leg is closed (nothing new is published, no revocation is "
-            "enacted) until a reload succeeds")
+            "enacted) until a reload succeeds%s",
+            "; delegation key changes in the refused config (a removed key) are NOT "
+            "applied" if cfg.delegation is not None else "")
     try:
         # The no-plugin call keeps its exact shape (`run_once(cfg)`), so a
         # router without a plugin runs precisely the code it ran before.
@@ -370,6 +374,9 @@ def classification_status(cfg: RouterConfig, report: Any,
     doc: Dict[str, Any] = {}
     if cfg.reload_failed:
         doc["config_reload_failed"] = True
+        failure = _RELOAD_FAILURE.get(str(cfg.state_dir))
+        if failure is not None:
+            doc["config_reload_failure"] = dict(failure)
     now = parse_utc_ts(utc_ts())
     revoked: Dict[str, List[Dict[str, Any]]] = {}
     for name in sorted(cfg.instances):
@@ -395,7 +402,49 @@ def classification_status(cfg: RouterConfig, report: Any,
     return doc or None
 
 
-def reload_config(config_path, current: RouterConfig) -> RouterConfig:
+def activate_delegation(cfg: RouterConfig, runtime: Any) -> None:
+    """With `delegation` configured: activate it against the loaded plugin
+    (`peerlane.activate`) and make it the one this process signs and
+    verifies with. Raises `peerlane.DelegationRefused` (startup stops).
+    Without `delegation`: whatever was active for this state_dir ends."""
+    from . import peerlane
+    if cfg.delegation is None:
+        peerlane.install(cfg, None)
+        return
+    plugin = getattr(runtime, "plugin", None)
+    if plugin is None:
+        raise peerlane.DelegationRefused("no_plugin", "delegation needs the loaded transport "
+                                                      "plugin")
+    fingerprint = peerlane.fingerprint(cfg, plugin)
+    current = peerlane.current(cfg)
+    if current is not None and fingerprint is not None and current.fingerprint == fingerprint:
+        # Nothing activation depends on has changed (the delegation config,
+        # the plugin, the seed file's identity, mode and size): keep it, with
+        # no seed read, no backend self-test and no probe on every poll.
+        peerlane.install(cfg, current)
+        return
+    delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))
+    peerlane.install(cfg, dataclasses.replace(delegation, fingerprint=fingerprint))
+    logger.info("delegation activated: signing key %s, %d peer runtime(s)",
+                cfg.delegation.signing_key_id, len(cfg.delegation.runtimes))
+
+
+#: PROCESS state: since when, and why, the config reload has been refused,
+#: per state_dir (status.json's `config_reload_failed`). Cleared by a good
+#: reload.
+_RELOAD_FAILURE: Dict[str, Dict[str, str]] = {}
+
+
+def _refuse_reload(current: RouterConfig, why: str) -> RouterConfig:
+    """`current`, kept, with `reload_failed` set and the refusal recorded
+    (its first sighting kept while it persists)."""
+    prior = _RELOAD_FAILURE.get(str(current.state_dir))
+    if prior is None or prior["error"] != why:
+        _RELOAD_FAILURE[str(current.state_dir)] = {"since": utc_ts(), "error": why}
+    return replace(current, reload_failed=True)
+
+
+def reload_config(config_path, current: RouterConfig, runtime: Any = None) -> RouterConfig:
     """Re-read the config for the next poll, or keep `current` and say why.
 
     NEVER RAISES. A config that has become unreadable or invalid is not a
@@ -423,31 +472,50 @@ def reload_config(config_path, current: RouterConfig) -> RouterConfig:
         logger.error(
             "config reload FAILED — continuing on the last good config, which "
             "may now be stale: %s", e)
-        return replace(current, reload_failed=True)
+        return _refuse_reload(current, "the config is invalid")
     except OSError as e:
         logger.error(
             "config reload could not READ %s — continuing on the last good "
             "config, which may now be stale: %s", config_path, e)
-        return replace(current, reload_failed=True)
+        return _refuse_reload(current, "the config could not be read")
     if fresh.state_dir != current.state_dir:
         logger.error(
             "config reload changed state_dir (%s -> %s) — REFUSED and ignored. "
             "This process holds that directory's drain lock and all of its "
             "private state; moving it needs a restart, not a reload.",
             current.state_dir, fresh.state_dir)
-        return replace(current, reload_failed=True)
+        return _refuse_reload(current, "state_dir changed")
     if fresh.transport_plugin != current.transport_plugin:
         logger.error(
             "config reload changed transport_plugin — REFUSED and ignored. The "
             "plugin is loaded once at startup and never hot-swapped; changing "
             "it needs a restart, not a reload.")
-        return replace(current, reload_failed=True)
+        return _refuse_reload(current, "transport_plugin changed")
     if fresh.hop != current.hop:
         logger.error(
             "config reload changed hop — REFUSED and ignored. Each generation is "
             "pinned to the hop binding it was admitted under; changing it needs a "
             "restart, and a changed root holds the generations pinned to the old one.")
-        return replace(current, reload_failed=True)
+        return _refuse_reload(current, "hop changed")
+    if fresh.delegation is not None or current.delegation is not None:
+        # Delegation is re-activated against the fresh config BEFORE it is
+        # adopted: a key gate, signing-key or probe failure refuses the
+        # whole reload, and the last good delegation stays in force.
+        from . import peerlane
+        try:
+            activate_delegation(fresh, runtime)
+        except peerlane.DelegationRefused as e:
+            logger.error(
+                "config reload REFUSED: delegation cannot be activated (%s) — continuing on "
+                "the last good config; a key removed in the refused config is NOT applied "
+                "until a reload succeeds", e)
+            return _refuse_reload(current, "delegation could not be activated")
+        except Exception:  # noqa: BLE001 -- NEVER RAISES (docstring): a fault refuses the reload
+            logger.exception(
+                "config reload REFUSED: delegation activation FAILED unexpectedly — "
+                "continuing on the last good config and the last good delegation")
+            return _refuse_reload(current, "delegation activation failed unexpectedly")
+    _RELOAD_FAILURE.pop(str(current.state_dir), None)
     return fresh
 
 
@@ -486,13 +554,14 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
     # Once, before the loop, and allowed to raise: a refused plugin stops
     # startup here (`start_transport`).
     transport = start_transport(cfg)
+    activate_delegation(cfg, transport)
     tracker = StatusTracker(interval_s=interval)
     seen_report = None
     seen_names = sorted(cfg.instances)
     try:
         while True:
             if config_path is not None:
-                cfg = reload_config(config_path, cfg)
+                cfg = reload_config(config_path, cfg, runtime=transport)
                 # THE ADMITTED SET IS ANNOUNCED WHEN IT CHANGES. The startup
                 # line above names it once, and before this it was the ONLY
                 # line that ever did — so a sandbox that appeared was visible
