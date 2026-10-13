@@ -216,6 +216,14 @@ class FactsCheckTests(unittest.TestCase):
         self.bad(parsed(facts=lambda f: f["attachments"][0].update(source_sha256="c" * 64)))
         self.bad(parsed(spool=lambda sp: sp.pop("attachments")))
         self.bad(parsed(facts=lambda f: f.update(attachments=None)))
+        # A present null on the notice or the spool: refused, never a crash
+        # (the codec owner's p5-*-attachments-null cases).
+        p = parsed()
+        p["notice"]["message"]["attachments"] = None
+        self.bad(p)
+        p = parsed()
+        p["spool"]["attachments"] = None
+        self.bad(p)
         # P5c only where the descriptor carries sha256: a stripped part is
         # aligned by size alone.
         self.ok(parsed(clean=False, facts=lambda f: f["attachments"][0].update(

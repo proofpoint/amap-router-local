@@ -453,6 +453,10 @@ def check_facts(parsed: Dict[str, Any]) -> int:
             if not (type(row["size_bytes"]) is int and row["size_bytes"] >= 0):
                 raise _bad(f"attachments[{k}].size_bytes is not a non-negative integer")
         descs = message.get("attachments", [])
+        spool_atts = parsed["spool"].get("attachments", []) if isinstance(
+            parsed["spool"], dict) else None
+        if not isinstance(descs, list) or not isinstance(spool_atts, list):
+            raise _bad("P5: a present attachments member is not a list")
         if len(rows) != len(descs):
             raise _bad("P5: the facts' row count is not the notice's descriptor count")
         for k, (row, d) in enumerate(zip(rows, descs)):
@@ -460,7 +464,6 @@ def check_facts(parsed: Dict[str, Any]) -> int:
                 raise _bad(f"P5: row {k}'s size_bytes is not descriptor {k}'s")
             if "sha256" in d and d["sha256"] != row["source_sha256"]:
                 raise _bad(f"P5c: descriptor {k}'s sha256 is not row {k}'s source_sha256")
-        spool_atts = parsed["spool"].get("attachments", [])
         if len(spool_atts) != len(rows):
             raise _bad("P5: the spool's attachment count is not the row count")
     return version
@@ -1640,7 +1643,14 @@ def addressed_to(cfg: Any, report: Any, logical_id: str,
     (`<name>@<fleet_domain>` for a configured name whose registry identity it
     is) or through an alias ACTIVE this poll whose target name's identity it
     is; False when none does; None when the registry report is not `ok`
-    (no decision: the transient hold)."""
+    (no decision: the transient hold).
+
+    THE CASE RULE, each half from the resolver it reuses: by name, the
+    domain and the local part both match case-insensitively
+    (`config.instance_for` against the configured names); through an alias,
+    the local part matches EXACTLY and the domain case-insensitively
+    (`aliases.match_key`, the alias table's own rule). A former name with no
+    active alias resolves to nobody."""
     if getattr(report, "state", None) != "ok":
         return None
     known = dict(report.known or {})

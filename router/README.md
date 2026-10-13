@@ -1414,6 +1414,71 @@ per instance the sender hold, the latched hand-over hold and the current
 retry, each with its first sighting and age, and the senders this process
 holds open.
 
+## The ingress journal (`router/ingress.py`)
+
+Inbound from the external leg arrives through the plugin's intake reader
+(`hoplink.reader_for`, one per identity and generation) and goes through
+ONE durable journal record per entry, per kind, per generation:
+`state_dir/<logical_id>/gen-<g>/ingress/<kind>/<key>.json`, the key the
+sha256 of the canonical `{kind, link, gen, entry_id}`. The entry id is
+opaque and never a path component.
+
+**Inbound is OFF without `hop.link`.** With it, each generation PINS the
+link at its first inbound use (`ingress/link.json`), and every later pump
+compares the config against the pin before listing anything. A difference
+latches that generation's inbound off with one ERROR: the link is inside
+every key, so a changed value must never re-key (re-keying would place
+entries again). To change the link, begin a new generation.
+
+**The order, per generation, per poll, under the drain lock**: recovery of
+`placing` and `prepared` records first; one listing page; then for each
+listed id the key lookup BEFORE any read (a placed or quarantined key is a
+duplicate, compared whole-bundle with its snapshot and never placed or
+quarantined again); the read (`notice_incomplete` held;
+`notice_invalid` on first sight QUARANTINED, contract amendment E17); the
+bundle and the facts checked as hostile input (this router's own check is
+additional to the reader's and verdict-identical with it); a generation
+no longer current gets `late_inbound` (E16); the recipient binding (a
+named recipient must resolve to this identity, by name or through an
+active alias, else `recipient_not_this_identity`); the admission order;
+then snapshot, `prepared` and placement.
+
+**Untrusted fleet mail is the only class this router places, and that set
+is EMPTY in every deployment today.** Everything else is held for the unit
+that owns it, or quarantined (`cold_fleet_mail` for a trusted host).
+
+**The guarantee: AT MOST ONCE per upstream entry id.** At most one
+agent-visible notice is ever placed for an entry id. Placement writes the
+RECORDED bytes (minted identity, digests journaled at `prepared`) through
+`deliver`'s commit routine, after a generation check immediately before the
+first byte. It rests on the ledger row being durable before the notice is
+committed, which `deliver._commit` guarantees. A crash between the ledger
+write and the notice, with no delivery evidence, is a TERMINAL, VISIBLE hold
+(`placing_ambiguous`), delivered to nobody until an operator acts. It is
+per entry id, never per message: two ids for one message are two entries.
+No ledger row of a record in `placing` or `placing_ambiguous` is ever
+pruned (nothing in this repository prunes the binding ledger).
+
+**Residuals, stated and accepted with the guarantee**: the dedup horizon
+must exceed the longest time the downstream runtime can be down after a
+crash, or ONE duplicate placement is possible (never a loss); and a mailbox
+UIDVALIDITY reset upstream mints new ids, so each message still present is
+placed once more, visibly, in the duplicate direction.
+
+**Holds.** A re-read hold (`notice_incomplete`, `bundle_schema`,
+`entry_id_mismatch`, `bundle_invalid`) takes no snapshot and is read again
+every pump. A snapshot hold (the admission holds and
+`recipient_not_this_identity`) is re-evaluated from what was READ and
+never re-read. The TERMINAL holds are never re-evaluated by a pump:
+`placing_ambiguous`, `placing_survivor_mismatch`, `exists_different`,
+`snapshot_invalid:<what>`, `quarantine_item_conflict`,
+`duplicate_different_held`, and `notice_invalid` on an entry that already
+had a record. The operator verbs that release them are OWED by the first
+unit that adds ingress verbs; they must also cover
+`recipient_not_this_identity`, and the verb that releases
+`placing_ambiguous` MUST warn that releasing is AT-LEAST-ONCE: it may
+deliver a notice the agent already consumed.
+
 ## The ingress quarantine (`router/quarantine.py`)
 
 Cross-host inbound that is not placed is held in the generation it arrived

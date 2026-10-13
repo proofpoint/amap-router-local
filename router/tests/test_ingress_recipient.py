@@ -64,6 +64,23 @@ class RecipientTests(unittest.TestCase):
         other = aliases.Decision(aliases.ACTIVE, target="bravo")
         self.assertIs(self.to(OLD, c=cfg(other)), False)
 
+    def test_the_case_rule(self):
+        # By name: domain and local part both case-insensitive.
+        self.assertIs(self.to("ALPHA@FLEET.EXAMPLE"), True)
+        self.assertIs(self.to("alpha@Fleet.Example"), True)
+        # Through an alias: the local part exact, the domain case-insensitive.
+        active = aliases.Decision(aliases.ACTIVE, target="alpha")
+        self.assertIs(self.to("old-alpha@FLEET.EXAMPLE", c=cfg(active)), True)
+        self.assertIs(self.to("Old-Alpha@fleet.example", c=cfg(active)), False)
+
+    def test_a_rename_reaches_l_only_through_an_active_alias(self):
+        # The registry renamed L from old-alpha to alpha; mail still names
+        # the old address. With the alias active it is L's; without one
+        # the old name resolves to nobody and the mail holds.
+        self.assertIs(self.to(OLD, c=cfg(aliases.Decision(aliases.ACTIVE, target="alpha"))),
+                      True)
+        self.assertIs(self.to(OLD, c=cfg(None)), False)
+
     def test_no_valid_registry_reading_is_no_decision(self):
         for state in ("unavailable", "rolled_back", "off"):
             with self.subTest(state=state):
