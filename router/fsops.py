@@ -1039,9 +1039,28 @@ class FsOps:
 
     def remove_pinned(self, dir_fd: int, name: str) -> None:
         """Remove `name` (a directory is renamed aside first, then emptied),
-        and fsync `dir_fd` even when the name was already missing."""
+        and fsync `dir_fd` even when the name was already missing.
+
+        CRASH-RESUMABLE (the `(3, 1)` postcondition the optional remover
+        relies on): before acting on `name` it sweeps every ASIDE of THAT
+        name in `dir_fd`, an entry matching exactly
+        `^\\.<escaped name>\\.old\\.tmp\\.[0-9]+\\.[0-9a-f]{16}\\Z` (the name this
+        method's own rename gives one). An aside is emptied IN PLACE, never
+        renamed a second time, so asides never nest; one that is not a
+        directory is unlinked. The sweep pages the bounded listing over that
+        prefix (`ListingTooLarge` propagates). A call that returns has left
+        neither `name` nor any aside of it."""
         self.binding(dir_fd)
         _check_name(name)
+        for aside in self._asides(dir_fd, name):
+            try:
+                st = os.stat(aside, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                _remove_tree(dir_fd, aside)
+            else:
+                os.unlink(aside, dir_fd=dir_fd)
         try:
             st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -1059,6 +1078,26 @@ class FsOps:
             except FileNotFoundError:
                 pass
         os.fsync(dir_fd)
+
+    def _asides(self, dir_fd: int, name: str) -> List[str]:
+        """The asides of `name` in `dir_fd`: the names in the prefix's range
+        that match the aside pattern exactly. Pages the bounded listing and
+        stops at the first name past the prefix."""
+        prefix = f".{name}.old.tmp."
+        pattern = re.compile(re.escape(prefix) + r"[0-9]+\.[0-9a-f]{16}\Z")
+        found: List[str] = []
+        after: Optional[str] = prefix
+        while True:
+            names, more = self.list_pinned(dir_fd, limit=transport_mod.LIST_LIMIT_MAX,
+                                           after=after)
+            for n in names:
+                if not n.startswith(prefix):
+                    return found
+                if pattern.fullmatch(n):
+                    found.append(n)
+            if not more or not names:
+                return found
+            after = names[-1]
 
     # -- reads ----------------------------------------------------------------
 
@@ -1097,6 +1136,17 @@ class FsOps:
             return data
         finally:
             os.close(fd)
+
+    def stat_group_pinned(self, dir_fd: int, name: str) -> Tuple[int, int, int, str]:
+        """(uid, gid, permission bits, kind) from ONE non-following stat:
+        exactly `stat_owner_pinned`'s semantics plus that stat's `st_gid`
+        (`transport.HOPFSOPS_OPTIONAL_METHODS`, at `(3, 1)`)."""
+        self.binding(dir_fd)
+        _check_name(name)
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        kind = "file" if stat.S_ISREG(st.st_mode) else "dir" if stat.S_ISDIR(st.st_mode) \
+            else "other"
+        return st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), kind
 
     def stat_owner_pinned(self, dir_fd: int, name: str) -> Tuple[int, int, str]:
         """(uid, permission bits, kind) from a non-following stat."""
@@ -1213,17 +1263,51 @@ def _check_deps_shape(deps) -> Tuple[Tuple[int, str, int, str], ...]:
     return tuple(out)
 
 
-def _remove_tree(parent_fd: int, name: str) -> None:
+#: The deepest nesting `_remove_tree` empties: deeper raises `ELOOP`.
+REMOVE_TREE_DEPTH_MAX = 8
+#: How many names `_remove_tree` holds at once while emptying a directory.
+_REMOVE_BATCH = 1024
+
+
+def _remove_tree(parent_fd: int, name: str, depth: int = 1) -> None:
     """Empty and remove a privately named directory. Its entries are not
-    synced one by one: only its disappearance is ordered against."""
+    synced one by one: only its disappearance is ordered against.
+
+    BOUNDED: each directory is first counted through a streaming scan that
+    stops at `transport.LIST_SCAN_MAX + 1` names (`ListingTooLarge`, before
+    anything in it is removed), then emptied in batches of at most
+    `_REMOVE_BATCH` names, never a full in-memory listing. Nesting deeper
+    than `REMOVE_TREE_DEPTH_MAX` raises `OSError(ELOOP)`. Every entry is
+    stat'd without following: a symlink, a FIFO or any other non-directory
+    is unlinked, its target never touched."""
+    if depth > REMOVE_TREE_DEPTH_MAX:
+        raise OSError(errno.ELOOP, f"nesting deeper than {REMOVE_TREE_DEPTH_MAX} under removal",
+                      name)
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
-        for entry in os.listdir(fd):
-            st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
-            if stat.S_ISDIR(st.st_mode):
-                _remove_tree(fd, entry)
-            else:
-                os.unlink(entry, dir_fd=fd)
+        counted = 0
+        with os.scandir(fd) as it:
+            for _entry in it:
+                counted += 1
+                if counted > transport_mod.LIST_SCAN_MAX:
+                    raise ListingTooLarge(
+                        f"more than {transport_mod.LIST_SCAN_MAX} names under removal; "
+                        "nothing in it was removed")
+        while True:
+            batch: List[str] = []
+            with os.scandir(fd) as it:
+                for entry in it:
+                    batch.append(entry.name)
+                    if len(batch) >= _REMOVE_BATCH:
+                        break
+            if not batch:
+                break
+            for entry in batch:
+                st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISDIR(st.st_mode):
+                    _remove_tree(fd, entry, depth + 1)
+                else:
+                    os.unlink(entry, dir_fd=fd)
     finally:
         os.close(fd)
     os.rmdir(name, dir_fd=parent_fd)

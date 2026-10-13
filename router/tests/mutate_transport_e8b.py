@@ -27,6 +27,9 @@ MX = "router.tests.test_transport_e8b.MatrixTests."
 SF = "router.tests.test_transport_e8b.SurfaceTests."
 LD = "router.tests.test_transport.LoaderTests."
 E8 = "router.tests.test_transport_e8.ShapeTests."
+RR = "router.tests.test_fsops_e8b.RemoveResumableTests."
+RB = "router.tests.test_fsops_e8b.RemoveBoundedTests."
+SG = "router.tests.test_fsops_e8b.StatGroupTests."
 
 M = [
  ('E1 the minor compared with PLUGIN_API', TP,
@@ -56,6 +59,39 @@ M = [
  ('E7 no INFO line for an ignored name', TP,
   '            if name in namespace:\n                _logger.info(', '            if False:\n                _logger.info(',
   [MX + "test_one_info_line_for_an_ignored_present_name"]),
+ # -- HopFsOps: remove_pinned crash-resumable and bounded; stat_group_pinned --
+ ('F1 the aside sweep skipped', FS,
+  '        for aside in self._asides(dir_fd, name):\n', '        for aside in []:\n',
+  [RR + "test_a_crash_after_the_rename_aside_is_finished_by_the_next_call"]),
+ ('F2 a prefix-only aside test', FS,
+  '                if pattern.fullmatch(n):\n', '                if True:\n',
+  [RR + "test_another_name_s_asides_and_junk_are_untouched"]),
+ ('F3 the sweep reads one page only', FS,
+  '            if not more or not names:\n                return found\n', '            return found\n',
+  [RR + "test_the_sweep_pages_past_one_listing_page"]),
+ ('F4 the emptying unbounded in count', FS,
+  '                if counted > transport_mod.LIST_SCAN_MAX:\n                    raise ListingTooLarge(\n                        f"more than {transport_mod.LIST_SCAN_MAX} names under removal; "',
+  '                if False:\n                    raise ListingTooLarge(\n                        f"more than {transport_mod.LIST_SCAN_MAX} names under removal; "',
+  [RB + "test_a_directory_over_the_scan_cap_raises_listing_too_large_and_keeps_it"]),
+ ('F5 the emptying unbounded in depth', FS,
+  '    if depth > REMOVE_TREE_DEPTH_MAX:\n', '    if False:\n',
+  [RB + "test_nesting_of_eight_removes_and_nine_raises_eloop"]),
+ ('F6 a symlink inside followed', FS,
+  '                st = os.stat(entry, dir_fd=fd, follow_symlinks=False)\n                if stat.S_ISDIR(st.st_mode):\n                    _remove_tree(fd, entry, depth + 1)\n',
+  '                st = os.stat(entry, dir_fd=fd, follow_symlinks=True)\n                if stat.S_ISDIR(st.st_mode):\n                    _remove_tree(fd, entry, depth + 1)\n',
+  [RB + "test_a_symlink_inside_is_unlinked_and_its_target_untouched"]),
+ ('F7 a full in-memory listing', FS,
+  '            batch: List[str] = []\n            with os.scandir(fd) as it:\n                for entry in it:\n                    batch.append(entry.name)\n                    if len(batch) >= _REMOVE_BATCH:\n                        break\n',
+  '            batch: List[str] = list(os.listdir(fd))\n',
+  [RB + "test_emptying_holds_a_bounded_batch_not_a_full_listing"]),
+ ('F8 stat_group_pinned follows symlinks', FS,
+  '        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)\n        kind = "file" if stat.S_ISREG(st.st_mode) else "dir" if stat.S_ISDIR(st.st_mode) \\\n            else "other"\n        return st.st_uid, st.st_gid,',
+  '        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=True)\n        kind = "file" if stat.S_ISREG(st.st_mode) else "dir" if stat.S_ISDIR(st.st_mode) \\\n            else "other"\n        return st.st_uid, st.st_gid,',
+  [SG + "test_it_agrees_with_stat_owner_pinned_and_adds_the_gid"]),
+ ('F9 the gid read from the parent', FS,
+  '        return st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), kind\n',
+  '        return st.st_uid, os.fstat(dir_fd).st_gid, stat.S_IMODE(st.st_mode), kind\n',
+  [SG + "test_the_gid_is_the_name_s_not_the_parent_s"]),
 ]
 
 
