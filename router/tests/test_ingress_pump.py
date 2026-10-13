@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -304,6 +305,124 @@ class RemovalTests(_Pump):
                 self.port.entries[eid] = enc(b)
                 counts = self.pump()
                 self.assertNotIn("hop_republished_after_horizon", counts)
+
+
+class QuarantineSweepTests(_Pump):
+
+    def test_items_past_the_retention_are_swept_and_damaged_ones_kept(self):
+        self.port.entries[E1] = "notice_invalid"
+        self.pump()
+        self.assertEqual(len(self.items()), 1)
+        qdir = generations.gen_dir(self.state_dir, self.lid, self.gen) / "ingress-quarantine"
+        (qdir / ("f" * 32 + ".json")).write_bytes(b"{damaged")
+        soon = datetime.now(timezone.utc) + timedelta(days=13)
+        self.assertNotIn("quarantine_swept", self.pump(now=soon))
+        later = datetime.now(timezone.utc) + timedelta(days=15)
+        with self.assertLogs("amap_router_local.ingress", "INFO") as logs:
+            counts = self.pump(now=later)
+        self.assertEqual(counts.get("quarantine_swept"), 1)
+        self.assertTrue(any("quarantine sweep removed 1" in m for m in logs.output))
+        self.assertEqual(sorted(os.listdir(qdir)), ["f" * 32 + ".json"])
+        # The record still holds the key: no second item on re-presentation.
+        self.assertEqual(self.state(E1), (ingress.QUARANTINED_WAITING_REMOVE, None))
+        self.pump(now=later)
+        self.assertEqual(sorted(os.listdir(qdir)), ["f" * 32 + ".json"])
+
+
+class _UnsafeRead(Exception):
+    pass
+
+
+class PumpAllTests(_Pump):
+    """The poll's inbound pass end to end through the reader seam: the
+    plugin's make_intake_reader hands out the double."""
+
+    def setUp(self):
+        super().setUp()
+        from router import hoplink
+        hoplink.forget_senders()
+        self.addCleanup(hoplink.forget_senders)
+        self.addCleanup(ingress._LINK_LATCHED.clear)
+        self.addCleanup(ingress._CURSORS.clear)
+        port = self.port
+
+        class Plugin:
+            made = []
+
+            def make_intake_reader(self, settings, fsops):
+                self.made.append(dict(settings))
+                return port
+
+        self.plugin = Plugin()
+        self.rt = SimpleNamespace(plugin=self.plugin, fsops=SimpleNamespace(
+            UnsafeRead=_UnsafeRead, ListingTooLarge=ListingTooLarge), hop=None)
+
+    def with_link(self, link):
+        from router import config as config_mod
+        from router.tests import helpers
+        hop = config_mod.HopConfig(root=str(self.tmp / "hop"), peer_uid=0, version_write=1,
+                                   caps=tuple(helpers.TEST_HOP_CAPS.items()), link=link)
+        return replace(self.keyed, hop=hop)
+
+    def test_the_pass_places_through_the_reader_seam(self):
+        self.port.entries[E1] = entry(E1)
+        out = ingress.pump_all(self.with_link(LINK), self.rt, self.report)
+        self.assertEqual(out[f"{self.lid}/{self.gen}"].get("placed"), 1)
+        self.assertEqual(len(self.notices()), 1)
+        self.assertIn({"hop_root": str(self.tmp / "hop"), "logical_id": self.lid,
+                       "generation": self.gen, "peer_uid": 0}, self.plugin.made)
+
+    def test_without_hop_link_nothing_is_listed_read_or_constructed(self):
+        self.port.entries[E1] = entry(E1)
+        self.assertEqual(ingress.pump_all(self.with_link(None), self.rt, self.report), {})
+        self.assertEqual((self.port.lists, self.port.reads, self.plugin.made), (0, [], []))
+
+    def test_run_once_runs_the_pass_after_the_drains_and_keeps_it_out_of_the_summary(self):
+        from unittest import mock
+        from router import outbound, service
+        calls = []
+        with mock.patch.object(outbound, "drain_instance",
+                               side_effect=lambda *a, **k: (calls.append("drain"), {})[1]), \
+                mock.patch.object(ingress, "pump_all",
+                                  side_effect=lambda *a, **k: (calls.append("pump"),
+                                                               {"l/g": {"pump-marker": 1}})[1]):
+            summary = service.run_once(self.cfg, SimpleNamespace(plugin=1, fsops=1, hop=1),
+                                       self.report)
+        self.assertEqual(calls[-1], "pump")
+        self.assertIn("drain", calls)
+        self.assertEqual(calls.count("pump"), 1)
+        # A key only the pass's own return carries: absent from the summary.
+        self.assertNotIn("pump-marker", json.dumps(summary))
+        self.assertEqual(service.LAST_INGRESS, {"l/g": {"pump-marker": 1}})
+
+
+class StatusTests(_Pump):
+
+    def test_counts_only_never_an_entry_id_or_content(self):
+        self.port.entries[E1] = entry(E1)
+        self.port.entries[E2] = "notice_invalid"
+        self.port.entries[E3] = entry(E3, to=addr("charlie"))
+        self.pump()
+        ingress.write(self.state_dir, self.lid, self.gen, "notice", LINK, "1700000000-9",
+                      ingress.HELD, reason=ingress.HELD_PLACING_AMBIGUOUS)
+        doc = ingress.status_doc(self.keyed)
+        g = doc["generations"][f"{self.lid}/{self.gen}"]
+        self.assertEqual(g["states"], {ingress.PUBLISHED_WAITING_REMOVE: 1,
+                                       ingress.QUARANTINED_WAITING_REMOVE: 1,
+                                       ingress.HELD: 2})
+        self.assertEqual(g["held"], {"recipient_not_this_identity": 1,
+                                     ingress.HELD_PLACING_AMBIGUOUS: 1})
+        self.assertEqual(g["quarantine"], {"notice_invalid": 1})
+        self.assertEqual(g["snapshots"], 2)
+        self.assertGreater(g["snapshot_bytes"], 0)
+        self.assertEqual(g["terminal_keys"],
+                         [ingress.key_for("notice", LINK, self.gen, "1700000000-9")])
+        self.assertEqual(doc["remover"], "not_offered")
+        self.assertEqual(doc["ingress_dedup_horizon_s"], 30 * 86400)
+        text = json.dumps(doc)
+        for eid in (E1, E2, E3, "1700000000-9"):
+            self.assertNotIn(eid, text)
+        self.assertNotIn("fleet-b.example", text)
 
 
 class LateTests(_Pump):

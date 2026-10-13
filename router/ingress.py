@@ -2069,6 +2069,29 @@ def advance_removal(pump: "Pump", now: datetime, horizon_s: int) -> None:
                 pump.count("tombstone_dropped")
 
 
+def sweep_quarantine(state_dir: Path, logical_id: str, gen: str, days: int,
+                     now: datetime) -> int:
+    """The ingress quarantine's EXPIRY SWEEP for one generation: every
+    well-formed item older than `days` is removed, durably, and the sweep is
+    logged when it removed any. A DAMAGED item is never removed (it is the
+    operator's to inspect). The journal is untouched: an item is evidence,
+    the record keeps the key. Returns how many were removed."""
+    qdir = generations_mod.gen_dir(state_dir, logical_id, gen) / quarantine_mod.DIR_NAME
+    removed = 0
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for item in quarantine_mod.list_ingress(state_dir, logical_id, logical_id, days=days,
+                                            now=stamp):
+        if item.generation != gen or item.damaged is not None:
+            continue
+        if item.expires_in_s is not None and item.expires_in_s <= 0:
+            os.unlink(qdir / f"{item.id}.json")
+            removed += 1
+    if removed:
+        fsync_dir(qdir)
+        logger.info("ingress %s gen %s: quarantine sweep removed %d item(s) older than %d days",
+                    logical_id, gen, removed, days)
+    return removed
+
 #: `Pump._read`'s answer for an entry `read_entry` reports absent.
 GONE = object()
 
@@ -2089,7 +2112,7 @@ _LINK_LATCHED: Dict[tuple, str] = {}
 
 def pump_generation(pump: Pump, *, listing_too_large: Any = (),
                     limit: int = transport_mod.LIST_LIMIT_MAX,
-                    horizon_s: int = 30 * 86400,
+                    horizon_s: int = 30 * 86400, quarantine_days: int = 14,
                     now: Optional[datetime] = None) -> Dict[str, int]:
     """Step 0, then one listing page and each listed entry through
     `Pump.dispatch`. A `listing_too_large` (the runtime's class) is a
@@ -2120,6 +2143,10 @@ def pump_generation(pump: Pump, *, listing_too_large: Any = (),
             what = "journal_damaged"
         pump.count(what or "undecided")
     advance_removal(pump, pump.now, horizon_s)
+    swept = sweep_quarantine(pump.state_dir, pump.logical_id, pump.gen,
+                             quarantine_days, pump.now)
+    if swept:
+        pump.counts["quarantine_swept"] = swept
     return pump.counts
 
 
@@ -2222,8 +2249,87 @@ def pump_all(cfg: Any, runtime: Any, report: Any) -> Dict[str, Dict[str, int]]:
             try:
                 out[label] = pump_generation(
                     pump, listing_too_large=too_large,
-                    horizon_s=cfg.ingress_dedup_horizon_days * 86400)
+                    horizon_s=cfg.ingress_dedup_horizon_days * 86400,
+                    quarantine_days=cfg.ingress_quarantine_days)
             except Exception:  # noqa: BLE001 -- isolated per generation
                 logger.exception("ingress %s: pump failed; isolated", label)
                 out[label] = {"pump_errored": 1}
+    return out
+
+
+def status_doc(cfg: Any, last_pump: Optional[Dict[str, Dict[str, int]]] = None
+               ) -> Dict[str, Any]:
+    """`status.json`'s `hop.ingress` section, COUNT-ONLY (never an entry's
+    content or id): per identity and generation, journal counts by state,
+    held counts by reason, quarantine items by cause, snapshot count and
+    bytes, the terminal holds by JOURNAL KEY, and the link pin; plus the
+    remover's state, the dedup horizon in seconds, and the last pump's
+    counts. A damaged record is counted as such, never skipped."""
+    state_dir = Path(cfg.state_dir)
+    out: Dict[str, Any] = {
+        "remover": REMOVER_NOT_OFFERED,
+        "ingress_dedup_horizon_s": cfg.ingress_dedup_horizon_days * 86400,
+        "inbound": "on" if (cfg.hop is not None and cfg.hop.link is not None) else "off",
+        "generations": {}, "last_pump": dict(last_pump or {})}
+    try:
+        lids = sorted(n for n in os.listdir(state_dir) if _GEN_RE.fullmatch(n))
+    except FileNotFoundError:
+        lids = []
+    for lid in lids:
+        try:
+            doc = generations_mod.read_doc(state_dir, lid)
+        except generations_mod.GenerationHeld:
+            continue
+        if doc is None:
+            continue
+        for g in doc["gens"]:
+            gen = g["gen"]
+            entry: Dict[str, Any] = {"states": {}, "held": {}, "terminal_keys": [],
+                                     "snapshots": 0, "snapshot_bytes": 0,
+                                     "quarantine": {}, "damaged": 0}
+            kd = kind_dir(state_dir, lid, gen, "notice")
+            try:
+                names = sorted(os.listdir(kd))
+            except FileNotFoundError:
+                names = []
+            for name in names:
+                if name.endswith(SNAP_SUFFIX):
+                    entry["snapshots"] += 1
+                    try:
+                        for f in os.scandir(kd / name):
+                            entry["snapshot_bytes"] += f.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        entry["damaged"] += 1
+                    continue
+                if not name.endswith(".json") or not _KEY_RE.fullmatch(name[:-5]):
+                    continue
+                try:
+                    rec = read(state_dir, lid, gen, "notice", name[:-5])
+                except JournalError:
+                    entry["damaged"] += 1
+                    continue
+                if rec is None:
+                    continue
+                st = rec["state"]
+                entry["states"][st] = entry["states"].get(st, 0) + 1
+                if st == HELD:
+                    r = rec.get("reason") or ""
+                    entry["held"][r] = entry["held"].get(r, 0) + 1
+                    if is_terminal(r):
+                        entry["terminal_keys"].append(name[:-5])
+                elif st == DUPLICATE_DIFFERENT_HELD:
+                    entry["terminal_keys"].append(name[:-5])
+            for item in quarantine_mod.list_ingress(state_dir, lid, lid, days=cfg.ingress_quarantine_days):
+                if item.generation != gen:
+                    continue
+                cause = "damaged" if item.damaged else item.doc["causes"][0]
+                entry["quarantine"][cause] = entry["quarantine"].get(cause, 0) + 1
+            pin = link_pin_path(state_dir, lid, gen)
+            entry["link_pinned"] = pin.exists()
+            latched = _LINK_LATCHED.get((str(state_dir), lid, gen))
+            if latched:
+                entry["inbound_latched"] = latched
+            if any(entry[k] for k in ("states", "quarantine", "snapshots", "damaged")) \
+                    or entry["link_pinned"] or latched:
+                out["generations"][f"{lid}/{gen}"] = entry
     return out

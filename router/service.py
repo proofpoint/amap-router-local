@@ -296,7 +296,12 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
             logger.exception("error reading the cross-host state for status — isolated")
         if hoplink.is_runtime(transport):
             try:
-                tracker.record_hop(hoplink.status_doc(keyed_cfg, keyed_cfg.instances))
+                hop_doc = hoplink.status_doc(keyed_cfg, keyed_cfg.instances)
+                try:
+                    hop_doc["ingress"] = ingress_mod.status_doc(keyed_cfg, LAST_INGRESS)
+                except Exception:
+                    logger.exception("error reading the ingress state for status — isolated")
+                tracker.record_hop(hop_doc)
             except Exception:
                 logger.exception("error reading the hop state for status — isolated")
         if report.state != "off":

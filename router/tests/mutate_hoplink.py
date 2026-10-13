@@ -136,6 +136,29 @@ M = [
   '        ingress_dedup_horizon_days=_days(top, "ingress_dedup_horizon_days",\n',
   '        ingress_dedup_horizon_days=30 or _days(top, "ingress_dedup_horizon_days",\n',
   ["router.tests.test_classify.ConfigTests.test_ingress_dedup_horizon_days"]),
+ # -- the quarantine expiry sweep and status -------------------------------------
+ ('Y1 the sweep ignores the retention', IG,
+  '        if item.expires_in_s is not None and item.expires_in_s <= 0:\n',
+  '        if item.expires_in_s is not None:\n',
+  [PU + "QuarantineSweepTests.test_items_past_the_retention_are_swept_and_damaged_ones_kept"]),
+ ('Y2 the sweep never runs', IG,
+  '    swept = sweep_quarantine(pump.state_dir, pump.logical_id, pump.gen,\n                             quarantine_days, pump.now)\n',
+  '    swept = 0\n',
+  [PU + "QuarantineSweepTests.test_items_past_the_retention_are_swept_and_damaged_ones_kept"]),
+ # (No mutant for the sweep's damaged-item guard alone: a damaged item has no
+ # age, so the retention test never selects it either.)
+ ('Y3 terminal holds not listed in status', IG,
+  '                    if is_terminal(r):\n                        entry["terminal_keys"].append(name[:-5])\n', '',
+  [PU + "StatusTests.test_counts_only_never_an_entry_id_or_content"]),
+ # -- the pass wired into the poll -----------------------------------------------
+ ('Y4 the pass never runs from run_once', SV,
+  '            pumped = ingress_mod.pump_all(cfg, transport, report)\n',
+  '            pumped = {}\n',
+  [PU + "PumpAllTests.test_run_once_runs_the_pass_after_the_drains_and_keeps_it_out_of_the_summary"]),
+ ('Y5 inbound without hop.link', IG,
+  '    if cfg.hop is None or cfg.hop.link is None:\n        return out\n',
+  '    if cfg.hop is None:\n        return out\n',
+  [PU + "PumpAllTests.test_without_hop_link_nothing_is_listed_read_or_constructed"]),
  # -- the facts version guard (driven directly at the guard unit) -------------
  ('G1 facts_version unchecked (presence selects version 2)', IG,
   '    if type(v) is int and v == 2:\n', '    if True:\n',
@@ -685,7 +708,7 @@ M = [
   '            doc["hop"] = self.hop\n', '            pass\n',
   [ST + "PollTests.test_status_json_carries_it_and_the_summary_does_not"]),
  ('S4 the hop section never recorded', SV,
-  'tracker.record_hop(hoplink.status_doc(keyed_cfg, keyed_cfg.instances))', 'None',
+  'tracker.record_hop(hop_doc)', 'tracker.record_hop(None)',
   [ST + "PollTests.test_status_json_carries_it_and_the_summary_does_not"]),
  ('S5 a latched hold not shown', HL,
   '                    entry["write_hold"] = held\n', '                    pass\n',
