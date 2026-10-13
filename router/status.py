@@ -197,6 +197,11 @@ class StatusTracker:
         or None when there is nothing to report. Replaced every poll."""
         self.classification = doc
 
+    def record_hop(self, doc: Optional[Dict[str, Any]]) -> None:
+        """This poll's hop section (`hoplink.status_doc`), or None without a
+        hop transport. Replaced every poll: it is state."""
+        self.hop = doc
+
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that
         errored — the set the loader accepted is known even when draining it
@@ -272,6 +277,12 @@ class StatusTracker:
         # count per agent (router/quarantine.py).
         if getattr(self, "classification", None) is not None:
             doc["classification"] = self.classification
+        # Present only with a hop transport: per instance, the sender hold,
+        # the latched hand-over hold and the current retry, each with its
+        # age, and the senders this process holds open (router/hoplink.py).
+        # Never in the drained summary line.
+        if getattr(self, "hop", None) is not None:
+            doc["hop"] = self.hop
         # Omitted, never defaulted, when this tracker cannot answer. A
         # consumer distinguishes "a router older than this field" from a
         # wrong value only if the absence is real.

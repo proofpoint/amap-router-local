@@ -124,6 +124,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import transport as transport_mod
 from . import config as config_mod
+from . import hoplink
 from .config import RouterConfig
 from .util import atomic_write, fsync_dir, parse_utc_ts, utc_ts
 
@@ -229,7 +230,7 @@ class RecordDamaged(ValueError):
 _RECORD_KEYS = {
     "digest": False, "transport_req_id": True, "recipients": True, "request": True,
     "written_ts": True, "policy_digest": False, "route": False,
-    "revocation_unenforceable": False,
+    "revocation_unenforceable": False, "from_address": False,
 }
 _ROUTES = ("fleet_host", "internet")
 _POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -253,7 +254,7 @@ def check_record(doc: Any) -> Dict[str, Any]:
         raise RecordDamaged("recipients is not a list of strings")
     if not isinstance(doc["request"], dict):
         raise RecordDamaged("request is not an object")
-    for key in ("written_ts", "revocation_unenforceable"):
+    for key in ("written_ts", "revocation_unenforceable", "from_address"):
         if key in doc and not isinstance(doc[key], str):
             raise RecordDamaged(f"{key} is not a string")
     if doc.get("digest") is not None and not isinstance(doc["digest"], str):
@@ -312,6 +313,7 @@ def begin(
     cfg: RouterConfig, name: str, req_id: str,
     *, digest: Optional[str], request_doc: Dict[str, Any], recipients: List[str],
     policy_digest: Optional[str] = None, route: Optional[str] = None,
+    from_address: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Put `req_id` in flight: allocate its transport id, then write the
     record. Returns the record. A crash between the two burns the id; the
@@ -332,6 +334,10 @@ def begin(
         record["policy_digest"] = policy_digest
     if route is not None:
         record["route"] = route
+    if from_address is not None:
+        # Pinned here, never filled in later from the current config: a
+        # retry must hand over exactly what the first attempt did.
+        record["from_address"] = from_address
     check_record(record)
     _write_record(cfg, name, req_id, record, "record")
     return record
@@ -346,24 +352,96 @@ def _write_record(cfg: RouterConfig, name: str, req_id: str, record: Dict[str, A
     )
 
 
+class FrontierUndecidable(Exception):
+    """This generation's in-flight directory cannot be read with certainty
+    (an unreadable, damaged, non-regular or symlinked record, or a failed
+    listing), so `settled_through` cannot be computed: nothing is handed
+    over for this generation this poll."""
+
+
+class HandoverUnavailable(Exception):
+    """A record that lacks what a handover needs (it predates `from_address`
+    being pinned), never handed over; nothing is filled in from the current
+    config."""
+
+
+def settled_through(cfg: RouterConfig, name: str) -> int:
+    """The settled frontier this generation hands to the transport: the
+    LOWEST transport id still live, less one. Live means every `<id>.json`
+    entry in this generation's in-flight directory, whatever its state,
+    including a record settled but not yet deleted (a crash between the
+    anchor and the unlink): a request counts as settled only once its
+    private anchor is durable AND its record is gone. Fail closed: any entry
+    that cannot be read as a record raises `FrontierUndecidable`, never
+    skipped, since skipping a live id would declare it settled."""
+    d = _inflight_dir(cfg, name)
+    try:
+        entries = sorted(os.listdir(d))
+    except OSError as e:
+        raise FrontierUndecidable(f"{d}: cannot be listed ({e.strerror})") from e
+    live = []
+    for entry in entries:
+        if not entry.endswith(".json"):
+            continue
+        p = d / entry
+        if p.is_symlink() or not p.is_file():
+            raise FrontierUndecidable(f"{p}: not a regular file")
+        try:
+            record = read_record(cfg, name, entry[: -len(".json")])
+        except (RecordDamaged, OSError) as e:
+            raise FrontierUndecidable(f"{p}: {e}") from e
+        if record is None:
+            raise FrontierUndecidable(f"{p}: vanished while listed")
+        live.append(int(record["transport_req_id"]))
+    if not live:
+        raise FrontierUndecidable(f"{d}: no live record, so no request to hand over")
+    return min(live) - 1
+
+
 def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]) -> bytes:
-    """The Submit Request this router hands to the transport, built from the
-    STAGED copy. `req_id` is the transport id and `agent_id` the namespace.
-    `draft.to`/`draft.cc` go out unchanged, and ONLY when together they are
-    exactly the evaluated set (`recipient_mismatch`); otherwise this raises
+    """The HANDOVER DOCUMENT this router hands to the transport for one
+    record (`router/hoplink.py`, API (3, 0)), built from the STAGED copy.
+    The request's `req_id` is the transport id and its `agent_id` this
+    instance's state key (its logical_id under a registry). `draft.to` and
+    `draft.cc` go out unchanged, and ONLY when together they are exactly the
+    evaluated set (`recipient_mismatch`); otherwise this raises
     `RecipientSetMismatch` and produces no bytes. Any threading key is
     dropped: mapping one to the downstream runtime's notice id is the
-    re-placement step's, and until it exists an unmapped id is dropped
-    rather than passed to the transport."""
+    re-placement step's. The envelope's `from_address` is the one pinned in
+    the record at begin, never the current config's; a record without one
+    raises `HandoverUnavailable`. `settled_through` is this generation's
+    frontier, asserted below the record's own id. Request, envelope and
+    attachments are identical on every retry of the same id; only
+    `settled_through` may rise."""
     mismatch = recipient_mismatch(record)
     if mismatch is not None:
         raise RecipientSetMismatch(mismatch)
+    if not isinstance(record.get("from_address"), str):
+        raise HandoverUnavailable("the record has no pinned from_address")
     doc = json.loads(json.dumps(record["request"]))
     doc["req_id"] = record["transport_req_id"]
-    doc["agent_id"] = name
+    doc["agent_id"] = config_mod.state_key(cfg, name)
     doc.pop("in_reply_to", None)
     doc.get("draft", {}).pop("reply_to_message_id", None)
-    return json.dumps(doc, sort_keys=True).encode("utf-8")
+    frontier = settled_through(cfg, name)
+    if not frontier < int(record["transport_req_id"]):
+        raise FrontierUndecidable(
+            f"settled_through {frontier} is not below {record['transport_req_id']}")
+    if cfg.hop is not None:
+        # The envelope's inputs come from the record and the PIN, never the
+        # current config: the version this generation was pinned to.
+        pin = hoplink.read_pin(cfg, name)
+        if pin is None or type(pin.get("version_write")) is not int:
+            raise HandoverUnavailable("this generation has no pinned version_write")
+        version_write = pin["version_write"]
+    else:
+        # No `hop` configured: only a test's stand-in transport reaches here
+        # (`config.load` requires `hop` beside a plugin, so a deployment
+        # cannot), and the envelope's version is the first one.
+        version_write = 1
+    return hoplink.build_handover(
+        doc, from_address=record["from_address"], version_write=version_write,
+        attachments=(), settled_through=frontier)
 
 
 class RecipientSetMismatch(Exception):
@@ -590,11 +668,63 @@ def advance(
             return SETTLED
         if _repin(name, req_id, record, rc):
             _write_record(cfg, name, req_id, record, "repin")
-    data = transport_request_bytes(cfg, name, record)
+    held = hoplink.write_hold(cfg, name)
+    if held is not None:
+        logger.error(
+            "instance %r req %r: NOT handed over: this generation's hand-overs are held "
+            "(%s, latched by transport id %s); `router generation new` moves the instance "
+            "on, and this record is left for disposal", name, req_id, held.get("reason"),
+            held.get("transport_req_id"))
+        return BLOCKED
+    try:
+        data = transport_request_bytes(cfg, name, record)
+    except (FrontierUndecidable, HandoverUnavailable) as e:
+        # Decided BEFORE the handed marker: nothing is published, the record
+        # and its transport id stay as they are, and the hold is this
+        # generation's until `router generation new` (the closed table's
+        # deterministic rows: an undecidable frontier, a record that cannot
+        # make a valid handover).
+        hold = (hoplink.LATCHED_WRITE_REASONS["below_frontier"]
+                if isinstance(e, FrontierUndecidable)
+                else hoplink.LATCHED_WRITE_REASONS["handover_invalid"])
+        hoplink.set_write_hold(cfg, name, hold, f"{type(e).__name__}: {e}", n)
+        logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
+                     name, req_id, hold, e)
+        return BLOCKED
     _effect("handed", atomic_write, handed, n.encode("ascii"),
             durable_root=cfg.state_dir)
-    _effect("transport", port.write_request, n, data)
+    try:
+        _effect("transport", port.write_request, n, data)
+    except Exception as e:  # noqa: BLE001 -- the closed table decides
+        latched = hoplink.latch_for_write(e)
+        if latched is not None:
+            hoplink.set_write_hold(cfg, name, latched, str(e), n)
+            logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
+                         name, req_id, latched, e)
+            return BLOCKED
+        # A retry: the same record and the same transport id, next poll.
+        status = hoplink.retry_status(e)
+        if status == "hop_object_closed":
+            hoplink.evict_sender(cfg, name)
+        if _is_hop(cfg):
+            age = hoplink.note_retry(cfg, name, status, f"{type(e).__name__}: {e}", n)
+        else:
+            age = 0.0
+        if status == hoplink.RETRY_UNEXPECTED:
+            raise   # logged with its traceback by the caller
+        quiet = status in hoplink.QUIET_RETRIES and age < STALE_AFTER_S
+        (logger.warning if quiet else logger.error)(
+            "instance %r req %r: NOT handed over this poll (%s, for %ds): %s; retried "
+            "next poll with transport id %s", name, req_id, status, age, e, n)
+        return BLOCKED
+    if _is_hop(cfg):
+        hoplink.clear_retry(cfg, name)
     return WRITTEN
+
+
+def _is_hop(cfg: RouterConfig) -> bool:
+    """A generation-keyed config with a hop: where retries are tracked."""
+    return getattr(cfg, "hop", None) is not None and getattr(cfg, "registry_dir", None) is not None
 
 
 def _check_revocation(
@@ -745,3 +875,42 @@ def summarize(
         {"inflight": count, "inflight_oldest_age_s": oldest, "inflight_stale": len(stale)},
         stale,
     )
+
+
+_TRANSPORT_ID_RE = re.compile(r"[0-9]{8,18}\Z")
+
+
+def settlement_record(state_dir: Path, logical_id: str, gen: str,
+                      n: str) -> Optional[Dict[str, Any]]:
+    """Where transport request `n` of generation `gen` stands, read-only, for
+    the hop conformance fixture (and an operator): `{"state": "settled",
+    "req_id", "outcome"}` from its private anchor, `{"state": "inflight",
+    "req_id", "outcome": None}` from its in-flight record, or None when
+    neither names `n` (a burned id, or an id never allocated). An anchor
+    wins over a lingering record (the window between settling and deleting
+    the record). A damaged record or anchor RAISES; it is never read as
+    absent. `n` is the 8-18 digit string throughout."""
+    if not (isinstance(n, str) and _TRANSPORT_ID_RE.fullmatch(n)):
+        raise ValueError(f"{n!r} is not a transport id")
+    gdir = Path(state_dir) / logical_id / f"gen-{gen}"
+    results = gdir / "results"
+    if results.is_dir():
+        for p in sorted(results.iterdir()):
+            if not p.name.endswith(".json"):
+                continue
+            doc = json.loads(p.read_bytes().decode("utf-8"))
+            if not (isinstance(doc, dict) and isinstance(doc.get("result"), dict)):
+                raise RecordDamaged(f"{p}: not an anchor envelope")
+            if doc.get("transport_req_id") == n:
+                return {"state": "settled", "req_id": p.name[: -len(".json")],
+                        "outcome": doc["result"].get("outcome")}
+    d = gdir / INFLIGHT_DIR
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if not p.name.endswith(".json"):
+                continue
+            rec = check_record(json.loads(p.read_bytes().decode("utf-8")))
+            if rec["transport_req_id"] == n:
+                return {"state": "inflight", "req_id": p.name[: -len(".json")],
+                        "outcome": None}
+    return None

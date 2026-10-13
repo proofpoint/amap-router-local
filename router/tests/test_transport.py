@@ -382,7 +382,8 @@ class ConfigTests(helpers.RouterTestCase):
 
     def test_path_and_sha256_together(self):
         sha = "a" * 64
-        cfg = self._write_and_load({"transport_plugin": {"path": "/opt/p.py", "sha256": sha}})
+        cfg = self._write_and_load(helpers.with_hop(
+            {"transport_plugin": {"path": "/opt/p.py", "sha256": sha}}, self.tmp))
         self.assertEqual(cfg.transport_plugin, config_mod.TransportPluginPin("/opt/p.py", sha))
 
     def test_both_or_neither_and_the_shapes(self):
@@ -476,10 +477,10 @@ class CanonicalPathTests(_PluginDir):
 
     def test_the_config_keeps_the_path_as_written_and_startup_refuses_it(self):
         path, sha = self.symlink_decoy()
-        cfg = config_mod.load_obj({
+        cfg = config_mod.load_obj(helpers.with_hop({
             "state_dir": str(self.dir.parent / "state"),
             "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
-            "transport_plugin": {"path": path, "sha256": sha}})
+            "transport_plugin": {"path": path, "sha256": sha}}, self.dir.parent))
         self.assertEqual(cfg.transport_plugin.path, path, "the config rewrote the pin")
         real = transport.load_plugin
         with mock.patch.object(transport, "load_plugin",
@@ -495,9 +496,11 @@ class CanonicalPathTests(_PluginDir):
         """A consequence, stated in the README: the pin is compared as
         written, so respelling the same file is a changed plugin, and the
         reload is refused (fail closed) like any other plugin change."""
-        doc = {"state_dir": str(self.dir.parent / "state"),
-               "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
-               "transport_plugin": {"path": str(self.path), "sha256": self.sha}}
+        doc = helpers.with_hop(
+            {"state_dir": str(self.dir.parent / "state"),
+             "instances": {"alice": {"namespace": str(self.dir.parent / "alice")}},
+             "transport_plugin": {"path": str(self.path), "sha256": self.sha}},
+            self.dir.parent)
         cfg = config_mod.load_obj(doc)
         respelled = config_mod.load_obj(dict(doc, transport_plugin={
             "path": f"{self.dir}/./plugin.py", "sha256": self.sha}))
@@ -518,7 +521,10 @@ class StartupTests(_PluginDir):
         self.addCleanup(base.tearDown)
         cfg = base.make_config({"alice": []})
         from dataclasses import replace
-        return replace(cfg, transport_plugin=pin)
+        hop = None if pin is None else config_mod.HopConfig(
+            root=str(base.tmp / "hop"), peer_uid=0, version_write=1,
+            caps=tuple(helpers.TEST_HOP_CAPS.items()))
+        return replace(cfg, transport_plugin=pin, hop=hop)
 
     def test_no_plugin_configured_gives_no_transport(self):
         self.assertIsNone(service.start_transport(self._cfg()))
@@ -542,15 +548,24 @@ class StartupTests(_PluginDir):
                 service.start_transport(cfg)
         self.assertEqual(cm.exception.reason, "missing")
 
-    def test_a_valid_plugin_is_refused_until_the_filesystem_port_exists(self):
+    def test_a_valid_plugin_is_activated_with_this_routers_filesystem_port(self):
+        """API (3, 0): a plugin that passes every check is ACTIVATED. The
+        drain receives the plugin-object carrier, never a port: senders are
+        constructed per generation on first use, not here."""
+        from router import fsops
         cfg = self._cfg(config_mod.TransportPluginPin(str(self.path), self.sha))
         with self._trusting_me(), mock.patch.object(service, "logger") as log:
-            with self.assertRaises(transport.PluginRefused) as cm:
-                service.start_transport(cfg)
-        self.assertEqual(cm.exception.reason, "fsops_unavailable")
-        log.info.assert_not_called()  # no success line for a refused plugin
-        self.assertIn(self.sha, cm.exception.detail)
-        self.assertIn(str(self.path), cm.exception.detail)
+            rt = service.start_transport(cfg)
+        self.assertIsInstance(rt, service.HopRuntime)
+        self.assertEqual([f.name for f in __import__("dataclasses").fields(rt)],
+                         ["plugin", "fsops", "hop"])
+        self.assertIsInstance(rt.plugin, transport.LoadedPlugin)
+        self.assertEqual(rt.plugin.sha256, self.sha)
+        self.assertIsInstance(rt.fsops, fsops.FsOps)
+        self.assertIs(rt.hop, cfg.hop)
+        self.assertEqual(rt.plugin.namespace["LOADS"], ["executed"])
+        log.info.assert_called()   # the activation is logged, naming the pin
+        self.assertIn(self.sha, " ".join(map(str, log.info.call_args[0])))
 
     def test_run_forever_refuses_to_start_and_never_polls(self):
         self.path.unlink()
@@ -571,6 +586,23 @@ class StartupTests(_PluginDir):
         self.assertEqual(kept, cfg)  # the last good config, with the failure flagged
         self.assertTrue(kept.reload_failed)
         self.assertFalse(cfg.reload_failed)
+
+    def test_a_reload_that_changes_hop_is_refused(self):
+        """The plugin unchanged, only the hop binding moved: refused by the
+        hop guard, which alone names `hop` in its log line."""
+        cfg = self._cfg(config_mod.TransportPluginPin(str(self.path), self.sha))
+        from dataclasses import replace
+        moved = replace(cfg, hop=replace(cfg.hop, root=cfg.hop.root + "-moved"))
+        with mock.patch.object(service, "load", return_value=moved):
+            with self.assertLogs("amap_router_local", logging.ERROR) as cm:
+                kept = service.reload_config("/unused", cfg)
+        self.assertEqual(kept.hop, cfg.hop)
+        self.assertTrue(kept.reload_failed)
+        self.assertIn("changed hop", "\n".join(cm.output))
+        same = replace(cfg, hop=replace(cfg.hop))
+        with mock.patch.object(service, "load", return_value=same):
+            self.assertFalse(service.reload_config("/unused", cfg).reload_failed,
+                             "control: an unchanged hop reloads")
 
 
 class ClaimedIsPendingTests(_InflightCase):

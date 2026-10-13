@@ -98,6 +98,17 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
     absent means no plugin (`transport.NullTransport`), and the external
     leg settles as not configured. This module checks only the shape; the
     file itself is checked, and refused, when the router starts.
+  - `hop` — `{"root", "peer_uid", "version_write", "caps": {"document",
+    "request", "attachment", "total"}}`, the hop tree the transport plugin
+    writes. Required exactly when `transport_plugin` is present, and only
+    under a `registry_dir` (a handover names its sender by logical_id).
+    `root` is used VERBATIM: it must be absolute and already in normal form
+    (no trailing `/`, `//`, `.` or `..`), and must not equal, contain or sit
+    inside `state_dir`, `registry_dir`, `intake_dir` or any instance root.
+    The caps are positive byte counts, and `caps.document` must be large
+    enough for the largest handover any accepted request can make
+    (`router/hoplink.py`, `document_floor`). Restart-only: a reload that
+    changes it is refused, like `transport_plugin`.
 
 A caller may declare ADDITIONAL permitted instance keys (`extra_instance_keys`)
 together with a `validate_extra` callable; validated values surface on
@@ -204,7 +215,7 @@ _TOP_KEYS = {
     "task_graph", "mail_graph",
     "instances_dir", "selected_json",
     "peer_senders", "peers",
-    "transport_plugin", "registry_dir", "aliases",
+    "transport_plugin", "registry_dir", "aliases", "hop",
     "trusted_fleet_hosts", "fleet_hosts", "egress", "ingress_quarantine_days",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders",
@@ -505,6 +516,9 @@ class RouterConfig:
     #: The host registry's directory, or None for none (`registry_dir` in
     #: the module docstring).
     registry_dir: Optional[Path] = None
+    #: The hop tree the transport plugin writes, or None without a plugin
+    #: (`hop` in the module docstring).
+    hop: Optional["HopConfig"] = None
     #: The alias table (`aliases` in the module docstring; `router/aliases.py`),
     #: validated at load. Empty without one.
     aliases: Tuple["AliasEntry", ...] = ()
@@ -552,6 +566,98 @@ class TransportPluginPin:
 
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
+#: `hop.caps`'s members, exactly.
+HOP_CAPS = ("document", "request", "attachment", "total")
+#: The largest `hop.version_write`: the envelope's `hop_contract` is a JSON
+#: integer 1..2^31-1, and a larger one would load here and then have every
+#: handover refused.
+HOP_CONTRACT_MAX = 2 ** 31 - 1
+
+
+@dataclass(frozen=True)
+class HopConfig:
+    """`hop` as configured (module docstring). `root` is the string exactly
+    as written, already checked to be in normal form: it is handed to the
+    filesystem port and to the plugin's settings unchanged, so the two can
+    never name the tree differently."""
+    root: str
+    peer_uid: int
+    version_write: int
+    caps: Tuple[Tuple[str, int], ...]
+
+    def cap(self, name: str) -> int:
+        return dict(self.caps)[name]
+
+
+def _positive_int(value, what: str, *, minimum: int = 1,
+                  maximum: Optional[int] = None) -> int:
+    if type(value) is not int or value < minimum:
+        raise ConfigError(f"{what}: expected an integer >= {minimum}, got {value!r}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{what}: expected an integer <= {maximum}, got {value!r}")
+    return value
+
+
+def _hop(top: Dict[str, Any], *, transport_plugin, registry_dir: Optional[Path],
+         state_dir: Path, intake_dir: Optional[Path], roots,
+         attachment_caps: Tuple[int, int, int]) -> Optional[HopConfig]:
+    if "hop" not in top:
+        if transport_plugin is not None:
+            raise ConfigError(
+                "config.hop: required with config.transport_plugin (the hop tree the "
+                "plugin writes)")
+        return None
+    if transport_plugin is None:
+        raise ConfigError("config.hop: only with config.transport_plugin")
+    if registry_dir is None:
+        raise ConfigError(
+            "config.hop: requires config.registry_dir: a handover names its sender by "
+            "logical_id, and generations exist only under a registry")
+    raw = _require_object(top["hop"], "config.hop")
+    if set(raw) != {"root", "peer_uid", "version_write", "caps"}:
+        raise ConfigError(
+            "config.hop: needs exactly 'root', 'peer_uid', 'version_write' and 'caps'; "
+            f"got {sorted(raw)}")
+    root = raw["root"]
+    if not isinstance(root, str) or not os.path.isabs(root):
+        raise ConfigError(f"config.hop.root: must be an absolute path, got {root!r}")
+    if os.path.normpath(root) != root:
+        raise ConfigError(
+            f"config.hop.root: {root!r} is not in normal form (a trailing '/', '//', '.' "
+            "or '..'); it is used exactly as written, so write it that way")
+    rp = Path(root)
+    others = [("config.state_dir", state_dir), ("config.registry_dir", registry_dir)]
+    if intake_dir is not None:
+        others.append(("config.intake_dir", intake_dir))
+    for name, (_mode, root_key, iroot) in roots.items():
+        others.append((f"config.instances.{name}.{root_key}", iroot))
+    for what, other in others:
+        if _is_within(rp, other) or _is_within(other, rp):
+            raise ConfigError(
+                f"config.hop.root ({root}) and {what} ({other}) must not be nested inside "
+                "one another")
+    peer_uid = _positive_int(raw["peer_uid"], "config.hop.peer_uid", minimum=0)
+    version_write = _positive_int(raw["version_write"], "config.hop.version_write",
+                                  maximum=HOP_CONTRACT_MAX)
+    caps = _require_object(raw["caps"], "config.hop.caps")
+    if set(caps) != set(HOP_CAPS):
+        raise ConfigError(f"config.hop.caps: needs exactly {list(HOP_CAPS)}; got {sorted(caps)}")
+    hop = HopConfig(
+        root=root, peer_uid=peer_uid, version_write=version_write,
+        caps=tuple((k, _positive_int(caps[k], f"config.hop.caps.{k}")) for k in HOP_CAPS))
+    from .hoplink import document_floor  # local: hoplink is a leaf, kept out of load order
+    count_cap, file_cap, total_cap = attachment_caps
+    floor = document_floor(
+        request_cap=hop.cap("request"), count_cap=count_cap,
+        file_cap=min(hop.cap("attachment"), file_cap),
+        total_cap=min(hop.cap("total"), total_cap), version_write=version_write)
+    if hop.cap("document") < floor:
+        raise ConfigError(
+            f"config.hop.caps.document: {hop.cap('document')} is below {floor}, the largest "
+            "handover an accepted request can make (the request cap less its newline, the "
+            "largest attachment array the attachment caps admit, and the fixed members)")
+    return hop
 
 
 def _transport_plugin(top: Dict[str, Any]) -> Optional[TransportPluginPin]:
@@ -1512,6 +1618,23 @@ def load_obj(
                 "logical_id (32 hex digits). Under a registry private state lives at "
                 "state_dir/<logical_id>/, so such a name cannot be told from an "
                 "identity's state; rename the instance")
+    hop = _hop(top, transport_plugin=transport_plugin, registry_dir=registry_dir,
+               state_dir=state_dir, intake_dir=intake_dir, roots=roots,
+               attachment_caps=(attachment_max_count, attachment_max_bytes,
+                                attachment_max_total_bytes))
+    if hop is not None:
+        # Every handover's envelope carries its instance's address as
+        # `from_address`, and the document floor assumes it is at most 254
+        # octets: an instance whose address cannot be one is refused here, by
+        # the same check begin runs (`hoplink.from_address_problem`).
+        from .hoplink import from_address_problem  # local, as `_hop`'s
+        for name in sorted(roots):
+            why = from_address_problem(address_for(name, fleet_domain))
+            if why is not None:
+                raise ConfigError(
+                    f"config.instances.{name}: its address "
+                    f"{address_for(name, fleet_domain)!r} cannot be a handover's "
+                    f"from_address ({why})")
 
     trusted, fleet_hosts, egress, per_instance = _classification(
         top, fleet_domain, classify_raw)
@@ -1533,6 +1656,7 @@ def load_obj(
         selected_json=selected_json,
         transport_plugin=transport_plugin,
         registry_dir=registry_dir,
+        hop=hop,
         aliases=_aliases(top, registry_dir, fleet_domain),
     )
 

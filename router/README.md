@@ -1158,9 +1158,9 @@ it is a test and embedding hook.
 `router/inflight.py` holds a request that stays unanswered across polls: one
 handed to a second runtime and settled from that runtime's result. The
 classifier above routes an item 6 or item 7 request here when a transport
-is present, but no plugin can be activated yet (below), so no deployment
-reaches it; the transport itself and re-placement are designed but not
-built. The transport is an optional plugin.
+is present. The transport is an optional plugin, activated at startup
+(below); the hand-over is built, while retiring a fenced generation's tree
+and re-placement are designed but not built yet.
 
 * A record per request at `state_dir/<name>/inflight/<req_id>.json`, holding
   the staged copy; the agent's file stays in its outbox, skipped, until settled.
@@ -1213,12 +1213,14 @@ fixed `PluginRefused.reason`:
 | `exec_failed` | those bytes, the only ones ever executed, fail to run |
 | `api_mismatch` | its `PLUGIN_API` is not `(our major, at least our minor)` |
 | `missing_factory` | it lacks a callable `make_sender`, `make_intake_reader` or `make_upstream_marker_store` |
-| `fsops_unavailable` | it passed every check, but the filesystem port its factories need is not built yet |
 
-The last one is deliberate and temporary: until that port exists, any
-configured plugin stops startup, so no transport is used before its
-durability work is done. `TransportPort.has_pending` is true for a request
-the downstream runtime has claimed as well as one it has not.
+`REFUSAL_REASONS` also lists `fsops_unavailable` and `role_mismatch`, which
+this router never raises (the first only until its filesystem port was
+activated); both loaders share one vocabulary. A plugin that passes every
+check is ACTIVATED: `start_transport` builds this router's `HopFsOps` for
+the configured hop root, checks its refusal classes, and hands the drain
+the plugin with it. `TransportPort.has_pending` is true for a request the
+downstream runtime has claimed as well as one it has not.
 
 **The ports a plugin receives** are Protocols in the same module, interface
 only: `HopFsOps` (every filesystem operation a plugin may make, on pinned
@@ -1296,12 +1298,115 @@ The contracts on `HopFsOps` worth knowing before implementing it:
 `UNSAFE_READ_REASONS`.
 
 **This router's implementation of `HopFsOps`** is `router/fsops.py`
-(internal). It is built and tested but NOT activated: nothing hands it to a
-plugin, and `start_transport` still refuses every plugin. It needs
+(internal), built once per process by `start_transport`. It needs
 `renameat2` with `RENAME_NOREPLACE` (Linux, glibc 2.28+), and a startup
 capability probe (`fsops.probe`) refuses a filesystem without it or without
 a working directory fsync. Whether a given mount honours those is a
 deployment measurement, not something this code can show.
+
+### The hand-over (`router/hoplink.py`)
+
+A plugin needs a `hop` object beside it, and a registry: a hand-over names
+its sender by logical_id, and generations exist only under a registry.
+
+```json
+"hop": {"root": "/srv/amap/hop", "peer_uid": 1001, "version_write": 1,
+        "caps": {"document": 50331648, "request": 1048576,
+                 "attachment": 8388608, "total": 33554432}}
+```
+
+`root` is absolute, written in normal form, and never nested with
+`state_dir`, `registry_dir`, `intake_dir` or an instance root. `peer_uid`
+is the downstream runtime's uid. `version_write` is the envelope's
+`hop_contract`, 1 to 2^31-1. The caps are the plugin's, in bytes: the
+handover document, the request file, one decoded attachment, all of them.
+`caps.document` must be at least the largest handover an accepted request
+can make, computed exactly at load (`hoplink.document_floor`), or the
+config is refused. The floor counts the attachment caps (the smaller of
+the plugin's and this router's), so at this router's defaults it is about
+43.7 MiB. A reload that changes `hop` is refused, like one that
+changes the plugin. Every instance's address must be able to serve as a
+handover's `from_address` (at most 254 octets, a local part of at most 64,
+the bare addr-spec pattern): one that cannot is refused at load, by the
+same check begin runs.
+
+**One sender per generation.** The drain asks for the current
+generation's sender on first use. Before the first construction this router
+writes the generation's binding pin, `transport/hop.json` (the root,
+`peer_uid`, `version_write`, and `admitted_at`: the generation's `minted_ts`
+from its durable record, never the clock). A later config that no longer
+matches the pin holds that generation (`hop_binding_changed`) rather than
+admit it a second time elsewhere. `transport/admitted.json` is written once
+the plugin's construction, which admits the tree, has succeeded; if that
+write fails, the constructed sender is closed and the generation is held
+for a retry, so nothing leaks. Any failure on the way to a sender (a
+damaged pin, an unreadable generations record) is likewise a retried
+construction hold (`hop_construct_failed:<class>`), never an error that
+stops the instance's local mail. A latched construction hold
+(`hop_settings_refused`, `hop_identity_conflict`, `hop_plugin_vocabulary`)
+is not re-attempted until a restart or a new generation. While a FENCED
+generation that was PINNED is not yet retired, no successor is admitted
+(`hop_predecessor_unretired`, for the whole instance): the pin, not
+`admitted.json`, is the key, since a construction can admit the tree and
+then fail before confirming it. One live generation per identity; a fenced
+generation's own work is left alone until it is retired.
+
+**The handover document** is built from the in-flight record only:
+`{"schema": "amap-hop-handover/1", "request", "envelope", "attachments",
+"settled_through"}`, canonical (sorted, compact, UTF-8, integers only, no
+trailing newline). The request's `req_id` is the transport id and its
+`agent_id` the logical_id. The envelope is `{"kind": "mail",
+"from_address", "hop_contract"}`, where `from_address` is pinned in the
+record when the request is begun, never filled in from a later config.
+`settled_through` is the lowest transport id still in flight, less one.
+When any in-flight entry cannot be read the frontier is undecidable:
+skipping one would declare it settled, so this generation's hand-overs are
+LATCHED (`hop_frontier_undecidable`), before anything is handed over, and
+only `router generation new` releases them. A record that cannot make a
+valid handover (one without its pinned `from_address`, a generation with no
+pin) latches `hop_handover_invalid` the same way. The envelope's
+`hop_contract` is the PIN's `version_write`, never the current config's. A retry
+changes `settled_through` and nothing else. `attachments` is always `[]`:
+a request with attachments on this leg is still answered
+`queued_for_human`/`transport_anomaly` ("not supported yet"), since the
+record keeps no copy of their bytes.
+
+**Mail only.** The hand-over carries kind `"mail"`, so a request the
+classifier did not put in a cold mail class (`fleet_host`, `internet`) is
+refused `rejected`/`no_route` before anything is allocated, never handed
+over as mail.
+
+**Refused at begin**, before a transport id is allocated: more than 100
+raw recipients across `to`, `cc` and `bcc` (`too_many_recipients`, with
+duplicates counted); a recipient over RFC 5321's octet limits, a request the
+canonical encoding cannot carry, or one over `caps.request` at the longest
+transport id (`malformed_request`); an instance address that cannot be a
+`from_address` (`queued_for_human`/`transport_anomaly`).
+
+**When a hand-over fails**, the plugin's `.reason` decides. A reason no
+retry can change LATCHES a hold on that generation's hand-overs, in
+`transport/hold.json`: `hop_request_conflict`, `hop_request_withdrawn`,
+`hop_request_settled`, `hop_frontier_undecidable`, `hop_handover_invalid`,
+`hop_heal:<reason>`. Results are still read under it, and `router
+generation new` moves the instance on. Anything else is retried next poll
+with the same record and transport id, under a named status:
+`hop_version_unavailable` (the peer does not read `version_write` yet) and
+`hop_layout` log a WARNING until stale (one hour), then an ERROR, as does
+`hop_io_error`. `hop_layout` has two causes, and its status entry carries a
+hint naming both: the peer's `down/` not existing yet, which clears, or this
+router's own tree directories missing, which does not. `hop_anomaly:<reason>`,
+`hop_unsafe_read:<reason>` and `hop_object_closed` (the sender is rebuilt)
+log an ERROR every poll. An exception the table does not name is
+`hop_unexpected`, logged with its traceback. A failed status probe never
+settles anything. While a sender is held, or this generation's hand-overs
+are latched, an external request stays in the outbox, unconsumed: it is
+decided once the hold clears or `router generation new` moves the instance
+on, never stranded in the held generation.
+
+**`status.json`** carries a `hop` section, never the drained summary line:
+per instance the sender hold, the latched hand-over hold and the current
+retry, each with its first sighting and age, and the senders this process
+holds open.
 
 ## The ingress quarantine (`router/quarantine.py`)
 

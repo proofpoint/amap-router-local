@@ -144,6 +144,7 @@ from . import classify as classify_mod
 from . import generations as generations_mod
 from . import audit as audit_mod
 from . import deliver as deliver_mod, inflight as inflight_mod, validate as validate_mod
+from . import hoplink
 from .config import (RouterConfig, address_for, gen_state_dir, instance_for, state_key,
                      target_hold, target_known_id, target_logical_id)
 from .util import (
@@ -1341,6 +1342,19 @@ def _begin_external(
     attachments, whose staging to the transport is not built yet (the
     sidecars sit in the agent-writable outbox; ingest by copy needs them
     staged first)."""
+    if isinstance(transport, hoplink.Held):
+        # This generation's sender is held: nothing is consumed, so the
+        # request is decided on a later poll, once the hold clears.
+        logger.warning("instance %r req %r: held unconsumed, the hop sender is held (%s)",
+                       name, req_id, transport.hold.reason)
+        return HELD
+    if transport is not None and hoplink.write_hold(cfg, name) is not None:
+        # This generation's hand-overs are latched: a request begun now would
+        # be stranded in it. Left unconsumed, it is decided once `router
+        # generation new` has moved the instance on.
+        logger.warning("instance %r req %r: held unconsumed, this generation's hand-overs "
+                       "are held", name, req_id)
+        return HELD
     if transport is None:
         result = _result_doc(
             req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
@@ -1353,10 +1367,46 @@ def _begin_external(
             recipients=[], detail="attachments on the external leg are not supported yet",
         )
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    # Mail only (D4): the hand-over carries kind "mail", so a request the
+    # classifier did not put in a cold mail class is refused before
+    # anything is allocated, never handed over as mail.
+    if klass not in (classify_mod.CLASS_FLEET, classify_mod.CLASS_INTERNET):
+        result = _result_doc(
+            req_id, "rejected", reason_code=classify_mod.REASON_NO_ROUTE, recipients=[],
+            detail="only mail of the fleet-host or internet class is handed to the hop")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    # The begin-time checks (`router/hoplink.py`): what the transport would
+    # refuse for a reason no retry can change is answered NOW, before a
+    # transport id is allocated, or the request would stay in flight forever
+    # and hold this generation's frontier. Checked on the request exactly as
+    # it will be handed over, with the longest transport id it can carry.
+    from_address = address_for(name, cfg.fleet_domain)
+    why = hoplink.from_address_problem(from_address)
+    if why is not None:
+        logger.error("instance %r: its address %r cannot be a handover's from_address "
+                     "(%s); nothing is handed over", name, from_address, why)
+        result = _result_doc(
+            req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY, recipients=[],
+            detail="this instance's address cannot be handed to the external leg")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    probe = json.loads(json.dumps(doc))
+    probe["req_id"] = "9" * hoplink.TRANSPORT_ID_MAX_DIGITS
+    probe["agent_id"] = state_key(cfg, name)
+    probe.pop("in_reply_to", None)
+    probe.get("draft", {}).pop("reply_to_message_id", None) if isinstance(
+        probe.get("draft"), dict) else None
+    try:
+        hoplink.check_begin(probe, request_cap=(cfg.hop.cap("request")
+                                                if cfg.hop is not None else 1 << 62))
+    except hoplink.Refused as e:
+        result = _result_doc(req_id, e.outcome, reason_code=e.reason_code,
+                             recipients=[], detail=e.detail)
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
     record = inflight_mod.begin(
         cfg, name, req_id, digest=req_digest, request_doc=doc,
         recipients=list(route.recipients),
         policy_digest=classify_mod.policy_digest(cfg, name), route=klass,
+        from_address=from_address,
     )
     _advance_one(cfg, name, req_id, record, transport, cold_policy=cold_policy)
     return INFLIGHT
@@ -1476,6 +1526,8 @@ def _advance_inflight(
     exactly as they are and only counted: nothing here may guess a verdict."""
     settled = errored = 0
     req_ids = inflight_mod.list_records(cfg, name)
+    if isinstance(transport, hoplink.Held):
+        return {"inflight_settled": 0, "inflight_errored": 0}
     if req_ids and transport is None:
         if (name, None) not in _STALE_WARNED:
             _STALE_WARNED.add((name, None))
@@ -3074,8 +3126,10 @@ def drain_instance(
     `_pin_own_root` returns, so it can only act on the verified root."""
     view, fd = _pin_own_root(cfg, name)
     try:
+        current, fenced = hoplink.resolve(transport, view, name)
         return _drain_instance(view, name, deliver_backend=deliver_backend,
-                               cold_policy=cold_policy, transport=transport)
+                               cold_policy=cold_policy, transport=current,
+                               fenced_transport=fenced)
     finally:
         if fd is not None:
             os.close(fd)
@@ -3086,6 +3140,7 @@ def _drain_instance(
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
     cold_policy: Optional[ColdPolicy] = None,
     transport: Optional[inflight_mod.TransportPort] = None,
+    fenced_transport: Any = None,
 ) -> Dict[str, int]:
     """Drain instance `name`'s `outbound/` once. Returns a summary dict for
     logging (mirrors `gate.outbound.drain_outbound`'s shape).
@@ -3141,7 +3196,7 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # A fenced generation's work first (its own transport ids, its own
     # snapshots); what it still owns at this root is neither first-sighted
     # nor drained by the current generation.
-    fenced_owned = _drain_fenced(cfg, name, transport, deliver_backend=deliver_backend,
+    fenced_owned = _drain_fenced(cfg, name, fenced_transport, deliver_backend=deliver_backend,
                                  cold_policy=cold_policy)
     marker_doc, first_sight = firstsight.record_first_sight(cfg, name, exclude=fenced_owned)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)

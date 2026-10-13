@@ -170,6 +170,23 @@ class RouterTestCase(unittest.TestCase):
         return cfg
 
 
+#: Hop caps every test config with a transport plugin uses: large enough
+#: for the document floor at the default attachment limits.
+TEST_HOP_CAPS = {"document": 1 << 30, "request": 1 << 20,
+                 "attachment": 8 << 20, "total": 32 << 20}
+
+
+def with_hop(doc: Dict, base: Path, *, peer_uid: int = 0) -> Dict:
+    """`doc` plus what a configured transport plugin requires: a `hop`
+    object (its root a sibling of everything else under `base`) and a
+    `registry_dir`, unless the doc already names one."""
+    out = dict(doc)
+    out.setdefault("registry_dir", str(base / "registry"))
+    out["hop"] = {"root": str(base / "hop"), "peer_uid": peer_uid, "version_write": 1,
+                  "caps": dict(TEST_HOP_CAPS)}
+    return out
+
+
 def write_request(
     cfg: RouterConfig,
     name: str,
