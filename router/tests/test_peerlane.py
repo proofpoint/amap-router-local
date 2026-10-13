@@ -122,6 +122,35 @@ class DelegationConfigTests(helpers.RouterTestCase):
         self.assertEqual(cfg.delegation.crypto_settings(), {"crypto_backend": "pyca"})
         self.assertEqual(cfg.delegation.key_table_input()[0]["domains"], [T1])
 
+    def test_a_domain_belongs_to_exactly_one_runtime(self):
+        """A peer domain belongs to exactly one configured runtime (the
+        profile's addressing section): a second runtime listing it, in any
+        case, is refused, and the distinct-domain twin loads."""
+        def runtimes(second_domains):
+            return [{"name": "host-a", "runtime": f"amap.router@{T1}", "domains": [T1],
+                     "keys": [{"key_id": PEER_KEY_ID, "public_key": "cd" * 32}]},
+                    {"name": "host-b", "runtime": f"amap.router@{T2}", "domains": second_domains,
+                     "keys": [{"key_id": "peer-key-b", "public_key": "ef" * 32}]}]
+        def doc(second_domains):
+            d = self.doc(runtimes=runtimes(second_domains))
+            d["trusted_fleet_hosts"] = d["fleet_hosts"] = [T1, T2]
+            return d
+        cfg = config_mod.load_obj(doc([T2]))
+        self.assertEqual([r.domains for r in cfg.delegation.runtimes], [(T1,), (T2,)])
+        for shared in ([T2, T1], [T2, T1.upper()]):
+            with self.subTest(domains=shared):
+                self.refused(doc(shared), "domain_shared")
+
+    def test_the_attachment_basis(self):
+        """Absent: None (every signed attachment unscanned). The one value
+        is "closed_fleet"; anything else is refused at load."""
+        self.assertIsNone(config_mod.load_obj(self.doc()).delegation.attachment_basis)
+        cfg = config_mod.load_obj(self.doc(attachment_basis="closed_fleet"))
+        self.assertEqual(cfg.delegation.attachment_basis, "closed_fleet")
+        for bad in ("clean", "", None, True, "CLOSED_FLEET"):
+            with self.subTest(value=bad):
+                self.refused(self.doc(attachment_basis=bad), "attachment_basis")
+
     def test_partition_evidence_is_required(self):
         """The fail-stop: delegation without the deploy's partition evidence."""
         for bad in ("", "   ", None, 7):
@@ -494,7 +523,7 @@ class SendTests(_Send):
         self.assertTrue(peer["message_id"].endswith(f"@{FD}>"))
         kind, k, statement, signature = si.check1([(peerlane.STATEMENT_FIELD,
                                                     peer["statement_header"])])
-        self.assertEqual((kind, k), ("peer", KEY_ID))
+        self.assertEqual((kind, k), ("statement", KEY_ID))
         st = json.loads(statement)
         self.assertEqual((st["from"], st["to"], st["kind"], st["v"]),
                          (f"alice@{FD}", TRUSTED, "peer", 1))
@@ -795,7 +824,7 @@ class VerifyTests(_Base):
     def test_a_good_statement_verifies(self):
         v = self.verify([self.field(self.statement())])
         self.assertIsInstance(v, peerverify.Verified)
-        self.assertEqual(v.kind, "peer")
+        self.assertEqual(v.kind, "statement")
 
     def test_forged_stripped_and_duplicate_headers(self):
         s = self.statement()

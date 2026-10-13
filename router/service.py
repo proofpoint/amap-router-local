@@ -424,6 +424,14 @@ def activate_delegation(cfg: RouterConfig, runtime: Any) -> None:
         peerlane.install(cfg, current)
         return
     delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))
+    # The durable decision key a decided signed placement is MAC'd under:
+    # created once, made durable before it is accepted (`peerbind`). A key
+    # that cannot be established refuses the activation.
+    from . import peerbind
+    try:
+        peerbind.ensure_decision_key(cfg.state_dir)
+    except (OSError, peerbind.RecoveryCorrupt) as e:
+        raise peerlane.DelegationRefused("decision_key", str(e)) from None
     peerlane.install(cfg, dataclasses.replace(delegation, fingerprint=fingerprint))
     logger.info("delegation activated: signing key %s, %d peer runtime(s)",
                 cfg.delegation.signing_key_id, len(cfg.delegation.runtimes))

@@ -1879,6 +1879,10 @@ class DelegationConfig:
     #: Every directory the signing key must not be inside: as configured and
     #: as resolved (realpath) at load, compared by path components.
     forbidden_roots: Tuple[str, ...] = ()
+    #: The deployment's basis for asserting `clean` on a signed peer task's
+    #: attachments: None (absent: every one is `unscanned`, no bytes) or
+    #: `ATTACHMENT_BASIS_CLOSED_FLEET`. A signature is never the basis.
+    attachment_basis: Optional[str] = None
 
     def crypto_settings(self) -> Dict[str, str]:
         """The signer's and verifier's settings, exactly."""
@@ -1894,6 +1898,10 @@ class DelegationConfig:
 
 
 _DELEGATION_KEYS = frozenset({"partition_verified", "signing_key", "runtimes", "crypto"})
+_DELEGATION_OPTIONAL = frozenset({"attachment_basis"})
+#: `delegation.attachment_basis`'s one value: every trusted fleet host is
+#: operator-supervised and no external sender reaches the peer lane.
+ATTACHMENT_BASIS_CLOSED_FLEET = "closed_fleet"
 _SIGNING_KEY_KEYS = frozenset({"path", "key_id", "public_key"})
 _RUNTIME_KEYS = frozenset({"name", "runtime", "domains", "keys"})
 _PEER_KEY_REQUIRED = frozenset({"key_id", "public_key"})
@@ -1932,8 +1940,13 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
         raise ConfigError(f"{where}: requires config.transport_plugin and config.hop: "
                           "a signed peer task travels over the hop")
     raw = _require_object(raw_value, where)
-    if set(raw) != _DELEGATION_KEYS:
-        raise ConfigError(f"{where}: needs exactly {sorted(_DELEGATION_KEYS)}; got {sorted(raw)}")
+    if not (_DELEGATION_KEYS <= set(raw) <= _DELEGATION_KEYS | _DELEGATION_OPTIONAL):
+        raise ConfigError(f"{where}: needs exactly {sorted(_DELEGATION_KEYS)}, and may have "
+                          f"{sorted(_DELEGATION_OPTIONAL)}; got {sorted(raw)}")
+    basis = raw.get("attachment_basis")
+    if "attachment_basis" in raw and basis != ATTACHMENT_BASIS_CLOSED_FLEET:
+        raise ConfigError(f"{where}.attachment_basis: absent, or "
+                          f"{ATTACHMENT_BASIS_CLOSED_FLEET!r}; got {basis!r}")
     partition = raw["partition_verified"]
     if not (isinstance(partition, str) and partition.strip()):
         raise ConfigError(f"{where}.partition_verified: the deploy's partition evidence is "
@@ -1967,6 +1980,7 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
     own = cfg.fleet_domain or ""
     trusted = set(cfg.trusted_fleet_hosts)
     parsed = []
+    owner: Dict[str, str] = {}      # domain -> the runtime that lists it
     for i, r in enumerate(runtimes):
         rw = f"{where}.runtimes[{i}]"
         if not isinstance(r, dict) or set(r) != _RUNTIME_KEYS:
@@ -1982,6 +1996,14 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
             if d not in trusted:
                 raise ConfigError(f"{rw}.domains: {d!r} is not in config.trusted_fleet_hosts; "
                                   "a runtime this router verifies for is a trusted fleet host")
+            # A peer domain belongs to exactly one configured runtime: a key
+            # vouches only for its own runtime's domains, so a domain two
+            # runtimes list would let either one's key speak for it.
+            if d in owner:
+                raise ConfigError(f"{rw}.domains: {d!r} is also listed by runtime "
+                                  f"{owner[d]!r}; a peer domain belongs to exactly one runtime "
+                                  "(domain_shared)")
+            owner[d] = r["name"]
         rt = r["runtime"]
         if not (isinstance(rt, str) and rt.startswith(ROUTER_LOCAL_PART + "@")
                 and rt.split("@", 1)[1] in domains):
@@ -2013,7 +2035,7 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
     return DelegationConfig(
         partition_verified=partition, signing_key_path=sk["path"], signing_key_id=sk["key_id"],
         signing_public_key=sk["public_key"], runtimes=tuple(parsed), crypto_backend=backend,
-        openssl_path=openssl, forbidden_roots=roots)
+        openssl_path=openssl, forbidden_roots=roots, attachment_basis=basis)
 
 
 _CLASSIFY_INSTANCE_KEYS = ("task_deny", "send_to", "remote_fleet")

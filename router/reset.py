@@ -246,6 +246,7 @@ from . import audit as audit_mod
 from . import generations as generations_mod
 from . import inflight as inflight_mod
 from . import lock as lock_mod
+from .peerbind import JOURNAL_DIR as PEER_JOURNAL_DIR
 from .peerlane import PEER_LEDGER_DIR
 from . import registry as registry_mod
 from .config import RouterConfig, instance_state_dir, state_key
@@ -283,8 +284,13 @@ _OUTCOMES = "outcomes"
 # ledger (`router/peerlane.py`): under a registry a reset FENCES the current
 # generation and keeps it, its in-flight peer tasks can still be handed over
 # AFTER the reset, and a reply or control notice to one of them must still
-# resolve. Only the retention overlay ever prunes it.
-_STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR, PEER_LEDGER_DIR)
+# resolve. Only the retention overlay ever prunes it. And the signed-peer
+# candidate journal (`router/peerbind.py`): a persisted decision is resumed as
+# recorded, so a reset never removes one. (The decision key lives at the top
+# of `state_dir`, outside every instance's directory, where a reset never
+# reaches.)
+_STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR, PEER_LEDGER_DIR,
+               PEER_JOURNAL_DIR)
 
 
 def _kept(cfg: RouterConfig, entry_name: str, *, blocker: bool = False) -> bool:

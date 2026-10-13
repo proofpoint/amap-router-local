@@ -197,7 +197,8 @@ def check1(fields):
         raise CodecError("codec", "header_encoding")
     if len(statement) > 8192:
         raise CodecError("codec", "header_size")
-    kind = "peer" if name == "amap-peer-statement" else "control"
+    # The real codec's field kinds: "statement" or "control".
+    kind = "statement" if name == "amap-peer-statement" else "control"
     return kind, tags["k"], statement, signature
 
 
@@ -233,7 +234,7 @@ def verify_checked(kind, k, statement, signature, key_table, verifier, now):
     key = key_table.select(k, now)
     if not verifier.verify(key.public_key, statement, signature):
         raise CodecError("crypto", "signature")
-    payload = decode_statement(statement, k) if kind == "peer" else decode_control(statement, k)
+    payload = decode_statement(statement, k) if kind == "statement" else decode_control(statement, k)
     return kind, payload, key
 
 
