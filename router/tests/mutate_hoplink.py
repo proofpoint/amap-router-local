@@ -13,6 +13,17 @@ after; every named test must pass unmutated first, and a mutant is RED only
 when unittest reports a FAILURE of the named test (an ERROR is printed and
 is not red). Exit 0 only when every mutant turns every named test red. Not a
 test module itself (its name keeps it out of discovery).
+
+EQUIVALENT mutants, recorded here and NOT run (each reachable by no input):
+  * `inflight-snapshots/` made by a plain `os.mkdir`, with no parent fsync:
+    the record's own `atomic_write(durable_root=state_dir)` fsyncs every
+    directory from `state_dir` down, the generation directory included
+    (`util._mkdir_durable`), before the record exists, so no power loss can
+    leave a durable record without that entry.
+  * begin applying the hop's per-file or total cap ALONE, where this
+    router's cap is the smaller: ingest has already refused anything over
+    this router's caps before begin runs. The reverse (this router's cap
+    alone, where the hop's is smaller) is J7 and J8.
 """
 import os
 import pathlib
@@ -59,6 +70,8 @@ LA = "router.tests.test_hop_lost_ack.LostAckTests."
 PB = "router.tests.test_hop_probes.ProbeRetryTests."
 RS = "router.tests.test_process_reset."
 AV = "router.tests.test_agent_visible_durability."
+IA = "router.tests.test_inflight_attachments."
+AT = "router/attachments.py"
 
 M = [
  # -- the inbound reader's link (config) ----------------------------------------
@@ -1171,6 +1184,104 @@ M = [
   '                            _sync_archive(name, req_id, processed_fd, outbox_fd)\n', '',
   [AV + "ResultPublicationIsDurableTests.test_the_archive_rename_is_followed_by_both_directory_barriers",
    AV + "ResultPublicationIsDurableTests.test_a_failed_archive_barrier_is_logged_and_the_request_stays_answered"]),
+ ('J1 cleanup: the record-parent barrier deferred to the end', IF,
+  '        pass\n    fsync_dir(record.parent)\n    try:\n        handed.unlink()\n',
+  '        pass\n    try:\n        handed.unlink()\n',
+  [IA + "PowerLossTests.test_cleanup_power_loss_at_every_point_never_leaves_a_record_without_its_snapshot"]),
+ ('J2 cleanup: the snapshot removed before the record', IF,
+  [('    try:\n        record.unlink()\n    except FileNotFoundError:\n        pass\n    fsync_dir(record.parent)\n',
+    '    _remove_snapshot_at(record.parent.parent, record.name[: -len(".json")])\n    try:\n        record.unlink()\n    except FileNotFoundError:\n        pass\n    fsync_dir(record.parent)\n'),
+   ('    _remove_snapshot_at(record.parent.parent, record.name[: -len(".json")])\n    fsync_dir(record.parent)\n\n\ndef summarize',
+    '    fsync_dir(record.parent)\n\n\ndef summarize')],
+  None, [IA + "PowerLossTests.test_cleanup_power_loss_at_every_point_never_leaves_a_record_without_its_snapshot"]),
+ ('J3 read-back: no size check', IF,
+  '            if len(data) != size:\n                raise SnapshotDamaged("size"', '            if False:\n                raise SnapshotDamaged("size"',
+  [IA + "ReadBackTests.test_a_truncated_blob_is_size"]),
+ ('J4 read-back: no digest check', IF,
+  '            if hashlib.sha256(data).hexdigest() != want["sha256"]:', '            if False:',
+  [IA + "ReadBackTests.test_each_kind_of_damage"]),
+ ('J5 read-back: no link-count check', IF,
+  '                if st.st_nlink != 1:', '                if False:',
+  [IA + "ReadBackTests.test_each_kind_of_damage"]),
+ ('J6 read-back: a blob opened following links', IF,
+  '                bfd = os.open(str(i), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cur)',
+  '                bfd = os.open(str(i), os.O_RDONLY | os.O_NONBLOCK, dir_fd=cur)',
+  [IA + "ReadBackTests.test_a_symlinked_blob_is_never_followed"]),
+ ('J7 begin: the per-file cap is RL\'s alone', OB,
+  '                file_cap=min(cfg.hop.cap("attachment"), cfg.attachment_max_bytes),',
+  '                file_cap=cfg.attachment_max_bytes,',
+  [IA + "HopCapTests.test_a_file_over_the_hop_cap_is_refused_before_allocation"]),
+ ('J8 begin: the total cap is RL\'s alone', OB,
+  '                total_cap=min(cfg.hop.cap("total"), cfg.attachment_max_total_bytes))',
+  '                total_cap=cfg.attachment_max_total_bytes)',
+  [IA + "HopCapTests.test_a_total_over_the_hop_cap_is_refused"]),
+ ('J9 damaged after a hand-over: settled', IF,
+  '        if _was_handed(handed, n):\n            hoplink.set_write_hold(cfg, name, hoplink.HOLD_SNAPSHOT_DAMAGED,',
+  '        if False:\n            hoplink.set_write_hold(cfg, name, hoplink.HOLD_SNAPSHOT_DAMAGED,',
+  [IA + "DamageRowTests.test_damage_after_a_hand_over_holds_the_generation"]),
+ ('J10 damaged, never handed over: held', IF,
+  '        if _was_handed(handed, n):\n            hoplink.set_write_hold(cfg, name, hoplink.HOLD_SNAPSHOT_DAMAGED,',
+  '        if True:\n            hoplink.set_write_hold(cfg, name, hoplink.HOLD_SNAPSHOT_DAMAGED,',
+  [IA + "DamageRowTests.test_damage_never_handed_over_settles_as_an_anomaly"]),
+ ('J11 sweep: an uncertain lookup removes', IF,
+  '                absent = _record_absent(gen_fd, owner)\n',
+  '                absent = _record_absent(gen_fd, owner) is not False\n',
+  [IA + "SweepTests.test_an_uncertain_lookup_retains_and_counts"]),
+ ('J12 sweep: a live snapshot removed', IF,
+  '                absent = _record_absent(gen_fd, owner)\n', '                absent = True\n',
+  [IA + "SweepTests.test_an_orphan_goes_and_a_live_one_stays"]),
+ ('J13 settlement leaves the snapshot', IF,
+  '    _remove_snapshot_at(record.parent.parent, record.name[: -len(".json")])\n    fsync_dir(record.parent)\n\n\ndef summarize',
+  '    fsync_dir(record.parent)\n\n\ndef summarize',
+  [IA + "CarriageTests.test_settlement_removes_the_record_marker_and_snapshot"]),
+ ('J14 the private mode not forced (fchmod dropped)', AT,
+  '            os.fchmod(fd, mode)\n', '            pass\n',
+  [IA + "ModeTests.test_0700_under_owner_clearing_umasks"]),
+ ('J15 the snapshot placed inside inflight/', IF,
+  'SNAPSHOT_DIR = "inflight-snapshots"\n', 'SNAPSHOT_DIR = "inflight"\n',
+  [IA + "PlacementTests.test_an_orphan_snapshot_never_counts_as_a_handed_out_id"]),
+ ('J16 a member added to the draft\'s descriptors', IF,
+  '    doc.pop("in_reply_to", None)\n',
+  '    doc.pop("in_reply_to", None)\n    [d.__setitem__("x", 1) for d in (doc.get("draft") or {}).get("attachments") or []]\n',
+  ["router.tests.test_inflight.LifecycleTests.test_attachments_go_over_the_leg_from_the_router_s_snapshot"]),
+ ('J17 the record\'s attachments not checked against its draft', IF,
+  '        raise RecordDamaged("attachments does not match the staged draft\'s descriptors")',
+  '        pass',
+  [IA + "RecordShapeTests.test_the_record_s_attachments_must_match_its_draft"]),
+ ('J18 the snapshot never written (the record still names it)', IF,
+  '    snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None\n',
+  '    snapshot = ([{"size_bytes": a.size_bytes, "sha256": a.sha256} for a in attachments]\n                if attachments else None)\n',
+  ["router.tests.test_inflight.LifecycleTests.test_attachments_go_over_the_leg_from_the_router_s_snapshot"]),
+ ('J19 read-back: a transient open error taken as damage', IF,
+  '                if why is None:\n                    raise          # transient: retried next poll, never damage\n',
+  '                if why is None:\n                    why = "linked"\n',
+  [IA + "DamageRowTests.test_a_transient_error_never_handed_over_neither_settles_nor_holds",
+   IA + "DamageRowTests.test_a_transient_error_after_a_hand_over_neither_settles_nor_holds"]),
+ ('J20 begin: the snapshot written after the record', IF,
+  [('    snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None\n',
+    '    snapshot = ([{"size_bytes": a.size_bytes, "sha256": a.sha256} for a in attachments]\n                if attachments else None)\n'),
+   ('    _write_record(cfg, name, req_id, record, "record")\n    return record\n',
+    '    _write_record(cfg, name, req_id, record, "record")\n    if attachments:\n        write_snapshot(cfg, name, req_id, attachments)\n    return record\n')],
+  None, [IA + "PowerLossTests.test_begin_power_loss_at_every_point_keeps_record_and_snapshot_together_nonregression"]),
+ ('J21 damage caught as HandoverUnavailable', IF,
+  [('    except SnapshotDamaged as e:\n        # This router', '    except ArithmeticError as e:\n        # This router'),
+   ('    except (FrontierUndecidable, HandoverUnavailable) as e:\n        # Decided BEFORE',
+    '    except (FrontierUndecidable, HandoverUnavailable, SnapshotDamaged) as e:\n        # Decided BEFORE')],
+  None, [IA + "DamageRowTests.test_damage_after_a_hand_over_holds_the_generation"]),
+ ('J22 the sweep follows a symlinked inflight/', IF,
+  '    kind, ifd = _pin_child(gen_fd, INFLIGHT_DIR)\n',
+  '    kind, ifd = "dir", os.open(INFLIGHT_DIR, os.O_RDONLY | os.O_DIRECTORY, dir_fd=gen_fd)\n',
+  [IA + "SweepTests.test_an_uncertain_lookup_retains_and_counts"]),
+ ('J23 removal: a directory\'s owner not checked', IF,
+  '        if not _own_dir(fd):\n            raise SnapshotNotOwned(f"{entry}: not this uid\'s directory; not removed")\n',
+  '        if False:\n            raise SnapshotNotOwned(f"{entry}: not this uid\'s directory; not removed")\n',
+  [IA + "ForeignOwnerTests.test_the_sweep_keeps_a_foreign_req_dir_and_counts_it",
+   IA + "ForeignOwnerTests.test_begin_refuses_a_foreign_leftover",
+   IA + "ForeignOwnerTests.test_cleanup_leaves_a_foreign_req_dir"]),
+ ('J24 cleanup: the snapshot root\'s owner not checked', IF,
+  '            if not _own_dir(sfd):\n                raise SnapshotNotOwned(f"{SNAPSHOT_DIR}: not this uid\'s directory")\n',
+  '            if False:\n                raise SnapshotNotOwned(f"{SNAPSHOT_DIR}: not this uid\'s directory")\n',
+  [IA + "ForeignOwnerTests.test_cleanup_leaves_a_foreign_snapshot_root"]),
 ]
 
 

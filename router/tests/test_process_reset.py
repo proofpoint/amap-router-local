@@ -32,7 +32,7 @@ CONSTANTS = {
     "generations": {"_UNKNOWN_BINDING", "_OUTCOME_VERSION"},
     "hoplink": {"LATCHED_WRITE_REASONS", "RETRY_WRITE_REASONS", "RETRY_HINTS",
                 "NOT_WRITE_REASONS", "PROCESS_STATE", "HOLD_HINTS"},
-    "inflight": {"_RECORD_KEYS"},
+    "inflight": {"_RECORD_KEYS", "_DAMAGE_ERRNO"},
     "ingress": {"TRANSITIONS", "_STATUS_DETAIL", "_V1_REQUIRED", "_V1_OPTIONAL",
                 "WAITING_REMOVE", "FAILURE_SUBJECT", "_STATUS_SUBJECT"},
     "outcomes": {"_DSN_MEANING"},

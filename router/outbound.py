@@ -1336,12 +1336,13 @@ def _begin_external(
     klass: Optional[str] = None, cold_policy: Optional[ColdPolicy] = None,
 ) -> str:
     """Put a request in flight and take its first step (which writes the
-    transport request). Two cases settle at once instead, both
-    `queued_for_human`/`transport_anomaly`, because neither is the agent's
-    fault and neither may be dropped: no transport configured, and
-    attachments, whose staging to the transport is not built yet (the
-    sidecars sit in the agent-writable outbox; ingest by copy needs them
-    staged first)."""
+    transport request). No transport configured settles at once,
+    `queued_for_human`/`transport_anomaly`: not the agent's fault, and never
+    dropped. Attachments go over the leg: checked against the EFFECTIVE caps
+    (the smaller of the hop's and this router's) before anything is
+    allocated, then snapshotted into this router's private state by
+    `inflight.begin`, so every hand-over carries exactly the bytes ingest
+    verified, whatever later happens to the agent's own sidecars."""
     if isinstance(transport, hoplink.Held):
         # This generation's sender is held: nothing is consumed, so the
         # request is decided on a later poll, once the hold clears.
@@ -1361,12 +1362,18 @@ def _begin_external(
             recipients=[], detail="the external leg is not configured for this instance",
         )
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
-    if attachments:
-        result = _result_doc(
-            req_id, "queued_for_human", reason_code=REASON_TRANSPORT_ANOMALY,
-            recipients=[], detail="attachments on the external leg are not supported yet",
-        )
-        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    if attachments and cfg.hop is not None:
+        try:
+            attachments_mod.check_effective_caps(
+                attachments,
+                file_cap=min(cfg.hop.cap("attachment"), cfg.attachment_max_bytes),
+                total_cap=min(cfg.hop.cap("total"), cfg.attachment_max_total_bytes))
+        except attachments_mod.AttachmentIngestError as e:
+            diag, detail = _refusal_diag(e, len(attachments))
+            result = _result_doc(req_id, e.outcome, reason_code=e.reason_code, detail=detail,
+                                 attachments=diag)
+            _write_held_copy(cfg, name, req_id)
+            return _finish(cfg, name, req_id, result, req_digest=req_digest)
     # Mail only (D4): the hand-over carries kind "mail", so a request the
     # classifier did not put in a cold mail class is refused before
     # anything is allocated, never handed over as mail.
@@ -1406,7 +1413,7 @@ def _begin_external(
         cfg, name, req_id, digest=req_digest, request_doc=doc,
         recipients=list(route.recipients),
         policy_digest=classify_mod.policy_digest(cfg, name), route=klass,
-        from_address=from_address,
+        from_address=from_address, attachments=attachments or None,
     )
     _advance_one(cfg, name, req_id, record, transport, cold_policy=cold_policy)
     return INFLIGHT
@@ -1528,8 +1535,14 @@ def _advance_inflight(
     so a record never handed over is never handed over now."""
     settled = errored = 0
     req_ids = inflight_mod.list_records(cfg, name)
+    # Orphan attachment snapshots (a record durably gone, its snapshot not),
+    # removed only on PROOF of the record's absence; anything uncertain is
+    # retained and logged. Whatever the transport's state. A fenced
+    # generation is swept by `_drain_fenced`, records or not.
+    uncertain = 0 if fenced else _sweep_snapshots(cfg, name)
+    extra = {"snapshot_sweep_uncertain": uncertain} if uncertain else {}
     if isinstance(transport, hoplink.Held):
-        return {"inflight_settled": 0, "inflight_errored": 0}
+        return dict({"inflight_settled": 0, "inflight_errored": 0}, **extra)
     if req_ids and transport is None:
         if (name, None) not in _STALE_WARNED:
             _STALE_WARNED.add((name, None))
@@ -1559,7 +1572,16 @@ def _advance_inflight(
                 )["result"]
                 if result["outcome"] in outcomes:
                     outcomes[result["outcome"]] += 1
-    return {"inflight_settled": settled, "inflight_errored": errored}
+    return dict({"inflight_settled": settled, "inflight_errored": errored}, **extra)
+
+
+def _sweep_snapshots(cfg: RouterConfig, name: str) -> int:
+    try:
+        return inflight_mod.sweep_snapshots(cfg, name)
+    except Exception:  # noqa: BLE001 -- housekeeping: never sinks the drain
+        logger.exception("instance %r: the attachment snapshot sweep failed; nothing "
+                         "removed", name)
+        return 1
 
 
 def _inflight_report(cfg: RouterConfig, name: str) -> Dict[str, int]:
@@ -2902,7 +2924,7 @@ def _fenced_views(cfg: RouterConfig, name: str) -> List[RouterConfig]:
 def _drain_fenced(
     cfg: RouterConfig, name: str, transport: Optional[inflight_mod.TransportPort],
     *, deliver_backend: Optional[deliver_mod.DeliveryBackend] = None,
-    cold_policy: Optional[ColdPolicy] = None,
+    cold_policy: Optional[ColdPolicy] = None, sweep_uncertain: Optional[List[int]] = None,
 ) -> Set[str]:
     """Step every fenced generation's work. Its in-flight records advance
     under their existing transport ids (a fenced generation never allocates
@@ -2943,6 +2965,11 @@ def _drain_fenced(
             except Exception:
                 logger.exception("instance %r: error stepping fenced in-flight work — "
                                  "isolated, its files stay claimed", name)
+        # Its orphan attachment snapshots, records or not (`_sweep_snapshots`);
+        # what could not be decided joins the drain summary's count.
+        n_uncertain = _sweep_snapshots(view, name)
+        if sweep_uncertain is not None:
+            sweep_uncertain.append(n_uncertain)
         # A record whose anchor exists is already answered (an error after the
         # anchor left it behind): it goes, as in the current generation, and
         # its verdict is completed by step 3 below, never replayed here.
@@ -3236,8 +3263,9 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     # A fenced generation's work first (its own transport ids, its own
     # snapshots); what it still owns at this root is neither first-sighted
     # nor drained by the current generation.
+    fenced_uncertain: List[int] = []
     fenced_owned = _drain_fenced(cfg, name, fenced_transport, deliver_backend=deliver_backend,
-                                 cold_policy=cold_policy)
+                                 cold_policy=cold_policy, sweep_uncertain=fenced_uncertain)
     marker_doc, first_sight = firstsight.record_first_sight(cfg, name, exclude=fenced_owned)
     quarantine_set = firstsight.quarantined_filenames(marker_doc)
 
@@ -3248,6 +3276,9 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     if transport is not None or inflight_mod.list_records(cfg, name):
         inflight_summary = _advance_inflight(cfg, name, transport, outcomes,
                                              cold_policy=cold_policy)
+    if sum(fenced_uncertain):
+        inflight_summary["snapshot_sweep_uncertain"] = (
+            inflight_summary.get("snapshot_sweep_uncertain", 0) + sum(fenced_uncertain))
 
     _sweep_answered_pending(cfg, name)
     filenames, skipped_symlinks = list_outbound(cfg, name)

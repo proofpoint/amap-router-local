@@ -1027,7 +1027,7 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `accepted` | `peer_routed` | Peer lane: placed in the recipient's `peer/` tree along a declared edge (or, for a reply, the reverse edge). `message_id` is the peer message id. Fresh task and reply alike — the code names the TREE |
 | `rejected` | `peer_single_recipient` | Peer lane: a submit touching a declared edge named more than one recipient or carried `cc`. Refused whole; a mixed-lane submit is never half-sent |
 | `rejected` | `peer_reply_window_expired` | Peer lane: the reply key resolves to a peer notice, no edge exists in the reply's direction, and the notice is older than `peer_reply_window_seconds` |
-| `queued_for_human` | `transport_anomaly` | External leg (see "In-flight requests"): the transport request was archived without a result, its result failed validation, the request carried attachments (staging to the transport is not built yet), a custom cold policy routed outside the request's class, or a trusted-host peer task passed every check with no cross-host peer lane built to carry it. Never resubmitted |
+| `queued_for_human` | `transport_anomaly` | External leg (see "In-flight requests"): the transport request was archived without a result, its result failed validation, the router's own attachment snapshot was damaged before anything was handed over, a custom cold policy routed outside the request's class, or a trusted-host peer task passed every check with no cross-host peer lane built to carry it. Never resubmitted |
 
 **Codes this router never originates.** They reach an agent only as a
 transport verdict, passed through verbatim with `detail` prefixed
@@ -1452,10 +1452,48 @@ only `router generation new` releases them. A record that cannot make a
 valid handover (one without its pinned `from_address`, a generation with no
 pin) latches `hop_handover_invalid` the same way. The envelope's
 `hop_contract` is the PIN's `version_write`, never the current config's. A retry
-changes `settled_through` and nothing else. `attachments` is always `[]`:
-a request with attachments on this leg is still answered
-`queued_for_human`/`transport_anomaly` ("not supported yet"), since the
-record keeps no copy of their bytes.
+changes `settled_through` and nothing else.
+
+**Attachments go over the leg, from this router's own snapshot.**
+- At begin, before a transport id is allocated, each attachment must be
+  within the EFFECTIVE per-file cap (the smaller of `hop.caps.attachment`
+  and `attachment_max_bytes`) and all of them within the effective total
+  (the smaller of `hop.caps.total` and `attachment_max_total_bytes`).
+  Over either: `queued_for_human`/`attachment_too_large`, the per-file row
+  with the `too_large` per-attachment outcome.
+- Then the bytes ingest verified are copied ONCE into private state,
+  `<generation>/inflight-snapshots/<req_id>/<i>` (0700 directories, 0600
+  files, every directory entry made durable), BEFORE the in-flight record
+  is written. The record names each attachment's size and digest, which
+  must equal the draft's descriptors. The snapshot sits beside
+  `inflight/`, never inside it, so `inflight/` keeps holding only records
+  and markers.
+- Every hand-over reads the snapshot afresh and re-proves each blob
+  against the record (no symlink followed at any level, a regular file
+  with one link, exactly the recorded size, the recorded digest), so
+  every retry carries exactly the bytes first verified, whatever happens
+  later to the agent's own sidecars. The draft's descriptors go out
+  unchanged.
+- Settlement removes the record (made durably gone first), then its
+  marker, then its snapshot. A snapshot whose record is gone is swept on a
+  later poll, under the lock, but only when the record's absence is PROVEN
+  (ENOENT); anything uncertain is kept and logged as an ERROR, and the
+  drain summary counts it (`snapshot_sweep_uncertain`).
+- A damaged snapshot is this router's own damage. If nothing was handed
+  over yet, the request is settled `queued_for_human`/`transport_anomaly`.
+  If it was handed over, this generation's hand-overs are LATCHED
+  (`hop_snapshot_damaged`) and only `router generation new` releases them:
+  settling could misreport a request pending downstream, and different
+  bytes are never handed over.
+- Storage: up to the effective total cap, as it was at begin, per
+  in-flight request with attachments.
+- Residuals: a hop cap lowered (across a restart) below the attachments of
+  a request already in flight makes its hand-over invalid at the plugin,
+  which latches `hop_handover_invalid` for that generation, the
+  "unreachable" row of the hand-over table, reached this way. Writing a
+  large snapshot before the record widens the window in which a crash
+  burns a transport id; the burned id is harmless and the snapshot is
+  swept.
 
 **Mail only.** The hand-over carries kind `"mail"`, so a request the
 classifier did not put in a cold mail class (`fleet_host`, `internet`) is
