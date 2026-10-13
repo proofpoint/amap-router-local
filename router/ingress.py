@@ -1495,7 +1495,7 @@ def recover_placing(cfg: Any, state_dir: Path, logical_id: str, gen: str, link: 
 # The §7.2 order and admission, on the FACTS only (provenance is never an
 # input). FIRST MATCH WINS; one outcome per facts document. The INTEGRITY
 # rows come first, for every class: a failure report or a reply never skips
-# them. Then the two classes §7.2 lets pre-empt the COLD rows (3, 6, 7), and
+# them. Then the two classes allowed to pre-empt the COLD rows (3, 6, 7), and
 # only those:
 #
 #   I4 fleet_hosts, ingress not "hub"       -> held admission_inconsistent
@@ -1756,14 +1756,15 @@ def addressed_to(cfg: Any, report: Any, logical_id: str,
     return not elsewhere
 
 # ---------------------------------------------------------------------------
-# §7.2 rows 1 and 2: a correlation the downstream runtime makes back to one
+# Rows 1 and 2: a correlation the downstream runtime makes back to one
 # of THIS router's own outbound transactions (a failure report, a reply). It
 # is believed only when this router's own record of that transaction agrees.
 # ---------------------------------------------------------------------------
 
 HELD_FAILURE_UNMATCHED = "failure_unmatched"
 FAILURE_SEEN_DIR = "failure-seen"
-FAILURE_SUBJECT = {"failed": "Not delivered: ", "delayed": "Delayed: "}
+FAILURE_SUBJECT = {"failed": "Not delivered: ", "delayed": "Delayed: ",
+                   "mixed": "Delivery report: "}
 #: The local description of a delivery status's subject (its middle digit).
 _STATUS_SUBJECT = {"0": "other", "1": "addressing", "2": "mailbox", "3": "mail system",
                    "4": "network or routing", "5": "mail delivery protocol",
@@ -1965,12 +1966,15 @@ def failure_documents(composed: Dict[str, Any], notice_id: str,
     this router's own records and local table (no text from the report, the
     failed message, or what the downstream runtime wrote). A pure function of
     its arguments, so a rebuild writes the same bytes."""
-    action = composed["pairs"][0]["action"]
+    actions = {p["action"] for p in composed["pairs"]}
+    action = actions.pop() if len(actions) == 1 else "mixed"
     lines = [
-        ("The downstream mail runtime reported that your message was not delivered "
-         "to the recipients below." if action == "failed" else
-         "The downstream mail runtime reported that delivery of your message to the "
-         "recipients below is delayed."),
+        {"failed": "The downstream mail runtime reported that your message was not "
+                   "delivered to the recipients below.",
+         "delayed": "The downstream mail runtime reported that delivery of your message "
+                    "to the recipients below is delayed.",
+         "mixed": "The downstream mail runtime reported on the delivery of your message "
+                  "to the recipients below."}[action],
         "",
         f"your request: {composed['req_id']}",
         f"transport id: {composed['n']}",
@@ -2332,7 +2336,7 @@ class Pump:
 
     def failure(self, entry_id: str, parsed: Dict[str, Any],
                 digests: Optional[Dict[str, Any]], rec: Optional[Dict[str, Any]]) -> Optional[str]:
-        """§7.2 row 1 and §7.3: a failure report on one of this router's own
+        """Row 1: a failure report on one of this router's own
         transactions, every reported recipient one it sent to. ONE notice per
         report, listing only the pairs not announced before (reserved durably
         first); none new: suppressed. Otherwise held `failure_unmatched`

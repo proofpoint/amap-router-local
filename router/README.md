@@ -1559,6 +1559,10 @@ lowercased, the local part exact).
   is gone; an owner that cannot be read decides nothing that pump
   (`failure_reservations_undecided` in the last pump's counts). Reservations
   are swept with the tombstones, past the same `ingress_dedup_horizon_days`.
+  A residual, in the duplicate-safe direction: a report suppressed because
+  its pair's owner was still `prepared` stays suppressed if that owner later
+  goes `late_inbound` (and so releases the pair); the pair is announced only
+  if a further report arrives.
   A report that does not match is held `failure_unmatched` and re-checked
   from its snapshot every pump, since this router's record of the send may
   land after the report.
@@ -1577,8 +1581,9 @@ without them never resolves as a binding across the external leg. (Sending a
 bound reply over the leg is a later change.)
 
 **A read that decides nothing, again** (the runtime's own refusal class, or
-an OSError from the reader) is kept per journal key with its first sighting:
-a WARNING while young, an ERROR once it has persisted an hour, and counted
+an OSError from the reader) is kept per journal key with its first sighting
+and logged on every pump: a WARNING while young, an ERROR once it has
+persisted an hour; and counted
 in status (`read_refusals`: a count, the oldest age and the reasons; the
 upstream entry id is in the log only, never in status).
 

@@ -11,6 +11,7 @@ placed threaded to the router's send; an unmatched one is classified exactly
 as mail without the correlation."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -161,17 +162,79 @@ class FailureNoticeTests(_Own):
             "another link": dict(reports=[failed(SENT_TO)], txn={"link": "link-b"}),
             "an unknown transaction": dict(reports=[failed(SENT_TO)],
                                            txn={"n": "00000099"}),
+            "a generation directory the generations file does not list":
+                dict(reports=[failed(SENT_TO)], txn={"generation": "d" * 32}, unlisted=True),
         }
         for why, case in cases.items():
             with self.subTest(why=why):
                 self.tearDown()
                 self.setUp()
                 self.anchor()
+                if case.get("unlisted"):
+                    # Pinned to this link and holding a matching anchor, so ONLY
+                    # the generations file's membership can refuse it.
+                    other = case["txn"]["generation"]
+                    self.assertEqual(ingress.pinned_link(self.state_dir, self.lid, other, LINK),
+                                     (LINK, None))
+                    self.anchor(gen=other)
                 txn = self.txn(**case.get("txn", {}))
                 self.port.entries[E1] = self.failure_entry(E1, case["reports"], txn=txn)
                 self.pump()
                 self.assertEqual(self.state(E1), (ingress.HELD, ingress.HELD_FAILURE_UNMATCHED))
                 self.assertEqual(self.placed(), [])
+
+    def test_a_matched_report_with_another_admission_link_holds(self):
+        self.anchor()
+        entry = self.failure_entry(E1, [failed(SENT_TO)])
+        doc = json.loads(entry)
+        facts = json.loads(base64.b64decode(doc["hop"]))
+        facts["admission_link"] = "link-b"
+        doc["hop"] = base64.b64encode(ingress.canonical(facts)).decode("ascii")
+        self.port.entries[E1] = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+        self.pump()
+        self.assertEqual(self.state(E1), (ingress.HELD, ingress.HELD_LINK_MISMATCH))
+        self.assertEqual(self.placed(), [])
+
+    def test_a_mixed_report_gets_a_neutral_subject(self):
+        self.anchor()
+        self.port.entries[E1] = self.failure_entry(
+            E1, [failed(SENT_TO), failed(OTHER, "4.4.1", "delayed")])
+        self.pump()
+        [(notice, spool)] = self.placed()
+        self.assertTrue(notice["message"]["subject"].startswith("Delivery report: "))
+        self.assertIn(f"{SENT_TO}: failed", spool["body_text"])
+        self.assertIn(f"{OTHER}: delayed", spool["body_text"])
+
+    def test_a_reservation_is_durable_before_anything_is_prepared(self):
+        """A crash writing the reservation leaves NO prepared record, so the
+        re-pump announces the pair exactly once. Reserving after `prepared`
+        would leave a prepared record with no reservation, and a second
+        report would announce the same pair again."""
+        self.anchor()
+        self.port.entries[E1] = self.failure_entry(E1, [failed(SENT_TO)])
+        real = ingress.atomic_write
+
+        class _Crash(Exception):
+            pass
+        fired = []
+
+        def crash_on_reservation(path, *a, **kw):
+            if ingress.FAILURE_SEEN_DIR in str(path) and not fired:
+                fired.append(path)
+                raise _Crash(path)
+            return real(path, *a, **kw)
+        with mock.patch.object(ingress, "atomic_write", crash_on_reservation):
+            try:
+                self.pump()
+            except _Crash:
+                pass
+        self.assertTrue(fired, "control: the reservation write was reached")
+        self.assertIsNone(self.state(E1), "a prepared record without its reservation")
+        self.pump()
+        self.port.entries[E2] = self.failure_entry(E2, [failed(SENT_TO)])
+        self.pump()
+        self.assertEqual(len(self.placed()), 1, "the pair was announced twice")
+        self.assertEqual(self.state(E2), (ingress.SUPPRESSED_WAITING_REMOVE, None))
 
     def test_a_record_never_handed_over_matches_nothing(self):
         d = generations.gen_dir(self.state_dir, self.lid, self.gen) / "inflight"
