@@ -233,6 +233,21 @@ M = [
   "                    and call.func.value.id == \"self\") and False:\n                return None\n",
   ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
    "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C43 a direct reset in setUp counted as class-wide", "router/tests/test_one_clock.py",
+  "                and owner.name in (\"tearDown\", \"tearDownClass\") and stmt in owner.body):\n",
+  "                and owner.name in (\"setUp\", \"tearDown\", \"tearDownClass\") and stmt in owner.body):\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C44 clock.reset anywhere in addCleanup's arguments", "router/tests/test_one_clock.py",
+  "            if call.args[0] is not node or len(call.args) != 1 or call.keywords:\n",
+  "            if False:\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C45 a direct reset with arguments accepted", "router/tests/test_one_clock.py",
+  "        if call.args or call.keywords:\n            return None     # clock.reset takes nothing",
+  "        if False:\n            return None     # clock.reset takes nothing",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
  ("C35 a dynamic importer taken as a value", "router/outcomes.py",
   "def outcomes_rel(connector_id: str) -> Path:",
   "def _imp():\n    import importlib\n    return importlib.import_module\n\n\n"

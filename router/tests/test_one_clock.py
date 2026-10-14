@@ -444,8 +444,9 @@ class ControlTests(unittest.TestCase):
 def unreset_installs(source: str):
     """`(line, where)` for each `router.clock.install` call in a test module
     (resolved through its imports) that no guaranteed reset covers THAT
-    install (see `reset_scope`): a class-wide reset (in `setUp`, `tearDown`
-    or `tearDownClass`, or `self.addCleanup(clock.reset)` in `setUp`), a
+    install (see `reset_scope`): a class-wide reset (`clock.reset()` in
+    `tearDown` or `tearDownClass`, or `self.addCleanup(clock.reset)` in
+    `setUp`), a
     `self.addCleanup(clock.reset)` at the top level of the same test method,
     or a top-level `finally: clock.reset()` whose `try` body holds the
     install. A reset in a sibling test never counts."""
@@ -465,10 +466,12 @@ def unreset_installs(source: str):
         function `f`), `("try", t)` (only installs inside the body of `try`
         statement `t`), or None (it might not run, or not for this test).
 
-        - `clock.reset()` as a top-level statement of `setUp`, `tearDown`
-          or `tearDownClass`: "class".
-        - `self.addCleanup(clock.reset)` as a top-level statement of
-          `setUp`: "class"; of a test method: that method only, since it is
+        - `clock.reset()`, with no arguments, as a top-level statement of
+          `tearDown` or `tearDownClass`: "class". Not `setUp`: it runs
+          before the install, never after it, so the last test's source
+          would outlive the class.
+        - `self.addCleanup(clock.reset)`, `clock.reset` the sole argument,
+          as a top-level statement of `setUp`: "class"; of a test method: that method only, since it is
           not registered for its siblings.
         - `clock.reset()` as a top-level statement of a `finally` body: the
           installs inside that `try`'s own body.
@@ -479,6 +482,10 @@ def unreset_installs(source: str):
         call = parents.get(id(node))
         if isinstance(call, ast.Call) and _call_name(call.func) == "addCleanup" \
                 and node in call.args:
+            # clock.reset must be the callback itself: the sole positional
+            # argument, with no extra arguments or keywords to pass it.
+            if call.args[0] is not node or len(call.args) != 1 or call.keywords:
+                return None
             if not (isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
                     and call.func.value.id == "self"):
                 return None
@@ -493,6 +500,8 @@ def unreset_installs(source: str):
             return ("fn", owner) if owner.name.startswith("test") else None
         if not (isinstance(call, ast.Call) and call.func is node):
             return None
+        if call.args or call.keywords:
+            return None     # clock.reset takes nothing: anything else raises first
         stmt = parents.get(id(call))
         owner = parents.get(id(stmt))
         if not isinstance(stmt, ast.Expr):
@@ -500,7 +509,7 @@ def unreset_installs(source: str):
         if isinstance(owner, ast.Try) and stmt in owner.finalbody:
             return ("try", owner)
         if (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and owner.name in ("setUp", "tearDown", "tearDownClass") and stmt in owner.body):
+                and owner.name in ("tearDown", "tearDownClass") and stmt in owner.body):
             return "class"
         return None
 
@@ -592,6 +601,18 @@ class TestsResetWhatTheyInstallTests(unittest.TestCase):
             "from router import clock\nclass T:\n    def test(self):\n"
             "        clock.install(f)\n        try:\n            pass\n"
             "        finally:\n            clock.reset()\n"),
+        "a direct reset in setUp": ("from router import clock\nclass T:\n"
+                                    "    def setUp(self):\n        clock.reset()\n"
+                                    "    def test(self):\n        clock.install(f)\n"),
+        "reset not the cleanup callback": ("from router import clock\nclass T:\n"
+                                           "    def test(self):\n        clock.install(f)\n"
+                                           "        self.addCleanup(other, clock.reset)\n"),
+        "reset registered with an argument": ("from router import clock\nclass T:\n"
+                                              "    def test(self):\n        clock.install(f)\n"
+                                              "        self.addCleanup(clock.reset, 1)\n"),
+        "reset called with an argument": ("from router import clock\nclass T:\n"
+                                          "    def test(self):\n        clock.install(f)\n"
+                                          "    def tearDown(self):\n        clock.reset(1)\n"),
         "reset referenced, not called": ("from router import clock\nclass T:\n"
                                          "    def test(self):\n        clock.install(f)\n"
                                          "    def tearDown(self):\n        clock.reset\n"),
@@ -602,8 +623,6 @@ class TestsResetWhatTheyInstallTests(unittest.TestCase):
                               "    def tearDown(self):\n        c.reset()\n"),
         "addCleanup": ("from router import clock\nclass T:\n    def test(self):\n"
                        "        clock.install(f)\n        self.addCleanup(clock.reset)\n"),
-        "reset in setUp": ("from router import clock\nclass T:\n    def setUp(self):\n"
-                           "        clock.reset()\n    def test(self):\n        clock.install(f)\n"),
         "addCleanup in setUp": ("from router import clock\nclass T:\n    def setUp(self):\n"
                                 "        self.addCleanup(clock.reset)\n"
                                 "    def test(self):\n        clock.install(f)\n"),
