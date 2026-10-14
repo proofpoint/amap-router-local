@@ -565,21 +565,25 @@ class AttemptTests(_Control):
         wrapper.done = False
         return mock.patch.object(target, name, wrapper)
 
-    def test_adopt_whose_pin_write_fails_after_the_record_is_committed_and_completed(self):
+    def test_adopt_whose_record_write_fails_after_the_pin_is_committed_and_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
         from router import hoplink
         with self.fail_once(peercontrol, "atomic_write",
-                            lambda path, *_a, **_k: Path(path).name == hoplink.PIN_FILE):
+                            lambda path, *_a, **_k: Path(path).name
+                            == config_mod.RUNTIME_GENERATION_FILE):
             code, err = self.cli("adopt", gen=a)
         self.assertEqual(code, 3, err)
         self.assertIn("COMMITTED", err)
         self.assertNotIn("refused", err)
-        self.assertEqual(self.recorded(), a, "the record committed")
-        self.assertFalse(self.pin_path().exists(), "the pin did not")
+        # The pin is written FIRST: the crash leaves the pin and no record,
+        # never a record naming a generation no port could be built for.
+        pin_a = peercontrol.runtime_dir(self.cfg) / a / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
+        self.assertIsNone(self.recorded(), "the record did not commit")
+        self.assertTrue(pin_a.is_file(), "the pin committed first")
         self.assertEqual((self.marker() or {}).get("verb"), peercontrol.ADOPT_VERB)
         self.cli("retire", gen="9" * 32)          # the next verb completes it first
-        self.assertTrue(self.pin_path().is_file())
+        self.assertEqual(self.recorded(), a)
         self.assertIsNone(self.marker())
         self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1)
 
@@ -621,23 +625,25 @@ class AttemptTests(_Control):
         self.assertEqual(len(lines), 1)
         self.assertIn(planned, lines[0].get("result", ""))
 
-    def test_new_whose_pin_write_fails_after_the_planned_record_is_completed(self):
+    def test_new_whose_record_write_fails_after_the_planned_pin_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
         peercontrol.record_generation(self.cfg, a, admitted_at=AT)
-        pin_before = self.pin_path()
-        self.assertTrue(pin_before.is_file())
-        from router import hoplink
         with self.fail_once(peercontrol, "atomic_write",
-                            lambda path, *_a, **_k: Path(path).name == hoplink.PIN_FILE):
+                            lambda path, *_a, **_k: Path(path).name
+                            == config_mod.RUNTIME_GENERATION_FILE):
             code, err = self.cli("new")
         self.assertEqual(code, 3, err)
         self.assertIn("COMMITTED", err)
         planned = self.marker()["detail"]["minted"]
-        self.assertEqual(self.recorded(), planned, "the planned record committed")
-        self.assertFalse(self.pin_path().exists(), "its pin did not")
+        from router import hoplink
+        pin = peercontrol.runtime_dir(self.cfg) / planned / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
+        # The pin FIRST: the crash leaves the planned generation's pin and no
+        # record (the retired one's record is already gone).
+        self.assertIsNone(self.recorded(), "the planned record did not commit")
+        self.assertTrue(pin.is_file(), "the planned pin committed first")
         self.send()                               # an empty-queue pass completes it
-        self.assertTrue(self.pin_path().is_file(), "the pin is written by the completion")
+        self.assertEqual(self.recorded(), planned, "the planned generation, recorded")
         self.assertIsNone(self.marker())
         self.assertEqual(len(self.acts(peercontrol.NEW_VERB)), 1)
 

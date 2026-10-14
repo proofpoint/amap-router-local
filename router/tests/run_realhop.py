@@ -303,6 +303,11 @@ def _cases():
                              (True, "rejected", "generation_retired"))
             self.assertFalse(self.handed(key), "the plugin wrote nothing")
             self.assertEqual(peercontrol._inflight_entries(self.cfg, gen), [])
+            # Settled IS finished: nothing left unsettled, and a following
+            # `new` is not refused by it.
+            self.assertEqual(peercontrol.unsettled_attempts(self.cfg), [])
+            peercontrol.operator_new(self.cfg, self.cap(), now=NOW, evidence="row")
+            self.assertNotEqual(peercontrol.recorded_admitted_at(self.cfg)[0], gen)
 
         def test_hold_before_hand_over(self):
             key, gen = self.frozen_unhanded()

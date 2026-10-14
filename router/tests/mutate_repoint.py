@@ -59,13 +59,13 @@ M = [
   '        record_generation(cfg, d["minted"], admitted_at=format_utc_ts(now))\n',
   [T + "AdmitTests.test_a_new_plan_replayed_uses_the_plans_time"]),
  ("R3 no settling row", INF,
-  '        settles = hoplink.settle_for_write(e)\n',
+  '        settles = hoplink.settle_for_write(e) if name == config_mod.RUNTIME_NS else None\n',
   '        settles = None\n',
   [T + "SettleTests.test_a_retired_generation_at_write_request_settles_rejected_and_cleans_up"]),
  ("C4 the settling row asked after the latched row", INF,
-  '        settles = hoplink.settle_for_write(e)\n',
+  '        settles = hoplink.settle_for_write(e) if name == config_mod.RUNTIME_NS else None\n',
   '        settles = (hoplink.settle_for_write(e) if hoplink.latch_for_write(e) is None\n'
-  '                   else None)\n',
+  '                   and name == config_mod.RUNTIME_NS else None)\n',
   [T + "SettleTests.test_the_settle_row_is_asked_before_the_latched_and_retried_rows"]),
  ("R3 generation_retired not a settling reason", HL,
   '    "generation_retired": "rejected",\n', '',
@@ -99,10 +99,70 @@ M = [
  ("N3b the own address keeps its case", CF,
   '    domain = fleet_domain.lower() if fleet_domain.isascii() else fleet_domain\n',
   '    domain = fleet_domain\n',
-  [T + "AddressTests.test_the_one_construction_lowercases_and_every_surface_takes_it"]),
+  [T + "AddressTests.test_the_one_construction_lowercases_and_every_surface_takes_it",
+   T + "AddressTests.test_an_authored_dsn_is_from_the_lowercase_address",
+   T + "AddressTests.test_an_exposure_stamp_is_asserted_by_the_lowercase_address",
+   T + "AddressTests.test_the_handed_envelope_and_control_statement_are_from_the_lowercase_address"]),
  ("N3b the runtime address built apart", PC,
   '    address = config_mod.router_address(cfg.fleet_domain)\n    if address is None:\n',
   '    address = f"amap.router@{cfg.fleet_domain}"\n    if address is None:\n',
+  [T + "AddressTests.test_no_module_but_config_builds_the_own_address"]),
+ ("R3 the settling row ungated: an agent tree settles", INF,
+  '        settles = hoplink.settle_for_write(e) if name == config_mod.RUNTIME_NS else None\n',
+  '        settles = hoplink.settle_for_write(e)\n',
+  ["router.tests.test_hoplink_write_table.RetryTests"
+   ".test_generation_retired_from_an_agent_tree_is_retried_never_settled"]),
+ ("R2 the record before the pin", PC,
+  '    atomic_write(pin, hoplink.canonical(hoplink.pin_doc(cfg.hop, admitted_at)),\n'
+  '                 durable_root=cfg.state_dir)\n'
+  '    atomic_write(d / config_mod.RUNTIME_GENERATION_FILE,\n'
+  '                 json.dumps({"generation": gen, "minted_ts": admitted_at},\n'
+  '                            sort_keys=True).encode("utf-8"), durable_root=cfg.state_dir)\n',
+  '    atomic_write(d / config_mod.RUNTIME_GENERATION_FILE,\n'
+  '                 json.dumps({"generation": gen, "minted_ts": admitted_at},\n'
+  '                            sort_keys=True).encode("utf-8"), durable_root=cfg.state_dir)\n'
+  '    atomic_write(pin, hoplink.canonical(hoplink.pin_doc(cfg.hop, admitted_at)),\n'
+  '                 durable_root=cfg.state_dir)\n',
+  [T + "CrashBoundaryTests.test_a_crash_at_the_fresh_mints_record_then_the_next_pass_hands_over",
+   T + "CrashBoundaryTests.test_a_crash_at_a_restores_record_then_the_next_pass_hands_over"]),
+ ("R6 the runtime namespace retries a probe anomaly in production", INF,
+  '        if not _is_hop(cfg) or name == config_mod.RUNTIME_NS:\n',
+  '        if not _is_hop(cfg):\n',
+  [T + "ProductionShapeTests.test_a_sender_method_anomaly_holds_named_in_the_production_shape"]),
+ ("R6 why the tree is unavailable is not kept", PC,
+  '    if not detail or (doc.get(e.reason) or {}).get("detail") == detail:\n',
+  '    if True:\n',
+  [T + "UnavailableNamedTests.test_an_identity_with_another_time_is_named_exists_different",
+   T + "UnavailableNamedTests.test_a_missing_pin_is_named",
+   T + "ProductionShapeTests.test_a_sender_method_anomaly_holds_named_in_the_production_shape"]),
+ ("R3 the cleanup after the held pass's early returns", PC,
+  '    cleaned = finish_settled(cfg)\n    if cleaned:\n        counts["settled_cleaned"] = cleaned\n'
+  '    try:\n        clock = peerclock.read(state_dir)\n'
+  '    except peerclock.ClockUntrusted:\n'
+  '        return dict(counts, held_clock_untrusted=len(pending(state_dir)))\n'
+  '    if clock.admission != "open":\n'
+  '        # H is untrusted until admission reopens: no token, no mint, no attempt.\n'
+  '        return dict(counts, held_admission_closed=len(pending(state_dir)))\n',
+  '    try:\n        clock = peerclock.read(state_dir)\n'
+  '    except peerclock.ClockUntrusted:\n'
+  '        return dict(counts, held_clock_untrusted=len(pending(state_dir)))\n'
+  '    if clock.admission != "open":\n'
+  '        # H is untrusted until admission reopens: no token, no mint, no attempt.\n'
+  '        return dict(counts, held_admission_closed=len(pending(state_dir)))\n'
+  '    cleaned = finish_settled(cfg)\n    if cleaned:\n        counts["settled_cleaned"] = cleaned\n',
+  [T + "HeldPassCleanupTests.test_closed_admission_still_cleans_up",
+   T + "HeldPassCleanupTests.test_an_untrusted_clock_defers_the_cleanup_to_the_first_trusted_pass"]),
+ ("R2 a resume admits with the clock's now", PC,
+  '    return cap.admit(port, gen, at)\n',
+  '    return cap.admit(port, gen, format_utc_ts(datetime.now()))\n',
+  [T + "AdmitTests.test_every_resume_admits_again_and_a_steady_state_is_exists"]),
+ ("R2 an unlisted restore re-stamps over its surviving pin", PC,
+  '    return pin["admitted_at"] if isinstance(pin.get("admitted_at"), str) else format_utc_ts(now)\n',
+  '    return format_utc_ts(now)\n',
+  [T + "AdmitTests.test_an_unlisted_restore_with_a_surviving_pin_takes_the_pins_time"]),
+ ("N3b the runtime address concatenated apart", PC,
+  '    address = config_mod.router_address(cfg.fleet_domain)\n    if address is None:\n',
+  '    address = config_mod.ROUTER_LOCAL_PART + "@" + cfg.fleet_domain\n    if address is None:\n',
   [T + "AddressTests.test_no_module_but_config_builds_the_own_address"]),
 ]
 

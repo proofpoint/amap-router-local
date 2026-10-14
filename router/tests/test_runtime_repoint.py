@@ -213,6 +213,17 @@ class AdmitTests(_Repoint):
                                    evidence="x")
         self.assertEqual(self.record_bytes(gen), before, "adopt is a byte-equal no-op")
 
+    def test_an_unlisted_restore_with_a_surviving_pin_takes_the_pins_time(self):
+        key, gen = self.frozen_and_lost()
+        self.tree.gens.pop(gen, None)
+        self.tree.identities.pop(gen, None)
+        pinned = self.pin(gen)["admitted_at"]
+        later = NOW.replace(minute=30)
+        self.assertNotEqual(pinned, later.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.send(now=later)
+        self.assertEqual(peercontrol.recorded_admitted_at(self.cfg), (gen, pinned))
+        self.assertEqual(self.tree.identities[gen]["admitted_at"], pinned, "admitted at the pin's")
+
 
 class SettleTests(_Repoint):
     """R3 and C4: a retired generation at write_request settles; elsewhere it holds."""
@@ -441,6 +452,64 @@ class AddressTests(_Repoint):
         peercontrol.Capability(self.runtime.plugin, self.runtime.fsops, mixed).sender("a" * 32)
         self.assertEqual(self.tree.calls[-1][1]["address"], self.LOWER)
 
+    def mixed(self):
+        return dataclasses.replace(self.cfg, fleet_domain=self.MIXED)
+
+    def test_an_authored_dsn_is_from_the_lowercase_address(self):
+        from router import deliver
+        mixed = self.mixed()
+        out = deliver.deliver_router_notice(mixed, self.state_dir, tpc.tpe.HOSTED
+                                            if hasattr(tpc.tpe, "HOSTED") else "bob",
+                                            subject="Delivery report", body_text="x\n",
+                                            in_reply_to=None)
+        inst = mixed.instances[out["recipient"]]
+        notice = json.loads((inst.inbox_root / "notices"
+                             / f"notice-{out['notice_id']}.json").read_text())
+        self.assertEqual(notice["message"]["from"], self.LOWER)
+
+    def test_an_exposure_stamp_is_asserted_by_the_lowercase_address(self):
+        from router import exposure
+        stamp = exposure.assess(self.mixed(), "bob", now=AT)
+        self.assertEqual((stamp or {}).get("asserted_by"), self.LOWER)
+
+    def test_the_handed_envelope_and_control_statement_are_from_the_lowercase_address(self):
+        import base64
+        key = self.refused()
+        self.cfg = self.mixed()
+        self.send()
+        n, doc = self.handover(key)
+        self.assertEqual(doc["envelope"]["from_address"], self.LOWER)
+        header = doc["envelope"]["peer"]["statement_header"]
+        s = [p.strip()[2:] for p in header.split(";") if p.strip().startswith("s=")][0]
+        statement = json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+        self.assertEqual(statement["from"], self.LOWER)
+
+    def test_the_control_receive_check_takes_the_lowercase_address(self):
+        from router import peerclock, peerpolicy
+        from router.tests.test_peerbind import KEY_ID, T1
+        import types
+        mixed = self.mixed()
+        clock = peerclock.read(self.state_dir)
+        hctx = peerpolicy.hook_context(mixed, delegation=self.lane, state_dir=self.state_dir,
+                                       now=NOW, clock=clock)
+        hooks = peerpolicy.production_hooks(hctx)
+
+        def receive(to):
+            payload = {"v": 1, "key_id": KEY_ID, "kind": "control", "id": "c" * 23,
+                       "from": f"amap.router@{T1}", "to": to, "ts": AT, "about": "a" * 23,
+                       "outcome": "refused", "cause": "policy"}
+            verdict = types.SimpleNamespace(payload=payload, key_id=KEY_ID)
+            try:
+                return hooks.control_receive(None, verdict)
+            except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL
+                return f"raised {type(e).__name__}"
+        def cause(out):
+            return getattr(out, "cause", out)
+        self.assertNotEqual(cause(receive(self.LOWER)), peerpolicy.CONTROL_MISROUTED,
+                            "its own lowercase address")
+        self.assertEqual(cause(receive("amap.router@other.example.org")),
+                         peerpolicy.CONTROL_MISROUTED, "positive control")
+
     def test_no_module_but_config_builds_the_own_address(self):
         """Every surface reaches the address through `config.router_address`:
         the runtime identity and control from (peercontrol.runtime_address),
@@ -451,20 +520,8 @@ class AddressTests(_Repoint):
         for path in sorted(ROUTER.glob("*.py")):
             if path.name == "config.py":
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for n in ast.walk(tree):
-                if isinstance(n, ast.Constant) and isinstance(n.value, str) \
-                        and n.value.startswith("amap.router@"):
-                    bad.append(f"{path.name}:{n.lineno}: a literal own address")
-                if isinstance(n, ast.JoinedStr) and any(
-                        isinstance(v, ast.Constant) and "amap.router@" in str(v.value)
-                        for v in n.values):
-                    bad.append(f"{path.name}:{n.lineno}: an f-string own address")
-                if isinstance(n, ast.JoinedStr) and any(
-                        isinstance(v, ast.FormattedValue)
-                        and isinstance(v.value, ast.Attribute)
-                        and v.value.attr == "ROUTER_LOCAL_PART" for v in n.values):
-                    bad.append(f"{path.name}:{n.lineno}: ROUTER_LOCAL_PART formatted")
+            bad += [f"{path.name}:{line}" for line in
+                    _own_address_builders(path.read_text(encoding="utf-8"))]
         self.assertEqual(bad, [])
         users = {}
         for name in ("peercontrol.py", "ingress.py", "deliver.py", "exposure.py",
@@ -475,6 +532,57 @@ class AddressTests(_Repoint):
                 or (isinstance(n.func, ast.Name) and n.func.id == "router_address"))
                 for n in ast.walk(tree))
         self.assertEqual(users, {k: True for k in users})
+
+
+    def test_the_address_scanner_sees_every_build_shape(self):
+        """Positive control: each shape is found; a comparison is not."""
+        shapes = [
+            'x = "amap.router@d"',
+            'x = f"amap.router@{d}"',
+            'x = f"{config_mod.ROUTER_LOCAL_PART}@{d}"',
+            'x = f"{ROUTER_LOCAL_PART}@{d}"',
+            'x = config_mod.ROUTER_LOCAL_PART + "@" + d',
+            'x = ROUTER_LOCAL_PART + "@" + d',
+            'x = "%s@%s" % (ROUTER_LOCAL_PART, d)',
+            'x = "{}@{}".format(config_mod.ROUTER_LOCAL_PART, d)',
+            'x = "@".join([ROUTER_LOCAL_PART, d])',
+        ]
+        self.assertEqual([s for s in shapes if not _own_address_builders(s)], [])
+        self.assertEqual(_own_address_builders(
+            "ok = local.casefold() != config_mod.ROUTER_LOCAL_PART.casefold()"), [])
+
+def _is_local_part(node) -> bool:
+    """`ROUTER_LOCAL_PART`, bare (imported) or as an attribute."""
+    return ((isinstance(node, ast.Name) and node.id == "ROUTER_LOCAL_PART")
+            or (isinstance(node, ast.Attribute) and node.attr == "ROUTER_LOCAL_PART"))
+
+
+def _own_address_builders(source: str) -> list:
+    """Every line of `source` that builds this router's own address outside
+    `config.router_address`: the literal, an f-string carrying it, or the
+    local part formatted, concatenated, %-formatted, `.format`ted or joined.
+    A comparison or a `.casefold()` of the local part is not a build."""
+    out = []
+    for n in ast.walk(ast.parse(source)):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) \
+                and n.value.startswith("amap.router@"):
+            out.append(n.lineno)
+        elif isinstance(n, ast.JoinedStr) and any(
+                (isinstance(v, ast.Constant) and "amap.router@" in str(v.value))
+                or (isinstance(v, ast.FormattedValue) and _is_local_part(v.value))
+                for v in n.values):
+            out.append(n.lineno)
+        elif isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Mod)) and (
+                _is_local_part(n.left) or _is_local_part(n.right)
+                or (isinstance(n.right, ast.Tuple) and any(_is_local_part(e) for e in n.right.elts))):
+            out.append(n.lineno)
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and n.func.attr in ("format", "join") and any(
+                    _is_local_part(a) or (isinstance(a, (ast.List, ast.Tuple))
+                                          and any(_is_local_part(e) for e in a.elts))
+                    for a in list(n.args) + [k.value for k in n.keywords]):
+            out.append(n.lineno)
+    return out
 
 
 class RealPluginHarnessTests(tpc._Control):
@@ -514,3 +622,150 @@ class RealPluginHarnessTests(tpc._Control):
         matrix = run_realhop._cases()
         self.assertEqual(sorted(n[5:] for n in dir(matrix) if n.startswith("test_")),
                          sorted(run_realhop.ROWS), "every row is run, and only these")
+
+
+class CrashBoundaryTests(_Repoint):
+    """R2: a crash between the pin and the record never strands the tree."""
+
+    def crash_between_the_writes(self):
+        """A crash at the SECOND of record_generation's two writes, whichever
+        it is: the pin first leaves a pin and no record, which a later pass
+        mints or restores past; the record first would leave a record
+        naming a generation with no pin, held forever."""
+        real = peercontrol.atomic_write
+        names = {config_mod.RUNTIME_GENERATION_FILE, hoplink.PIN_FILE}
+        state = {"seen": 0}
+
+        def write(path, *a, **k):
+            if pathlib.Path(path).name in names and state["seen"] < 2:
+                state["seen"] += 1
+                if state["seen"] == 2:
+                    raise OSError("crash between the pin and the record")
+            return real(path, *a, **k)
+        return mock.patch.object(peercontrol, "atomic_write", write)
+
+    def test_a_crash_at_the_fresh_mints_record_then_the_next_pass_hands_over(self):
+        key = self.refused()
+        with self.crash_between_the_writes():
+            self.send()
+        self.assertIsNone(peercontrol.recorded_admitted_at(self.cfg), "no record without its pin")
+        self.send()
+        n, _doc = self.handover(key)
+        self.assertTrue(n)
+
+    def test_a_crash_at_a_restores_record_then_the_next_pass_hands_over(self):
+        key = self.refused()
+        with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
+            self.send()
+        gen = self.control(key)["attempt"]["gen"]
+        (peercontrol.runtime_dir(self.cfg) / config_mod.RUNTIME_GENERATION_FILE).unlink()
+        with self.crash_between_the_writes():
+            self.send()
+        self.assertIsNone(peercontrol.recorded_admitted_at(self.cfg))
+        self.send()
+        self.assertEqual(peercontrol.recorded_admitted_at(self.cfg)[0], gen)
+        n, _doc = self.handover(key)
+        self.assertTrue(n)
+
+
+class ProductionShapeTests(_Repoint):
+    """R6: with `hop` and a registry (`_is_hop`), as production always has,
+    a runtime port anomaly holds the pass named, never a silent retry."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(inflight, "_is_hop", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_sender_method_anomaly_holds_named_in_the_production_shape(self):
+        key = self.refused()
+        self.send()
+        with mock.patch.object(rs.RuntimeSender, "has_result",
+                               side_effect=rs.Anomaly("owner", "up/ misowned")):
+            got = self.send()
+        self.assertEqual(got, {peercontrol.UNAVAILABLE: 1})
+        tree = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)["runtime_tree"]
+        self.assertIn("owner", (tree.get("unavailable") or {}).get(peercontrol.UNAVAILABLE, {})
+                      .get("detail", ""))
+        self.assertTrue(self.control(key)["attempt"])
+
+
+class UnavailableNamedTests(_Repoint):
+    """R6: why the tree is unavailable is logged and named in status."""
+
+    def named(self):
+        tree = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)["runtime_tree"]
+        return ((tree.get("unavailable") or {}).get(peercontrol.UNAVAILABLE) or {}).get("detail", "")
+
+    def test_an_identity_with_another_time_is_named_exists_different(self):
+        gen = "e" * 32
+        self.tree.admit(gen, OTHER_AT, address=peercontrol.runtime_address(self.cfg))
+        peercontrol.record_generation(self.cfg, gen, admitted_at=AT)
+        self.refused()
+        with self.assertLogs("amap_router_local.peercontrol", level="WARNING") as logs:
+            self.send()
+        self.assertIn("exists_different", self.named())
+        self.assertTrue(any("exists_different" in line for line in logs.output))
+
+    def test_a_missing_pin_is_named(self):
+        gen = "e" * 32
+        peercontrol.record_generation(self.cfg, gen, admitted_at=AT)
+        (peercontrol.runtime_dir(self.cfg) / gen / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE).unlink()
+        self.refused()
+        self.send()
+        self.assertIn("no pinned", self.named())
+
+
+class HeldPassCleanupTests(_Repoint):
+    """R3: the cleanup a settlement owes runs before the held pass's
+    early returns, so its residue never blocks retire or new."""
+
+    def residue(self):
+        key = self.refused()
+        with mock.patch.object(inflight, "advance", side_effect=RuntimeError("crash")):
+            self.send()
+        gen = self.control(key)["attempt"]["gen"]
+        self.tree.gens[gen] = "retired"
+        real = inflight._cleanup
+        calls = []
+
+        def crash_once(*a, **k):
+            calls.append(a)
+            if len(calls) == 1:
+                raise RuntimeError("crash after the settlement")
+            return real(*a, **k)
+        with mock.patch.object(peercontrol, "_require_writable"), \
+                mock.patch.object(inflight, "_cleanup", crash_once), \
+                mock.patch.object(peercontrol, "finish_settled", return_value=0):
+            self.send()
+        self.assertTrue(self.control(key)["sent"])
+        self.assertTrue(peercontrol._inflight_entries(self.cfg, gen), "the residue")
+        return key, gen
+
+    def test_closed_admission_still_cleans_up(self):
+        key, gen = self.residue()
+        from router import peerclock
+        peerclock.close(self.state_dir, peerclock.read(self.state_dir), "test")
+        got = self.send()
+        self.assertIn("held_admission_closed", got)
+        self.assertEqual(peercontrol._inflight_entries(self.cfg, gen), [])
+        self.assertEqual(peercontrol.unsettled_attempts(self.cfg), [])
+
+    def test_an_untrusted_clock_defers_the_cleanup_to_the_first_trusted_pass(self):
+        # The journal is verified by the same clock (`read_meta`), so no
+        # settlement can be read while it is untrusted: nothing is removed,
+        # and the first trusted pass, held or not, completes it.
+        key, gen = self.residue()
+        from router import peerclock
+        with mock.patch.object(peerclock, "read",
+                               side_effect=peerclock.ClockUntrusted("lost")):
+            got = self.send()
+        self.assertIn("held_clock_untrusted", got)
+        self.assertNotIn("settled_cleaned", got)
+        self.assertTrue(peercontrol._inflight_entries(self.cfg, gen))
+        peerclock.close(self.state_dir, peerclock.read(self.state_dir), "test")
+        got = self.send()
+        self.assertEqual(got.get("settled_cleaned"), 1)
+        self.assertIn("held_admission_closed", got)
+        self.assertEqual(peercontrol._inflight_entries(self.cfg, gen), [])

@@ -939,6 +939,12 @@ def router_address(fleet_domain: Optional[str]) -> Optional[str]:
     return f"{ROUTER_LOCAL_PART}@{domain}"
 
 
+def router_runtime(fleet_domain: Optional[str]) -> str:
+    """`router_address`, or, without a fleet domain, the bare local part and
+    its `@` (the own-key gate's runtime name when no domain is configured)."""
+    return router_address(fleet_domain) or f"{ROUTER_LOCAL_PART}@"
+
+
 _ADDR_RE = re.compile(r"agent\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})@local\Z")
 
 

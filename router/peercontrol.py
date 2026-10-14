@@ -478,9 +478,9 @@ def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any
                 raise PlanPending(f"the planned mint is blocked by {others or frozen}")
         elif recorded != d["minted"]:
             raise PlanPending(f"another generation {recorded} is recorded")
-        # The planned generation's FULL effect, the record AND its pin, is
-        # replayed even when the record already names it: a pin write that
-        # failed after the record committed is completed here.
+        # The planned generation's FULL effect, its pin AND its record, is
+        # replayed even when the pin is already there: a record write that
+        # failed after the pin committed is completed here.
         record_generation(cfg, d["minted"], admitted_at=marker["at"])   # the plan's time
         return f"{retired}, minted {d['minted']}"
     raise PlanPending(f"unknown verb {verb!r}")
@@ -708,6 +708,36 @@ def _inflight_dir(cfg: Any, gen: str) -> Path:
     return Path(cfg.state_dir) / config_mod.RUNTIME_NS / gen / inflight.INFLIGHT_DIR
 
 
+#: Where the last detail of each `Unavailable` reason is kept for status.
+UNAVAILABLE_FILE = "unavailable.json"
+
+
+def note_unavailable(cfg: Any, e: "Unavailable", now: datetime) -> None:
+    """Name why the runtime tree is unavailable (an `exists_different`
+    identity, a missing pin, a record/pin disagreement, a plugin anomaly):
+    logged and kept as the last detail per reason, with its time, for
+    status. Written (and logged) only when the detail changes."""
+    path = runtime_dir(cfg) / UNAVAILABLE_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    detail = e.detail or ""
+    if not detail or (doc.get(e.reason) or {}).get("detail") == detail:
+        return                      # nothing to name, or named already
+    logger.warning("control notices: the runtime tree is unavailable (%s): %s", e.reason,
+                   detail or "no detail")
+    doc[e.reason] = {"detail": detail[:500], "at": format_utc_ts(now)}
+    try:
+        runtime_dir(cfg).mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(doc, sort_keys=True).encode("utf-8"),
+                     durable_root=cfg.state_dir)
+    except OSError:
+        logger.exception("control notices: the unavailable detail could not be kept")
+
+
 def finish_settled(cfg: Any) -> int:
     """The cleanup a settlement owes, completed: an attempt whose journal
     record is SENT (settled: delivered, refused, or rejected because its
@@ -792,13 +822,17 @@ def record_generation(cfg: Any, gen: str, *, admitted_at: str) -> None:
     from . import hoplink
     d = runtime_dir(cfg)
     d.mkdir(parents=True, exist_ok=True)
-    atomic_write(d / config_mod.RUNTIME_GENERATION_FILE,
-                 json.dumps({"generation": gen, "minted_ts": admitted_at},
-                            sort_keys=True).encode("utf-8"), durable_root=cfg.state_dir)
+    # The PIN FIRST, then the record: a pin for a generation no record names
+    # is inert (a fresh mint picks another id; an unlisted restore reuses
+    # its admitted_at), while a record without its pin would leave a
+    # recorded generation no port can be built for.
     pin = d / gen / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
     pin.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(pin, hoplink.canonical(hoplink.pin_doc(cfg.hop, admitted_at)),
                  durable_root=cfg.state_dir)
+    atomic_write(d / config_mod.RUNTIME_GENERATION_FILE,
+                 json.dumps({"generation": gen, "minted_ts": admitted_at},
+                            sort_keys=True).encode("utf-8"), durable_root=cfg.state_dir)
 
 
 def recorded_admitted_at(cfg: Any) -> Optional[Tuple[str, str]]:
@@ -1092,13 +1126,19 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
         counts[what] = counts.get(what, 0) + 1
 
     state_dir = Path(cfg.state_dir)
+    # FIRST, before any early return: the cleanup a settlement owes needs no
+    # clock, no admission and no capability, and its residue would otherwise
+    # block retire and `new` while the pass is held.
+    cleaned = finish_settled(cfg)
+    if cleaned:
+        counts["settled_cleaned"] = cleaned
     try:
         clock = peerclock.read(state_dir)
     except peerclock.ClockUntrusted:
-        return {"held_clock_untrusted": len(pending(state_dir))}
+        return dict(counts, held_clock_untrusted=len(pending(state_dir)))
     if clock.admission != "open":
         # H is untrusted until admission reopens: no token, no mint, no attempt.
-        return {"held_admission_closed": len(pending(state_dir))}
+        return dict(counts, held_admission_closed=len(pending(state_dir)))
     # A pending audited act (its audit line, or a verb's plan) is completed
     # BEFORE anything is attempted or handed over, whether or not any notice
     # is pending.
@@ -1110,9 +1150,6 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
     except Exception:  # noqa: BLE001 -- retried next pass; nothing is attempted meanwhile
         logger.exception("control notices: an audit repair failed; nothing attempted this pass")
         return dict(counts, audit_repair_failed=1)
-    cleaned = finish_settled(cfg)
-    if cleaned:
-        counts["settled_cleaned"] = cleaned
     if delegation is None:
         # No signing key: nothing can be signed, so nothing is tried.
         n = len(pending(state_dir))
@@ -1126,6 +1163,7 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
             count(_one(cfg, cap, record, delegation=delegation, h=clock.H, now=now))
         except Unavailable as e:
             count(e.reason)
+            note_unavailable(cfg, e, now)
         except Exception:  # noqa: BLE001 -- one record never stops the others
             logger.exception("control notice for %s: isolated, retried next pass", record["key"])
             count("errored")
@@ -1364,7 +1402,10 @@ def pin(cfg: Any, attempt: Mapping[str, Any]) -> Dict[str, Any]:
     """The runtime in-flight record's frozen signed pin."""
     from . import peerlane
     return {"kind": "control", "id": attempt["id"],
-            "message_id": peerlane.message_id(attempt["id"], cfg.fleet_domain),
+            # The Message-ID's domain is the canonical own address's, the same
+            # bytes as the envelope's from_address beside it.
+            "message_id": peerlane.message_id(attempt["id"],
+                                              runtime_address(cfg).rsplit("@", 1)[1]),
             "key_id": json.loads(base64.b64decode(attempt["statement_b64"]))["key_id"],
             "statement": attempt["statement_b64"], "signature": attempt["signature_b64"],
             "statement_header": attempt["header"], "in_reply_to": None, "references": []}
@@ -1426,6 +1467,12 @@ def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dic
     except config_mod.StateKeyUnresolved:
         recorded = None
     tree: Dict[str, Any] = {"generation": recorded}
+    try:
+        last = json.loads((runtime_dir(cfg) / UNAVAILABLE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        last = None
+    if isinstance(last, dict) and last:
+        tree["unavailable"] = last
     try:
         tree["generations"] = [[g, s] for g, s in cap.generations()]
     except Exception as e:  # noqa: BLE001 -- status never fails on the lister
