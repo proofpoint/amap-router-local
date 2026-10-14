@@ -58,6 +58,10 @@
   peer-candidate quarantine KEY --evidence TEXT
                                  the exit from a candidate held on a view that can never be read:
                                  mail, quarantined (or tombstoned), done
+  peer-epochs trust --evidence TEXT
+                                 after an epoch-store loss or fault: reseed from decided records,
+                                 recount and verify, then clear the untrusted flag (it stays set,
+                                 exit 1, while anything is unsafe or does not verify)
   quarantine list [NAME] [--control-dir DIR]
   quarantine show NAME SOURCE GEN ID [--control-dir DIR]
                                  read-only inspection of the ingress quarantine
@@ -219,6 +223,11 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="proceed over surviving placement evidence, recording why")
     p_psr = ps_sub.add_parser("declare-restored", help="state_dir was restored: close admission")
     p_psr.add_argument("--evidence", required=True)
+    p_pe = sub.add_parser("peer-epochs", help="operator verbs on the receiver's epoch store")
+    pe_sub = p_pe.add_subparsers(dest="peer_epochs_command", required=True)
+    p_pet = pe_sub.add_parser("trust", help="reseed, recount and verify the epoch store, then "
+                                            "clear its untrusted flag")
+    p_pet.add_argument("--evidence", required=True)
     p_pb = sub.add_parser("peer-bound", help="record an operator bound B after a lost clock")
     p_pb.add_argument("--at", required=True, help="B, as YYYY-MM-DDTHH:MM:SSZ (no default)")
     p_pb.add_argument("--evidence", required=True,
@@ -284,7 +293,8 @@ def _peer_operator(cfg, args) -> int:
     from .util import parse_utc_ts
     verb = " ".join(v for v in (args.command, getattr(args, "peer_store_command", None),
                                 getattr(args, "peer_decision_command", None),
-                                getattr(args, "peer_candidate_command", None)) if v)
+                                getattr(args, "peer_candidate_command", None),
+                                getattr(args, "peer_epochs_command", None)) if v)
     try:
         lk = acquire_lock(cfg.state_dir)
     except LockHeldError as e:
@@ -307,12 +317,19 @@ def _peer_operator(cfg, args) -> int:
         elif verb == "peer-candidate quarantine":
             out = peerjournal.operator_quarantine_candidate(cfg, now, key=args.key,
                                                             evidence=args.evidence)
+        elif verb == "peer-epochs trust":
+            from . import peerepochs
+            out = peerepochs.operator_trust(cfg.state_dir, now, evidence=args.evidence)
+            if not out["cleared"]:
+                print(json.dumps(out, sort_keys=True))
+                print(f"router: {verb}: the flag stays set: {out['problems']}", file=sys.stderr)
+                return 1
         elif verb == "peer-decision drop":
             out = peerjournal.operator_drop(cfg, now, key=args.key, evidence=args.evidence)
         else:
             out = peerjournal.operator_restore_key(cfg, now, source=args.source)
     except (peerjournal.StoreRefused, peerjournal.DropRefused, peerclock.BoundRefused,
-            peerclock.ClockUntrusted, peerjournal.StoreBlocked, OSError) as e:
+            peerclock.ClockUntrusted, peerjournal.StoreBlocked, OSError, ValueError) as e:
         print(f"router: {verb}: refused: {e}", file=sys.stderr)
         return 1
     finally:
@@ -791,7 +808,8 @@ def main(argv=None) -> int:
     if args.command == "quarantine":
         return _quarantine(cfg, args)
 
-    if args.command in ("peer-store", "peer-bound", "peer-decision", "peer-candidate"):
+    if args.command in ("peer-store", "peer-bound", "peer-decision", "peer-candidate",
+                        "peer-epochs"):
         return _peer_operator(cfg, args)
     if args.command == "runtime-generation":
         return _runtime_generation(cfg, args)

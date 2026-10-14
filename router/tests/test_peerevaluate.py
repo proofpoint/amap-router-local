@@ -68,7 +68,8 @@ def permissive(hctx):
     """The test fleet's pass profile: the trusted-host edge (the production
     edge code) and the interim permissive policy part."""
     return peerpolicy.Profile(context=hctx, edges=peerpolicy.TRUSTED_HOST_DEFAULT,
-                              policy=peerpolicy.PERMISSIVE)
+                              policy=peerpolicy.PolicyPart(exposure_required=False,
+                                                                   min_sender_age_s=None))
 
 
 def hooks(**over):
@@ -280,7 +281,7 @@ class HookTests(_Eval):
 
     def test_a_policy_refusal_is_refused_with_its_code_and_control(self):
         rec = self.evaluate(self.take(self.raw()),
-                       hk=hooks(policy=lambda _p, _h: peerjournal.Refuse("policy", "not_today")))
+                       hk=hooks(policy=lambda _p, _h, _r: peerjournal.Refuse("policy", "not_today")))
         self.assertEqual((rec["disposed"], rec["cause"], rec["policy_code"]),
                          ("refused", "policy", "not_today"))
         self.assertEqual((rec.get("control") or {}).get("policy_code"), "not_today")

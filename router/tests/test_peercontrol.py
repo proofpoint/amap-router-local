@@ -64,7 +64,7 @@ class _Control(ClockMixin, tpe._Eval):
         """A statement refused after its reservation: a pending control."""
         key = self.take(self.raw(**over))
         rec = self.evaluate(key, hk=tpe.hooks(
-            policy=lambda _p, _h: peerjournal.Refuse("policy", "not_today")))
+            policy=lambda _p, _h, _r: peerjournal.Refuse("policy", "not_today")))
         self.assertEqual(rec["control"]["sent"], False)
         return key
 
