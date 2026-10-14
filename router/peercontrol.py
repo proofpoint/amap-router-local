@@ -55,8 +55,10 @@ live or does not list it at all (never admitted, so nothing was handed over
 in it) and shows no other generation live or unreadable. Otherwise the
 attempt is held visibly (`attempt_generation_unrecorded`, or
 `attempt_generation_not_recorded_one` when another is recorded); no other
-generation is ever selected for it, and while one is held unrecorded none is
-minted. Its exits are `adopt`, or the audited `abandon-attempt`, which
+generation is ever selected for it, and while any unsent attempt is frozen
+in a generation other than the recorded one, none is minted (read from the
+journal's state, whatever order a pass visits records in; frozen attempts are
+also visited first). Its exits are `adopt`, or the audited `abandon-attempt`, which
 suppresses the notice (`attempt_abandoned`). After 4 the in-flight machinery
 drives it. A handed marker with no
 record holds, recorded on the record as `control.stuck` (reason
@@ -132,8 +134,8 @@ DELEGATION_INACTIVE = "delegation_inactive"
 #: generation. The exits: `router runtime-generation adopt <gen>` when the
 #: lister shows that generation as the only live one, or
 #: `router runtime-generation abandon-attempt <record key>`, which ends the
-#: notice suppressed `attempt_abandoned`. While one is held unrecorded no new
-#: generation is minted.
+#: notice suppressed `attempt_abandoned`. While any unsent attempt is frozen
+#: in a generation other than the recorded one, no new generation is minted.
 HELD_GENERATION_UNRECORDED = "attempt_generation_unrecorded"
 HELD_GENERATION_MISMATCH = "attempt_generation_not_recorded_one"
 GENERATION_HOLDS = frozenset({HELD_GENERATION_UNRECORDED, HELD_GENERATION_MISMATCH})
@@ -284,26 +286,47 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     if others:
         raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: adopt "
                                        "or retire one (router runtime-generation)")
-    held = _held_unrecorded(cfg)
-    if held:
+    frozen = _frozen_elsewhere(cfg, recorded)
+    if frozen:
         # A frozen attempt still names a generation of its own: a new one
-        # would split the runtime tree. Adopt it, or abandon the attempt.
-        raise Unavailable(UNAVAILABLE, f"a frozen attempt's generation is unrecorded ({held[0]}):"
-                                       " adopt it, or abandon the attempt")
+        # would split the runtime tree. It is restored, adopted or abandoned.
+        raise Unavailable(UNAVAILABLE, f"a frozen attempt names another generation ({frozen[0]}):"
+                                       " it is restored, adopted or abandoned first")
     gen = secrets.token_hex(16)
     record_generation(cfg, gen, now=now)
     return gen
 
 
-def _held_unrecorded(cfg: Any) -> List[str]:
-    """The record keys of unsent attempts held `attempt_generation_unrecorded`."""
+def _frozen_elsewhere(cfg: Any, recorded: Optional[str]) -> List[str]:
+    """The record keys of unsent, unsuppressed attempts frozen in a
+    generation other than `recorded` (any generation, when none is
+    recorded). Read from the journal's state, so the answer does not depend
+    on which records a pass has visited."""
     out = []
     for rec in peerjournal.all_records(Path(cfg.state_dir)):
         c = rec.get("control") or {}
-        if (c.get("held") == HELD_GENERATION_UNRECORDED and not c.get("sent")
-                and not c.get("suppressed")):
+        gen = (c.get("attempt") or {}).get("gen")
+        if gen is not None and gen != recorded and not c.get("sent") and not c.get("suppressed"):
             out.append(rec["key"])
     return out
+
+
+def _inflight_dir(cfg: Any, gen: str) -> Path:
+    """The runtime in-flight directory of generation `gen`, keyed by `gen`
+    itself (inflight's own path helpers resolve through the RECORDED
+    generation, which is what may be missing here)."""
+    from . import inflight
+    return Path(cfg.state_dir) / config_mod.RUNTIME_NS / gen / inflight.INFLIGHT_DIR
+
+
+def _inflight_entries(cfg: Any, gen: str) -> List[str]:
+    """Every in-flight record and handed marker name in generation `gen`."""
+    from . import inflight
+    d = _inflight_dir(cfg, gen)
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir()
+                  if p.name.endswith(".json") or p.name.endswith(inflight.HANDED_SUFFIX))
 
 
 def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
@@ -329,9 +352,8 @@ def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
     state = dict(cap.generations()).get(gen)
     if state in ("live", "unreadable"):
         raise ValueError(f"the attempt's generation {gen} is {state}: adopt or retire it")
-    d = sd / config_mod.RUNTIME_NS / gen / inflight.INFLIGHT_DIR
     for name in (f"{attempt['id']}.json", f"{attempt['id']}{inflight.HANDED_SUFFIX}"):
-        if os.path.lexists(d / name):
+        if name in _inflight_entries(cfg, gen):
             raise ValueError(f"the attempt {attempt['id']} is in flight in {gen}")
     _update(sd, record, suppressed=SUPPRESS_ABANDONED, held=None)
     return {"result": f"abandoned the control attempt {attempt['id']} of {key}"}
@@ -506,7 +528,11 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
         n = len(pending(state_dir))
         return {DELEGATION_INACTIVE: n} if n else {}
     cap = capability(cfg, runtime)
-    for record in pending(state_dir):
+    # Frozen attempts first: their generation is reconciled before any fresh
+    # notice could need one.
+    for record in sorted(pending(state_dir),
+                         key=lambda r: ("gen" not in ((r["control"] or {}).get("attempt") or {}),
+                                        r["take_seq"])):
         try:
             count(_one(cfg, cap, record, delegation=delegation, h=clock.H, now=now))
         except Unavailable as e:
@@ -651,7 +677,11 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
         return HELD_GENERATION_MISMATCH
     listed = dict(cap.generations())
     others = [g for g, st in listed.items() if st in ("live", "unreadable") and g != gen]
-    if listed.get(gen) in ("live", None) and not others:
+    # "Not listed" is read as "never admitted" only while this router's own
+    # state shows nothing in flight in that generation: a generation that
+    # carried traffic and lost both its tree and its record is held.
+    unlisted_ok = listed.get(gen) is None and not _inflight_entries(cfg, gen)
+    if (listed.get(gen) == "live" or unlisted_ok) and not others:
         record_generation(cfg, gen, now=now)
         peerjournal._audit(cfg.state_dir, RESTORE_VERB, now, key=key, generation=gen,
                            listed=listed.get(gen) or "not listed")

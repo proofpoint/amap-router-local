@@ -292,6 +292,45 @@ class AttemptTests(_Control):
         self.assertEqual([(a.get("key"), a.get("generation")) for a in restores],
                          [(key, attempt["gen"])])
 
+    def test_no_mint_while_any_attempt_is_frozen_elsewhere_whatever_the_order(self):
+        """A fresh notice with a LOWER take_seq than the frozen attempt (its
+        record lost): no B is minted. The guard reads the journal, so it
+        holds even before the frozen record is visited."""
+        fresh = self.refused(id="qFresh01234567890abcdef")
+        hidden = self.record(fresh)
+        peerjournal.write_record(self.state_dir, dict(hidden, control=dict(hidden["control"],
+                                                                            sent=True)))
+        key, attempt = self.frozen_then_record_lost()
+        rec = self.record(fresh)
+        peerjournal.write_record(self.state_dir, dict(rec, control=dict(rec["control"],
+                                                                         sent=False)))
+        self.assertLess(self.record(fresh)["take_seq"], self.record(key)["take_seq"])
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        with self.assertRaises(peercontrol.Unavailable):
+            peercontrol.generation(self.cfg, cap, now=NOW)
+        self.assertEqual(list(self.tree.gens), [], "nothing minted by a direct selection")
+        self.send()
+        self.assertEqual(list(self.tree.gens), [attempt["gen"]], "no B minted")
+        fresh_attempt = self.record(fresh)["control"].get("attempt")
+        self.assertIn((fresh_attempt or {}).get("gen"), (None, attempt["gen"]))
+        n, _doc = self.handover(key)
+        self.assertEqual(n, attempt["n"])
+
+    def test_an_unlisted_generation_with_traffic_in_flight_is_held_not_restored(self):
+        """Unlisted reads as never admitted only while nothing is in flight
+        in that generation: one that carried traffic and lost both its tree
+        and its record is held, never re-admitted."""
+        key, attempt = self.frozen_then_record_lost()
+        d = peercontrol._inflight_dir(self.cfg, attempt["gen"])
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ("other-request" + inflight.HANDED_SUFFIX)).write_text("00000009")
+        got = self.send()
+        self.assertEqual(got, {"held_" + peercontrol.HELD_GENERATION_UNRECORDED: 1})
+        self.assertFalse((self.state_dir / config_mod.RUNTIME_NS
+                          / config_mod.RUNTIME_GENERATION_FILE).exists(), "not restored")
+        self.assertEqual(self.audit(), [])
+        self.assertEqual(self.tree.senders, {}, "no sender for it")
+
     def test_a_lost_record_beside_another_live_generation_holds_and_restores_nothing(self):
         key, attempt = self.frozen_then_record_lost()
         self.tree.gens.update({attempt["gen"]: "live", "b" * 32: "live"})
