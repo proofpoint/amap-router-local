@@ -93,15 +93,16 @@ def _parse(line):
 
 def stamps_added(prev, text: str, jsonl: bool):
     """`(state, stamps)` for one visible write of a file whose previous state
-    was `prev` (None the first time). For an append-only file, every value on
-    every appended line, repeats included; for a document, each member whose
-    value differs from that member's previous value."""
+    was `prev` (None the first time); each stamp is `[member, value]`. For an
+    append-only file, every value on every appended line, repeats included;
+    for a document, each member whose value differs from that member's
+    previous value."""
     if jsonl:
         lines = text.splitlines()
         old = prev or 0
-        return len(lines), [v for line in lines[old:] for _k, v in _pairs(_parse(line))]
+        return len(lines), [[k, v] for line in lines[old:] for k, v in _pairs(_parse(line))]
     pairs = set(_pairs(_parse(text)))
-    return pairs, sorted(v for _k, v in pairs - (prev or set()))
+    return pairs, [[k, v] for k, v in sorted(pairs - (prev or set()))]
 
 
 def _record(path: str) -> None:

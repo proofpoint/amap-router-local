@@ -113,18 +113,33 @@ class InstalledSourceTests(unittest.TestCase):
 
     def test_writes_within_an_operation_never_go_backwards(self):
         """In the order writes became visible, inside each operation, no
-        stamp is earlier than the latest stamp of any earlier write unless
-        it is a reading an earlier write already stamped (`backwards`): a
+        stamp is earlier than the latest stamp of any earlier write, except
+        a declared reuse site (`backwards`, `DECLARED_REUSE`): a
         value read early and written after a later one shows here, where
         the operation-level check cannot see it."""
         emitted, data = self.doc["emitted"], self.data()
         events, log_high = 0, {}
         for r in sorted(self.ops(), key=lambda r: (r["flow"], r["op"])):
-            bad = backwards(r["trace"], set(emitted) - data, set(emitted[:r["pre"]]), log_high)
+            bad = backwards(r["trace"], set(emitted) - data, set(emitted[:r["pre"]]), log_high,
+                            op=(r["flow"], r["label"]))
             events += sum(1 for e in r["trace"] if e[1])
             with self.subTest(flow=r["flow"], op=r["label"]):
                 self.assertEqual(bad, [], "a write stamped a time earlier than an earlier write")
         self.assertGreater(events, 10, "the write trace saw almost nothing: not tracing")
+
+    def test_every_declared_site_is_used_by_the_real_flows(self):
+        """A declared site that no real write matches is a stale exemption."""
+        doc, used = self.doc, set()
+        for r in doc["records"]:
+            for _kind, stamps, path in r.get("trace", ()):
+                for m, _v in stamps:
+                    for site in DECLARED_REUSE:
+                        flow, label, pattern, member, _why = site
+                        import re
+                        if (flow, label) == (r["flow"], r["label"]) and member == m \
+                                and re.search(pattern, path):
+                            used.add(site)
+        self.assertEqual(set(DECLARED_REUSE) - used, set())
 
     def test_the_exposure_follows_the_file_time_set_from_the_installed_clock(self):
         [rec] = [r for r in self.doc["records"] if "exposure" in r]
@@ -132,41 +147,73 @@ class InstalledSourceTests(unittest.TestCase):
         self.assertEqual(rec["exposure"]["last_external_delivery_ts"], rec["written"])
 
 
-def backwards(trace, valid, before, log_high=None):
-    """The stamps in `trace` (`[kind, stamps]` per write, in order) that are
-    earlier than the HIGHEST stamp of an earlier write, and are not a
-    reading this operation already stamped in an earlier write.
+#: The declared reuse sites: where production DELIBERATELY writes one
+#: reading after a fresher stamp of the same operation. Each is
+#: (flow, operation, path pattern, member, reason). A repeat of an earlier
+#: reading is exempt from the high-water rule only where it matches one.
+DECLARED_REUSE = (
+    ("ingress", "pump", r"/inbox/notices/notice-[0-9a-f]{32}\.json$", "ts",
+     "the pump reads Pump.now once per pass; it is the placed notice's time"),
+    ("ingress", "pump", r"/delivered/notice-[0-9a-f]{32}\.json$", "ts",
+     "the same Pump.now on the notice's delivered-ledger record"),
+    ("ingress", "pump", r"/delivered/notice-[0-9a-f]{32}\.json$", "received_at",
+     "the same Pump.now as the ledger record's receipt time"),
+    ("peer_send", "drain", r"/peer/notices/notice-[0-9a-f]{32}\.json$", "ts",
+     "deliver's one placement time; the notice, the commit sentinel, is "
+     "written last, after the audit line took a fresh stamp"),
+    ("peer_send", "drain", r"/peer/notices/notice-[0-9a-f]{32}\.json$",
+     "message/sender_exposure/window_end",
+     "the exposure window ends at that same placement time"),
+)
+
+
+def _declared(op, path, member) -> bool:
+    import re
+    return any((flow, label) == op and re.search(pattern, path) and m == member
+               for flow, label, pattern, m, _why in DECLARED_REUSE)
+
+
+def backwards(trace, valid, before, log_high=None, op=None):
+    """The stamps in `trace` that step back. `trace` is `[kind, stamps,
+    path]` per write, in the order writes became visible; each stamp is
+    `[member, value]`; `op` is the operation's `(flow, label)`.
 
     Only values the source emitted count (`valid`). A document value the
     source emitted before the operation began (`before`) was carried from
-    earlier state, not stamped now. An appended line's values always count,
-    so an append repeating a stamp from before the operation is caught.
+    earlier state, not stamped now; an appended line's values always count.
 
-    Re-using one reading across a pass is deliberate (the ingress pump's
-    `Pump.now` stamps the notice and its ledger record after the journal
-    record took fresh reads), so a value an earlier write of the same
-    operation already stamped is the same reading, not a step back. A value
-    read early, never written, and written after a later one is the defect
-    this catches. And on one append-only path (`[kind, stamps, path]`), a
-    line stamped earlier than an earlier line of that path is backwards
-    even when it repeats a reading; pass the same `log_high` to successive
-    operations and the rule holds over the log's whole life."""
+    Rule 1, across the operation: a stamp is backwards when it is earlier
+    than the HIGHEST stamp of any earlier write in the operation. The one
+    exception is a declared reuse site (`DECLARED_REUSE`): there, a value an
+    earlier write of the operation already stamped is the same reading
+    written again, by design. Anywhere else, a repeat of an earlier value
+    after a later stamp is backwards, and so is a value read early, held
+    back, and written after a later one.
+
+    Rule 2, on one append-only path: a line stamped earlier than an earlier
+    line of that path is backwards, with no exception. Pass the same
+    `log_high` to successive operations and it holds over the log's life."""
     bad, high, stamped = [], None, set()
     log_high = {} if log_high is None else log_high
-    for kind, stamps, *where in trace:
-        vals = [v for v in stamps if v in valid and (kind == "jsonl" or v not in before)]
+    for kind, stamps, path in trace:
+        pairs = [(m, v) for m, v in stamps if v in valid and (kind == "jsonl" or v not in before)]
+        vals = [v for _m, v in pairs]
         if high is not None:
-            bad += [v for v in vals if v < high and v not in stamped]
-        if kind == "jsonl" and where:
-            # An append-only log never steps back on its own path, reuse or not.
-            last = log_high.get(where[0])
+            bad += [v for m, v in pairs if v < high
+                    and not (v in stamped and _declared(op, path, m))]
+        if kind == "jsonl":
+            last = log_high.get(path)
             bad += [v for v in vals if last is not None and v < last and v not in bad]
             if vals:
-                log_high[where[0]] = max([last] + vals) if last else max(vals)
+                log_high[path] = max([last] + vals) if last else max(vals)
         if vals:
             high = max(vals) if high is None else max(high, max(vals))
             stamped.update(vals)
     return bad
+
+
+NOTICE = "/t/instances/bravo/inbox/notices/notice-" + "a" * 32 + ".json"
+JOURNAL = "/t/state/l/gen-g/ingress/notice/" + "b" * 64 + ".json"
 
 
 class BackwardsTests(unittest.TestCase):
@@ -178,15 +225,39 @@ class BackwardsTests(unittest.TestCase):
         self.f = f
 
     def test_a_multi_valued_write_then_an_earlier_one_is_backwards(self):
-        trace = [["json", ["t1", "t5"]], ["json", ["t3"]]]
+        trace = [["json", [["a", "t1"], ["b", "t5"]], "/a.json"], ["json", [["c", "t3"]], "/b.json"]]
         self.assertEqual(backwards(trace, {"t1", "t3", "t5"}, set()), ["t3"])
 
-    def test_reusing_a_reading_this_operation_already_stamped_is_not_backwards(self):
-        trace = [["json", ["t1", "t2"]], ["json", ["t3"]], ["json", ["t1", "t1"]]]
-        self.assertEqual(backwards(trace, {"t1", "t2", "t3"}, set()), [])
+    def test_an_undeclared_repeat_across_paths_after_a_later_stamp_is_backwards(self):
+        trace = [["json", [["ts", "t1"]], "/a.json"], ["json", [["ts", "t5"]], "/b.json"],
+                 ["json", [["ts", "t1"]], "/c.json"]]
+        self.assertEqual(backwards(trace, {"t1", "t5"}, set()), ["t1"])
+
+    def test_a_first_append_repeating_another_paths_earlier_value_is_backwards(self):
+        """A new log has no high-water of its own yet; rule 1 still catches
+        it, because the line is not a declared site."""
+        trace = [["json", [["ts", "t1"]], "/a.json"], ["json", [["ts", "t5"]], "/b.json"],
+                 ["jsonl", [["ts", "t1"]], "/new-log.jsonl"]]
+        self.assertEqual(backwards(trace, {"t1", "t5"}, set()), ["t1"])
+
+    def test_the_declared_pump_reuse_passes_and_only_there(self):
+        trace = [["json", [["ts", "t1"], ["first_seen_ts", "t2"]], JOURNAL],
+                 ["json", [["state_ts", "t3"]], JOURNAL],
+                 ["json", [["ts", "t1"]], NOTICE]]
+        valid = {"t1", "t2", "t3"}
+        self.assertEqual(backwards(trace, valid, set(), op=("ingress", "pump")), [])
+        # The same shape in another operation, or on another member, is backwards.
+        self.assertEqual(backwards(trace, valid, set(), op=("mail_once", "once")), ["t1"])
+        # An UNDECLARED member of a declared file reusing it is backwards...
+        other = trace[:2] + [["json", [["date", "t1"]], NOTICE]]
+        self.assertEqual(backwards(other, valid, set(), op=("ingress", "pump")), ["t1"])
+        # ...and so is an undeclared file reusing the declared site's value.
+        elsewhere = trace + [["json", [["ts", "t1"]], "/t/state/l/elsewhere.json"]]
+        self.assertEqual(backwards(elsewhere, valid, set(), op=("ingress", "pump")), ["t1"])
 
     def test_in_order_writes_pass_and_carried_values_do_not_count(self):
-        trace = [["json", ["t2"]], ["json", ["t1", "t3"]], ["jsonl", ["t3"]]]
+        trace = [["json", [["a", "t2"]], "/a.json"], ["json", [["a", "t1"], ["b", "t3"]], "/b.json"],
+                 ["jsonl", [["ts", "t3"]], "/c.jsonl"]]
         self.assertEqual(backwards(trace, {"t1", "t2", "t3"}, {"t1"}), [])
 
     def test_an_append_repeating_an_older_stamp_on_the_same_path_is_backwards(self):
@@ -195,8 +266,9 @@ class BackwardsTests(unittest.TestCase):
         state, s1 = self.f.stamps_added(None, first + "\n", True)
         state, s2 = self.f.stamps_added(state, first + "\n" + later + "\n", True)
         state, s3 = self.f.stamps_added(state, first + "\n" + later + "\n" + first + "\n", True)
-        self.assertEqual((s1, s2, s3), (["2001-02-03T04:05:06Z"], ["2001-02-03T04:05:09Z"],
-                                        ["2001-02-03T04:05:06Z"]))
+        self.assertEqual((s1, s2, s3), ([["ts", "2001-02-03T04:05:06Z"]],
+                                        [["ts", "2001-02-03T04:05:09Z"]],
+                                        [["ts", "2001-02-03T04:05:06Z"]]))
         valid = {"2001-02-03T04:05:06Z", "2001-02-03T04:05:09Z"}
         log = "/x/audit.jsonl"
         # The repeat on the same path is backwards even inside one operation...
@@ -215,8 +287,7 @@ class BackwardsTests(unittest.TestCase):
         b = json.dumps({"first_seen_ts": "2001-02-03T04:05:06Z", "state_ts": "2001-02-03T04:05:09Z"})
         state, _ = self.f.stamps_added(None, a, False)
         _state, stamps = self.f.stamps_added(state, b, False)
-        self.assertEqual(stamps, ["2001-02-03T04:05:09Z"])
-
+        self.assertEqual(stamps, [["state_ts", "2001-02-03T04:05:09Z"]])
 
 class CompanionTests(unittest.TestCase):
 

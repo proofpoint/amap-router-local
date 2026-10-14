@@ -175,9 +175,9 @@ M = [
   ["router.tests.test_clock_child.BackwardsTests."
    "test_a_multi_valued_write_then_an_earlier_one_is_backwards"]),
  ("C33 appended lines diffed as a set, hiding a repeat", "router/tests/clock_child_flows.py",
-  "        return len(lines), [v for line in lines[old:] for _k, v in _pairs(_parse(line))]\n",
+  "        return len(lines), [[k, v] for line in lines[old:] for k, v in _pairs(_parse(line))]\n",
   "        seen = {v for line in lines[:old] for _k, v in _pairs(_parse(line))}\n"
-  "        return len(lines), [v for line in lines[old:] for _k, v in _pairs(_parse(line))\n"
+  "        return len(lines), [[k, v] for line in lines[old:] for k, v in _pairs(_parse(line))\n"
   "                            if v not in seen]\n",
   ["router.tests.test_clock_child.BackwardsTests."
    "test_an_append_repeating_an_older_stamp_on_the_same_path_is_backwards"]),
@@ -189,6 +189,23 @@ M = [
   "        while owner is not None and not isinstance(\n"
   "                owner, (ast.Try, ast.FunctionDef, ast.AsyncFunctionDef)):\n"
   "            stmt, owner = owner, parents.get(id(owner))\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C36 the reuse exemption widened back to value-only", "router/tests/test_clock_child.py",
+  "                    and not (v in stamped and _declared(op, path, m))]\n",
+  "                    and not (v in stamped)]\n",
+  ["router.tests.test_clock_child.BackwardsTests."
+   "test_an_undeclared_repeat_across_paths_after_a_later_stamp_is_backwards",
+   "router.tests.test_clock_child.BackwardsTests."
+   "test_a_first_append_repeating_another_paths_earlier_value_is_backwards"]),
+ ("C37 a declared site keyed by its path pattern alone", "router/tests/test_clock_child.py",
+  "    return any((flow, label) == op and re.search(pattern, path) and m == member\n",
+  "    return any(re.search(pattern, path)\n",
+  ["router.tests.test_clock_child.BackwardsTests."
+   "test_the_declared_pump_reuse_passes_and_only_there"]),
+ ("C38 an addCleanup registration accepted wherever it is", "router/tests/test_one_clock.py",
+  "            return (isinstance(stmt, ast.Expr)\n",
+  "            return True or (isinstance(stmt, ast.Expr)\n",
   ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
    "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
  ("C35 a dynamic importer taken as a value", "router/outcomes.py",

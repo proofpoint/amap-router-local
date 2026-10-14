@@ -446,20 +446,32 @@ def unreset_installs(source: str):
     that calls `router.clock.install` (resolved through its imports) without
     resetting it where a reset always runs: `clock.reset()` as a top-level
     statement of `tearDown`, `tearDownClass` or a `finally` body, or
-    `clock.reset` passed to `addCleanup`."""
+    `clock.reset` passed to an `addCleanup` that is a top-level statement of
+    `setUp`, a test method or `install_clock`."""
     tree = ast.parse(source)
     aliases = _aliases(tree, "router.tests")
     parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
 
     def always_runs(node):
-        """Guaranteed to run: passed directly to `addCleanup`, or called as
-        a TOP-LEVEL statement of `tearDown`/`tearDownClass` or of a
-        `finally` body. Nested under `if`, `while`, `for`, `try` or `with`,
-        it might not run, and does not count."""
+        """Guaranteed to run: called as a TOP-LEVEL statement of
+        `tearDown`/`tearDownClass` or of a `finally` body, or passed to an
+        `addCleanup` that is itself a top-level statement of `setUp`, a test
+        method or `install_clock`. Nested under `if`, `while`, `for`, `try`
+        or `with`, or registered from any other helper, it might not run,
+        and does not count."""
         call = parents.get(id(node))
         if isinstance(call, ast.Call) and _call_name(call.func) == "addCleanup" \
                 and node in call.args:
-            return True
+            # The registration itself must run: a top-level statement of
+            # setUp, of a test method, or of install_clock; never guarded,
+            # never in a helper that might not be called.
+            stmt = parents.get(id(call))
+            owner = parents.get(id(stmt))
+            return (isinstance(stmt, ast.Expr)
+                    and isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and stmt in owner.body
+                    and (owner.name in ("setUp", "install_clock")
+                         or owner.name.startswith("test")))
         if not (isinstance(call, ast.Call) and call.func is node):
             return False
         stmt = parents.get(id(call))
@@ -511,6 +523,14 @@ class TestsResetWhatTheyInstallTests(unittest.TestCase):
         "conditional in finally": ("from router import clock\ndef f():\n    try:\n"
                                    "        clock.install(g)\n    finally:\n"
                                    "        if False:\n            clock.reset()\n"),
+        "guarded registration": ("from router import clock\nclass T:\n"
+                                 "    def test(self):\n        clock.install(f)\n"
+                                 "        if False:\n"
+                                 "            self.addCleanup(clock.reset)\n"),
+        "registration in an uncalled helper": ("from router import clock\nclass T:\n"
+                                               "    def test(self):\n        clock.install(f)\n"
+                                               "    def helper(self):\n"
+                                               "        self.addCleanup(clock.reset)\n"),
         "reset referenced, not called": ("from router import clock\nclass T:\n"
                                          "    def test(self):\n        clock.install(f)\n"
                                          "    def tearDown(self):\n        clock.reset\n"),
@@ -521,6 +541,9 @@ class TestsResetWhatTheyInstallTests(unittest.TestCase):
                               "    def tearDown(self):\n        c.reset()\n"),
         "addCleanup": ("from router import clock\nclass T:\n    def test(self):\n"
                        "        clock.install(f)\n        self.addCleanup(clock.reset)\n"),
+        "addCleanup in setUp": ("from router import clock\nclass T:\n    def setUp(self):\n"
+                                "        self.addCleanup(clock.reset)\n"
+                                "    def test(self):\n        clock.install(f)\n"),
         "finally": ("from router.clock import install, reset\ndef f():\n    try:\n"
                     "        install(g)\n    finally:\n        reset()\n"),
         "mixin": ("class T:\n    def test(self):\n        self.install_clock(f)\n"),
