@@ -239,7 +239,13 @@ class ForgeryTests(_Reserved):
     def test_the_inode_replaced_after_the_receipt_is_refused(self):
         chk, snap = self.pre()
         rec, rcp = self.reserve(chk)
+        # Hold the old file open while it is replaced: a filesystem may hand a
+        # freed inode number straight back (ext4 does), and identical bytes on
+        # the SAME number would be no replacement at all.
+        held = os.open(self.path(rcp), os.O_RDONLY)
+        self.addCleanup(os.close, held)
         self.rewrite(self.path(rcp), rec)            # identical bytes, a new inode
+        self.assertNotEqual(os.stat(self.path(rcp)).st_ino, rcp.ino, "the inode did change")
         with self.assertRaises(peerbind.RecoveryCorrupt) as cm:
             peerbind.resume_reserved(rcp, snap, state_dir=self.state_dir)
         self.assertEqual(cm.exception.reason, "replaced")
