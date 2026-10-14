@@ -20,7 +20,7 @@ bug, never a verdict.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from . import peerlane
 
@@ -41,11 +41,19 @@ class Verified:
 @dataclass(frozen=True)
 class Refused:
     """A check refused the candidate. `cause` is the codec's token
-    (`duplicate` for check 2)."""
+    (`duplicate` for check 2). For a refusal made only after the signature
+    verified (`POST_SIGNATURE_CAUSES`), `statement` is the signature-verified
+    bytes and `key_id` the key that signed them, so the refusal can name the
+    statement it is about; for every earlier refusal both are None."""
     cause: str
+    statement: Optional[bytes] = None
+    key_id: Optional[str] = None
 
 
 CHECK2_DUPLICATE = "duplicate"
+#: Check 5(b), the statement's VALUES: run by the codec only after check 4
+#: (the signature) passed, so the bytes it refuses are signature-verified.
+POST_SIGNATURE_CAUSES = frozenset({"statement_value"})
 
 
 def verify(fields: Iterable[Tuple[str, Any]], *, delegation: "peerlane.Delegation", now: Any,
@@ -66,6 +74,8 @@ def verify(fields: Iterable[Tuple[str, Any]], *, delegation: "peerlane.Delegatio
                                                   delegation.key_table, delegation.verifier, now)
     except Exception as e:  # noqa: BLE001 -- classified exactly
         if peerlane.error_kind(delegation, e) == "CodecError":
+            if e.reason in POST_SIGNATURE_CAUSES:
+                return Refused(e.reason, statement, k)
             return Refused(e.reason)
         raise
     return Verified(kind, payload, key, k, statement)

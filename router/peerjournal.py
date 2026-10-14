@@ -645,28 +645,43 @@ def _require_clear(meta: Mapping[str, Any]) -> None:
         raise StoreBlocked(f"an operation is unreconciled: {meta['pending_op']}")
 
 
-def known(state_dir: Path, statement_sha256: str) -> Optional[Tuple[str, str]]:
+#: The kinds a digest index entry names: a signed statement's reservation,
+#: or a control notice's (`peercontrol`, the receive side).
+DIGEST_KINDS = ("statement", "control")
+
+
+def known(state_dir: Path, statement_sha256: str, kind: str = "statement"
+          ) -> Optional[Tuple[str, str]]:
     """Check 2's lookup: the (rt, idk) a retained reservation of this exact
-    statement is filed under, or None. The caller excludes its own record's
-    reservation by comparing `candidate_ref`."""
+    signed bytes, of this `kind`, is filed under, or None. An entry of the
+    other kind is not a match. An entry without a kind (the form before the
+    index recorded one) or with an unknown kind is corrupt, never guessed.
+    The caller excludes its own record's reservation by comparing
+    `candidate_ref`."""
     if not _HEX64.fullmatch(statement_sha256):
         raise ValueError("statement_sha256: 64 lower-case hex")
+    if kind not in DIGEST_KINDS:
+        raise ValueError(f"kind: one of {DIGEST_KINDS}")
     try:
         ref = (_replay(state_dir) / DIGESTS_DIR / statement_sha256).read_text(encoding="ascii")
     except FileNotFoundError:
         return None
-    rt, _, idk = ref.partition("/")
-    if not (_HEX32.fullmatch(rt) and _HEX64.fullmatch(idk)):
+    entry_kind, sep, where = ref.partition(" ")
+    rt, _, idk = where.partition("/")
+    if not (sep and entry_kind in DIGEST_KINDS and _HEX32.fullmatch(rt) and _HEX64.fullmatch(idk)):
         raise peerbind.RecoveryCorrupt("digest", statement_sha256)
-    return rt, idk
+    return (rt, idk) if entry_kind == kind else None
 
 
-def _link_digest(state_dir: Path, statement_sha256: str, rt: str, idk: str) -> None:
+def _link_digest(state_dir: Path, statement_sha256: str, rt: str, idk: str,
+                 kind: str = "statement") -> None:
+    if kind not in DIGEST_KINDS:
+        raise ValueError(f"kind: one of {DIGEST_KINDS}")
     ddir = _replay(state_dir) / DIGESTS_DIR
     if not ddir.is_dir():
         ddir.mkdir(mode=0o700)
         fsync_dir(ddir.parent)
-    _write_once(ddir, statement_sha256, f"{rt}/{idk}".encode("ascii"))
+    _write_once(ddir, statement_sha256, f"{kind} {rt}/{idk}".encode("ascii"))
 
 
 def reserve(state_dir: Path, checked: "peerbind.Checked", *, record: Dict[str, Any]
@@ -1080,6 +1095,18 @@ def _control_to(ctx: "Ctx", key_id: Any) -> Optional[str]:
     return runtime.runtime if runtime is not None else None
 
 
+def _statement_id(raw: bytes) -> Optional[str]:
+    """A statement's `id` from its bytes: strict JSON, the id grammar, or
+    None."""
+    from . import peerlane
+    try:
+        doc = peerbind._strict_json(raw)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    ident = doc.get("id") if isinstance(doc, dict) else None
+    return ident if isinstance(ident, str) and peerlane.RECORD_ID_RE.fullmatch(ident) else None
+
+
 def _snapshot_key_id(state_dir: Path, record: Mapping[str, Any]) -> Optional[str]:
     """The statement's key_id, from the snapshot."""
     raw = read_snapshot(state_dir, record, SNAPSHOT_STATEMENT)
@@ -1136,8 +1163,8 @@ def _view(ctx: Ctx, record: Dict[str, Any]) -> Union[Dict[str, Any], Tuple[str, 
 
 
 def _known(ctx: Ctx, record: Mapping[str, Any]):
-    def known(_kind: str, statement: bytes) -> bool:
-        hit = known_fn(ctx.state_dir, hashlib.sha256(statement).hexdigest())
+    def known(kind: str, statement: bytes) -> bool:
+        hit = known_fn(ctx.state_dir, hashlib.sha256(statement).hexdigest(), kind)
         if hit is None:
             return False
         rt, idk = hit
@@ -1216,7 +1243,17 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             return _finish(ctx, transition(ctx.state_dir, record, "mail", now, cause=cause))
         if cause == peerverify.CHECK2_DUPLICATE:
             return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE))
-        control = _control("demoted", cause, None) if cause in CONTROL_CODEC_CAUSES else None
+        control = None
+        if cause in CONTROL_CODEC_CAUSES and verdict.statement is not None:
+            # The demotion names its statement: the signature-verified bytes
+            # are snapshotted BEFORE the disposition is written, and the
+            # control's `about` and destination are read from them. A
+            # statement whose id cannot be read gets no control at all.
+            add_snapshot(ctx.state_dir, record, SNAPSHOT_STATEMENT, verdict.statement)
+            about = _statement_id(verdict.statement)
+            if about is not None:
+                control = _control("demoted", cause, about,
+                                   to=_control_to(ctx, verdict.key_id))
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=cause,
                                        control=control))
     about = verdict.payload.get("id") if hasattr(verdict.payload, "get") else None
@@ -1806,9 +1843,15 @@ def operator_declare_restored(state_dir: Path, now: datetime, *, evidence: str
     return {"admission": clock.admission}
 
 
-def observed_times(state_dir: Path, hop_root: Optional[Path]) -> List[Tuple[datetime, str]]:
+def observed_times(state_dir: Path, hop_root: Optional[Path],
+                   reply_window_s: Optional[int] = None) -> List[Tuple[datetime, str]]:
     """Every receiver time this router can see, each with its source (file
-    and field): the bound B's mechanical lower bound."""
+    and field): the bound B's mechanical lower bound. Among them, every
+    in-flight record's `written_ts` (an agent's or the runtime control
+    tree's: the exact time a signed request was begun), and, with
+    `reply_window_s`, each issued peer-ledger record's issue time derived as
+    `expires_at - reply_window_s` (it understates the issue time if the
+    window has grown since, which only lowers this bound)."""
     state_dir = Path(state_dir)
     seen: List[Tuple[datetime, str]] = []
 
@@ -1837,6 +1880,25 @@ def observed_times(state_dir: Path, hop_root: Optional[Path]) -> List[Tuple[date
                     add(json.loads(line).get("ts"), f"{log} ts")
                 except ValueError:
                     continue
+    from . import inflight as inflight_mod
+    from . import peerlane
+    for pattern in (f"*/{inflight_mod.INFLIGHT_DIR}/*.json",
+                    f"*/*/{inflight_mod.INFLIGHT_DIR}/*.json"):
+        for f in sorted(state_dir.glob(pattern)):
+            try:
+                add(json.loads(f.read_bytes()).get("written_ts"), f"{f} written_ts")
+            except (OSError, ValueError, AttributeError):
+                continue
+    if reply_window_s is not None:
+        for f in sorted(state_dir.glob(f"*/{peerlane.PEER_LEDGER_DIR}/*.json")):
+            try:
+                doc = json.loads(f.read_bytes())
+            except (OSError, ValueError):
+                continue
+            expires = parse_utc_ts(doc.get("expires_at")) if isinstance(doc, dict) else None
+            if expires is not None and doc.get("direction") == "issued":
+                add(format_utc_ts(expires - timedelta(seconds=reply_window_s)),
+                    f"{f} issued (expires_at - window)")
     replay = state_dir / REPLAY_DIR
     for f in sorted(replay.glob("*/*" + DONE_SUFFIX)) if replay.is_dir() else ():
         try:
@@ -1872,7 +1934,10 @@ def operator_bound(cfg: Any, now: datetime, *, at: datetime, evidence: str,
     hop_root = Path(cfg.hop.root) if getattr(cfg, "hop", None) is not None else None
     clock = peerclock.record_bound(cfg.state_dir, now, at=at, evidence=evidence,
                                    not_from_wall_clock=not_from_wall_clock,
-                                   observed=observed_times(cfg.state_dir, hop_root))
+                                   observed=observed_times(
+                                       cfg.state_dir, hop_root,
+                                       reply_window_s=getattr(cfg, "peer_reply_window_seconds",
+                                                              None)))
     rebuild_meta(cfg.state_dir)
     _audit(cfg.state_dir, "peer-bound", now, B=format_utc_ts(at), evidence=evidence,
            not_from_wall_clock=bool(not_from_wall_clock))
