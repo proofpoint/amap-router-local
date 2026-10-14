@@ -281,7 +281,11 @@ class AttemptTests(_Control):
         key, attempt = self.frozen_then_record_lost()
         second = self.refused(id="qSecond0123456789abcde")
         self.send()
-        self.assertEqual(self.gen(), attempt["gen"], "A restored, never another")
+        try:
+            recorded = self.gen()
+        except config_mod.StateKeyUnresolved:
+            recorded = None
+        self.assertEqual(recorded, attempt["gen"], "A restored, never another")
         self.assertEqual(list(self.tree.gens), [attempt["gen"]], "no B minted")
         n, doc = self.handover(key)
         self.assertEqual(n, attempt["n"])
