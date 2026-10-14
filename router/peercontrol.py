@@ -365,6 +365,10 @@ def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any
     and return its result: every step is checked against the state it
     produces and skipped once done. `PlanPending` when it cannot complete
     yet (no capability; a planned mint whose conditions do not hold)."""
+    if any(line.get("audit_id") == marker.get("id")
+           for line in _audit_lines(Path(cfg.state_dir))):
+        # Decided (completed or abandoned): never an effect again.
+        raise PlanPending("the plan is already decided; only its marker remains")
     verb, d = marker["verb"], marker["detail"]
     if verb == ADOPT_VERB:
         record_generation(cfg, d["generation"], now=now)   # the record and the pin, rewritten
@@ -426,6 +430,8 @@ def _repair_verb_audit(cfg: Any, cap: Optional[Capability]) -> int:
         marker = json.loads(_verb_marker_path(cfg).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return 0
+    if _settled_if_audited(cfg, marker):
+        return 0
     try:
         result = _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
     except Exception:  # noqa: BLE001 -- pending; retried by the next pass or verb
@@ -445,13 +451,28 @@ def _pending_plan(cfg: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _settled_if_audited(cfg: Any, marker: Mapping[str, Any]) -> bool:
+    """A plan whose audit line is already durable (completed, or abandoned)
+    is DECIDED: its marker is only removed (durably) and no effect of it is
+    ever taken again. Every path that reads the marker asks this first."""
+    if not any(line.get("audit_id") == marker.get("id")
+               for line in _audit_lines(Path(cfg.state_dir))):
+        return False
+    try:
+        os.unlink(_verb_marker_path(cfg))
+    except FileNotFoundError:
+        pass
+    fsync_dir(runtime_dir(cfg))
+    return True
+
+
 def _refuse_while_plan_pending(cfg: Any, cap: Optional[Capability]) -> None:
     """ONE plan at a time: every verb refuses, BEFORE any effect, while an
     earlier plan is still pending (the caller has already tried to complete
     it), naming why and its exits, so a committed effect's audit line is
     never overwritten."""
     marker = _pending_plan(cfg)
-    if marker is None:
+    if marker is None or _settled_if_audited(cfg, marker):
         return
     try:
         _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
@@ -477,6 +498,9 @@ def operator_abandon_plan(cfg: Any, cap: Optional[Capability], *, now: datetime,
     marker = _pending_plan(cfg)
     if marker is None:
         raise ValueError("no runtime-generation plan is pending")
+    if _settled_if_audited(cfg, marker):
+        return {"result": f"the {marker['verb']} plan was already decided; its plan is removed",
+                "audited": True}
     try:
         result = _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
         _finish_verb_audit(cfg, marker, result=result, completed_on_repair=True)

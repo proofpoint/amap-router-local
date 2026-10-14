@@ -695,6 +695,40 @@ class AttemptTests(_Control):
         self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1)
         self.assertEqual(len([l for l in self.audit() if l.get("audit_id") == marker["id"]]), 1)
 
+    def test_an_abandoned_plan_whose_marker_survived_is_never_resumed(self):
+        """abandon-plan appends the plan's line, then removing the marker
+        fails; once the blocker clears, a pass must take NO effect of the
+        abandoned plan: the line is terminal."""
+        a, b, marker = self.pending_new_plan()
+        with self.fail_once(peercontrol.os, "unlink",
+                            lambda path, *_a, **_k: Path(path).name == peercontrol.VERB_AUDIT_FILE):
+            code, err = self.cli("abandon-plan")
+        self.assertNotEqual(code, 0, err)
+        self.assertEqual(self.marker(), marker, "the marker survived the failed unlink")
+        self.assertEqual(len([l for l in self.audit() if l.get("audit_id") == marker["id"]]), 1)
+        self.tree.gens[b] = "retired"               # the blocker clears
+        self.send()
+        self.assertIsNone(self.recorded(), "the abandoned planned generation was never minted")
+        self.assertIsNone(self.marker(), "the marker is removed")
+        lines = [l for l in self.audit() if l.get("audit_id") == marker["id"]]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].get("abandoned_by"), peercontrol.ABANDON_PLAN_VERB)
+
+    def test_completing_a_decided_plan_takes_no_effect(self):
+        a, b, marker = self.pending_new_plan()
+        with self.fail_once(peercontrol.os, "unlink",
+                            lambda path, *_a, **_k: Path(path).name == peercontrol.VERB_AUDIT_FILE):
+            self.cli("abandon-plan")
+        self.tree.gens[b] = "retired"
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        try:
+            peercontrol._complete_plan(self.cfg, cap, marker, NOW)
+            got = "completed"
+        except peercontrol.PlanPending:
+            got = "refused"
+        self.assertEqual(got, "refused")
+        self.assertIsNone(self.recorded(), "nothing minted")
+
     def test_every_verb_refuses_while_a_plan_is_pending(self):
         a, b, marker = self.pending_new_plan()
         for command, args in (("adopt", {"gen": b}), ("retire", {"gen": b}), ("new", {})):
