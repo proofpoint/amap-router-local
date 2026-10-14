@@ -36,7 +36,7 @@ import sys
 
 M = [
  ("J1 vacant not on exception",
-  [("router/peerjournal.py", "                fsync_dir(rdir.parent)\n            _mark_vacant(state_dir, seq)\n", "                fsync_dir(rdir.parent)\n            pass\n")],
+  [("router/peerjournal.py", "            _unmark_open(state_dir, owner, key, durable=True)\n            _mark_vacant(state_dir, seq)\n", "            _unmark_open(state_dir, owner, key, durable=True)\n            pass\n")],
   ["router.tests.test_peerjournal.SynchronousTakeFailureTests.test_a_failed_snapshot_write_leaves_a_vacant_seq"]),
  ("J2 mutation while pending",
   [("router/peerjournal.py", "    if meta[\"pending_op\"] is not None:\n        raise StoreBlocked(f\"an operation is unreconciled: {meta['pending_op']}\")\n    _ensure_root", "    _ensure_root")],
@@ -399,7 +399,7 @@ M = [
   [("router/peerjournal.py", "        record = transition(sd, record, \"decided\", now, decided_sticky=True)\n        return _decided(ctx, record)\n", "        record = write_record(sd, dict(record, state=\"decided\", decided_sticky=True, hold=None))\n        return _decided(ctx, record)\n")],
   ["router.tests.test_peerevaluate.HostIntakeTests.test_a_crash_after_the_decision_freezes_the_tombstone_on_recovery"]),
  ("P10 recovery walk skips unlisted records",
-  [("router/peerjournal.py", "            if rec[\"state\"] != \"done\" or (rec[\"intake\"] not in HOST_INTAKES\n                                          and not rec.get(\"removed\")):\n                pending.append(rec)\n", "            pass\n")],
+  [("router/peerjournal.py", "            if is_open(rec):\n                open_recs.append(rec)\n                seen_open[owner].add(d.name)\n", "            pass\n")],
   ["router.tests.test_peerevaluate.HostIntakeTests.test_a_record_whose_entry_is_gone_is_recovered", "router.tests.test_peerevaluate.PollTests.test_a_tree_record_whose_entry_vanished_is_recovered"]),
  ("P11 late inbound ignored",
   [("router/peerjournal.py", "        if not current:\n            # First observed in a generation that is no longer current.\n", "        if False:\n")],

@@ -22,7 +22,9 @@ flag reaches them.
 What is NOT a clock read: a time passed in as data (a statement's `ts`, a
 record's `recorded_ts`, a bound's `at`) and a file time (`st_mtime`), which the
 kernel stamps. `time.monotonic` is allowed at exactly one site,
-`hoplink._clock`, whose consumers are status ages and log levels only.
+`hoplink._clock`, whose consumers are status ages, log levels and the peer
+recovery's full-walk backstop schedule (`peerjournal._monotonic`): elapsed
+intervals within one process, never a protocol timestamp.
 """
 
 from __future__ import annotations

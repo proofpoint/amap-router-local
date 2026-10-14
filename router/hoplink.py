@@ -417,7 +417,8 @@ import time  # noqa: E402
 
 from .util import atomic_write, utc_ts  # noqa: E402
 
-#: The clock hold and retry ages are measured on (tests replace it).
+#: The clock hold and retry ages are measured on, and the peer recovery's
+#: full-walk backstop (`peerjournal._monotonic`); tests replace it.
 _clock = time.monotonic
 
 logger = logging.getLogger("amap_router_local.hoplink")
@@ -672,7 +673,7 @@ PROCESS_STATE: Dict[str, Tuple[str, ...]] = {
     "outbound": ("_STALE_WARNED",),
     "service": ("LAST_INGRESS", "_REGISTRY_LOGGED", "_RELOAD_FAILURE", "PEER_STARTUP",
                 "LAST_PEER_POLL"),
-    "peerjournal": ("_CURSORS", "_DISPOSED", "_POLLED", "EPOCH_COUNTS"),
+    "peerjournal": ("_CURSORS", "_DISPOSED", "_POLLED", "EPOCH_COUNTS", "_RECOVERY"),
     "peerlane": ("_ACTIVE",),
     "aliases": ("LAST_TOMBSTONE_ERRORS",),
 }
