@@ -314,8 +314,11 @@ class BuilderTests(_Hooks):
                          peerpolicy.PolicyPart(exposure_required=True, min_sender_age_s=86400))
         hk = self.production()
         self.assertIsNone(hk.check8(payload(), KEY_ID), "no exposure: check 8 passes")
-        self.assertEqual(outcome(hk.policy(payload(), "bob", RUNTIME)),
-                         ("refuse", "policy", "sender_age_missing"))
+        try:
+            got = outcome(hk.policy(payload(), "bob", RUNTIME))
+        except Exception as e:  # noqa: BLE001 -- a wrong member must FAIL, not error
+            got = type(e).__name__
+        self.assertEqual(got, ("refuse", "policy", "sender_age_missing"))
 
     def test_production_hooks_is_decide_hooks_of_the_production_profile(self):
         self.issued("issued-1")

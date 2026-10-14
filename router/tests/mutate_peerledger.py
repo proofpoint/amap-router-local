@@ -100,7 +100,7 @@ M = [
  ("L14 a member built from the wrong part", POL,
   "        policy=_policy(profile), control_receive=_control_receive(profile), context=ctx)\n",
   "        policy=_check8(profile), control_receive=_control_receive(profile), context=ctx)\n",
-  [T + "BuilderTests.test_production_holds_every_statement_at_check8_and_policy"]),
+  [T + "BuilderTests.test_production_is_the_pinned_real_policy"]),
  ("L15 conformance with production's policy part", POL,
   "                   policy=PolicyPart(exposure_required=False, min_sender_age_s=age))\n",
   "                   policy=PRODUCTION_POLICY)\n",
