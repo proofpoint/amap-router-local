@@ -399,9 +399,8 @@ M = [
   '    if (listed.get(gen) in ("live", "retired") or unlisted_ok) and not others:\n',
   [C + "AttemptTests.test_no_generation_is_minted_while_an_attempt_is_held_unrecorded"]),
  ("L115 a restore not audited", PC,
-  '        peerjournal._audit(cfg.state_dir, RESTORE_VERB, now, key=key, generation=gen,\n'
-  '                           listed=listed.get(gen) or "not listed")\n',
-  '',
+  '        record_generation(cfg, gen, now=now)\n        _finish_audit(cfg, record)\n        return None\n',
+  '        record_generation(cfg, gen, now=now)\n        return None\n',
   [C + "AttemptTests.test_a_never_admitted_generation_is_restored_and_no_other_is_minted"]),
  ("L116 a generation minted while an attempt is frozen elsewhere", PC,
   '    if frozen:\n        # A frozen attempt still names',
@@ -457,8 +456,8 @@ M = [
   '        if False:\n',
   [C + "AttemptTests.test_abandon_refuses_a_live_or_unreadable_generation_and_an_attempt_in_flight"]),
  ("L119 abandon without the suppression", PC,
-  '    _update(sd, record, suppressed=SUPPRESS_ABANDONED, held=None)\n',
-  '    _update(sd, record, held=None)\n',
+  '    record = _update(sd, record, suppressed=SUPPRESS_ABANDONED, held=None, audit_pending=marker)\n',
+  '    record = _update(sd, record, held=None, audit_pending=marker)\n',
   [C + "AttemptTests.test_abandon_ends_a_held_attempt_never_resent"]),
  ("L88 a de-trusted remote's result signed", OUT,
   "    if klass != classify_mod.CLASS_TRUSTED:\n        result = _result_doc(\n"
