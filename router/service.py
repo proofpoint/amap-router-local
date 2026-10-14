@@ -161,7 +161,10 @@ def poll_inputs(cfg: RouterConfig, *,
     so a conformance driver that runs a single pass through it
     (`peerjournal.poll(inputs.cfg, transport, inputs.report, ...)`) gets the
     inputs production gets. No transport is loaded or read: the glue needs
-    none. `report` and `gen_keys` are honoured when given because `run_once`
+    none. It is NOT read-only: `generations.apply` begins, fences and holds
+    generations, and `aliases.attach` settles and tombstones alias entries.
+    So, as in production, the caller holds the drain lock, and never calls it
+    beside a running router on the same `state_dir`. `report` and `gen_keys` are honoured when given because `run_once`
     is itself handed them (`poll_once` computes both before it calls
     `run_once`); recomputing them would apply generations twice in one poll.
 
