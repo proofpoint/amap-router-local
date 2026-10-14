@@ -152,7 +152,7 @@ class PollInputs(NamedTuple):
     gen_keys: Dict[str, str]
 
 
-def poll_inputs(cfg: RouterConfig, transport: Any = None, *,
+def poll_inputs(cfg: RouterConfig, *,
                 report: Optional["registry_mod.Report"] = None,
                 gen_keys: Optional[Dict[str, str]] = None) -> PollInputs:
     """The (keyed cfg, report, gen_keys) one poll runs on: exactly the four
@@ -160,8 +160,10 @@ def poll_inputs(cfg: RouterConfig, transport: Any = None, *,
     drain, no ingress pump, no signed-candidate poll). `run_once` calls it,
     so a conformance driver that runs a single pass through it
     (`peerjournal.poll(inputs.cfg, transport, inputs.report, ...)`) gets the
-    inputs production gets. `transport` is accepted so a caller can pass what
-    it passes `run_once`; the glue reads none of it.
+    inputs production gets. No transport is loaded or read: the glue needs
+    none. `report` and `gen_keys` are honoured when given because `run_once`
+    is itself handed them (`poll_once` computes both before it calls
+    `run_once`); recomputing them would apply generations twice in one poll.
 
     1. the registry report (`registry_report`), unless one is given;
     2. every instance's generation resolved (begun, fenced or held) BEFORE
@@ -223,7 +225,7 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
     """
     if transport is _LOAD:
         transport = start_transport(cfg)
-    cfg, report, gen_keys = poll_inputs(cfg, transport, report=report, gen_keys=gen_keys)
+    cfg, report, gen_keys = poll_inputs(cfg, report=report, gen_keys=gen_keys)
     summary: Dict[str, Dict[str, int]] = {}
     for name in sorted(cfg.instances):
         if report.state != "off" and name not in report.resolved:

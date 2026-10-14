@@ -113,6 +113,10 @@ class SendControlPendingTests(_Aliases):
 
 class StructureTests(_Aliases):
 
+    def test_poll_inputs_takes_no_transport(self):
+        params = inspect.signature(service.poll_inputs).parameters
+        self.assertNotIn("transport", params, "the glue needs no transport")
+
     def test_run_once_reaches_send_pending_only_through_the_wrapper(self):
         calls = _calls(service.run_once)
         self.assertIn("send_control_pending", calls)

@@ -21,7 +21,7 @@ SVC = "router/service.py"
 
 M = [
  ("P1 run_once re-inlines the glue", SVC,
-  "    cfg, report, gen_keys = poll_inputs(cfg, transport, report=report, gen_keys=gen_keys)\n",
+  "    cfg, report, gen_keys = poll_inputs(cfg, report=report, gen_keys=gen_keys)\n",
   "    if report is None:\n        report = registry_report(cfg)\n    if gen_keys is None:\n"
   "        report, gen_keys = generations.apply(cfg, report)\n"
   "    cfg = generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys)\n"
@@ -53,8 +53,8 @@ M = [
   "    if True:\n        report = registry_report(cfg)\n    if gen_keys is None:\n        report, gen_keys = generations.apply(cfg, report)\n    cfg = generations.keyed",
   [T + "PollInputsTests.test_given_report_and_generation_keys_are_used_not_recomputed"]),
  ("P8 run_once not draining on poll_inputs' cfg", SVC,
-  "    cfg, report, gen_keys = poll_inputs(cfg, transport, report=report, gen_keys=gen_keys)\n",
-  "    _cfg, report, gen_keys = poll_inputs(cfg, transport, report=report, gen_keys=gen_keys)\n",
+  "    cfg, report, gen_keys = poll_inputs(cfg, report=report, gen_keys=gen_keys)\n",
+  "    _cfg, report, gen_keys = poll_inputs(cfg, report=report, gen_keys=gen_keys)\n",
   [T + "PollInputsTests.test_run_once_drains_on_exactly_poll_inputs_configuration"]),
  ("P9 the wrapper changes an argument", SVC,
   "    return peercontrol.send_pending(cfg, transport, delegation=delegation, now=now)\n",
