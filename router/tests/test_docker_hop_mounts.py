@@ -207,6 +207,23 @@ class HopMountsTests(unittest.TestCase):
         m, _ = self.mounts(self.cfg(registry_dir=self.p("hop-registry")))
         self.assertEqual((m.get(self.p("hop")), m.get(self.p("hop-registry"))), ("rw", "ro"))
 
+    def test_a_config_file_inside_hop_root_is_refused(self):
+        # run.sh mounts the config by itself; only this comparison sees it.
+        f = self.t / "hop" / "router.json"
+        f.write_text(json.dumps(self.cfg()))
+        r = subprocess.run([sys.executable, "-B", str(SCRIPT), str(f)],
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn(f"overlaps the config file ({f}, ro)", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_a_config_file_beside_a_read_only_path_is_accepted(self):
+        f = self.t / "registry" / "router.json"
+        f.write_text(json.dumps(self.cfg()))
+        r = subprocess.run([sys.executable, "-B", str(SCRIPT), str(f)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_a_missing_hop_root_is_refused(self):
         os.rmdir(self.p("hop"))
         self.refused(self.cfg(), "do not exist", f"hop.root: {self.p('hop')}")

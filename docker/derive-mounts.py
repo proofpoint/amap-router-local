@@ -206,6 +206,12 @@ if hop is not None:
     # add nothing: each new path is its own realpath, so it can sit inside a
     # spelling only if that spelling resolves to itself.
     others = [(os.path.realpath(p), mode, "an existing mount") for p, mode in roots]
+    # The config file too: run.sh mounts it read-only by itself, outside this
+    # list. Inside hop.root, the tree the downstream runtime's uid writes, it
+    # could be replaced on the host and would be read at the next start,
+    # plugin pin, peer uid and all; the read-only bind pins only the inode it
+    # found.
+    others.append((os.path.realpath(cfg_path), "ro", "the config file"))
     for i, (p, mode, what) in enumerate(new):
         rivals = others + [n for j, n in enumerate(new) if j != i]
         for q, qmode, qwhat in rivals:

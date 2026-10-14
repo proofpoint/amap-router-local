@@ -62,7 +62,9 @@ realpath (no symlinked component, and neither file a symlink); none may be a
 container system path (`/`, `/etc`, `/var` and the like as a whole, or
 anything under `/usr`, `/lib*`, `/bin`, `/sbin`, `/app`, `/proc`, `/sys` or
 `/dev`, where an identity mount would replace what the image runs);
-`hop.root` may be nested with no other mount; and a read-only path may be
+`hop.root` may be nested with no other mount, the config file included (it
+is mounted by `run.sh` on its own, and inside the tree the downstream
+runtime writes it could be replaced before the next start); and a read-only path may be
 nested with no read-write one. Each refusal names the path. Without a `hop`
 section the list is exactly what it was, whatever else the config carries.
 
