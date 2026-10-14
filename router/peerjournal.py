@@ -81,7 +81,9 @@ SNAPSHOT_FILES = (SNAPSHOT_CANDIDATE, SNAPSHOT_VIEW, SNAPSHOT_STATEMENT)
 INTAKES = ("candidates", ".unresolved", ".control")
 _MOD = 1 << 256
 _META_MEMBERS = ("v", "take_seq", "reserve_seq", "settled_through", "roots", "replay",
-                 "pending_op")
+                 "epochs", "epochs_untrusted", "pending_op")
+#: The store bookkeeping's version: 2 adds the epoch store (`peerepochs`).
+STORE_V = 2
 _KEY_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -137,14 +139,71 @@ class StoreAbsent(ValueError):
     initialised, or its bookkeeping was lost with the clock."""
 
 
+class StoreV1(ValueError):
+    """A `store.v` 1 record: read ONLY through `migrate_v1`, never as an
+    epoch store that is complete and empty."""
+
+
+_V1_MEMBERS = ("v", "take_seq", "reserve_seq", "settled_through", "roots", "replay",
+               "pending_op")
+
+
 def read_meta(state_dir: Path) -> Dict[str, Any]:
     doc = peerclock.read_doc(state_dir)
     store = doc.get("store")
     if store is None:
         raise StoreAbsent("no store bookkeeping in the clock file")
-    if not isinstance(store, dict) or set(store) != set(_META_MEMBERS) or store["v"] != 1:
+    if isinstance(store, dict) and store.get("v") == 1 and set(store) == set(_V1_MEMBERS):
+        raise StoreV1("a store.v 1 record: migrated at startup only")
+    if not isinstance(store, dict) or set(store) != set(_META_MEMBERS) or store["v"] != STORE_V:
         raise ValueError("not a closed peer-store record")
     return store
+
+
+def _epochs_entry(token: str) -> Dict[str, Any]:
+    return {"token": token, "live": 0, "content_sum": "0", "rev_total": 0}
+
+
+def migrate_v1(state_dir: Path) -> str:
+    """A `store.v` 1 record at startup. Migrated ONLY when `peer-epochs/` is
+    absent, or holds exactly a migration's own leftover (its root and
+    witness token, no epoch files): (1) the epoch root and its witness,
+    durable; (2) the v2 record in ONE write. A v1 record BESIDE epoch files
+    (a clock restored after this build ran) is BEHIND: the record is written
+    at v2 with `epochs_untrusted` set, and the caller closes admission.
+    Returns "migrated" or "behind"."""
+    from . import peerepochs
+    state_dir = Path(state_dir)
+    doc = peerclock.read_doc(state_dir)
+    store = dict(doc["store"])
+    eroot = peerepochs.root(state_dir)
+    files = [p for p in eroot.rglob("*") if p.is_file() and p.name != WITNESS] \
+        if eroot.is_dir() else []
+    try:
+        leftover = (eroot / WITNESS).read_text(encoding="ascii")
+    except OSError:
+        leftover = None
+    if files:
+        token = leftover or store["replay"]["token"]
+        live, total, _p, _m = (0, 0, 0, 0)
+        try:
+            live, total, _p, _m = peerepochs.scan(state_dir)
+        except peerepochs.EpochFault:
+            pass
+        store.update(v=STORE_V, epochs=dict(_epochs_entry(token), live=live,
+                                            content_sum=str(total)),
+                     epochs_untrusted=True)
+        doc["store"] = store
+        peerclock.write_doc(state_dir, doc)
+        return "behind"
+    token = leftover or secrets.token_hex(32)
+    if leftover is None:
+        eroot.mkdir(mode=0o700, exist_ok=True)
+        atomic_write(eroot / WITNESS, token.encode("ascii"), durable_root=state_dir)
+    store.update(v=STORE_V, epochs=_epochs_entry(token), epochs_untrusted=False)
+    doc["store"] = store
+    peerclock.write_doc(state_dir, doc)
+    return "migrated"
 
 
 def _write_meta(state_dir: Path, meta: Mapping[str, Any]) -> None:
@@ -165,7 +224,8 @@ def _delta(store: str, owner: Optional[str], dsum: int, drev: int, dlive: int) -
 
 
 def _apply(meta: Dict[str, Any], d: Mapping[str, Any]) -> None:
-    entry = meta["replay"] if d["store"] == "replay" else meta["roots"][d["owner"]]
+    entry = (meta["replay"] if d["store"] == "replay" else
+             meta["epochs"] if d["store"] == "epochs" else meta["roots"][d["owner"]])
     _add(entry, int(d["sum"]), d["rev"], d["live"])
 
 
@@ -181,7 +241,7 @@ def _add(entry: Dict[str, Any], delta_sum: int, delta_rev: int, delta_live: int)
 
 def _artefacts(state_dir: Path) -> List[str]:
     found = []
-    for name in (peerclock.CLOCK_FILE, REPLAY_DIR, VACANT_DIR):
+    for name in (peerclock.CLOCK_FILE, REPLAY_DIR, VACANT_DIR, "peer-epochs"):
         if (Path(state_dir) / name).exists():
             found.append(name)
     for child in sorted(Path(state_dir).iterdir()) if Path(state_dir).is_dir() else ():
@@ -235,9 +295,14 @@ def init_store(state_dir: Path, now: datetime, *, hop_root: Optional[Path],
     replay = state_dir / REPLAY_DIR
     replay.mkdir(mode=0o700)
     atomic_write(replay / WITNESS, clock.store_token.encode("ascii"), durable_root=state_dir)
-    meta = {"v": 1, "take_seq": 0, "reserve_seq": 0, "settled_through": 0, "roots": {},
+    from . import peerepochs
+    eroot = peerepochs.root(state_dir)
+    eroot.mkdir(mode=0o700)
+    atomic_write(eroot / WITNESS, clock.store_token.encode("ascii"), durable_root=state_dir)
+    meta = {"v": STORE_V, "take_seq": 0, "reserve_seq": 0, "settled_through": 0, "roots": {},
             "replay": {"token": clock.store_token, "live": 0, "high_reserve_seq": 0,
                        "content_sum": "0", "rev_total": 0},
+            "epochs": _epochs_entry(clock.store_token), "epochs_untrusted": False,
             "pending_op": None}
     peerclock.write(state_dir, clock, previous=None)
     _write_meta(state_dir, meta)
@@ -508,6 +573,10 @@ def reconcile(state_dir: Path) -> List[str]:
                                     "names it")
                     continue
                 shutil.rmtree(d)
+    if op is not None and op["op"] == "epoch_prune":
+        # An epoch prune is completed, never half-undone.
+        from . import peerepochs
+        peerepochs.complete_prune(Path(op["target"]))
     if op is not None and op["op"] == "prune":
         # A prune is completed, never half-undone: every target goes.
         _remove_targets(*_prune_targets(state_dir, {"owner": op["owner"], "key": op["key"],
@@ -567,6 +636,9 @@ def reconcile(state_dir: Path) -> List[str]:
         ahead = rhigh > replay["high_reserve_seq"] or rlive > replay["live"]
         problems.append(f"{BEHIND if ahead else LOSS}replay store: content does not match its "
                         f"bookkeeping")
+    # The epoch store. Any finding (or an unreadable file) sets the
+    # fail-closed flag; a pair caught mid-prune is completed only without one.
+    problems += _reconcile_epochs(state_dir, meta, deltas)
     # Roots on disk that the bookkeeping does not know.
     for child in sorted(state_dir.iterdir()):
         if (child / JOURNAL_DIR).is_dir() and child.name not in meta["roots"]:
@@ -586,6 +658,39 @@ def reconcile(state_dir: Path) -> List[str]:
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
     return problems
+
+
+def _reconcile_epochs(state_dir: Path, meta: Dict[str, Any], deltas: List[Any]) -> List[str]:
+    from . import peerepochs
+    entry = meta["epochs"]
+    found: List[str] = []
+    try:
+        token = (peerepochs.root(state_dir) / WITNESS).read_text(encoding="ascii")
+    except OSError:
+        token = None
+    if token != entry["token"]:
+        found.append(f"{LOSS}epoch store: witness does not match")
+    try:
+        live, total, _pairs, midprune = peerepochs.scan(state_dir)
+    except peerepochs.EpochFault as e:
+        meta["epochs_untrusted"] = True
+        return found + [f"{LOSS}epoch store: {e.reason}"]
+    d = next((x for x in deltas if x["store"] == "epochs"), None)
+    if _rolled(entry, d, live, total, 0):
+        entry.update(live=live, content_sum=str(total))
+    elif (live, str(total)) != (entry["live"], entry["content_sum"]):
+        found.append(f"{BEHIND if live > entry['live'] else LOSS}epoch store: content does "
+                     "not match its bookkeeping")
+    if found:
+        meta["epochs_untrusted"] = True
+    elif midprune:
+        # Completed through the bookkept prune, which reads and writes the
+        # record: persist what reconcile settled first.
+        meta["pending_op"] = None
+        _write_meta(state_dir, meta)
+        peerepochs.complete_pairs(state_dir)
+        meta.update(read_meta(state_dir))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -899,15 +1004,18 @@ HOLD_REASONS = frozenset({
     "candidate_view_unavailable", "candidate_view_refused", "candidate_malformed",
     "admission_closed", "undecided", "hook_absent", "key_runtime_changed",
     "recovery_corrupt", "recipient_gone", "unpublishable", "control_plain_mail",
-    "no_fleet_domain"})
+    "no_fleet_domain", "epoch_store_unavailable"})
 #: Holds only an operator act clears: never re-evaluated by a poll.
 OPERATOR_HOLDS = frozenset({"candidate_view_refused", "candidate_malformed",
-                            "recovery_corrupt", "recipient_gone", "unpublishable"})
+                            "recovery_corrupt", "recipient_gone", "unpublishable",
+                            "epoch_store_unavailable"})
 #: Of those, the ones re-tried without an operator verb: `recipient_gone`
 #: once the decision's recipient is configured again (re-enrolment; checked
 #: from config, so a recipient still gone is never attempted), and
 #: `unpublishable` once per start (a published id's grammar changes only
-#: with the code). Each stays visible in status, with its age, until then.
+#: with the code), and `epoch_store_unavailable` once `router peer-epochs
+#: trust` has cleared the epoch flag. Each stays visible in status, with its
+#: age, until then.
 #: The codec causes whose demotion carries a control notice (check 5(b));
 #: every binding cause (checks 6-11) carries one too.
 CONTROL_CODEC_CAUSES = frozenset({"statement_value"})
@@ -1077,6 +1185,13 @@ class ViewUnavailable(Exception):
 def _retry_due(ctx: "Ctx", record: Mapping[str, Any], hold: Mapping[str, Any]) -> bool:
     if hold["reason"] == "unpublishable":
         return ctx.first_pass
+    if hold["reason"] == "epoch_store_unavailable":
+        # Re-tried once the trust verb has cleared the flag (in take order:
+        # the pass visits records by take_seq).
+        try:
+            return not read_meta(ctx.state_dir)["epochs_untrusted"]
+        except (StoreAbsent, ValueError):
+            return False
     if hold["reason"] == "recipient_gone" and record.get("kind") == "control":
         try:
             res = _control_reservation(ctx, record)
@@ -1546,7 +1661,7 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     payload = auth.payload
     for name, call in (("reply", lambda: ctx.hooks.reply(payload, auth.hosted)),
                        ("edge", lambda: ctx.hooks.edge(payload, auth.hosted)),
-                       ("policy", lambda: ctx.hooks.policy(payload, auth.hosted))):
+                       ("policy", lambda: ctx.hooks.policy(payload, auth.hosted, auth.runtime))):
         out = call()
         if isinstance(out, Hold):
             return set_hold(sd, record, out.reason, out.detail, now)
@@ -1813,8 +1928,10 @@ def _recount(state_dir: Path, token: str, old: Optional[Mapping[str, Any]]) -> D
     (retention may have pruned what they cover); without `old` the frontier
     is the contiguous settled prefix of what is on disk."""
     state_dir = Path(state_dir)
-    meta: Dict[str, Any] = {"v": 1, "take_seq": 0, "reserve_seq": 0, "settled_through": 0,
-                            "roots": {}, "replay": None, "pending_op": None}
+    from . import peerepochs
+    meta: Dict[str, Any] = {"v": STORE_V, "take_seq": 0, "reserve_seq": 0, "settled_through": 0,
+                            "roots": {}, "replay": None, "epochs": None,
+                            "epochs_untrusted": True, "pending_op": None}
     states: Dict[int, str] = {}
     for child in sorted(state_dir.iterdir()):
         if (child / JOURNAL_DIR).is_dir():
@@ -1834,6 +1951,17 @@ def _recount(state_dir: Path, token: str, old: Optional[Mapping[str, Any]]) -> D
     meta["replay"] = {"token": token, "live": rlive,
                       "high_reserve_seq": max(rhigh, prev_replay.get("high_reserve_seq", 0)),
                       "content_sum": str(rtotal), "rev_total": 0}
+    fault = False
+    try:
+        elive, etotal, _p, _m = peerepochs.scan(state_dir)
+    except peerepochs.EpochFault:
+        elive, etotal, fault = 0, 0, True
+    meta["epochs"] = {"token": token, "live": elive, "content_sum": str(etotal), "rev_total": 0}
+    # The flag survives every recount; without the prior epoch bookkeeping
+    # (a lost clock file) the store can no longer be shown complete, so it
+    # is set; an unreadable file sets it too.
+    prior = old if (old is not None and isinstance(old.get("epochs"), dict)) else None
+    meta["epochs_untrusted"] = fault or prior is None or bool(prior.get("epochs_untrusted"))
     vacant = _vacant(state_dir)
     meta["take_seq"] = max([meta["take_seq"], (old or {}).get("take_seq", 0)] + list(vacant))
     meta["reserve_seq"] = max(rhigh, (old or {}).get("reserve_seq", 0))
@@ -1873,6 +2001,10 @@ def rebuild_meta(state_dir: Path) -> Dict[str, Any]:
     replay = state_dir / REPLAY_DIR
     replay.mkdir(exist_ok=True, mode=0o700)
     atomic_write(replay / WITNESS, token.encode("ascii"), durable_root=state_dir)
+    from . import peerepochs
+    peerepochs.root(state_dir).mkdir(exist_ok=True, mode=0o700)
+    atomic_write(peerepochs.root(state_dir) / WITNESS, token.encode("ascii"),
+                 durable_root=state_dir)
     meta = _recount(state_dir, token, _old_meta(state_dir))
     _write_meta(state_dir, meta)
     return meta
@@ -1905,7 +2037,12 @@ def _rebase_after_loss(state_dir: Path, meta: Mapping[str, Any]) -> None:
     replay = state_dir / REPLAY_DIR
     replay.mkdir(exist_ok=True, mode=0o700)
     _restore_witness(state_dir, replay / WITNESS, token)
-    _write_meta(state_dir, _recount(state_dir, token, meta))
+    from . import peerepochs
+    peerepochs.root(state_dir).mkdir(exist_ok=True, mode=0o700)
+    _restore_witness(state_dir, peerepochs.root(state_dir) / WITNESS, meta["epochs"]["token"])
+    # The rebase never clears the epoch flag (`_recount` keeps it).
+    _write_meta(state_dir, _recount(state_dir, token, dict(meta, epochs=dict(
+        meta["epochs"]))))
 
 
 def _restore_witness(state_dir: Path, path: Path, token: str) -> None:
@@ -1945,6 +2082,19 @@ def startup(state_dir: Path, now: datetime) -> Dict[str, Any]:
         return {"admission": "closed",
                 "why": "uninitialised" if not found else "clock_untrusted",
                 "problems": [str(e)] if found else [], "digests_repaired": 0}
+    migrated = None
+    try:
+        read_meta(state_dir)
+    except StoreV1:
+        migrated = migrate_v1(state_dir)
+        if migrated == "behind":
+            clock = peerclock.close(state_dir, peerclock.read(state_dir),
+                                    "a store.v 1 record beside epoch files")
+            return {"admission": "closed", "why": "clock_behind_stores",
+                    "problems": [f"{BEHIND}epoch store: files beside a v1 record"],
+                    "digests_repaired": 0}
+    except (StoreAbsent, ValueError):
+        pass
     try:
         problems = reconcile(state_dir)
     except StoreAbsent:
@@ -2014,7 +2164,37 @@ def status_doc(state_dir: Path, now: datetime,
                             "age_s": int((now - since).total_seconds()) if since else None})
     doc["holds"] = sorted(holds, key=lambda h: h["take_seq"])
     doc["retries"] = sorted(retries, key=lambda h: h["take_seq"])
+    doc["epochs"] = _epochs_status(state_dir, meta)
     return doc
+
+
+#: The policy codes the epoch section counts.
+_EPOCH_POLICY_CODES = ("quarantined", "sender_age_missing", "sender_since_inconsistent",
+                       "exposure_missing")
+
+
+def _epochs_status(state_dir: Path, meta: Mapping[str, Any]) -> Dict[str, Any]:
+    """Status `peer_store.epochs`: the tracked pairs, pairs mid-prune,
+    `epochs_untrusted`, and over the RETAINED records, the policy refusals
+    by code, the `exposure_signer` demotions and the epoch holds."""
+    from . import peerepochs
+    out: Dict[str, Any] = {"untrusted": bool(meta["epochs_untrusted"])}
+    try:
+        _live, _total, out["pairs"], out["pairs_mid_prune"] = peerepochs.scan(state_dir)
+    except peerepochs.EpochFault as e:
+        out["pairs"], out["pairs_mid_prune"], out["fault"] = None, None, e.reason
+    refusals = {c: 0 for c in _EPOCH_POLICY_CODES}
+    demotions = holds = 0
+    for rec in all_records(state_dir):
+        if rec.get("cause") == "policy" and rec.get("policy_code") in refusals:
+            refusals[rec["policy_code"]] += 1
+        if rec.get("cause") == "exposure_signer":
+            demotions += 1
+        if (rec.get("hold") or {}).get("reason") == "epoch_store_unavailable":
+            holds += 1
+    out.update(refusals=refusals, exposure_signer_demotions=demotions,
+               epoch_store_unavailable_holds=holds)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2052,10 +2232,17 @@ def operator_init(cfg: Any, now: datetime, *, acknowledge_surviving: Optional[st
 def operator_declare_restored(state_dir: Path, now: datetime, *, evidence: str
                               ) -> Dict[str, Any]:
     """`router peer-store declare-restored --evidence`: after any restore of
-    `state_dir`, H proves nothing; admission closes until a bound B."""
+    `state_dir`, H proves nothing; admission closes until a bound B. A
+    restore may have rolled the epoch store back too, so its flag is set
+    (cleared only by `router peer-epochs trust`)."""
     if not (isinstance(evidence, str) and evidence.strip()):
         raise StoreRefused("evidence is required")
     clock = peerclock.close(state_dir, peerclock.read(state_dir), "declared restored")
+    from . import peerepochs
+    try:
+        peerepochs.set_untrusted(state_dir, "declared restored")
+    except (StoreAbsent, ValueError):
+        pass
     _audit(state_dir, "peer-store declare-restored", now, evidence=evidence)
     return {"admission": clock.admission}
 

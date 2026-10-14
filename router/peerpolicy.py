@@ -15,8 +15,8 @@ conformance driver passes one that returns `conformance_profile(...)`; that
 is the only difference between the two, and both run the same hook code.
 
 A `Profile` is DATA: an edge part (`TRUSTED_HOST_DEFAULT`, or a frozenset of
-canonical `(from, to)` pairs from `conformance_edges`) and a policy part (in
-this build the closed markers `HOLD` or `PERMISSIVE`). `decide_hooks`
+canonical `(from, to)` pairs from `conformance_edges`) and a policy part, a
+frozen `PolicyPart(exposure_required, min_sender_age_s)`. `decide_hooks`
 validates every part's exact type, so a factory contributes nothing a hook
 could run. Each hook reads only its call arguments, its profile and the
 profile's `HookContext`, which is frozen and bound to one pass's `cfg`,
@@ -27,18 +27,28 @@ What each hook reads:
 
 | hook | reads |
 |---|---|
-| `check8` | the policy part only, in this build (the real check is a later build's) |
+| `check8` | `delegation` ONLY: the key's configured runtime and its address (the exposure asserter); identical under every profile |
 | `reply` | `cfg.instances[hosted].task_deny` (the deny, first), the hosted instance's state key and address, `state_dir` (the peer ledger), `now` |
 | `edge` | the same resolution; the edge part; `delegation.config` (the key's runtime and its domains) |
-| `policy` | the policy part only, in this build |
+| `policy` | the policy part; `state_dir` (the epoch store, `peerepochs`); `now`; the reservation's runtime (a call argument) |
 | `control_receive` | `delegation.config` (the key's configured runtime and its domains), `cfg.fleet_domain` (this router's runtime address), the clock and `now` (freshness), `state_dir` (the `issued` records) |
 
 The decide order is deny, reply, edge, policy. The deny is the reply hook's
 first step, so a denied sender is refused `(policy, denied)` whatever its
-`in_reply_to`, and learns nothing about the ledger. Until the policy build
-lands, the PRODUCTION profile holds every statement at `check8` and at
-`policy` (`hook_absent`), so production places nothing; only a conformance
-profile has the interim permissive policy part.
+`in_reply_to`, and learns nothing about the ledger.
+
+THE POLICY HOOK's order (the first failure decides): `sender_age_missing`
+(no `sender_since`, under an age policy); consistency against the epoch
+store (an earlier `sender_since` is `sender_since_inconsistent` and persists
+nothing; a later one is persisted and audited BEFORE the age test); then
+`quarantined` (`now - sender_since < min_sender_age_s`, `now` the router's
+own, a future value quarantined); then `exposure_missing`. With no age
+policy the epoch store is not consulted at all. An unreadable or untrusted
+epoch store HOLDS (`epoch_store_unavailable`), never refuses.
+
+PRODUCTION is pinned: `PolicyPart(exposure_required=True,
+min_sender_age_s=86400)`. No config member selects another profile or
+weakens it; a delegation naming either overlay is refused at load.
 """
 
 from __future__ import annotations
@@ -63,16 +73,22 @@ class _Marker:
         return self.name
 
 
+@dataclass(frozen=True)
+class PolicyPart:
+    """The policy part of a profile: whether `sender_exposure` is required,
+    and the minimum sender age in seconds (None: no age policy; 0 is an
+    ACTIVE zero-second policy that still runs the consistency rule)."""
+    exposure_required: bool
+    min_sender_age_s: Optional[int]
+
+
+#: Production's policy part (contract §8.8), pinned.
+PRODUCTION_POLICY = PolicyPart(exposure_required=True, min_sender_age_s=86400)
+
 #: The edge part production uses: the edge exists when the key's runtime owns
 #: the domain of `from` (`peerbind.check6`, the same predicate check 6 runs).
 TRUSTED_HOST_DEFAULT = _Marker("TRUSTED_HOST_DEFAULT")
-#: The policy part production uses until the policy build: hold everything.
-HOLD = _Marker("HOLD")
-#: The interim policy part a conformance profile uses until the policy build.
-PERMISSIVE = _Marker("PERMISSIVE")
-
 _EDGE_MARKERS = (TRUSTED_HOST_DEFAULT,)
-_POLICY_MARKERS = (HOLD, PERMISSIVE)
 
 
 @dataclass(frozen=True)
@@ -105,7 +121,7 @@ class Profile:
 
 def production_profile(ctx: HookContext) -> Profile:
     """The only profile the router builds."""
-    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT, policy=HOLD)
+    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT, policy=PRODUCTION_POLICY)
 
 
 def conformance_edges(pairs) -> FrozenSet[Tuple[str, str]]:
@@ -120,13 +136,17 @@ def conformance_edges(pairs) -> FrozenSet[Tuple[str, str]]:
 
 def conformance_profile(ctx: HookContext, receiver_patch: Optional[Mapping[str, Any]],
                         pairs) -> Profile:
-    """A conformance driver's profile: the given edges, and (in this build)
-    the interim permissive policy part. `receiver_patch` is accepted for the
-    policy build, which maps it; here it must be a mapping or None. For tests
-    and conformance drivers only."""
+    """A conformance driver's profile: the given edges; exposure not
+    required (the spec test receiver's); `min_sender_age_s` the receiver
+    patch's when it sets one, else None. Absent maps to None, never a
+    falsy value: a patch of 0 is an active policy. For tests and conformance
+    drivers only."""
     if receiver_patch is not None and not isinstance(receiver_patch, Mapping):
         raise TypeError("receiver_patch: a mapping or None")
-    return Profile(context=ctx, edges=conformance_edges(pairs), policy=PERMISSIVE)
+    patch = receiver_patch or {}
+    age = patch["min_sender_age_s"] if "min_sender_age_s" in patch else None
+    return Profile(context=ctx, edges=conformance_edges(pairs),
+                   policy=PolicyPart(exposure_required=False, min_sender_age_s=age))
 
 
 def _check_profile(profile: Any) -> None:
@@ -142,8 +162,11 @@ def _check_profile(profile: Any) -> None:
                         and all(type(a) is str for a in p) for p in edges))):
         raise TypeError("decide_hooks: the edge part is TRUSTED_HOST_DEFAULT or a frozenset "
                         "of (from, to) string pairs")
-    if not any(profile.policy is m for m in _POLICY_MARKERS):
-        raise TypeError("decide_hooks: the policy part is HOLD or PERMISSIVE")
+    part = profile.policy
+    if not (type(part) is PolicyPart and type(part.exposure_required) is bool
+            and (part.min_sender_age_s is None
+                 or (type(part.min_sender_age_s) is int and part.min_sender_age_s >= 0))):
+        raise TypeError("decide_hooks: the policy part is a PolicyPart(bool, int >= 0 | None)")
 
 
 def decide_hooks(profile: Profile):
@@ -178,12 +201,33 @@ def _resolution(ctx: HookContext, payload: Mapping[str, Any], hosted: str):
                               remote=payload["from"], now=ctx.now)
 
 
+EXPOSURE_SIGNER = "exposure_signer"
+
+
+def _same_address(a: Any, b: Any) -> bool:
+    """The local part EXACTLY, the domain ASCII case-insensitively."""
+    if not (isinstance(a, str) and isinstance(b, str)) or a.count("@") != 1 or b.count("@") != 1:
+        return False
+    al, ad = a.split("@")
+    bl, bd = b.split("@")
+    return al == bl and ad.isascii() and bd.isascii() and ad.lower() == bd.lower()
+
+
 def _check8(profile: Profile) -> Callable:
-    from . import peerjournal
+    from . import peerbind
+    ctx = profile.context
 
     def check8(payload: Mapping[str, Any], key_id: str):
-        if profile.policy is HOLD:
-            return peerjournal.Hold("hook_absent", "check8")
+        """Check 8: a present `sender_exposure` must be asserted by the
+        configured runtime that owns the verifying key (never this
+        receiver's own). Absence is the policy hook's, never check 8's."""
+        exposure = payload.get("sender_exposure")
+        if exposure is None:
+            return None
+        runtime = peerbind.runtime_for_key(ctx.delegation.config, key_id)
+        asserted = exposure.get("asserted_by") if isinstance(exposure, Mapping) else None
+        if runtime is None or not _same_address(asserted, runtime.runtime):
+            return EXPOSURE_SIGNER
         return None
     return check8
 
@@ -236,12 +280,38 @@ def _edge(profile: Profile) -> Callable:
     return edge
 
 
-def _policy(profile: Profile) -> Callable:
-    from . import peerjournal
+SENDER_AGE_MISSING = "sender_age_missing"
+SENDER_SINCE_INCONSISTENT = "sender_since_inconsistent"
+QUARANTINED = "quarantined"
+EXPOSURE_MISSING = "exposure_missing"
+EPOCH_STORE_UNAVAILABLE = "epoch_store_unavailable"
 
-    def policy(payload: Mapping[str, Any], hosted: str):
-        if profile.policy is HOLD:
-            return peerjournal.Hold("hook_absent", "policy")
+
+def _policy(profile: Profile) -> Callable:
+    from . import peerepochs, peerjournal
+    from .util import parse_utc_ts
+    ctx = profile.context
+    part = profile.policy
+
+    def policy(payload: Mapping[str, Any], hosted: str, runtime: str):
+        """The order (module docstring): age missing, consistency, quarantined,
+        exposure missing. `runtime` is the RESERVATION's runtime."""
+        if part.min_sender_age_s is not None:
+            since = payload.get("sender_since")
+            if since is None:
+                return peerjournal.Refuse("policy", SENDER_AGE_MISSING)
+            try:
+                seen = peerepochs.consult(ctx.state_dir, runtime=runtime, sender=payload["from"],
+                                          sender_since=since, now=ctx.now)
+            except (peerepochs.Untrusted, peerepochs.EpochFault):
+                return peerjournal.Hold(EPOCH_STORE_UNAVAILABLE)
+            if seen == peerepochs.INCONSISTENT:
+                return peerjournal.Refuse("policy", SENDER_SINCE_INCONSISTENT)
+            age = (ctx.now - parse_utc_ts(since)).total_seconds()
+            if age < part.min_sender_age_s:
+                return peerjournal.Refuse("policy", QUARANTINED)
+        if part.exposure_required and payload.get("sender_exposure") is None:
+            return peerjournal.Refuse("policy", EXPOSURE_MISSING)
         return None
     return policy
 

@@ -182,7 +182,8 @@ PUBLIC_MODULES = ("attachments", "binding", "config", "deliver", "exposure",
 #: Implementation. May change shape without notice.
 INTERNAL_MODULES = ("__main__", "aliases", "audit", "classify", "clock", "console", "fsops",
                     "generations", "hoplink", "inflight", "ingress", "outcomes", "peerclock",
-                    "peercontrol", "peerjournal", "peerlane", "peerledger", "peerpolicy", "provision",
+                    "peercontrol", "peerepochs", "peerjournal", "peerlane", "peerledger", "peerpolicy",
+                    "provision",
                     "quarantine",
                     "registry", "reset", "roster", "service", "status")
 

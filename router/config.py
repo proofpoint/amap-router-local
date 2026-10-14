@@ -1939,6 +1939,10 @@ class DelegationConfig:
 
 _DELEGATION_KEYS = frozenset({"partition_verified", "signing_key", "runtimes", "crypto"})
 _DELEGATION_OPTIONAL = frozenset({"attachment_basis", "inbound", "windows", "retention"})
+#: Any delegation key naming the exposure or sender-age overlay: refused, so
+#: no deployed config can weaken the production profile (contract §8.8).
+_OVERLAY_TOKENS = ("exposure", "sender_age", "sender_since", "age_policy", "min_age",
+                   "quarantine")
 #: Inbound peer intake (taking signed candidates at all). False in this
 #: build: `delegation.inbound: true` is refused at load until the policy,
 #: edge and reply hooks exist. Tests patch it.
@@ -1986,6 +1990,11 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
         raise ConfigError(f"{where}: requires config.transport_plugin and config.hop: "
                           "a signed peer task travels over the hop")
     raw = _require_object(raw_value, where)
+    overlays = sorted(k for k in raw if isinstance(k, str) and any(
+        t in k.lower() for t in _OVERLAY_TOKENS))
+    if overlays:
+        raise ConfigError(f"{where}: {overlays}: the exposure and sender-age policy is fixed "
+                          "by the production profile and is not configurable")
     if not (_DELEGATION_KEYS <= set(raw) <= _DELEGATION_KEYS | _DELEGATION_OPTIONAL):
         raise ConfigError(f"{where}: needs exactly {sorted(_DELEGATION_KEYS)}, and may have "
                           f"{sorted(_DELEGATION_OPTIONAL)}; got {sorted(raw)}")

@@ -21,6 +21,8 @@ NOW = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
 LATER = "2026-10-20T00:00:00Z"
 EARLIER = "2026-10-13T11:00:00Z"
 PLANNER = f"planner@{T1}"
+#: The configured runtime owning KEY_ID (the reservation's runtime).
+RUNTIME = f"amap.router@{T1}"
 BOB = f"bob@{FD}"
 ROUTER = pathlib.Path(router.__file__).parent
 
@@ -307,10 +309,13 @@ class ControlReceiveTests(_Hooks):
 
 class BuilderTests(_Hooks):
 
-    def test_production_holds_every_statement_at_check8_and_policy(self):
+    def test_production_is_the_pinned_real_policy(self):
+        self.assertEqual(peerpolicy.production_profile(self.ctx()).policy,
+                         peerpolicy.PolicyPart(exposure_required=True, min_sender_age_s=86400))
         hk = self.production()
-        self.assertEqual(outcome(hk.check8(payload(), KEY_ID)), ("hold", "hook_absent", "check8"))
-        self.assertEqual(outcome(hk.policy(payload(), "bob")), ("hold", "hook_absent", "policy"))
+        self.assertIsNone(hk.check8(payload(), KEY_ID), "no exposure: check 8 passes")
+        self.assertEqual(outcome(hk.policy(payload(), "bob", RUNTIME)),
+                         ("refuse", "policy", "sender_age_missing"))
 
     def test_production_hooks_is_decide_hooks_of_the_production_profile(self):
         self.issued("issued-1")
@@ -322,9 +327,11 @@ class BuilderTests(_Hooks):
                   payload(**{"from": "planner@elsewhere.example"})):
             with self.subTest(p=p):
                 self.assertEqual(outcome(a.check8(p, KEY_ID)), outcome(b.check8(p, KEY_ID)))
-                for m in ("reply", "edge", "policy"):
+                for m in ("reply", "edge"):
                     self.assertEqual(outcome(getattr(a, m)(p, "bob")),
                                      outcome(getattr(b, m)(p, "bob")))
+                self.assertEqual(outcome(a.policy(p, "bob", RUNTIME)),
+                                 outcome(b.policy(p, "bob", RUNTIME)))
         for v in control_probes():
             with self.subTest(control=v.payload):
                 self.assertEqual(outcome(a.control_receive(None, v)),
@@ -339,10 +346,11 @@ class BuilderTests(_Hooks):
         for v in control_probes():
             self.assertEqual(outcome(prod.control_receive(None, v)),
                              outcome(conf.control_receive(None, v)))
-        self.assertNotEqual(outcome(prod.policy(payload(), "bob")),
-                            outcome(conf.policy(payload(), "bob")))
-        self.assertNotEqual(outcome(prod.check8(payload(), KEY_ID)),
-                            outcome(conf.check8(payload(), KEY_ID)))
+        self.assertNotEqual(outcome(prod.policy(payload(), "bob", RUNTIME)),
+                            outcome(conf.policy(payload(), "bob", RUNTIME)))
+        # Check 8 is profile-independent: the same statement, the same result.
+        for p in (payload(), payload(sender_exposure={"asserted_by": "x@y.example"})):
+            self.assertEqual(prod.check8(p, KEY_ID), conf.check8(p, KEY_ID))
         self.assertNotEqual(outcome(prod.edge(payload(), "bob")),
                             outcome(conf.edge(payload(), "bob")))
 
@@ -359,12 +367,12 @@ class BuilderTests(_Hooks):
     def test_every_part_must_be_data(self):
         ctx = self.ctx()
         for label, prof in (
-                ("callable edge", peerpolicy.Profile(ctx, lambda *_a: None, peerpolicy.HOLD)),
+                ("callable edge", peerpolicy.Profile(ctx, lambda *_a: None, peerpolicy.PRODUCTION_POLICY)),
                 ("callable policy", peerpolicy.Profile(ctx, peerpolicy.TRUSTED_HOST_DEFAULT,
                                                        lambda *_a: None)),
-                ("a set of non-pairs", peerpolicy.Profile(ctx, frozenset({"x"}), peerpolicy.HOLD)),
+                ("a set of non-pairs", peerpolicy.Profile(ctx, frozenset({"x"}), peerpolicy.PRODUCTION_POLICY)),
                 ("a foreign context", peerpolicy.Profile(object(), peerpolicy.TRUSTED_HOST_DEFAULT,
-                                                         peerpolicy.HOLD))):
+                                                         peerpolicy.PRODUCTION_POLICY))):
             with self.subTest(label):
                 with self.assertRaises(TypeError):
                     peerpolicy.decide_hooks(prof)
@@ -420,7 +428,8 @@ class PassFactoryTests(unittest.TestCase):
     def test_no_factory_is_production(self):
         hooks = peerjournal._pass_hooks(object(), delegation=object(), state_dir=pathlib.Path("/x"),
                                         now=NOW, clock=object(), profile_factory=None)
-        self.assertEqual(outcome(hooks.policy(payload(), "bob")), ("hold", "hook_absent", "policy"))
+        self.assertEqual(outcome(hooks.policy(payload(), "bob", RUNTIME)),
+                         ("refuse", "policy", "sender_age_missing"))
 
 
 class ForwardingTests(unittest.TestCase):
@@ -567,11 +576,11 @@ class FactoryThroughAPassTests(tpe._Polling):
         rec = peerjournal.read_record(self.state_dir, tpe.OWNER, self.key("c2"))
         self.assertEqual(rec["disposed"], "placed")
 
-    def test_the_production_default_holds_at_check8(self):
+    def test_the_production_default_is_the_production_policy(self):
         port = tpe.FakePort({"c1": self.raw()})
         self.poll_with(None, port)
         rec = peerjournal.read_record(self.state_dir, tpe.OWNER, self.key("c1"))
-        self.assertEqual((rec["hold"] or {}).get("reason"), "hook_absent")
+        self.assertEqual((rec["disposed"], rec["policy_code"]), ("refused", "sender_age_missing"))
 
 
 from router.tests import test_peerlane as tpl  # noqa: E402
