@@ -1363,9 +1363,9 @@ same check begin runs.
 downstream runtime's own host intakes beside the identities (`.unresolved/`,
 `.control/`, where inbound control mail lands). `.runtime/` is different:
 it is this router's OUTBOUND runtime control tree, the upstream side of
-control notices, which is not built yet. When it is, this router creates it
-and admits its generations exactly as it does an agent's (identity
-`logical_id` "runtime" and the router's own address), and the downstream
+control notices (see "The runtime control tree" below). The plugin creates
+it, and admits each generation when this router calls `admit` (identity
+`logical_id` "runtime" and the router's own address); the downstream
 runtime creates `down/` and its receiver directories on first sight. The
 deployment never pre-creates it. Everything under `<root>/<logical_id>/` is the
 plugin's, created when a generation is admitted or first seen. This router,
@@ -1964,16 +1964,16 @@ Each (sending runtime, `from`) pair's accepted `sender_since` is kept in
 `state_dir/peer-epochs/`, one immutable file per pair, counted in the
 store bookkeeping like the journal and the replay index.
 
-- **A lost or rolled-back epoch store HOLDS (PROVISIONAL, pending an
-  operator-policy decision).** Any loss or behind finding for the epoch
+- **A lost or rolled-back epoch store HOLDS (fail-closed, decided
+  2026-10-14).** Any loss or behind finding for the epoch
   store, any epoch file that does not read back as written, and any
   `declare-restored`, set a durable `epochs_untrusted` flag. While it is
   set, every statement that reaches the consistency step is held
   `epoch_store_unavailable` (its record stays reserved and is decided after
   the trust verb); refusals before that step, and profiles without an age
-  policy, are unaffected. The alternative under consideration accepts the
-  residual instead: a lost or rolled-back pair would accept an earlier
-  `sender_since` once, with a named startup finding.
+  policy, are unaffected. Accepting the residual instead (a lost or
+  rolled-back pair accepting an earlier `sender_since` once) was considered
+  and rejected.
 - **`exposure_missing` may advance the epoch.** The consistency step runs
   before the exposure requirement, so a statement refused for a missing
   exposure still records a later `sender_since`. That only lengthens the
@@ -2297,6 +2297,92 @@ state that has to go with it) rather than a raw `rm -rf`. Appendix A
 sketches a future connector-written GC signal (`outbound/acks/notice-<id>`)
 that would let the runtime reclaim consumed inbound artifacts safely; it is
 explicitly **not-yet-specified** and nothing here implements it.
+
+## The runtime control tree (`router/peercontrol.py`)
+
+Control notices go out through the router's own runtime tree,
+`<hop_root>/.runtime/<generation>/`, which this router reaches ONLY through
+the plugin's runtime capability (PLUGIN_API (3, 5): `make_runtime_sender`
+and `make_runtime_lister`, named in one table, `transport.RUNTIME_CAPABILITY`).
+A plugin that does not declare both factories leaves the capability off, and
+every control notice is held `runtime_tree_unavailable`.
+
+- **One recorded generation** (`state_dir/_runtime/generation.json`, with its
+  pin beside its in-flight state): minted when the lister shows nothing live
+  or unreadable, never beside another live one.
+- **Admission is explicit.** Before the first call of any transport method
+  in a generation, on every pass, the router calls `admit(admitted_at)` with
+  the generation's own recorded time, which is stable on every path: a fresh
+  mint's own time; the tree's identity for an adopt or for the automatic
+  restore of a listed live generation; the restore's own time, once, for a
+  generation never admitted; the plan's time for `new`. A record and pin
+  that disagree, or a tree whose identity carries another time
+  (`exists_different`), hold visibly and are never re-admitted.
+- **The sender's settings** are the plugin's closed list: the hop root, the
+  generation, the peer uid, the router's own address (one canonical,
+  lowercase `amap.router@<fleet_domain>`, the same bytes on every surface
+  that names this router), `version_write` from the generation's pin, and
+  `caps` from `hop.caps`.
+- **A retired generation.** The plugin refuses a NEW request in a retired
+  generation (`generation_retired`) only when no part of it exists in the
+  tree; the router settles that attempt `rejected` with reason
+  `generation_retired` (counted as failed, never retried, re-signed or handed
+  over again) and removes its in-flight record. The settling row is asked
+  before the latched and retried rows. Anywhere before the hand-over, a
+  retired or unreadable generation holds the attempt instead.
+- **Every plugin anomaly** (a misowned tree, a stray entry, an unreadable
+  identity) holds as `runtime_tree_unavailable`, naming it, on every path,
+  the verbs included.
+
+**Operator verbs** (each takes the drain lock, is audited intent-first, and
+prints one JSON line):
+
+- `router runtime-generation adopt GEN --evidence TEXT`: the only live
+  generation becomes the recorded one again, with the tree's own admitted
+  time.
+- `router runtime-generation retire GEN --evidence TEXT`: refused while
+  anything of `GEN` is unsettled, and refused for an unreadable generation.
+- `router runtime-generation new --evidence TEXT`: retire the recorded
+  generation, then mint, as one durable plan; refused before the plan when
+  either step would be.
+- `router runtime-generation abandon-attempt KEY --evidence TEXT`: end a
+  frozen control attempt whose generation can be neither restored nor
+  adopted; reads only the lister.
+- `router runtime-generation abandon-plan --evidence TEXT`: end a verb's plan
+  that cannot complete, auditing what it committed.
+
+A frozen attempt's lost generation record is restored automatically, and
+audited, only when its generation is the sole live one, or was never
+admitted while no other generation is live or unreadable; nothing is minted
+while such an attempt is held. These verbs and the restore rule are final.
+
+### Runtime tree repair
+
+- **An unreadable generation** stops sending in it. The plugin never deletes
+  a generation and its `retire` refuses one whose identity cannot be read, so
+  adopt, retire and abandon cannot act on it: the operator repairs the tree
+  out of band, as the transport plugin's operator notes describe for its own
+  tree, then retries. Status lists unreadable generations with this exit.
+- **A stray entry in `.runtime/`** makes the whole listing fail; status
+  names it, and the operator removes it.
+- **An address change** makes the existing generation's admission
+  `exists_different`: once in-flight attempts settle, `runtime-generation
+  new` rotates to a generation admitted with the new address.
+- **`.adm-<generation>-*` directories** are crashed admissions' stages: inert,
+  never listed; the operator may remove one once no router runs `admit` for
+  that generation.
+
+### Testing against the plugin
+
+The suite runs against an in-repository stand-in of the capability. The real
+plugin's rows run in `router/tests/run_realhop.py --plugin <file>`: adopt,
+retire, new, both restores, abandon-attempt, abandon-plan, the
+`generation_retired` settlement and the hold before any hand-over, and the
+crash and exactly-once audit seams, against the real runtime sender and
+lister over this router's real filesystem port. The file must hash to the
+pinned artifact digest (`ARTIFACT_SHA256`); without it the run is refused,
+never skipped. Its evidence is a recorded run with the plugin file's
+sha256, not continuous integration, which has no copy of the plugin.
 
 ## Known limitation (documented, not a test target)
 

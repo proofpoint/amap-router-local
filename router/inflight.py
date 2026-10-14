@@ -1165,7 +1165,10 @@ def advance(
         return state
     except ProbeFailed as failed:
         e = failed.raised
-        if not _is_hop(cfg):
+        if not _is_hop(cfg) or name == config_mod.RUNTIME_NS:
+            # The runtime control namespace's caller holds the whole pass on
+            # a plugin anomaly and names it (`peercontrol`), production shape
+            # or not: never a silent per-record retry there.
             raise e from None
         status = probe_status(e)
         age = hoplink.note_retry(cfg, name, status, f"{type(e).__name__}: {e}",
@@ -1358,6 +1361,22 @@ def _advance(
     try:
         _effect("transport", writer.write_request, n, data)
     except Exception as e:  # noqa: BLE001 -- the closed table decides
+        # A settling reason FIRST, before the latched and retried rows: the
+        # plugin raised it with no part of the request in the tree, so it is
+        # a definite non-delivery, settled once and cleaned up (a crash
+        # between the two repeats the refusal and settles again, idempotently).
+        # Only the runtime control namespace's sender gives the guarantee the
+        # settlement rests on; from an agent tree the reason stays a hold.
+        settles = hoplink.settle_for_write(e) if name == config_mod.RUNTIME_NS else None
+        if settles is not None:
+            outcome, reason = settles
+            logger.error("instance %r req %r: NOT handed over, settled %s/%s: %s",
+                         name, req_id, outcome, reason, e)
+            _effect("settle", settle, {"outcome": outcome, "reason_code": reason,
+                                       "detail": f"{DETAIL_PREFIX}{e}"[:_DETAIL_CAP],
+                                       "recipients": []}, record.get("digest"))
+            _effect("unlink", _cleanup, path, handed)
+            return SETTLED
         latched = hoplink.latch_for_write(e)
         if latched is not None:
             hoplink.set_write_hold(cfg, name, latched, str(e), n)

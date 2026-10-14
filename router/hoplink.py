@@ -1361,9 +1361,21 @@ LATCHED_WRITE_REASONS: Dict[str, str] = {
     "sidecars_orphaned": "hop_heal:sidecars_orphaned",
 }
 
+#: A plugin `.reason` from `write_request` that SETTLES the record, with the
+#: outcome it settles as. Evaluated BEFORE the latched and retried rows, so
+#: an exception carrying one is never held or retried, whatever its class
+#: (the runtime capability's `RuntimeRetired` is an anomaly subclass). The
+#: plugin raises it only when NO part of the request exists in the tree,
+#: so the settlement is a definite non-delivery, never retried, re-signed
+#: or handed over again.
+SETTLE_WRITE_REASONS: Dict[str, str] = {
+    "generation_retired": "rejected",
+}
+
 #: The plugin `.reason`s that are NOT `write_request` rows, and why: with
-#: `LATCHED_WRITE_REASONS` and `RETRY_WRITE_REASONS` they partition
-#: `transport.TRANSPORT_REASONS` (asserted), so a new reason is classified.
+#: `SETTLE_WRITE_REASONS`, `LATCHED_WRITE_REASONS` and `RETRY_WRITE_REASONS`
+#: they partition `transport.TRANSPORT_REASONS` (asserted), so a new reason
+#: is classified.
 NOT_WRITE_REASONS: Dict[str, str] = {
     "owner": "only an intake reader raises it; from a sender it is unexpected",
     "settings_invalid": "a factory's settings check; a construction row",
@@ -1377,6 +1389,15 @@ _RUNTIME_CLASSES: List[Tuple[type, str]] = []
 def write_hold(cfg: Any, name: str) -> Optional[Dict[str, Any]]:
     """This generation's latched hand-over hold, or None."""
     return _read_json_file(transport_dir(cfg, name) / HOLD_FILE)
+
+
+def settle_for_write(exc: BaseException) -> Optional[Tuple[str, str]]:
+    """`(outcome, reason)` when `exc` settles the record (`SETTLE_WRITE_REASONS`),
+    else None. The write path asks this FIRST."""
+    kind, detail = transport_mod.classify(exc, runtime=tuple(_RUNTIME_CLASSES))
+    if kind == "reason" and detail in SETTLE_WRITE_REASONS:
+        return SETTLE_WRITE_REASONS[detail], detail
+    return None
 
 
 def latch_for_write(exc: BaseException) -> Optional[str]:

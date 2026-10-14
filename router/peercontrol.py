@@ -9,19 +9,22 @@ of the statement key's owner, as a signed `kind: control` statement in the
 router's own runtime tree `<hop_root>/.runtime/<generation>/`, never through
 an agent's.
 
-THE RUNTIME CAPABILITY (provisional). The runtime tree is reached ONLY through
-the plugin's runtime capability, named in one table, `transport.RUNTIME_CAPABILITY`
-(provisional until HOP-RUNTIME-IDENTITY freezes):
+THE RUNTIME CAPABILITY, PLUGIN_API (3, 5). The runtime tree is reached ONLY
+through the plugin's runtime capability, named in one table,
+`transport.RUNTIME_CAPABILITY`:
 
 - `make_runtime_sender(settings, fsops)`, bound to one generation, with closed
-  settings `{hop_root, generation, peer_uid, address}`: the sender protocol,
-  and `retire(retired_at)`, `retired()`, `retired_at()`, `identity()`.
+  settings `{hop_root, generation, peer_uid, address, version_write, caps}`:
+  `admit(admitted_at)` (called before the first transport method in the
+  generation, on every pass, with the generation's recorded time), the
+  sender protocol, and `retire(retired_at)`, `retired()`, `retired_at()`,
+  `identity()`.
 - `make_runtime_lister(settings, fsops)`, with closed settings
   `{hop_root, peer_uid}`, READ-ONLY: `generations()` lists every runtime
   generation as `(generation, state)`, state `live`, `retired` or
   `unreadable`; an absent tree lists empty.
 
-A plugin that declares neither (every plugin today) leaves the capability OFF:
+A plugin that declares neither leaves the capability OFF:
 pending controls stay pending, status says the runtime tree is unavailable,
 the operator verbs refuse `runtime_tree_unavailable`, and no plugin factory is
 ever called with the runtime tree. Nothing here reads or writes the runtime
@@ -124,6 +127,12 @@ SUPPRESS_ABANDONED = "attempt_abandoned"
 RESTORE_VERB = "runtime-generation restore (automatic)"
 ABANDON_VERB = "runtime-generation abandon-attempt"
 UNAVAILABLE = "runtime_tree_unavailable"
+#: The exit for an `unreadable` runtime generation. The plugin never deletes
+#: a generation and `retire` refuses an unreadable one (its identity cannot
+#: be read), so neither adopt, retire nor abandon applies: the operator
+#: repairs the tree out of band (README, "Runtime tree repair"), then retries.
+REPAIR_EXIT = ("repair it out of band (README, \"Runtime tree repair\"); adopt, retire and "
+               "abandon cannot act on an unreadable generation")
 STUCK_HANDED = "handed_without_record"
 STUCK_UNSETTLED = "unsettled_past_horizon"
 #: A pending notice with no `about` or no `to` cannot be addressed: HELD,
@@ -163,8 +172,13 @@ class Unavailable(Exception):
 
 
 def runtime_address(cfg: Any) -> str:
-    """This router's own runtime address."""
-    return f"amap.router@{cfg.fleet_domain}"
+    """This router's own runtime address: `config.router_address`, the one
+    canonical construction (`Unavailable` without a fleet domain: the
+    runtime tree needs one)."""
+    address = config_mod.router_address(cfg.fleet_domain)
+    if address is None:
+        raise Unavailable(UNAVAILABLE, "no fleet_domain: the runtime has no address")
+    return address
 
 
 def runtime_dir(cfg: Any) -> Path:
@@ -211,20 +225,37 @@ def statement_doc(*, key_id: str, control_id: str, from_address: str, to: str, t
 # ---------------------------------------------------------------------------
 
 class Capability:
-    """The plugin's runtime capability, when it declares one."""
+    """The plugin's runtime capability, when it declares one. Every call into
+    it goes through `_call`: an anomaly the plugin raises (a `.reason` from
+    the closed vocabulary: a misowned tree, a stray entry, an unreadable
+    identity, `exists_different`) becomes `Unavailable(runtime_tree_unavailable)`
+    naming it, on every path, never an escaping exception."""
 
     def __init__(self, plugin: Any, fsops: Any, cfg: Any):
         self.plugin, self.fsops, self.cfg = plugin, fsops, cfg
 
+    def _call(self, what: str, fn: Any, *args: Any) -> Any:
+        try:
+            return fn(*args)
+        except Unavailable:
+            raise
+        except Exception as e:  # noqa: BLE001 -- classified exactly
+            reason = anomaly_reason(e)
+            if reason is None:
+                raise
+            raise Unavailable(UNAVAILABLE, f"{what}: {reason}: {e}") from None
+
     def lister(self) -> Any:
         from . import transport as transport_mod
         settings = {"hop_root": str(self.cfg.hop.root), "peer_uid": self.cfg.hop.peer_uid}
-        return transport_mod.runtime_factory(self.plugin, "lister")(settings, self.fsops)
+        return self._call("the runtime lister",
+                          transport_mod.runtime_factory(self.plugin, "lister"),
+                          settings, self.fsops)
 
     def generations(self) -> List[Tuple[str, str]]:
         from . import transport as transport_mod
         names = transport_mod.RUNTIME_CAPABILITY
-        out = getattr(self.lister(), names["generations"])()
+        out = self._call("the runtime lister", getattr(self.lister(), names["generations"]))
         listed = []
         for gen, state in out:
             if state not in ("live", "retired", "unreadable"):
@@ -232,16 +263,63 @@ class Capability:
             listed.append((gen, state))
         return listed
 
-    def sender(self, generation: str) -> Any:
+    def sender(self, generation: str, *, port: bool = False) -> Any:
+        """The runtime sender for `generation`, its settings EXACTLY the
+        plugin's closed list: `version_write` from that generation's runtime
+        pin (as an agent sender takes it from its pin) and `caps` from
+        `cfg.hop.caps`. A sender used as the transport port (`port=True`)
+        REQUIRES the pin; one only read or retired falls back to the
+        configured `version_write`, which it never uses to send."""
         from . import transport as transport_mod
+        pin = runtime_pin(self.cfg, generation)
+        version = pin.get("version_write") if isinstance(pin, dict) else None
+        if type(version) is not int:
+            if port:
+                raise Unavailable(UNAVAILABLE, f"generation {generation} has no pinned "
+                                               "version_write")
+            version = self.cfg.hop.version_write
         settings = {"hop_root": str(self.cfg.hop.root), "generation": generation,
-                    "peer_uid": self.cfg.hop.peer_uid, "address": runtime_address(self.cfg)}
-        return transport_mod.runtime_factory(self.plugin, "factory")(settings, self.fsops)
+                    "peer_uid": self.cfg.hop.peer_uid, "address": runtime_address(self.cfg),
+                    "version_write": version, "caps": dict(self.cfg.hop.caps)}
+        return self._call(f"the runtime sender for {generation}",
+                          transport_mod.runtime_factory(self.plugin, "factory"),
+                          settings, self.fsops)
 
     def retire(self, generation: str, retired_at: str) -> Any:
         from . import transport as transport_mod
         names = transport_mod.RUNTIME_CAPABILITY
-        return getattr(self.sender(generation), names["retire"])(retired_at)
+        return self._call(f"retire {generation}",
+                          getattr(self.sender(generation), names["retire"]), retired_at)
+
+    def identity(self, generation: str) -> Optional[Dict[str, Any]]:
+        from . import transport as transport_mod
+        names = transport_mod.RUNTIME_CAPABILITY
+        return self._call(f"the identity of {generation}",
+                          getattr(self.sender(generation), names["identity"]))
+
+    def admit(self, port: Any, generation: str, admitted_at: str) -> str:
+        from . import transport as transport_mod
+        names = transport_mod.RUNTIME_CAPABILITY
+        return self._call(f"admit {generation}", getattr(port, names["admit"]), admitted_at)
+
+
+def anomaly_reason(exc: BaseException) -> Optional[str]:
+    """The closed-vocabulary `.reason` of a plugin anomaly, or None."""
+    from . import hoplink
+    from . import transport as transport_mod
+    kind, detail = transport_mod.classify(exc, runtime=tuple(hoplink._RUNTIME_CLASSES))
+    return detail if kind == "reason" else None
+
+
+def runtime_pin(cfg: Any, generation: str) -> Optional[Dict[str, Any]]:
+    """`generation`'s runtime binding pin (`record_generation`), or None."""
+    from . import hoplink
+    path = runtime_dir(cfg) / generation / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def capability(cfg: Any, runtime: Any) -> Optional[Capability]:
@@ -277,16 +355,17 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     if recorded is not None:
         state = states.get(recorded)
         if state == "unreadable":
-            raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} is unreadable")
+            raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} is unreadable: "
+                                           f"{REPAIR_EXIT}")
         if state in ("live", None):
             if others:
                 raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} beside "
-                                               f"{others}: retire one (router runtime-generation)")
+                                               f"{others}: {_exit_for(others)}")
             return recorded
         # Retired: never written again, whatever the record says.
     if others:
-        raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: adopt "
-                                       "or retire one (router runtime-generation)")
+        raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: "
+                                       f"{_exit_for(others, adopt=True)}")
     frozen = _frozen_elsewhere(cfg, recorded)
     if frozen:
         # A frozen attempt still names a generation of its own: a new one
@@ -294,7 +373,7 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
         raise Unavailable(UNAVAILABLE, f"a frozen attempt names another generation ({frozen[0]}):"
                                        " it is restored, adopted or abandoned first")
     gen = secrets.token_hex(16)
-    record_generation(cfg, gen, now=now)
+    record_generation(cfg, gen, admitted_at=format_utc_ts(now))
     return gen
 
 
@@ -371,7 +450,15 @@ def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any
         raise PlanPending("the plan is already decided; only its marker remains")
     verb, d = marker["verb"], marker["detail"]
     if verb == ADOPT_VERB:
-        record_generation(cfg, d["generation"], now=now)   # the record and the pin, rewritten
+        # The record and the pin, rewritten with the tree's OWN admitted_at,
+        # carried in the plan (read once, at the verb), so every replay writes
+        # the same bytes; a plan from before it was carried reads it again.
+        at = d.get("admitted_at")
+        if not isinstance(at, str):
+            if cap is None:
+                raise PlanPending("the plugin declares no runtime capability")
+            at = _admitted_at_for_restore(cfg, cap, d["generation"], "live", now)
+        record_generation(cfg, d["generation"], admitted_at=at)
         return f"adopted {d['generation']}"
     if cap is None:
         raise PlanPending("the plugin declares no runtime capability")
@@ -391,10 +478,10 @@ def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any
                 raise PlanPending(f"the planned mint is blocked by {others or frozen}")
         elif recorded != d["minted"]:
             raise PlanPending(f"another generation {recorded} is recorded")
-        # The planned generation's FULL effect, the record AND its pin, is
-        # replayed even when the record already names it: a pin write that
-        # failed after the record committed is completed here.
-        record_generation(cfg, d["minted"], now=now)
+        # The planned generation's FULL effect, its pin AND its record, is
+        # replayed even when the pin is already there: a record write that
+        # failed after the pin committed is completed here.
+        record_generation(cfg, d["minted"], admitted_at=marker["at"])   # the plan's time
         return f"{retired}, minted {d['minted']}"
     raise PlanPending(f"unknown verb {verb!r}")
 
@@ -621,6 +708,59 @@ def _inflight_dir(cfg: Any, gen: str) -> Path:
     return Path(cfg.state_dir) / config_mod.RUNTIME_NS / gen / inflight.INFLIGHT_DIR
 
 
+#: Where the last detail of each `Unavailable` reason is kept for status.
+UNAVAILABLE_FILE = "unavailable.json"
+
+
+def note_unavailable(cfg: Any, e: "Unavailable", now: datetime) -> None:
+    """Name why the runtime tree is unavailable (an `exists_different`
+    identity, a missing pin, a record/pin disagreement, a plugin anomaly):
+    logged and kept as the last detail per reason, with its time, for
+    status. Written (and logged) only when the detail changes."""
+    path = runtime_dir(cfg) / UNAVAILABLE_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    detail = e.detail or ""
+    if not detail or (doc.get(e.reason) or {}).get("detail") == detail:
+        return                      # nothing to name, or named already
+    logger.warning("control notices: the runtime tree is unavailable (%s): %s", e.reason,
+                   detail or "no detail")
+    doc[e.reason] = {"detail": detail[:500], "at": format_utc_ts(now)}
+    try:
+        runtime_dir(cfg).mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(doc, sort_keys=True).encode("utf-8"),
+                     durable_root=cfg.state_dir)
+    except OSError:
+        logger.exception("control notices: the unavailable detail could not be kept")
+
+
+def finish_settled(cfg: Any) -> int:
+    """The cleanup a settlement owes, completed: an attempt whose journal
+    record is SENT (settled: delivered, refused, or rejected because its
+    generation was retired) whose in-flight record or handed marker is still
+    in its generation's directory (a crash between the settlement and the
+    cleanup; `pending` never selects a sent record again) has them removed,
+    as `inflight.advance` does for a settled record. Needs no capability:
+    nothing is read from or written to the runtime tree. Returns how many."""
+    from . import inflight
+    n = 0
+    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+        c = rec.get("control") or {}
+        attempt = c.get("attempt") or {}
+        if not (c.get("sent") and attempt.get("gen") and attempt.get("id")):
+            continue
+        d = _inflight_dir(cfg, attempt["gen"])
+        path, handed = d / f"{attempt['id']}.json", d / f"{attempt['id']}{inflight.HANDED_SUFFIX}"
+        if os.path.lexists(path) or os.path.lexists(handed):
+            inflight._cleanup(path, handed)
+            n += 1
+    return n
+
+
 def _inflight_entries(cfg: Any, gen: str) -> List[str]:
     """Every in-flight record and handed marker name in generation `gen`."""
     from . import inflight
@@ -652,8 +792,10 @@ def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
         raise ValueError(f"{key} has no frozen, unsent control attempt")
     gen = attempt["gen"]
     state = dict(cap.generations()).get(gen)
-    if state in ("live", "unreadable"):
-        raise ValueError(f"the attempt's generation {gen} is {state}: adopt or retire it")
+    if state == "unreadable":
+        raise ValueError(f"the attempt's generation {gen} is unreadable: {REPAIR_EXIT}")
+    if state == "live":
+        raise ValueError(f"the attempt's generation {gen} is live: adopt or retire it")
     for name in (f"{attempt['id']}.json", f"{attempt['id']}{inflight.HANDED_SUFFIX}"):
         if name in _inflight_entries(cfg, gen):
             raise ValueError(f"the attempt {attempt['id']} is in flight in {gen}")
@@ -669,17 +811,56 @@ def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
     return {"result": result, "audited": True}
 
 
-def record_generation(cfg: Any, gen: str, *, now: datetime) -> None:
+def record_generation(cfg: Any, gen: str, *, admitted_at: str) -> None:
+    """Record `gen` as the runtime generation, with its pin, both carrying
+    `admitted_at` AS GIVEN, never a clock read here: the value the plugin's
+    `admit` is called with, which must be stable on every path (the
+    caller's source: a fresh mint's own time, the tree's identity for an
+    adopt or a listed-live restore, the restore's own time once for an
+    unlisted one, the plan's time for `new`). The record's `minted_ts` and
+    the pin's `admitted_at` are that same value."""
     from . import hoplink
     d = runtime_dir(cfg)
     d.mkdir(parents=True, exist_ok=True)
-    atomic_write(d / config_mod.RUNTIME_GENERATION_FILE,
-                 json.dumps({"generation": gen, "minted_ts": format_utc_ts(now)},
-                            sort_keys=True).encode("utf-8"), durable_root=cfg.state_dir)
-    pin = hoplink.transport_dir(cfg, config_mod.RUNTIME_NS) / hoplink.PIN_FILE
+    # The PIN FIRST, then the record: a pin for a generation no record names
+    # is inert (a fresh mint picks another id; an unlisted restore reuses
+    # its admitted_at), while a record without its pin would leave a
+    # recorded generation no port can be built for.
+    pin = d / gen / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
     pin.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(pin, hoplink.canonical(hoplink.pin_doc(cfg.hop, format_utc_ts(now))),
+    atomic_write(pin, hoplink.canonical(hoplink.pin_doc(cfg.hop, admitted_at)),
                  durable_root=cfg.state_dir)
+    atomic_write(d / config_mod.RUNTIME_GENERATION_FILE,
+                 json.dumps({"generation": gen, "minted_ts": admitted_at},
+                            sort_keys=True).encode("utf-8"), durable_root=cfg.state_dir)
+
+
+def recorded_admitted_at(cfg: Any) -> Optional[Tuple[str, str]]:
+    """(generation, minted_ts) of the runtime generation record, or None."""
+    try:
+        doc = json.loads((runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(doc, dict) and isinstance(doc.get("generation"), str)
+            and isinstance(doc.get("minted_ts"), str)):
+        return None
+    return doc["generation"], doc["minted_ts"]
+
+
+def _admitted_at_for_restore(cfg: Any, cap: "Capability", gen: str, listed: Optional[str],
+                             now: datetime) -> str:
+    """The value a restored generation is recorded with: the tree's identity
+    for a LISTED generation; for an unlisted one (never admitted) a pin that
+    survived, else the restore's own time, written once and reused."""
+    if listed is not None:
+        ident = cap.identity(gen)
+        at = ident.get("admitted_at") if isinstance(ident, dict) else None
+        if not isinstance(at, str):
+            raise Unavailable(UNAVAILABLE, f"generation {gen} has no readable admitted_at")
+        return at
+    pin = runtime_pin(cfg, gen) or {}
+    return pin["admitted_at"] if isinstance(pin.get("admitted_at"), str) else format_utc_ts(now)
 
 
 def unsettled_attempts(cfg: Any) -> List[str]:
@@ -697,6 +878,16 @@ NEW_VERB = "runtime-generation new"
 VERB_AUDIT_FILE = "verb-audit-pending.json"
 
 
+def _exit_for(others: List[Tuple[str, str]], *, adopt: bool = False) -> str:
+    """The operator's exit named for what is listed: the out-of-band repair
+    for an unreadable generation, never `retire` (which refuses it)."""
+    unreadable = [g for g, st in others if st == "unreadable"]
+    if unreadable:
+        return f"{unreadable[0]} is unreadable: {REPAIR_EXIT}"
+    return ("adopt or retire one (router runtime-generation)" if adopt
+            else "retire one (router runtime-generation)")
+
+
 def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: datetime,
                    evidence: str) -> Dict[str, Any]:
     """`router runtime-generation adopt <gen>`: the only live generation
@@ -710,7 +901,9 @@ def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: dateti
     live = [g for g, s in listed.items() if s in ("live", "unreadable")]
     if live != [gen] or listed.get(gen) != "live":
         raise ValueError(f"{gen} is not the only live generation: {sorted(listed.items())}")
-    marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence)
+    admitted_at = _admitted_at_for_restore(cfg, cap, gen, "live", now)
+    marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence,
+                               admitted_at=admitted_at)
     return _run_plan(cfg, cap, marker, now)
 
 
@@ -744,6 +937,11 @@ def _check_retirable(cfg: Any, cap: Capability, gen: str) -> None:
     if gen not in listed:
         # Never construct a sender for a generation the lister does not show.
         raise ValueError(f"{gen} is not a listed runtime generation: {sorted(listed.items())}")
+    if listed[gen] == "unreadable":
+        # Refused BEFORE any durable plan, for retire and for `new` alike:
+        # the plugin's retire raises on an unreadable identity, so a plan to
+        # retire it could never complete.
+        raise ValueError(f"{gen} is unreadable: {REPAIR_EXIT}")
 
 
 def _retire_idempotent(cfg: Any, cap: Capability, gen: str, now: datetime) -> str:
@@ -928,13 +1126,19 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
         counts[what] = counts.get(what, 0) + 1
 
     state_dir = Path(cfg.state_dir)
+    # FIRST, before any early return: the cleanup a settlement owes needs no
+    # clock, no admission and no capability, and its residue would otherwise
+    # block retire and `new` while the pass is held.
+    cleaned = finish_settled(cfg)
+    if cleaned:
+        counts["settled_cleaned"] = cleaned
     try:
         clock = peerclock.read(state_dir)
     except peerclock.ClockUntrusted:
-        return {"held_clock_untrusted": len(pending(state_dir))}
+        return dict(counts, held_clock_untrusted=len(pending(state_dir)))
     if clock.admission != "open":
         # H is untrusted until admission reopens: no token, no mint, no attempt.
-        return {"held_admission_closed": len(pending(state_dir))}
+        return dict(counts, held_admission_closed=len(pending(state_dir)))
     # A pending audited act (its audit line, or a verb's plan) is completed
     # BEFORE anything is attempted or handed over, whether or not any notice
     # is pending.
@@ -959,6 +1163,7 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
             count(_one(cfg, cap, record, delegation=delegation, h=clock.H, now=now))
         except Unavailable as e:
             count(e.reason)
+            note_unavailable(cfg, e, now)
         except Exception:  # noqa: BLE001 -- one record never stops the others
             logger.exception("control notice for %s: isolated, retried next pass", record["key"])
             count("errored")
@@ -1079,17 +1284,35 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
             cfg, ns, rid, attempt["n"], digest=None,
             request_doc=request_doc(cfg, record, attempt), recipients=[record["control"]["to"]],
             from_address=runtime_address(cfg), peer=pin(cfg, attempt))
-    port = cap.sender(attempt["gen"])
+    port = cap.sender(attempt["gen"], port=True)
+    # ADMIT before the first call of ANY port method in the generation, on
+    # every resume (idempotent; a steady state writes nothing), with the
+    # generation's own stable admitted_at.
+    _admit(cfg, cap, port, attempt["gen"])
 
     def settle(verdict: Dict[str, Any], _digest: Optional[str]) -> str:
-        _update(sd, record, sent=True, stuck=None,
-                settled={"outcome": verdict.get("outcome"), "at": format_utc_ts(clock_mod.now())})
+        settled = {"outcome": verdict.get("outcome"), "at": format_utc_ts(clock_mod.now())}
+        if verdict.get("reason_code") is not None:
+            settled["reason_code"] = verdict["reason_code"]
+        _update(sd, record, sent=True, stuck=None, settled=settled)
         return verdict.get("outcome") or ""
 
     if not inflight._was_handed(inflight.handed_path(cfg, ns, rid), attempt["n"]):
         _require_writable(cap, attempt["gen"])
-    state = inflight.advance(cfg, ns, rid, existing, port, settle=settle,
-                             already_settled=bool(record["control"].get("settled")))
+    try:
+        state = inflight.advance(cfg, ns, rid, existing, port, settle=settle,
+                                 already_settled=bool(record["control"].get("settled")))
+    except Unavailable:
+        raise
+    except Exception as e:  # noqa: BLE001 -- classified exactly
+        # A port anomaly outside the write row (the write row settles,
+        # latches or retries inside `advance`): the tree cannot be used this
+        # pass, named; a RuntimeRetired here, before any hand-over, HOLDS.
+        reason = anomaly_reason(e)
+        if reason is None:
+            raise
+        raise Unavailable(UNAVAILABLE, f"the runtime port for {attempt['gen']}: {reason}: "
+                                       f"{e}") from None
     if state not in (inflight.SETTLED, inflight.CLEANED):
         current = peerjournal.read_record(sd, record["owner"], record["key"])
         signed = parse_utc_ts(attempt.get("ts"))
@@ -1134,12 +1357,29 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
     unlisted_ok = (listed.get(gen) is None and not _inflight_entries(cfg, gen)
                    and not _named_elsewhere(cfg, gen, record["key"]))
     if (listed.get(gen) == "live" or unlisted_ok) and not others:
+        admitted_at = _admitted_at_for_restore(cfg, cap, gen, listed.get(gen), now)
         record = _begin_audit(cfg, record, RESTORE_VERB, now, key=record["key"], generation=gen,
-                              listed=listed.get(gen) or "not listed")
-        record_generation(cfg, gen, now=now)
+                              listed=listed.get(gen) or "not listed", admitted_at=admitted_at)
+        record_generation(cfg, gen, admitted_at=admitted_at)
         _finish_audit(cfg, record)
         return None
     return HELD_GENERATION_UNRECORDED
+
+
+def _admit(cfg: Any, cap: Capability, port: Any, gen: str) -> str:
+    """`admit(admitted_at)` on `gen`'s port, with the value its pin carries,
+    which must equal the generation record's `minted_ts` when the record
+    names `gen`: a disagreement HOLDS, visibly, and is never re-admitted
+    with another time."""
+    pin = runtime_pin(cfg, gen) or {}
+    at = pin.get("admitted_at")
+    if not isinstance(at, str):
+        raise Unavailable(UNAVAILABLE, f"generation {gen} has no pinned admitted_at")
+    rec = recorded_admitted_at(cfg)
+    if rec is not None and rec[0] == gen and rec[1] != at:
+        raise Unavailable(UNAVAILABLE, f"generation {gen}: the record's minted_ts {rec[1]} is "
+                                       f"not its pin's admitted_at {at}")
+    return cap.admit(port, gen, at)
 
 
 def _require_writable(cap: Capability, gen: str) -> None:
@@ -1162,7 +1402,10 @@ def pin(cfg: Any, attempt: Mapping[str, Any]) -> Dict[str, Any]:
     """The runtime in-flight record's frozen signed pin."""
     from . import peerlane
     return {"kind": "control", "id": attempt["id"],
-            "message_id": peerlane.message_id(attempt["id"], cfg.fleet_domain),
+            # The Message-ID's domain is the canonical own address's, the same
+            # bytes as the envelope's from_address beside it.
+            "message_id": peerlane.message_id(attempt["id"],
+                                              runtime_address(cfg).rsplit("@", 1)[1]),
             "key_id": json.loads(base64.b64decode(attempt["statement_b64"]))["key_id"],
             "statement": attempt["statement_b64"], "signature": attempt["signature_b64"],
             "statement_header": attempt["header"], "in_reply_to": None, "references": []}
@@ -1225,10 +1468,20 @@ def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dic
         recorded = None
     tree: Dict[str, Any] = {"generation": recorded}
     try:
+        last = json.loads((runtime_dir(cfg) / UNAVAILABLE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        last = None
+    if isinstance(last, dict) and last:
+        tree["unavailable"] = last
+    try:
         tree["generations"] = [[g, s] for g, s in cap.generations()]
     except Exception as e:  # noqa: BLE001 -- status never fails on the lister
         tree["generations"] = None
         tree["lister_error"] = f"{type(e).__name__}: {e}"
+    else:
+        unreadable = [g for g, st in tree["generations"] if st == "unreadable"]
+        if unreadable:
+            tree["repair"] = {"unreadable": unreadable, "exit": REPAIR_EXIT}
     doc["runtime_tree"] = tree
     return doc
 

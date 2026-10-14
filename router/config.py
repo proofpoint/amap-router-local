@@ -924,10 +924,25 @@ def router_address(fleet_domain: Optional[str]) -> Optional[str]:
     """`amap.router@<fleet_domain>` — this router's own address: `asserted_by`
     on every `sender_exposure` stamp, the `from` of every DSN it authors,
     and (cross-host, later) the signer. `None` without a fleet domain: the
-    router never authors a message on the legacy addressing scheme."""
+    router never authors a message on the legacy addressing scheme.
+
+    THE ONE construction of this router's own address, in canonical form: the
+    domain ASCII-lowercased, so every surface that names this router (the
+    runtime identity, a control notice's `from` and its envelope's
+    `from_address`, a DSN's `from`, `sender_exposure.asserted_by`, and the
+    receive side's check of a control notice's `to`) carries the same bytes.
+    `load` already refuses a fleet domain that is not lowercase; this holds
+    for a config built any other way too."""
     if not fleet_domain:
         return None
-    return f"{ROUTER_LOCAL_PART}@{fleet_domain}"
+    domain = fleet_domain.lower() if fleet_domain.isascii() else fleet_domain
+    return f"{ROUTER_LOCAL_PART}@{domain}"
+
+
+def router_runtime(fleet_domain: Optional[str]) -> str:
+    """`router_address`, or, without a fleet domain, the bare local part and
+    its `@` (the own-key gate's runtime name when no domain is configured)."""
+    return router_address(fleet_domain) or f"{ROUTER_LOCAL_PART}@"
 
 
 _ADDR_RE = re.compile(r"agent\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})@local\Z")

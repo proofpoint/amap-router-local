@@ -31,6 +31,7 @@ from router.tests.helpers import ClockMixin
 from router.tests.test_peerbind import FD, KEY_ID, STATEMENT_ID, T1
 
 NOW = tpe.NOW
+AT = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
 DEST = f"amap.router@{T1}"
 ROUTER = pathlib.Path(router.__file__).parent
 
@@ -502,7 +503,7 @@ class AttemptTests(_Control):
     def test_new_refuses_before_retiring_when_the_mint_would_be_refused(self):
         live = "a" * 32
         self.tree.gens.update({live: "live", "b" * 32: "live"})
-        peercontrol.record_generation(self.cfg, live, now=NOW)
+        peercontrol.record_generation(self.cfg, live, admitted_at=AT)
         self.assert_refused_untouched("new", live)
 
     def test_every_verb_whose_audit_fails_reports_committed_and_is_repaired(self):
@@ -564,28 +565,32 @@ class AttemptTests(_Control):
         wrapper.done = False
         return mock.patch.object(target, name, wrapper)
 
-    def test_adopt_whose_pin_write_fails_after_the_record_is_committed_and_completed(self):
+    def test_adopt_whose_record_write_fails_after_the_pin_is_committed_and_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
         from router import hoplink
         with self.fail_once(peercontrol, "atomic_write",
-                            lambda path, *_a, **_k: Path(path).name == hoplink.PIN_FILE):
+                            lambda path, *_a, **_k: Path(path).name
+                            == config_mod.RUNTIME_GENERATION_FILE):
             code, err = self.cli("adopt", gen=a)
         self.assertEqual(code, 3, err)
         self.assertIn("COMMITTED", err)
         self.assertNotIn("refused", err)
-        self.assertEqual(self.recorded(), a, "the record committed")
-        self.assertFalse(self.pin_path().exists(), "the pin did not")
+        # The pin is written FIRST: the crash leaves the pin and no record,
+        # never a record naming a generation no port could be built for.
+        pin_a = peercontrol.runtime_dir(self.cfg) / a / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
+        self.assertIsNone(self.recorded(), "the record did not commit")
+        self.assertTrue(pin_a.is_file(), "the pin committed first")
         self.assertEqual((self.marker() or {}).get("verb"), peercontrol.ADOPT_VERB)
         self.cli("retire", gen="9" * 32)          # the next verb completes it first
-        self.assertTrue(self.pin_path().is_file())
+        self.assertEqual(self.recorded(), a)
         self.assertIsNone(self.marker())
         self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1)
 
     def test_retire_whose_record_removal_fails_after_the_capability_retired_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         with self.fail_once(peercontrol.os, "unlink",
                             lambda path, *_a, **_k: Path(path).name
                             == config_mod.RUNTIME_GENERATION_FILE):
@@ -603,7 +608,7 @@ class AttemptTests(_Control):
     def test_new_whose_mint_fails_after_the_retire_completes_its_planned_mint(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         with self.fail_once(peercontrol, "record_generation", lambda *_a, **_k: True):
             code, err = self.cli("new")
         self.assertEqual(code, 3, err)
@@ -620,30 +625,32 @@ class AttemptTests(_Control):
         self.assertEqual(len(lines), 1)
         self.assertIn(planned, lines[0].get("result", ""))
 
-    def test_new_whose_pin_write_fails_after_the_planned_record_is_completed(self):
+    def test_new_whose_record_write_fails_after_the_planned_pin_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
-        pin_before = self.pin_path()
-        self.assertTrue(pin_before.is_file())
-        from router import hoplink
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         with self.fail_once(peercontrol, "atomic_write",
-                            lambda path, *_a, **_k: Path(path).name == hoplink.PIN_FILE):
+                            lambda path, *_a, **_k: Path(path).name
+                            == config_mod.RUNTIME_GENERATION_FILE):
             code, err = self.cli("new")
         self.assertEqual(code, 3, err)
         self.assertIn("COMMITTED", err)
         planned = self.marker()["detail"]["minted"]
-        self.assertEqual(self.recorded(), planned, "the planned record committed")
-        self.assertFalse(self.pin_path().exists(), "its pin did not")
+        from router import hoplink
+        pin = peercontrol.runtime_dir(self.cfg) / planned / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
+        # The pin FIRST: the crash leaves the planned generation's pin and no
+        # record (the retired one's record is already gone).
+        self.assertIsNone(self.recorded(), "the planned record did not commit")
+        self.assertTrue(pin.is_file(), "the planned pin committed first")
         self.send()                               # an empty-queue pass completes it
-        self.assertTrue(self.pin_path().is_file(), "the pin is written by the completion")
+        self.assertEqual(self.recorded(), planned, "the planned generation, recorded")
         self.assertIsNone(self.marker())
         self.assertEqual(len(self.acts(peercontrol.NEW_VERB)), 1)
 
     def test_new_whose_record_removal_fails_mid_rotation_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         with self.fail_once(peercontrol.os, "unlink",
                             lambda path, *_a, **_k: Path(path).name
                             == config_mod.RUNTIME_GENERATION_FILE):
@@ -661,7 +668,7 @@ class AttemptTests(_Control):
         mint, so the plan cannot complete (Committed, pending)."""
         a, b = "a" * 32, "b" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         real = peercontrol._retire_idempotent
 
         def retire_then_b_live(*args, **kwargs):
@@ -1098,7 +1105,8 @@ class ControlStatusTests(_Control):
         self.assertEqual(doc["runtime_tree"], {
             "generation": None,
             "generations": [["1" * 32, "live"], ["2" * 32, "unreadable"],
-                            ["3" * 32, "retired"]]})
+                            ["3" * 32, "retired"]],
+            "repair": {"unreadable": ["2" * 32], "exit": peercontrol.REPAIR_EXIT}})
 
     def test_a_settled_failure_is_counted_as_failed_never_as_sent(self):
         ok, bad = self.refused(), self.refused(id="qB2c3D4e5F6g7H8i9J0kLmx")
@@ -1118,7 +1126,7 @@ class GenerationClassifiedTests(_Control):
         return peercontrol.capability(self.cfg, self.runtime)
 
     def recorded(self, gen):
-        peercontrol.record_generation(self.cfg, gen, now=NOW)
+        peercontrol.record_generation(self.cfg, gen, admitted_at=AT)
 
     def test_a_recorded_generation_retired_before_its_record_was_removed_is_never_reused(self):
         old = "a" * 32
@@ -1159,7 +1167,20 @@ class GenerationClassifiedTests(_Control):
             self.send()
         gen = self.record(key)["control"]["attempt"]["gen"]
         self.tree.gens[gen] = state
-        self.assertEqual(self.send(), {peercontrol.UNAVAILABLE: 1})
+        # The admission passes, so the lister's state is the ONLY thing that
+        # can stop the hand-over (an unreadable identity also refuses `admit`).
+        port_calls = []
+        real = rs.RuntimeSender._admitted
+
+        def counted(sender):
+            port_calls.append(sender.generation)
+            return real(sender)
+        with mock.patch.object(peercontrol.Capability, "admit", return_value="exists"), \
+                mock.patch.object(rs.RuntimeSender, "_admitted", counted):
+            self.assertEqual(self.send(), {peercontrol.UNAVAILABLE: 1})
+        # Held from the lister alone, BEFORE any port method: the record is
+        # never trusted, and the port's own refusal is not what stopped it.
+        self.assertEqual(port_calls, [], "no port method was called")
         port = self.tree.senders.get(gen)
         self.assertEqual(port.writes if port is not None else [], [], "nothing handed over")
 
@@ -1188,15 +1209,19 @@ class RetireListedOnlyTests(_Control):
 
     def test_retire_refuses_a_generation_the_lister_does_not_show(self):
         cap = peercontrol.capability(self.cfg, self.runtime)
-        with self.assertRaises(ValueError):
+        try:
             peercontrol.operator_retire(self.cfg, cap, "9" * 32, now=NOW, evidence="x")
+            got = "returned"
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL
+            got = type(e).__name__
+        self.assertEqual(got, "ValueError")
         self.assertEqual([c for c in self.tree.calls if c[0] == "sender"], [],
                          "no sender constructed for an unlisted generation")
 
     def test_retire_makes_the_record_removal_durable(self):
         live = "f" * 32
         self.tree.gens[live] = "live"
-        peercontrol.record_generation(self.cfg, live, now=NOW)
+        peercontrol.record_generation(self.cfg, live, admitted_at=AT)
         cap = peercontrol.capability(self.cfg, self.runtime)
         # The audit's own bookkeeping (which fsyncs the same directory) is
         # stubbed, so only the retire's fsync can satisfy this.

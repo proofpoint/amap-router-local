@@ -113,6 +113,17 @@ class RetryTests(_Case):
                                  "not retried with the same transport id")
                 self.assertEqual(self.port.writes, ["00000001"])
 
+    def test_generation_retired_from_an_agent_tree_is_retried_never_settled(self):
+        """Only the runtime control namespace's sender gives the guarantee a
+        `generation_retired` settlement rests on; from an agent tree the
+        reason is retried with the same id, never settled."""
+        write_request(self.cfg, "alice", "00000001", to=[EXT])
+        self.port.raise_on_write = _Reasoned("generation_retired")
+        self.drain()
+        self.assertFalse(self.has_result(), "settled from an agent tree")
+        self.assertEqual(inflight.list_records(self.cfg, "alice"), ["00000001"])
+        self.assertIsNone(hoplink.write_hold(self.cfg, "alice"))
+
     def test_a_runtime_unsafe_read_with_a_colliding_reason_never_latches(self):
         hoplink._RUNTIME_CLASSES.extend([(UnsafeRead, "unsafe_read")])
         e = UnsafeRead.__new__(UnsafeRead)

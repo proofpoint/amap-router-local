@@ -288,10 +288,12 @@ class ReasonTableCompletenessTests(unittest.TestCase):
 
     def test_the_write_tables_partition_the_transport_reasons(self):
         latched, retry = set(hoplink.LATCHED_WRITE_REASONS), set(hoplink.RETRY_WRITE_REASONS)
-        other = set(hoplink.NOT_WRITE_REASONS)
-        self.assertEqual(latched | retry | other, set(transport_mod.TRANSPORT_REASONS))
+        other, settle = set(hoplink.NOT_WRITE_REASONS), set(hoplink.SETTLE_WRITE_REASONS)
+        self.assertEqual(latched | retry | other | settle, set(transport_mod.TRANSPORT_REASONS))
         self.assertEqual(latched & retry, set())
         self.assertEqual((latched | retry) & other, set())
+        self.assertEqual(settle & (latched | retry | other), set())
+        self.assertEqual(settle, {"generation_retired"})
 
 
 if __name__ == "__main__":
