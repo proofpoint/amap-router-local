@@ -2054,9 +2054,12 @@ def rebuild_meta(state_dir: Path) -> Dict[str, Any]:
     replay.mkdir(exist_ok=True, mode=0o700)
     atomic_write(replay / WITNESS, token.encode("ascii"), durable_root=state_dir)
     from . import peerepochs
-    peerepochs.root(state_dir).mkdir(exist_ok=True, mode=0o700)
-    atomic_write(peerepochs.root(state_dir) / WITNESS, token.encode("ascii"),
-                 durable_root=state_dir)
+    if peerepochs.root_safe(peerepochs.root(state_dir)):
+        # Never through a link and never over a file: an unsafe root stays
+        # as found, a fault to the recount (the flag set), for the operator.
+        peerepochs.root(state_dir).mkdir(exist_ok=True, mode=0o700)
+        atomic_write(peerepochs.root(state_dir) / WITNESS, token.encode("ascii"),
+                     durable_root=state_dir)
     meta = _recount(state_dir, token, _old_meta(state_dir))
     _write_meta(state_dir, meta)
     return meta
@@ -2090,8 +2093,12 @@ def _rebase_after_loss(state_dir: Path, meta: Mapping[str, Any]) -> None:
     replay.mkdir(exist_ok=True, mode=0o700)
     _restore_witness(state_dir, replay / WITNESS, token)
     from . import peerepochs
-    peerepochs.root(state_dir).mkdir(exist_ok=True, mode=0o700)
-    _restore_witness(state_dir, peerepochs.root(state_dir) / WITNESS, meta["epochs"]["token"])
+    if peerepochs.root_safe(peerepochs.root(state_dir)):
+        # As in rebuild_meta: an unsafe root is left as found and stays a
+        # flagged finding at every start, never written through or over.
+        peerepochs.root(state_dir).mkdir(exist_ok=True, mode=0o700)
+        _restore_witness(state_dir, peerepochs.root(state_dir) / WITNESS,
+                         meta["epochs"]["token"])
     # The rebase never clears the epoch flag (`_recount` keeps it), and
     # keeps the epoch store's own token, the one its witness was just
     # restored to: a migration gives it a token distinct from the replay's.

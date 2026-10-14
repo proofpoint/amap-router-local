@@ -94,6 +94,7 @@ class PolicyOrderTests(_Epochs):
                          [("peer_epoch_changed", None, ts(-60), SENDER)])
 
     def test_an_earlier_epoch_is_inconsistent_and_persists_nothing(self):
+        self.maxDiff = None
         self.decide(payload(sender_since=ts(-2 * DAY)))
         before = (self.epoch_files(), len(self.audit_lines()))
         self.assertEqual(self.decide(payload(sender_since=ts(-3 * DAY))),
@@ -627,6 +628,54 @@ class RootObjectTests(_Epochs):
                                  and str(r) in p], out["problems"])
                 self.assertTrue(os.path.lexists(r), "never removed")
                 self.assertTrue(self.meta()["epochs_untrusted"])
+                self.setUp()
+
+
+class UnsafeRootStartupTests(_Epochs):
+    """A root that is not a directory survives startup and a bound-B
+    rebuild as found: no crash, nothing written through a link or over a
+    file, the flag set and the finding repeated at every start."""
+
+    def unsafe(self, kind):
+        r = RootObjectTests.make_root(self, kind)
+        target = self.state_dir / "elsewhere"
+        return r, target
+
+    def assert_left_as_found(self, r, target, kind):
+        self.assertEqual(r.is_symlink(), kind == "symlink")
+        if kind == "file":
+            self.assertEqual(r.read_text(), "x", "never written over")
+        else:
+            self.assertEqual(list(target.iterdir()), [], "nothing written through the link")
+        self.assertTrue(self.meta()["epochs_untrusted"])
+
+    def test_two_startups_over_an_unsafe_root(self):
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind):
+                r, target = self.unsafe(kind)
+                for n in (1, 2):
+                    try:
+                        rep = peerjournal.startup(self.state_dir, NOW)
+                    except Exception as e:  # noqa: BLE001 -- a crash must FAIL
+                        rep = {"problems": [], "raised": type(e).__name__}
+                    self.assertNotIn("raised", rep, f"startup {n}")
+                    self.assertTrue([p for p in rep["problems"] if "epoch store" in p],
+                                    f"startup {n}: {rep}")
+                    self.assert_left_as_found(r, target, kind)
+                self.setUp()
+
+    def test_a_rebuild_under_bound_b_over_an_unsafe_root(self):
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind):
+                r, target = self.unsafe(kind)
+                StoreTests.bound(self)
+                try:
+                    peerjournal.rebuild_meta(self.state_dir)
+                    raised = None
+                except Exception as e:  # noqa: BLE001 -- a crash must FAIL
+                    raised = type(e).__name__
+                self.assertIsNone(raised)
+                self.assert_left_as_found(r, target, kind)
                 self.setUp()
 
 

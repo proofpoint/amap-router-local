@@ -318,6 +318,14 @@ M = [
   '        problems.append(e.reason)       # no derived counts after a scan fault\n'
   '        live = total = midprune = -1\n    if True:\n',
   [E + "TrustWitnessTests.test_a_scan_fault_reports_no_derived_counts"]),
+ ("PP62 the loss rebase writes over an unsafe root", PJ,
+  '    if peerepochs.root_safe(peerepochs.root(state_dir)):\n        # As in rebuild_meta:',
+  '    if True:\n        # As in rebuild_meta:',
+  [E + "UnsafeRootStartupTests.test_two_startups_over_an_unsafe_root"]),
+ ("PP63 the bound-B rebuild writes over an unsafe root", PJ,
+  '    if peerepochs.root_safe(peerepochs.root(state_dir)):\n        # Never through a link',
+  '    if True:\n        # Never through a link',
+  [E + "UnsafeRootStartupTests.test_a_rebuild_under_bound_b_over_an_unsafe_root"]),
 ]
 
 
