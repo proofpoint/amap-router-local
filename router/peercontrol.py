@@ -1085,3 +1085,76 @@ def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dic
         tree["lister_error"] = f"{type(e).__name__}: {e}"
     doc["runtime_tree"] = tree
     return doc
+
+
+# ---------------------------------------------------------------------------
+# Control notices IN: the issuing agent's failure notice
+# ---------------------------------------------------------------------------
+
+#: What the receiving runtime's report means, in this router's own words,
+#: keyed by the control schema's (outcome, cause). Nothing from the control
+#: notice is rendered but its vocabulary values and the message id.
+FAILURE_TEXT: Mapping[Tuple[str, str], str] = {
+    ("refused", "unresolved_reply"): "refused it: it answered a message the receiving runtime "
+                                     "could not match to a task it had delivered",
+    ("refused", "no_edge"): "refused it: you may not task that recipient there",
+    ("refused", "policy"): "refused it: refused by the receiving runtime's policy ({code})",
+    ("dropped", "duplicate"): "dropped it as a duplicate. The receiving runtime already holds a "
+                              "record of this message, and that record may have been placed: "
+                              "this report is NOT proof that the task failed",
+    ("dropped", "misrouted"): "dropped it: the recipient is not hosted there",
+    ("demoted", "statement_value"): "did not accept it as a signed task: a signed value was "
+                                    "invalid",
+    ("demoted", "key_domain"): "did not accept it as a signed task: the signing key does not "
+                               "cover the sender's domain",
+    ("demoted", "ts_window"): "did not accept it as a signed task: it arrived outside the "
+                              "receiver's time window",
+    ("demoted", "exposure_signer"): "did not accept it as a signed task: the exposure "
+                                    "assertion was not signed by its asserter",
+    ("demoted", "body_charset"): "did not accept it as a signed task: the body's charset did "
+                                 "not decode",
+    ("demoted", "body_digest"): "did not accept it as a signed task: the body did not match "
+                                "its signed digest",
+    ("demoted", "attachment_count"): "did not accept it as a signed task: the attachments did "
+                                     "not match their signed count",
+    ("demoted", "attachment_digest"): "did not accept it as a signed task: an attachment did "
+                                      "not match its signed digest",
+    ("demoted", "message_id"): "did not accept it as a signed task: its Message-ID did not "
+                               "match the signed id",
+}
+
+
+def escaped_token(value: Any) -> str:
+    """A token from a control notice, rendered and never interpreted: ASCII
+    letters, digits, `_`, `.` and `-` kept, every other character as
+    `\\xNN`/`\\uNNNN`, at most 64 characters before escaping."""
+    text = value if isinstance(value, str) else repr(value)
+    out = []
+    for ch in text[:64]:
+        if ch.isascii() and (ch.isalnum() or ch in "_.-"):
+            out.append(ch)
+        elif ord(ch) < 0x100:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(f"\\u{ord(ch):04x}")
+    return "".join(out)
+
+
+def failure_notice(*, about: str, outcome: str, cause: str,
+                   policy_code: Optional[str]) -> Tuple[str, str]:
+    """(subject, body) of the issuing agent's failure notice, entirely
+    runtime-authored."""
+    text = FAILURE_TEXT.get((outcome, cause))
+    if text is None:
+        text = (f"reported it as {escaped_token(outcome)} "
+                f"({escaped_token(cause)}), which this router has no description for")
+    if (outcome, cause) == ("refused", "policy"):
+        # The code is deployment-defined: shown escaped, never interpreted.
+        text = text.format(code=escaped_token(policy_code) if policy_code is not None
+                           else "no code")
+    subject = f"Delivery report for peer message {about}"
+    body = (f"The receiving runtime {text}.\n\n"
+            f"Message: {about}\n"
+            "This report was written by your router from the receiving runtime's signed "
+            "control notice; no text from that notice is included.\n")
+    return subject, body

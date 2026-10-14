@@ -149,13 +149,33 @@ def payload(**over):
     return doc
 
 
+#: The runtime configured for KEY_ID, and this router's own runtime address.
+SIGNER_RUNTIME = f"amap.router@{T1}"
+OWN_RUNTIME = f"amap.router@{FD}"
+
+
+def control_verdict(**over):
+    """A verified control notice (what checks 1-5 hand the receive hook)."""
+    doc = {"v": 1, "key_id": KEY_ID, "kind": "control", "id": "c" * 23,
+           "from": SIGNER_RUNTIME, "to": OWN_RUNTIME, "ts": "2026-10-13T11:59:00Z",
+           "about": "issued-1", "outcome": "refused", "cause": "no_edge"}
+    doc.update(over)
+    return types.SimpleNamespace(payload=doc, key_id=KEY_ID)
+
+
+def probe_clock(admission="open"):
+    """A clock for check 7: admission, F, and the lower bound an hour back."""
+    return types.SimpleNamespace(admission=admission, f=300,
+                                 lower=lambda: NOW - timedelta(hours=1))
+
+
 class _Hooks(_Ledger):
 
     def ctx(self, *, cfg=None, state_dir=None, delegation=None, now=NOW, clock=None):
         return peerpolicy.hook_context(cfg or self.cfg,
                                        delegation=delegation or types.SimpleNamespace(config=self.dc),
                                        state_dir=state_dir or self.state_dir, now=now,
-                                       clock=clock if clock is not None else object())
+                                       clock=clock if clock is not None else probe_clock())
 
     def production(self, **kw):
         return peerpolicy.production_hooks(self.ctx(**kw))
@@ -175,7 +195,14 @@ def outcome(out):
         return ("hold", out.reason, out.detail)
     if isinstance(out, peerjournal.Resolved):
         return ("resolved", out.in_reply_to)
+    if isinstance(out, peerjournal.ControlAccepted):
+        return ("accepted", out.runtime, out.logical_id, out.issued_path, out.issued_sha256)
     return out
+
+
+def control_probes():
+    return (control_verdict(), control_verdict(**{"from": f"planner@{T1}"}),
+            control_verdict(to=f"amap.router@{T2}"), control_verdict(about="nowhere"))
 
 
 class DenyReplyEdgeTests(_Hooks):
@@ -226,20 +253,64 @@ class DenyReplyEdgeTests(_Hooks):
                          ("refuse", "no_edge", None))
 
 
+class ControlReceiveTests(_Hooks):
+    """The receive hook's checks after 1-5, in order; every failure a
+    refusal the journal drops."""
+
+    def test_a_good_notice_is_accepted_naming_its_issued_record(self):
+        self.issued("issued-1")
+        got = outcome(self.production().control_receive(None, control_verdict()))
+        rel = "bob/peer-ledger/issued-1.json"
+        import hashlib
+        self.assertEqual(got, ("accepted", SIGNER_RUNTIME, "bob", rel, hashlib.sha256(
+            (self.state_dir / rel).read_bytes()).hexdigest()))
+
+    def test_from_must_be_the_keys_configured_runtime(self):
+        self.issued("issued-1")
+        for frm in (f"planner@{T1}", f"amap.router@{T2}", "not an address"):
+            with self.subTest(frm=frm):
+                self.assertEqual(outcome(self.production().control_receive(
+                    None, control_verdict(**{"from": frm}))), ("refuse", "control_signer", None))
+
+    def test_to_must_be_this_routers_runtime_address(self):
+        self.issued("issued-1")
+        self.assertEqual(outcome(self.production().control_receive(
+            None, control_verdict(to=f"bob@{FD}"))), ("refuse", "misrouted", None))
+
+    def test_ts_must_be_fresh_and_closed_admission_holds(self):
+        self.issued("issued-1")
+        self.assertEqual(outcome(self.production().control_receive(
+            None, control_verdict(ts="2026-10-13T10:00:00Z"))), ("refuse", "ts_window", None))
+        self.assertEqual(outcome(self.production(clock=probe_clock("closed")).control_receive(
+            None, control_verdict())), ("hold", "admission_closed", None))
+
+    def test_about_must_name_an_issued_record_in_the_signers_domains(self):
+        self.issued("issued-1")
+        self.issued("to-elsewhere", remote="planner@elsewhere.example")
+        self.placed("placed-1")
+        for about in ("nowhere", "to-elsewhere", "placed-1"):
+            with self.subTest(about=about):
+                self.assertEqual(outcome(self.production().control_receive(
+                    None, control_verdict(about=about))), ("refuse", "unknown_about", None))
+
+    def test_a_late_notice_after_expires_at_still_finds_its_record(self):
+        self.issued("issued-1", expires=EARLIER)
+        self.assertEqual(outcome(self.production().control_receive(
+            None, control_verdict()))[0], "accepted")
+
+    def test_no_fleet_domain_holds(self):
+        self.issued("issued-1")
+        cfg = dataclasses.replace(self.cfg, fleet_domain=None)
+        self.assertEqual(outcome(self.production(cfg=cfg).control_receive(
+            None, control_verdict())), ("hold", "no_fleet_domain", None))
+
+
 class BuilderTests(_Hooks):
 
     def test_production_holds_every_statement_at_check8_and_policy(self):
         hk = self.production()
         self.assertEqual(outcome(hk.check8(payload(), KEY_ID)), ("hold", "hook_absent", "check8"))
         self.assertEqual(outcome(hk.policy(payload(), "bob")), ("hold", "hook_absent", "policy"))
-
-    def test_control_candidates_still_hold_hook_absent_under_every_profile(self):
-        """control_receive is unchanged from the base: a control candidate
-        holds `hook_absent` under production and conformance alike, so the
-        receive path is not half-built in this part."""
-        for hk in (self.production(), self.conformance(pairs=[(PLANNER, BOB)])):
-            self.assertEqual(outcome(hk.control_receive(None, None)),
-                             ("hold", "hook_absent", "control_receive"))
 
     def test_production_hooks_is_decide_hooks_of_the_production_profile(self):
         self.issued("issued-1")
@@ -254,8 +325,10 @@ class BuilderTests(_Hooks):
                 for m in ("reply", "edge", "policy"):
                     self.assertEqual(outcome(getattr(a, m)(p, "bob")),
                                      outcome(getattr(b, m)(p, "bob")))
-                self.assertEqual(outcome(a.control_receive(None, None)),
-                                 outcome(b.control_receive(None, None)))
+        for v in control_probes():
+            with self.subTest(control=v.payload):
+                self.assertEqual(outcome(a.control_receive(None, v)),
+                                 outcome(b.control_receive(None, v)))
 
     def test_conformance_differs_only_in_the_policy_and_edge_members(self):
         self.issued("issued-1")
@@ -263,8 +336,9 @@ class BuilderTests(_Hooks):
         probes = (payload(), payload(in_reply_to="issued-1"), payload(in_reply_to="x"))
         for p in probes:
             self.assertEqual(outcome(prod.reply(p, "bob")), outcome(conf.reply(p, "bob")))
-            self.assertEqual(outcome(prod.control_receive(None, None)),
-                             outcome(conf.control_receive(None, None)))
+        for v in control_probes():
+            self.assertEqual(outcome(prod.control_receive(None, v)),
+                             outcome(conf.control_receive(None, v)))
         self.assertNotEqual(outcome(prod.policy(payload(), "bob")),
                             outcome(conf.policy(payload(), "bob")))
         self.assertNotEqual(outcome(prod.check8(payload(), KEY_ID)),

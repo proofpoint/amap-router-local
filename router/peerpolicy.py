@@ -31,7 +31,7 @@ What each hook reads:
 | `reply` | `cfg.instances[hosted].task_deny` (the deny, first), the hosted instance's state key and address, `state_dir` (the peer ledger), `now` |
 | `edge` | the same resolution; the edge part; `delegation.config` (the key's runtime and its domains) |
 | `policy` | the policy part only, in this build |
-| `control_receive` | nothing yet: control candidates are held (`hook_absent`) until the control receive path is built |
+| `control_receive` | `delegation.config` (the key's configured runtime and its domains), `cfg.fleet_domain` (this router's runtime address), the clock and `now` (freshness), `state_dir` (the `issued` records) |
 
 The decide order is deny, reply, edge, policy. The deny is the reply hook's
 first step, so a denied sender is refused `(policy, denied)` whatever its
@@ -43,6 +43,7 @@ profile has the interim permissive policy part.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -245,9 +246,63 @@ def _policy(profile: Profile) -> Callable:
     return policy
 
 
+#: The control receive checks' refusal causes (every one is a drop).
+CONTROL_SIGNER = "control_signer"
+CONTROL_MISROUTED = "misrouted"
+CONTROL_TS_WINDOW = "ts_window"
+UNKNOWN_ABOUT = "unknown_about"
+
+
 def _control_receive(profile: Profile) -> Callable:
-    from . import peerjournal
+    from . import config as config_mod
+    from . import peerbind, peerclock, peerjournal
+    ctx = profile.context
 
     def control_receive(view: Any, verdict: Any):
-        return peerjournal.Hold("hook_absent", "control_receive")
+        """A verified control notice's checks after 1-5, in order: `from` is
+        the configured runtime that owns the verifying key; `to` is this
+        router's own runtime address; `ts` is fresh (check 7; closed
+        admission holds); `about` names exactly one `issued` record of an
+        agent whose remote is in that runtime's domains (`expires_at` not
+        applied). Check 4, that (runtime, `id`) is new, is the journal's
+        reservation. A failure is `Refuse(cause)`, which the journal drops;
+        success is `ControlAccepted`, naming the issued record."""
+        payload = verdict.payload
+        runtime = peerbind.runtime_for_key(ctx.delegation.config, verdict.key_id)
+        own = config_mod.router_address(ctx.cfg.fleet_domain)
+        if own is None:
+            return peerjournal.Hold("no_fleet_domain")
+        try:
+            signer_ok = (runtime is not None and peerledger.canonical(payload["from"])
+                         == peerledger.canonical(runtime.runtime))
+        except Exception:  # noqa: BLE001 -- an unparseable address is not the runtime's
+            signer_ok = False
+        if not signer_ok:
+            return peerjournal.Refuse(CONTROL_SIGNER)
+        try:
+            to_ok = peerledger.canonical(payload["to"]) == peerledger.canonical(own)
+        except Exception:  # noqa: BLE001
+            to_ok = False
+        if not to_ok:
+            return peerjournal.Refuse(CONTROL_MISROUTED)
+        try:
+            if peerclock.check7(ctx.clock, ctx.now)(payload, verdict.key_id) is not None:
+                return peerjournal.Refuse(CONTROL_TS_WINDOW)
+        except peerclock.Held:
+            return peerjournal.Hold("admission_closed")
+        domains = {d.lower() for d in runtime.domains}
+        matches = []
+        for lid, rel, data, rec in peerledger.find_issued(ctx.state_dir, payload["about"]):
+            try:
+                domain = peerledger.canonical(rec["remote"]).rsplit("@", 1)[1]
+            except Exception:  # noqa: BLE001
+                continue
+            if domain in domains:
+                matches.append((lid, rel, data))
+        if len(matches) != 1:
+            return peerjournal.Refuse(UNKNOWN_ABOUT)
+        lid, rel, data = matches[0]
+        return peerjournal.ControlAccepted(
+            runtime=runtime.runtime, logical_id=lid, issued_path=rel,
+            issued_sha256=hashlib.sha256(data).hexdigest())
     return control_receive

@@ -931,6 +931,14 @@ RESERVATION_SUFFIX = ".json"
 _LABEL_CHECKED = b"amap-rl/checked/1\x00"
 _LABEL_PERSISTED_RESERVATION = b"amap-rl/persisted-reservation/1\x00"
 _LABEL_RESERVATION = b"amap-rl/peer-reservation/1\x00"
+#: A control notice's reservation: a record type of its own, under its own
+#: label, so neither kind's MAC can ever verify as the other's.
+_LABEL_CONTROL_RESERVATION = b"amap-rl/peer-control-reservation/1\x00"
+_CONTROL_RESERVATION_MEMBERS = ("v", "state", "kind", "rt", "idk", "runtime", "id", "ts",
+                                "statement_sha256", "about", "outcome", "cause", "policy_code",
+                                "logical_id", "issued_path", "issued_sha256", "notice_id",
+                                "notice_ts", "candidate_ref", "reserve_seq")
+RESERVATION_KIND_CONTROL = "control"
 _RESERVATION_MEMBERS = ("v", "state", "rt", "idk", "runtime", "id", "ts", "statement_sha256",
                         "body_sha256", "attachment_sha256s", "key_id", "notice_id",
                         "candidate_ref", "reserve_seq")
@@ -1050,15 +1058,24 @@ def reservation_record(checked: Checked, *, record_id: str, reserve_seq: int,
                                                                _decision_key(state_dir))))
 
 
+def reservation_kind(doc: Mapping[str, Any]) -> str:
+    """"control" for a control notice's reservation, else "statement" (a
+    statement's reservation carries no `kind` member)."""
+    return RESERVATION_KIND_CONTROL if "kind" in doc else "statement"
+
+
 def parse_reservation(raw: bytes, key: Optional[bytes]) -> Dict[str, Any]:
     """A reservation's members, its MAC verified FIRST; `RecoveryCorrupt`.
-    With `key` None (the decision key is lost) the record is read as DATA
-    ONLY: strict JSON, the closed member set and the field grammars, never
-    as an authority."""
+    Either record type: a statement's, or a control notice's (closed members
+    of its own, its own MAC label). With `key` None (the decision key is
+    lost) the record is read as DATA ONLY: strict JSON, the closed member set
+    and the field grammars, never as an authority."""
     try:
         doc = _strict_json(raw)
     except (UnicodeDecodeError, ValueError):
         raise RecoveryCorrupt("mac", "not a reservation") from None
+    if isinstance(doc, dict) and "kind" in doc:
+        return _parse_control_reservation(doc, key)
     if not isinstance(doc, dict) or set(doc) != set(_RESERVATION_MEMBERS) | {"mac"}:
         raise RecoveryCorrupt("mac", "not a closed reservation")
     members = {k: doc[k] for k in _RESERVATION_MEMBERS}
@@ -1077,6 +1094,94 @@ def parse_reservation(raw: bytes, key: Optional[bytes]) -> Dict[str, Any]:
             and isinstance(members["candidate_ref"], str)):
         raise RecoveryCorrupt("grammar")
     return members
+
+
+def _control_reservation_mac(members: Mapping[str, Any], key: bytes) -> str:
+    return hmac.new(key, _LABEL_CONTROL_RESERVATION + hoplink.canonical(dict(members)),
+                    hashlib.sha256).hexdigest()
+
+
+def _parse_control_reservation(doc: Dict[str, Any], key: Optional[bytes]) -> Dict[str, Any]:
+    if set(doc) != set(_CONTROL_RESERVATION_MEMBERS) | {"mac"}:
+        raise RecoveryCorrupt("mac", "not a closed control reservation")
+    members = {k: doc[k] for k in _CONTROL_RESERVATION_MEMBERS}
+    if key is not None:
+        try:
+            want = _control_reservation_mac(members, key)
+        except hoplink.CanonicalRefused:
+            raise RecoveryCorrupt("mac", "not canonical") from None
+        if not (isinstance(doc["mac"], str) and hmac.compare_digest(want, doc["mac"])):
+            raise RecoveryCorrupt("mac")
+    if (members["v"] != 1 or members["state"] != "reserved"
+            or members["kind"] != RESERVATION_KIND_CONTROL):
+        raise RecoveryCorrupt("state")
+    if not (isinstance(members["notice_id"], str) and _NOTICE_ID_RE.fullmatch(members["notice_id"])
+            and isinstance(members["notice_ts"], str) and _TS_RE.fullmatch(members["notice_ts"])
+            and isinstance(members["rt"], str) and _RT_RE.fullmatch(members["rt"])
+            and isinstance(members["idk"], str) and _IDK_RE.fullmatch(members["idk"])
+            and isinstance(members["issued_sha256"], str)
+            and _IDK_RE.fullmatch(members["issued_sha256"])
+            and isinstance(members["statement_sha256"], str)
+            and _IDK_RE.fullmatch(members["statement_sha256"])
+            and all(isinstance(members[k], str)
+                    for k in ("candidate_ref", "about", "logical_id", "issued_path"))):
+        raise RecoveryCorrupt("grammar")
+    return members
+
+
+def control_reservation_record(*, runtime: str, payload: Mapping[str, Any], statement: bytes,
+                               logical_id: str, issued_path: str, issued_sha256: str,
+                               record_id: str, reserve_seq: int, notice_ts: str,
+                               state_dir: Path) -> bytes:
+    """A control notice's reservation bytes: (runtime, `id`), what it
+    reports, the issuing agent's logical_id, the matched `issued` record's
+    identity (its path under `state_dir` and the sha256 of its bytes), and
+    the failure notice's id and time, minted here once. MAC'd under the
+    decision key with the control reservation's own label. Not an authority
+    until committed (`commit_reservation`)."""
+    if not (isinstance(record_id, str) and record_id):
+        raise ValueError("record_id: a non-empty string")
+    if not (type(reserve_seq) is int and reserve_seq > 0):
+        raise ValueError("reserve_seq: a positive integer")
+    if not _TS_RE.fullmatch(notice_ts or ""):
+        raise ValueError("notice_ts: YYYY-MM-DDTHH:MM:SSZ")
+    rt, idk = replay_keys(runtime, payload["id"])
+    members = {"v": 1, "state": "reserved", "kind": RESERVATION_KIND_CONTROL, "rt": rt,
+               "idk": idk, "runtime": runtime, "id": payload["id"], "ts": payload["ts"],
+               "statement_sha256": _sha(statement), "about": payload["about"],
+               "outcome": payload["outcome"], "cause": payload["cause"],
+               "policy_code": payload.get("policy_code"), "logical_id": logical_id,
+               "issued_path": issued_path, "issued_sha256": issued_sha256,
+               "notice_id": secrets.token_hex(16), "notice_ts": notice_ts,
+               "candidate_ref": record_id, "reserve_seq": reserve_seq}
+    return hoplink.canonical(dict(members, mac=_control_reservation_mac(
+        members, _decision_key(state_dir))))
+
+
+def read_control_reservation(receipt: "PersistedReservation", *, state_dir: Path
+                             ) -> Dict[str, Any]:
+    """A control reservation's members, re-read through its receipt (inode
+    and digest), its MAC first. A statement's reservation is refused."""
+    _require_reservation_receipt(receipt)
+    key = _decision_key(state_dir)
+    name = _reservation_name(receipt.idk)
+    dirfd = _replay_dir_fd(Path(state_dir), receipt.rt, create=False)
+    try:
+        try:
+            data, fd, dev, ino = _read_checked(dirfd, name)
+        except FileNotFoundError:
+            raise RecoveryCorrupt("replaced", "the reservation is gone") from None
+        os.close(fd)
+    finally:
+        os.close(dirfd)
+    if (dev, ino) != (receipt.dev, receipt.ino) or _sha(data) != receipt.sha256:
+        raise RecoveryCorrupt("replaced")
+    rec = parse_reservation(data, key)
+    if reservation_kind(rec) != RESERVATION_KIND_CONTROL:
+        raise RecoveryCorrupt("kind", "not a control reservation")
+    if rec["candidate_ref"] != receipt.record_id or rec["notice_id"] != receipt.notice_id:
+        raise RecoveryCorrupt("candidate_ref")
+    return rec
 
 
 def _replay_dir_fd(state_dir: Path, rt: str, *, create: bool) -> int:
@@ -1240,6 +1345,8 @@ def resume_reserved(receipt: PersistedReservation, snapshot: Snapshot, *,
     if (dev, ino) != (receipt.dev, receipt.ino) or _sha(data) != receipt.sha256:
         raise RecoveryCorrupt("replaced")
     rec = parse_reservation(data, key)
+    if reservation_kind(rec) != "statement":
+        raise RecoveryCorrupt("kind", "a control reservation is never resumed as a statement")
     if rec["candidate_ref"] != receipt.record_id or rec["notice_id"] != receipt.notice_id:
         raise RecoveryCorrupt("candidate_ref")
     if not isinstance(snapshot, Snapshot) or not isinstance(snapshot.statement, bytes):
