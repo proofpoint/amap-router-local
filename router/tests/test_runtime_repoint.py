@@ -622,6 +622,10 @@ class RealPluginHarnessTests(tpc._Control):
         matrix = run_realhop._cases()
         self.assertEqual(sorted(n[5:] for n in dir(matrix) if n.startswith("test_")),
                          sorted(run_realhop.ROWS), "every row is run, and only these")
+        resend = run_realhop._resend_cases()
+        self.assertEqual(sorted(n[5:] for n in dir(resend) if n.startswith("test_")
+                                and n[5:] in run_realhop.RESEND_ROWS),
+                         sorted(run_realhop.RESEND_ROWS), "every resend row exists")
 
 
 class CrashBoundaryTests(_Repoint):

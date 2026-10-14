@@ -2502,7 +2502,10 @@ plugin's rows run in `router/tests/run_realhop.py --plugin <file>`: adopt,
 retire, new, both restores, abandon-attempt, abandon-plan, the
 `generation_retired` settlement and the hold before any hand-over, and the
 crash and exactly-once audit seams, against the real runtime sender and
-lister over this router's real filesystem port. The file must hash to the
+lister over this router's real filesystem port; and one resend row
+(`peer_block_republished_under_new_n`): a signed peer task handed over
+through the real AGENT sender, then retransmitted under a new transport id,
+the hub publishing the identical peer block both times. The file must hash to the
 pinned artifact digest (`ARTIFACT_SHA256`); without it the run is refused,
 never skipped. Its evidence is a recorded run with the plugin file's
 sha256, not continuous integration, which has no copy of the plugin.
