@@ -884,3 +884,87 @@ class SignedResultAnswersTests(_Retransmit):
                 self.assertIn("signed Result", e.detail)
             else:
                 self.fail("retransmitted an answered task")
+
+
+class FrontierTests(_Retransmit):
+    """`rtx.<n>.json` passes `read_record`, so it holds the frontier while it
+    lives and never blocks it."""
+
+    def test_a_live_retransmit_record_holds_the_frontier_and_its_cleanup_releases_it(self):
+        k, pid = self.unknown()
+        n = self.retransmit(k, pid)["n"]
+        write_request(self.cfg, "alpha", "00000002", to=["you@example.com"])
+        k, _ = self.drain()
+        self.assertEqual(inflight.settled_through(k, "alpha"), int(n) - 1,
+                         "the live retransmit is the lowest live id")
+        port = self.plugin.ports[-1]
+        port.send(n, outcome="accepted", reason_code="allowlisted")
+        k, _ = self.drain()
+        self.assertGreaterEqual(inflight.settled_through(k, "alpha"), int(n),
+                                "released once cleaned up")
+
+
+class GenerationKeyingTests(_Retransmit):
+
+    def test_a_rotation_reusing_n_keeps_two_distinct_settlements(self):
+        d = None
+        k, pid = self.unknown()
+        n1 = self.retransmit(k, pid)["n"]
+        k, _ = self.drain()
+        port = self.plugin.ports[-1]
+        port.send(n1, outcome="queued_for_human", reason_code="delivery_unknown")
+        k, _ = self.drain()
+        g1 = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))[1]
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        # The same n in another generation: a distinct settlement entry.
+        rec = {"retransmit": {"id": pid}, "transport_req_id": n1}
+        with mock.patch.object(peerresend, "_gen_of", return_value=(LIDS["alpha"], "f" * 32)):
+            peerresend.settle_retransmit(k, "alpha", rec, {"outcome": "accepted",
+                                                           "reason_code": "allowlisted"})
+        self.assertEqual(sorted(p.name for p in (d / peerresend.RETRANSMITS).iterdir()),
+                         sorted([f"{g1}-{n1}.json", f"{'f' * 32}-{n1}.json"]))
+
+
+class CompleteAloneTests(_Retransmit):
+    """The copy alone is enough: the original record and its snapshot are
+    gone, and the retransmit hands the same request, attachments included,
+    shaped as the design's hop request says."""
+
+    def test_the_retransmit_from_the_copy_alone_carries_every_attachment(self):
+        from router.tests import helpers as h
+        blobs = [b"first attachment", b"second \x00 attachment"]
+        descs = [h.attachment_descriptor(b, filename=f"a{i}.txt") for i, b in enumerate(blobs)]
+        h.stage_outbound_sidecars(self.cfg, "alpha", "00000001", blobs)
+        write_request(self.cfg, "alpha", "00000001", to=[TRUSTED], body_text="with files",
+                      attachments=descs)
+        k, _ = self.drain()
+        port = self.plugin.ports[-1]
+        original = json.loads(port.pending["00000001"])
+        port.send("00000001", outcome="queued_for_human", reason_code="delivery_unknown")
+        k, _ = self.drain()
+        self.assertIsNone(inflight.read_record(k, "alpha", "00000001"), "the original is gone")
+        self.assertFalse((config_mod.gen_state_dir(k, "alpha") / inflight.SNAPSHOT_DIR
+                          / "00000001").exists(), "its snapshot is gone")
+        pid = next(peerresend.sent_root(self.state_dir, LIDS["alpha"]).iterdir()).name
+        try:
+            n = self.retransmit(k, pid)["n"]
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL
+            self.fail(f"the copy alone could not be retransmitted: {type(e).__name__}: {e}")
+        k, _ = self.drain()
+        self.assertIn(n, port.pending, "handed over")
+        sent = json.loads(port.pending[n])
+        lid, _gen = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))
+        self.assertEqual(sent["request"]["agent_id"], lid)
+        self.assertEqual(sent["request"]["req_id"], n)
+        self.assertEqual(sent["request"]["draft"], original["request"]["draft"])
+        self.assertEqual(sent["envelope"]["peer"], original["envelope"]["peer"])
+        self.assertEqual(sent["envelope"]["from_address"], original["envelope"]["from_address"])
+        import base64
+        def carried(doc):
+            return [base64.b64decode(a) for a in (doc.get("envelope") or {}).get("attachments")
+                    or doc.get("attachments") or []]
+        self.assertEqual(carried(original), blobs, "the original carried both")
+        self.assertEqual(carried(sent), blobs, "the retransmit carries both, in order")
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        self.assertEqual([(d / peerresend.ATTACHMENTS / str(i)).read_bytes() for i in range(2)],
+                         blobs)

@@ -175,6 +175,19 @@ M = [
   '        if isinstance(doc, dict) and doc.get("in_reply_to") == peer_id:\n',
   '        if False:\n',
   [T + "SignedResultAnswersTests.test_a_placed_statement_replying_to_it_answers_it"]),
+ ("a retransmit keyed by n alone", PR,
+  '    _link_once(d / RETRANSMITS / f"{gen}-{record[\'transport_req_id\']}.json", _canonical({\n',
+  '    _link_once(d / RETRANSMITS / f"{record[\'transport_req_id\']}.json", _canonical({\n',
+  [T + "GenerationKeyingTests.test_a_rotation_reusing_n_keeps_two_distinct_settlements"]),
+ ("an attachment omitted from the retransmit", PR,
+  '                              rec.get("attachments") or [], copy["blobs"])]\n',
+  '                              rec.get("attachments") or [], copy["blobs"][:-1])]\n',
+  [T + "CompleteAloneTests.test_the_retransmit_from_the_copy_alone_carries_every_attachment"]),
+ ("the draft omitted from the retransmit", PR,
+  '    request = dict(rec["request"], req_id=rid)\n',
+  '    request = dict(rec["request"], req_id=rid)\n    request["draft"] = dict(request["draft"], body_text="")\n',
+  [T + "CompleteAloneTests.test_the_retransmit_from_the_copy_alone_carries_every_attachment",
+   T + "RetransmitFlowTests.test_trigger_1_hands_the_original_bytes_under_a_new_n_and_settles_apart"]),
 ]
 
 
