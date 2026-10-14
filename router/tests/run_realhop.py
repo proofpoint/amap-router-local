@@ -35,7 +35,7 @@ PLUGIN_API = (3, 5)
 REAL_CAPS = {"document": 1 << 16, "request": 1 << 16, "attachment": 1 << 12, "total": 1 << 20}
 #: The matrix, by row name, in order (the PR body names the same rows).
 ROWS = (
-    "adopt", "retire", "new", "restore_listed_live", "restore_unlisted",
+    "w15_capability_table", "adopt", "retire", "new", "restore_listed_live", "restore_unlisted",
     "adopt_after_unlisted_restore", "abandon_attempt", "abandon_plan",
     "settle_generation_retired", "hold_before_hand_over",
     "crash_adopt_audited_once", "crash_retire_audited_once", "crash_new_audited_once",
@@ -156,6 +156,27 @@ def _cases():
             self.assertTrue(self.handed(key), "handed over through the real port")
 
         # -- rows ------------------------------------------------------------
+        def test_w15_capability_table(self):
+            """The drift row: every name in this router's table is on the
+            plugin's real objects, both factories at the minor this router
+            expects, and the capability is ON at that minor."""
+            names = transport_mod.RUNTIME_CAPABILITY
+            self.assertEqual(tuple(self.plugin.api), transport_mod.RUNTIME_MINOR)
+            self.assertTrue(transport_mod.runtime_capability_declared(self.plugin))
+            for role in ("factory", "lister"):
+                self.assertIn(names[role], self.plugin.optional_capabilities)
+                self.assertEqual(transport_mod.OPTIONAL_FACTORIES[names[role]][0],
+                                 transport_mod.RUNTIME_MINOR)
+            sender = self.raw_sender("a" * 32)
+            for name in ("retire", "retired", "retired_at", "identity", "admit"):
+                self.assertTrue(callable(getattr(sender, names[name], None)), name)
+            for name in ("has_pending", "has_result", "has_archived", "read_result",
+                         "write_request", "withdraw_request"):
+                self.assertTrue(callable(getattr(sender, name, None)), name)
+            lister = self.cap().lister()
+            self.assertTrue(callable(getattr(lister, names["generations"], None)))
+            self.assertEqual(getattr(sender, "RuntimeRetired")("x").reason, "generation_retired")
+
         def test_adopt(self):
             gen = "a" * 32
             self.admitted_out_of_band(gen, at="2026-10-01T09:00:00Z")

@@ -186,18 +186,21 @@ OPTIONAL_FACTORIES: Mapping[str, Tuple[Tuple[int, int], Optional[str]]] = {
     "make_runtime_lister": ((3, 5), "HopFsOps"),
 }
 
-#: THE RUNTIME CAPABILITY, provisional until HOP-RUNTIME-IDENTITY freezes:
-#: every name this router calls to reach its own runtime control tree
-#: (`router/peercontrol.py`), in this one table, so that re-pointing it to
-#: the final shape is a change here and nowhere else.
-#: - `factory`: bound to one generation, closed settings
-#:   {hop_root, generation, peer_uid, address}; the sender protocol plus
-#:   `retire(retired_at)`, `retired()`, `retired_at()` and `identity()`.
+#: THE RUNTIME CAPABILITY, in its frozen PLUGIN_API (3, 5) shape: every name
+#: this router calls to reach its own runtime control tree
+#: (`router/peercontrol.py`), in this one table.
+#: - `factory`: bound to one generation, closed settings {hop_root,
+#:   generation, peer_uid, address, version_write, caps}; construction never
+#:   admits; `admit(admitted_at)` ("admitted" | "exists"), called before the
+#:   first transport method in the generation; the sender protocol (a NEW
+#:   request in a retired generation raises reason `generation_retired`,
+#:   only when no part of it exists); `retire(retired_at)` (never admits;
+#:   "absent" for an absent tree), `retired()`, `retired_at()`, `identity()`.
 #: - `lister`: READ-ONLY, closed settings {hop_root, peer_uid};
 #:   `generations()` -> [(generation, "live" | "retired" | "unreadable")],
 #:   an absent runtime tree listing empty.
 #: Both are optional factories at `RUNTIME_MINOR`; a plugin declaring
-#: neither (every plugin today) leaves the runtime tree unavailable.
+#: neither leaves the runtime tree unavailable.
 RUNTIME_MINOR: Tuple[int, int] = (3, 5)
 RUNTIME_CAPABILITY: Mapping[str, str] = {
     "factory": "make_runtime_sender",
