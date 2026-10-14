@@ -1830,6 +1830,14 @@ generation: a generation fenced since is finished by its own fenced pass,
 and a claim never begun there is cancelled `generation_unavailable`. (An
 unhanded record in a fenced, retired generation settles `rejected/no_route`
 by the shared rule first: never a first hand-over into a retired tree.)
+After the cleanup a retransmit's settlement is read from
+`peer-sent/<id>/retransmits/` (`show` lists them): its in-flight record is
+gone by design.
+
+A task can be handed over, settled and cleaned up in the pass that first
+finds its handed marker: `handed.json` is linked first in that pass, so it
+always exists beside `settled.json`, and the two may carry almost the same
+time. That is a fast answer, not a missing hand-over.
 
 **Control notices.** A retransmit the receiver demotes emits a failure
 notice about the same id; the one-per-message `notified/<id>` marker caps
