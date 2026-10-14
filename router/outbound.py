@@ -3521,6 +3521,14 @@ def _drain_fenced(
             except Exception:
                 logger.exception("instance %r: error stepping fenced in-flight work — "
                                  "isolated, its files stay claimed", name)
+            # The resend workflow's claims in this generation: finished here,
+            # by its own generation's pass (a claim never moves generation).
+            try:
+                from . import clock, peerresend
+                peerresend.finish(view, name, clock.now(), fenced=True)
+            except Exception:  # noqa: BLE001 -- retried next poll
+                logger.exception("instance %r: finishing a fenced generation's retransmit "
+                                 "claims failed; retried next poll", name)
         # Its orphan attachment snapshots, records or not (`_sweep_snapshots`);
         # what could not be decided joins the drain summary's count.
         n_uncertain = _sweep_snapshots(view, name)

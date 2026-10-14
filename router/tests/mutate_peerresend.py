@@ -138,6 +138,19 @@ M = [
  ("the sweep ignores its switch", PR,
   '    if not getattr(cfg, "peer_sent_prune", True):\n', '    if False:\n',
   [T + "PruneTests.test_with_the_sweep_off_nothing_is_pruned"]),
+ ("trigger 2 measured from the preservation", PR,
+  '        handed = parse_utc_ts((copy.get("handed") or {}).get("handed_ts"))\n',
+  '        handed = parse_utc_ts((copy.get("origin") or {}).get("preserved_ts"))\n',
+  [T + "StaleFromHandedTests.test_trigger_2_is_measured_from_handed_never_from_preserved"]),
+ ("a fenced generation's claims never finished", OUT,
+  '                peerresend.finish(view, name, clock.now(), fenced=True)\n',
+  '                pass\n',
+  [T + "FencedGenerationTests.test_a_handed_retransmit_settles_as_itself_in_its_fenced_generation",
+   T + "FencedGenerationTests.test_a_claim_never_begun_in_a_fenced_generation_is_cancelled"]),
+ ("a claim begun in a fenced generation", PR,
+  '                if fenced:\n                    raise Refused("generation_unavailable", "its generation is fenced")\n',
+  '',
+  [T + "FencedGenerationTests.test_a_claim_never_begun_in_a_fenced_generation_is_cancelled"]),
 ]
 
 

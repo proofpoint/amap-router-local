@@ -410,7 +410,10 @@ def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
 
 def gate(cfg: Any, name: str, record: Mapping[str, Any], now: datetime) -> Optional[Tuple[str, str]]:
     """Before a retransmit record's FIRST hand-over: every dynamic refusal
-    again, the copy's re-checks included. `(code, detail)` cancels it."""
+    again, the copy's re-checks included. `(code, detail)` cancels it. (A
+    record in a fenced generation never reaches it: under the hop a fenced
+    generation advances only once its tree is retired, and an unhanded
+    record there settles `rejected/no_route` first, `inflight.advance`.)"""
     rt = record["retransmit"]
     lid = config_mod.state_key(cfg, name)
     try:
@@ -539,8 +542,12 @@ def retransmit_settled(cfg: Any, name: str, record: Mapping[str, Any]) -> bool:
     return (d / RETRANSMITS / f"{gen}-{record['transport_req_id']}.json").is_file()
 
 
-def finish(cfg: Any, name: str, now: datetime) -> int:
-    """Recovery and completion for every claimed copy of `name`: a claim
+def finish(cfg: Any, name: str, now: datetime, *, fenced: bool = False) -> int:
+    """`fenced`: `cfg` is a view of a FENCED generation (`outbound._drain_fenced`);
+    a claim there whose record was never begun is cancelled
+    `generation_unavailable` (refusal 6), never begun.
+
+    Recovery and completion for every claimed copy of `name`: a claim
     without its requested line gets it; a claim with neither record nor
     settlement gets its record (or, failing the gate, a cancellation); a
     settled claim whose record is gone gets its settled line, then the claim
@@ -567,6 +574,8 @@ def finish(cfg: Any, name: str, now: datetime) -> int:
         live = inflight.read_record(cfg, name, rtx_name(n))
         if settled is None and live is None:
             try:
+                if fenced:
+                    raise Refused("generation_unavailable", "its generation is fenced")
                 copy = load(d)
                 check_dynamic(cfg, name, lid, copy, allow_pending=True, now=now)
                 begin_record(cfg, name, copy, claim)

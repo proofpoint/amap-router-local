@@ -655,3 +655,101 @@ class PruneTests(_Retransmit):
         import datetime
         far = self.now() + datetime.timedelta(days=60)
         self.assertEqual(peerresend.sweep(k, "alpha", far), 0)
+
+
+class StaleFromHandedTests(_Retransmit):
+
+    def test_trigger_2_is_measured_from_handed_never_from_preserved(self):
+        import datetime
+        from router import clock as clock_mod
+        t0 = self.now()
+        with mock.patch.object(peerresend, "note_handed", return_value=False):
+            k, _ = self.send()
+        # The hand-over is found 200 s after the preservation: inside the
+        # window (P + F = 3900 s at the defaults), so trigger 2 is reachable.
+        t1 = t0 + datetime.timedelta(seconds=200)
+        with mock.patch.object(clock_mod, "now", return_value=t1):
+            k, _ = self.drain()                   # the pass that finds the marker
+        pid = next(peerresend.sent_root(self.state_dir, LIDS["alpha"]).iterdir()).name
+        early = t1 + datetime.timedelta(seconds=inflight.STALE_AFTER_S - 1)
+        try:
+            peerresend.operator_retransmit(k, pid, now=early, evidence="t", allow_pending=True)
+        except peerresend.Refused as e:
+            self.assertEqual(e.code, "not_yet_stale")
+        else:
+            self.fail("stale already: measured from the preservation, not the hand-over")
+        late = t1 + datetime.timedelta(seconds=inflight.STALE_AFTER_S + 1)
+        out = peerresend.operator_retransmit(k, pid, now=late, evidence="t", allow_pending=True)
+        self.assertIn("claimed", out["result"])
+
+
+class FencedGenerationTests(_Retransmit):
+    """A claim belongs to its generation: a generation fenced after the verb
+    still settles and finishes its retransmit, by its own pass."""
+
+    def fence(self):
+        self.put(alpha={"binding_seq": 9})        # a rebind fences the current generation
+
+    def test_a_handed_retransmit_settles_as_itself_in_its_fenced_generation(self):
+        k, pid = self.unknown()
+        n = self.retransmit(k, pid)["n"]
+        k, _ = self.drain()
+        port = self.plugin.ports[-1]
+        self.assertIn(n, port.pending)
+        lid, gen = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))
+        self.fence()
+        k, _ = self.drain()
+        self.assertNotEqual(hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))[1], gen,
+                            "fenced: a new generation is current")
+        port.send(n, outcome="accepted", reason_code="allowlisted")
+        k, _ = self.drain()
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        path = d / peerresend.RETRANSMITS / f"{gen}-{n}.json"
+        self.assertTrue(path.is_file(), "settled as itself, in its own generation")
+        self.assertEqual(json.loads(path.read_text())["outcome"], "accepted")
+        self.assertFalse((d / peerresend.CLAIM).exists(), "finished by its generation's pass")
+
+    def unhanded_then_fenced(self):
+        k, pid = self.unknown()
+        n = self.retransmit(k, pid)["n"]
+        lid, gen = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))
+        self.fence()
+        k, _ = self.drain()
+        k, _ = self.drain()
+        self.assertFalse(any(n in p.writes for p in self.plugin.ports), "never handed")
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        path = d / peerresend.RETRANSMITS / f"{gen}-{n}.json"
+        self.assertTrue(path.is_file(), "settled as itself")
+        doc = json.loads(path.read_text())
+        self.assertFalse((d / peerresend.CLAIM).exists(), "finished by its generation's pass")
+        return doc
+
+    def test_an_unhanded_retransmit_in_a_fenced_retired_generation_settles_no_route(self):
+        # The shared rule decides first: never a FIRST hand-over into a
+        # retired tree (`inflight.advance`, rejected/no_route).
+        doc = self.unhanded_then_fenced()
+        self.assertEqual((doc["outcome"], doc["reason_code"]), ("rejected", "no_route"))
+
+    def test_a_claim_never_begun_in_a_fenced_generation_is_cancelled(self):
+        k, pid = self.unknown()
+        with mock.patch.object(peerresend, "begin_record", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.retransmit(k, pid)
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        claim = json.loads((d / peerresend.CLAIM).read_text())
+        self.fence()
+        begun = []
+        real = inflight.begin_reserved
+
+        def spy(cfg, name, rid, *a, **kw):
+            begun.append(rid)
+            return real(cfg, name, rid, *a, **kw)
+        with mock.patch.object(inflight, "begin_reserved", spy):
+            k, _ = self.drain()
+        self.assertEqual(begun, [], "never begun in a fenced generation")
+        path = d / peerresend.RETRANSMITS / f"{claim['generation']}-{claim['n']}.json"
+        self.assertTrue(path.is_file(), "settled by its generation's pass")
+        doc = json.loads(path.read_text())
+        self.assertEqual((doc["outcome"], doc["reason_code"]),
+                         (peerresend.CANCELLED, "generation_unavailable"))
+        self.assertFalse((d / peerresend.CLAIM).exists())
