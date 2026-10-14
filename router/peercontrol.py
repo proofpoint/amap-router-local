@@ -49,7 +49,12 @@ THE ATTEMPT (one per pending notice), each step durable before the next:
      `delivery_unknown`, `rejected` and `halted` are recorded, never retried.
 Recovery resumes at the step reached: after 2 and before 3 the id is burned
 (nothing was signed); after 3 the frozen bytes are begun under the recorded
-id; after 4 the in-flight machinery drives it. A handed marker with no
+id, in the attempt's OWN generation, reconciled before anything else: a
+lost generation record is restored only when the lister shows that
+generation live, and otherwise the attempt is held visibly
+(`attempt_generation_unrecorded`, or `attempt_generation_not_recorded_one`
+when another is recorded); no other generation is ever selected or minted
+for it. After 4 the in-flight machinery drives it. A handed marker with no
 record holds, recorded on the record as `control.stuck` (reason
 `handed_without_record`), never re-sent. An attempt with no result past the
 settle horizon (`SETTLE_HORIZON_S`) is recorded stuck too (reason
@@ -116,6 +121,12 @@ STUCK_UNSETTLED = "unsettled_past_horizon"
 #: visibly, under this reason, never labelled `unconfigured_runtime`.
 HELD_NO_DESTINATION = "destination_unknown"
 DELEGATION_INACTIVE = "delegation_inactive"
+#: A frozen attempt whose generation cannot be used as recorded: held
+#: visibly (status `held`), never re-signed, never moved to another
+#: generation. An operator adopts the generation, or retires it.
+HELD_GENERATION_UNRECORDED = "attempt_generation_unrecorded"
+HELD_GENERATION_MISMATCH = "attempt_generation_not_recorded_one"
+GENERATION_HOLDS = frozenset({HELD_GENERATION_UNRECORDED, HELD_GENERATION_MISMATCH})
 #: The settle horizon: an attempt with no result this long after it was
 #: signed is recorded stuck. Reporting only, the in-flight records' own
 #: staleness bound (`inflight.STALE_AFTER_S`): nothing is settled on age.
@@ -497,8 +508,21 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
     sd = Path(cfg.state_dir)
     if cap is None:
         raise Unavailable(UNAVAILABLE)
-    gen = gen or generation(cfg, cap, now=now)
     attempt = record["control"]["attempt"]
+    if "gen" in attempt:
+        # The attempt is frozen in ITS generation, whose private counter
+        # holds its `n`: reconcile that generation first, never select (or
+        # mint) another and read the counter through it.
+        held = _attempt_generation(cfg, cap, attempt["gen"], now=now)
+        if held is not None:
+            if record["control"].get("held") != held:
+                _update(sd, record, held=held)
+            return "held_" + held
+        if record["control"].get("held") in GENERATION_HOLDS:
+            record = _update(sd, record, held=None)
+        gen = attempt["gen"]
+    else:
+        gen = gen or generation(cfg, cap, now=now)
     if "n" not in attempt:
         n = inflight.reserve_transport_id(cfg, config_mod.RUNTIME_NS)
         ts = format_utc_ts(clock_mod.now())        # signed now, never at the intent time
@@ -546,6 +570,28 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
                                             "since": format_utc_ts(now)})
             return "stuck_" + STUCK_UNSETTLED
     return f"attempt_{state}"
+
+
+def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime
+                        ) -> Optional[str]:
+    """None when a frozen attempt's generation `gen` is the recorded one, or
+    the record is lost and the lister shows `gen` live (the record is then
+    restored to it). Otherwise the reason the attempt is HELD, visibly:
+    `HELD_GENERATION_UNRECORDED` (no record, and `gen` not live), or
+    `HELD_GENERATION_MISMATCH` (another generation is recorded). Nothing is
+    minted here."""
+    try:
+        recorded: Optional[str] = config_mod.runtime_generation(cfg)
+    except config_mod.StateKeyUnresolved:
+        recorded = None
+    if recorded == gen:
+        return None
+    if recorded is not None:
+        return HELD_GENERATION_MISMATCH
+    if dict(cap.generations()).get(gen) == "live":
+        record_generation(cfg, gen, now=now)
+        return None
+    return HELD_GENERATION_UNRECORDED
 
 
 def _require_writable(cap: Capability, gen: str) -> None:

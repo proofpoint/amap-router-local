@@ -259,6 +259,41 @@ class AttemptTests(_Control):
         self.assertEqual(n, frozen["n"])
         self.assertEqual(doc["envelope"]["peer"]["statement_header"], frozen["header"])
 
+    def frozen_then_record_lost(self):
+        """A signed attempt frozen in generation A, a crash in begin_reserved
+        (before the in-flight record and the sender's admission), then
+        generation.json lost."""
+        key = self.refused()
+        with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
+            self.send()
+        attempt = self.record(key)["control"]["attempt"]
+        (self.state_dir / config_mod.RUNTIME_NS / config_mod.RUNTIME_GENERATION_FILE).unlink()
+        return key, attempt
+
+    def test_a_frozen_attempt_with_its_generation_record_lost_is_held_never_minted(self):
+        key, attempt = self.frozen_then_record_lost()
+        got = self.send()
+        self.assertEqual(got, {"held_" + peercontrol.HELD_GENERATION_UNRECORDED: 1})
+        self.assertEqual(self.record(key)["control"].get("held"),
+                         peercontrol.HELD_GENERATION_UNRECORDED)
+        self.assertFalse((self.state_dir / config_mod.RUNTIME_NS
+                          / config_mod.RUNTIME_GENERATION_FILE).exists(), "nothing minted")
+        self.assertEqual(self.tree.senders, {}, "nothing handed over")
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)
+        self.assertEqual(doc["held"], {peercontrol.HELD_GENERATION_UNRECORDED: 1})
+        self.assertEqual(self.send(), got, "the same visible hold, never an error")
+
+    def test_a_lost_record_beside_its_live_generation_is_restored_under_the_same_n(self):
+        key, attempt = self.frozen_then_record_lost()
+        self.tree.gens[attempt["gen"]] = "live"
+        self.send()
+        self.assertEqual(self.gen(), attempt["gen"], "the record is restored to it")
+        n, doc = self.handover(key)
+        self.assertEqual(n, attempt["n"], "begun under the recorded n")
+        self.assertEqual(doc["envelope"]["peer"]["statement_header"], attempt["header"])
+        self.assertIsNone(self.record(key)["control"].get("held"))
+        self.assertEqual(len(self.signs), 1, "never re-signed")
+
     def test_a_handed_marker_without_its_record_is_stuck_never_resent(self):
         key = self.refused()
         with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
