@@ -188,6 +188,23 @@ M = [
   '    request = dict(rec["request"], req_id=rid)\n    request["draft"] = dict(request["draft"], body_text="")\n',
   [T + "CompleteAloneTests.test_the_retransmit_from_the_copy_alone_carries_every_attachment",
    T + "RetransmitFlowTests.test_trigger_1_hands_the_original_bytes_under_a_new_n_and_settles_apart"]),
+ ("the verb requires an active delegation", PR,
+  '    rc = outbound._recheck_peer(cfg, name, rec, lambda why: _Refusal(why),\n                                key_id=cfg.delegation.signing_key_id)\n',
+  '    rc = outbound._recheck_peer(cfg, name, rec, lambda why: _Refusal(why))\n',
+  [T + "NoActiveDelegationTests.test_the_verb_claims_with_no_delegation_installed",
+   T + "NoActiveDelegationTests.test_show_reports_it_available_with_no_delegation_installed"]),
+ ("show omits the sender's policy", PR,
+  '        rc = _sender_recheck(cfg, name, copy)\n        verdict = (',
+  '        rc = None\n        verdict = (',
+  [T + "NoActiveDelegationTests.test_show_names_a_changed_policy_like_the_verb"]),
+ ("show says not answered under an untrusted clock", PR,
+  '    out["answered"] = (answered(cfg, lid, peer_id) if clock_trusted(cfg)\n',
+  '    out["answered"] = (answered(cfg, lid, peer_id) if True\n',
+  [T + "UntrustedClockShowAndPruneTests.test_show_never_says_not_answered_under_an_untrusted_clock"]),
+ ("the sweep ignores an untrusted clock", PR,
+  '    if not clock_trusted(cfg):\n        return 0                              # held, like every resend step',
+  '    if False:\n        return 0                              # held, like every resend step',
+  [T + "UntrustedClockShowAndPruneTests.test_the_sweep_holds_under_an_untrusted_clock"]),
 ]
 
 

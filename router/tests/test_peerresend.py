@@ -209,6 +209,8 @@ class RetransmitFlowTests(_Retransmit):
         k, _ = self.drain()
         self.assertIn(n, port.pending, "handed over under the new n")
         sent = json.loads(port.pending[n])
+        self.assertEqual(sent["request"]["req_id"], n, "the downstream sees an ordinary n")
+        self.assertNotIn(b"rtx.", port.pending[n], "the record's own name never leaves")
         self.assertEqual(sent["envelope"]["peer"], original["envelope"]["peer"], "never re-signed")
         self.assertEqual(sent["envelope"]["from_address"], original["envelope"]["from_address"])
         self.assertEqual(sent["request"]["draft"], original["request"]["draft"])
@@ -314,7 +316,7 @@ class RefusalTests(_Retransmit):
         k, pid = self.unknown()
         from router import outbound
         with mock.patch.object(outbound, "_recheck_peer",
-                               lambda cfg, name, rec, refuse: refuse("task_denied")):
+                               lambda cfg, name, rec, refuse, **kw: refuse("task_denied")):
             self.refused("policy_changed", k, pid)
 
 
@@ -985,3 +987,56 @@ class PendingRowsTests(unittest.TestCase):
         self.assertIn("PENDING, by name", section)
         for row in self.PENDING:
             self.assertIn(f"`{row}`", section, row)
+
+
+class NoActiveDelegationTests(_Retransmit):
+    """An operator command is a fresh process: no delegation is activated in
+    it. The verb and `show` work on the CONFIGURED key alone."""
+
+    def test_the_verb_claims_with_no_delegation_installed(self):
+        k, pid = self.unknown()
+        peerlane.forget_all()
+        try:
+            out = self.retransmit(k, pid)
+        except peerresend.Refused as e:
+            self.fail(f"refused without an active delegation: {e.code}: {e.detail}")
+        self.assertIn("claimed", out["result"])
+
+    def test_show_reports_it_available_with_no_delegation_installed(self):
+        k, pid = self.unknown()
+        peerlane.forget_all()
+        self.assertEqual(peerresend.show(k, pid, now=self.now())["actions"]["retransmit"],
+                         "available")
+
+    def test_show_names_a_changed_policy_like_the_verb(self):
+        k, pid = self.unknown()
+        from router import outbound
+        with mock.patch.object(outbound, "_recheck_peer",
+                               lambda cfg, name, rec, refuse, **kw: refuse("task_denied")):
+            self.assertEqual(peerresend.show(k, pid, now=self.now())["actions"]["retransmit"],
+                             "refused: policy_changed")
+
+
+class UntrustedClockShowAndPruneTests(_Retransmit):
+
+    def untrusted(self):
+        from router import peerclock
+        return mock.patch.object(peerclock, "read",
+                                 side_effect=peerclock.ClockUntrusted("lost"))
+
+    def test_show_never_says_not_answered_under_an_untrusted_clock(self):
+        k, pid = self.unknown()
+        with self.untrusted():
+            out = peerresend.show(k, pid, now=self.now())
+        self.assertEqual(out["answered"], "unknown (clock untrusted)")
+        self.assertEqual(out["actions"]["retransmit"], "refused: clock_untrusted")
+
+    def test_the_sweep_holds_under_an_untrusted_clock(self):
+        k, pid = self.unknown()
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        import datetime
+        far = self.now() + datetime.timedelta(days=60)
+        with self.untrusted():
+            self.assertEqual(peerresend.sweep(k, "alpha", far), 0)
+        self.assertTrue(d.is_dir())
+        self.assertEqual(peerresend.sweep(k, "alpha", far), 1, "pruned once trusted")

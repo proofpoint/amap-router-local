@@ -505,7 +505,10 @@ def _sender_recheck(cfg: Any, name: str, copy: Mapping[str, Any]) -> Optional[st
     from . import outbound
     rec = dict(copy["record"])
     rec["request"] = dict(rec["request"], req_id=rtx_name("00000000"))
-    rc = outbound._recheck_peer(cfg, name, rec, lambda why: _Refusal(why))
+    # The CONFIGURED key: this runs in an operator command, which never
+    # activates delegation (check_dynamic(configured=True) proved one is set).
+    rc = outbound._recheck_peer(cfg, name, rec, lambda why: _Refusal(why),
+                                key_id=cfg.delegation.signing_key_id)
     return None if rc.permitted else rc.why
 
 
@@ -664,10 +667,15 @@ def show(cfg: Any, peer_id: str, *, now: datetime) -> Dict[str, Any]:
                     if copy["claim"] else None)
     out["retransmits"] = retransmits(d)
     out["agent_result"] = _origin_result(cfg, lid, origin)
-    out["answered"] = answered(cfg, lid, peer_id)
+    # A received signed Result is readable only under a trusted clock: never
+    # report "not answered" when it cannot be known.
+    out["answered"] = (answered(cfg, lid, peer_id) if clock_trusted(cfg)
+                       else "unknown (clock untrusted)")
     try:
         check_dynamic(cfg, name, lid, copy, allow_pending=True, now=now, configured=True)
-        verdict = "available" if copy["claim"] is None else "refused: retransmit_pending"
+        rc = _sender_recheck(cfg, name, copy)
+        verdict = ("refused: policy_changed" if rc is not None
+                   else "available" if copy["claim"] is None else "refused: retransmit_pending")
     except Refused as e:
         verdict = f"refused: {e.code}"
     out["actions"] = {"reconcile": "this output, and the receiving router's status for the id",
@@ -695,6 +703,8 @@ def sweep(cfg: Any, name: str, now: datetime) -> int:
     if not enabled(cfg):
         return 0
     from . import inflight
+    if not clock_trusted(cfg):
+        return 0                              # held, like every resend step, until it recovers
     if not getattr(cfg, "peer_sent_prune", True):
         return 0
     try:

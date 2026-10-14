@@ -1817,7 +1817,10 @@ reachable only when the hand-over was found within 300 s of the statement's
 
 **The first hand-over, and after.** Before an `rtx.<n>` record's FIRST
 hand-over the drain re-runs every dynamic refusal; a failure is a terminal
-cancellation, settled `cancelled/<code>` with nothing handed. While the
+cancellation, settled `cancelled/<code>` with nothing handed. That outcome is
+this router's own: no transaction exists for it downstream and no
+downstream outcome, so `retransmit_cancelled` in status is never the
+downstream runtime's verdict. While the
 peer clock is untrusted the record is HELD instead (never handed, never
 cancelled). Once handed nothing cancels it. It settles as ITSELF, from
 every settle path, at `peer-sent/<id>/retransmits/<generation>-<n>.json`,

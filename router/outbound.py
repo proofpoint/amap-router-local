@@ -1988,7 +1988,7 @@ DETAIL_KEY_ROTATED = "signed under a signing key no longer configured; never re-
 
 def _recheck_peer(
     cfg: RouterConfig, name: str, record: Dict[str, Any],
-    refused: Callable[[str], inflight_mod.Recheck],
+    refused: Callable[[str], inflight_mod.Recheck], *, key_id: Optional[str] = None,
 ) -> inflight_mod.Recheck:
     """`_recheck` for a signed peer task. Permitted only while delegation is
     active, the recipient is still a trusted fleet host, `task_deny` still
@@ -1996,16 +1996,23 @@ def _recheck_peer(
     handed over is also refused when its signing key is no longer the
     configured one: it is never re-signed. A handed record is pending
     downstream and validly signed, so rotation alone never refuses it.
-    Exposure and `sender_since` are in the signed bytes: never re-evaluated."""
+    Exposure and `sender_since` are in the signed bytes: never re-evaluated.
+
+    `key_id`: an operator command's CONFIGURED signing key. Such a process
+    never activates delegation (only the drain's startup and reload do), so
+    it passes the key instead of requiring an active delegation; the drain
+    re-checks the active one before the first hand-over."""
     from . import peerlane
-    delegation = peerlane.active(cfg)
-    if delegation is None:
-        return refused("delegation is not active")
+    if key_id is None:
+        delegation = peerlane.active(cfg)
+        if delegation is None:
+            return refused("delegation is not active")
+        key_id = delegation.key_id
     pin = record["peer"]
     rid = record.get("request", {}).get("req_id")
     handed = isinstance(rid, str) and inflight_mod._was_handed(
         inflight_mod.handed_path(cfg, name, rid), record["transport_req_id"])
-    if not handed and pin["key_id"] != delegation.key_id:
+    if not handed and pin["key_id"] != key_id:
         return refused(DETAIL_KEY_ROTATED)
     recipient = record["recipients"][0]
     try:
