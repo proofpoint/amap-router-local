@@ -385,9 +385,12 @@ def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any
             frozen = _frozen_elsewhere(cfg, None)
             if others or frozen:
                 raise PlanPending(f"the planned mint is blocked by {others or frozen}")
-            record_generation(cfg, d["minted"], now=now)
         elif recorded != d["minted"]:
             raise PlanPending(f"another generation {recorded} is recorded")
+        # The planned generation's FULL effect, the record AND its pin, is
+        # replayed even when the record already names it: a pin write that
+        # failed after the record committed is completed here.
+        record_generation(cfg, d["minted"], now=now)
         return f"{retired}, minted {d['minted']}"
     raise PlanPending(f"unknown verb {verb!r}")
 
@@ -430,6 +433,83 @@ def _repair_verb_audit(cfg: Any, cap: Optional[Capability]) -> int:
         return 0
     _finish_verb_audit(cfg, marker, result=result, completed_on_repair=True)
     return 1
+
+
+ABANDON_PLAN_VERB = "runtime-generation abandon-plan"
+
+
+def _pending_plan(cfg: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(_verb_marker_path(cfg).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+
+
+def _refuse_while_plan_pending(cfg: Any, cap: Optional[Capability]) -> None:
+    """ONE plan at a time: every verb refuses, BEFORE any effect, while an
+    earlier plan is still pending (the caller has already tried to complete
+    it), naming why and its exits, so a committed effect's audit line is
+    never overwritten."""
+    marker = _pending_plan(cfg)
+    if marker is None:
+        return
+    try:
+        _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
+        why = "its completion has not been recorded yet"
+    except Exception as e:  # noqa: BLE001 -- the reason it is still pending
+        why = f"{type(e).__name__}: {e}"
+    raise ValueError(
+        f"a {marker.get('verb')} plan is pending: {why}. Its exits: it completes on its own "
+        "once its conditions hold (the next pass or verb retries it), or end it with "
+        "`router runtime-generation abandon-plan --evidence TEXT`, which audits what it "
+        "committed")
+
+
+def operator_abandon_plan(cfg: Any, cap: Optional[Capability], *, now: datetime,
+                          evidence: str) -> Dict[str, Any]:
+    """`router runtime-generation abandon-plan --evidence TEXT`: end a plan
+    that cannot complete. Intent first: the PLAN's own audit line (its id,
+    once) is appended, naming what it committed and that it was abandoned,
+    BEFORE the plan is removed. Idempotent: a repeat after a crash finds the
+    line and only removes the plan."""
+    if not evidence:
+        raise ValueError("evidence is required")
+    marker = _pending_plan(cfg)
+    if marker is None:
+        raise ValueError("no runtime-generation plan is pending")
+    try:
+        result = _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
+        _finish_verb_audit(cfg, marker, result=result, completed_on_repair=True)
+        return {"result": f"the {marker['verb']} plan completed: {result}", "audited": True}
+    except Exception as e:  # noqa: BLE001 -- it cannot complete: abandoned, audited
+        why = f"{type(e).__name__}: {e}"
+    try:
+        _finish_verb_audit(cfg, marker, result=f"abandoned incomplete ({why})",
+                           committed=_committed_so_far(cfg, cap, marker),
+                           abandoned_by=ABANDON_PLAN_VERB, evidence=evidence,
+                           abandoned_at=format_utc_ts(now))
+    except Exception as e:  # noqa: BLE001
+        raise AuditPending(f"the {marker['verb']} plan was not abandoned", e) from e
+    return {"result": f"abandoned the {marker['verb']} plan ({why})", "audited": True}
+
+
+def _committed_so_far(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any]) -> str:
+    """What of a plan took effect, read from the state it produces."""
+    verb, d = marker.get("verb"), marker.get("detail") or {}
+    try:
+        recorded: Optional[str] = config_mod.runtime_generation(cfg)
+    except config_mod.StateKeyUnresolved:
+        recorded = None
+    listed = dict(cap.generations()) if cap is not None else {}
+    if verb == ADOPT_VERB:
+        return "recorded" if recorded == d.get("generation") else "nothing"
+    gen = d.get("generation") if verb == RETIRE_VERB else d.get("retired")
+    parts = []
+    if listed.get(gen) == "retired":
+        parts.append(f"retired {gen}")
+    if verb == NEW_VERB and recorded == d.get("minted"):
+        parts.append(f"minted {recorded}")
+    return ", ".join(parts) or ("unknown (no capability)" if cap is None else "nothing")
 
 
 def _audit_marker(verb: str, now: datetime, **detail: Any) -> Dict[str, Any]:
@@ -601,6 +681,7 @@ def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: dateti
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     if not evidence:
         raise ValueError("evidence is required")
+    _refuse_while_plan_pending(cfg, cap)
     listed = dict(cap.generations())
     live = [g for g, s in listed.items() if s in ("live", "unreadable")]
     if live != [gen] or listed.get(gen) != "live":
@@ -670,6 +751,7 @@ def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datet
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     if not evidence:
         raise ValueError("evidence is required")
+    _refuse_while_plan_pending(cfg, cap)
     _check_retirable(cfg, cap, gen)
     marker = _begin_verb_audit(cfg, RETIRE_VERB, now, generation=gen, evidence=evidence)
     return _run_plan(cfg, cap, marker, now)
@@ -686,6 +768,7 @@ def operator_new(cfg: Any, cap: Optional[Capability], *, now: datetime,
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     if not evidence:
         raise ValueError("evidence is required")
+    _refuse_while_plan_pending(cfg, cap)
     gen = config_mod.runtime_generation(cfg)
     _check_retirable(cfg, cap, gen)
     _check_mint_after_retire(cfg, cap, gen)

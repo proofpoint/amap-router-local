@@ -251,6 +251,7 @@ CONTROL_SIGNER = "control_signer"
 CONTROL_MISROUTED = "misrouted"
 CONTROL_TS_WINDOW = "ts_window"
 UNKNOWN_ABOUT = "unknown_about"
+CONTROL_DUPLICATE = "duplicate"
 
 
 def _control_receive(profile: Profile) -> Callable:
@@ -290,6 +291,12 @@ def _control_receive(profile: Profile) -> Callable:
                 return peerjournal.Refuse(CONTROL_TS_WINDOW)
         except peerclock.Held:
             return peerjournal.Hold("admission_closed")
+        # Check 4 before check 5 (the spec oracle's order, v2.1 §3.1): a
+        # (runtime, id) already reserved is a duplicate, whatever `about`
+        # now names. The journal's reservation is the backstop.
+        rt, idk = peerbind.replay_keys(runtime.runtime, payload["id"])
+        if (Path(ctx.state_dir) / "peer-replay" / rt / (idk + peerbind.RESERVATION_SUFFIX)).exists():
+            return peerjournal.Refuse(CONTROL_DUPLICATE)
         domains = {d.lower() for d in runtime.domains}
         matches = []
         for lid, rel, data, rec in peerledger.find_issued(ctx.state_dir, payload["about"]):

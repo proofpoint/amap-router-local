@@ -173,15 +173,19 @@ class AcceptedControlTests(_ControlIn):
         self.assertEqual(got, ("RecoveryCorrupt", "kind"))
 
     def test_a_reply_to_the_failure_notice_has_no_binding(self):
-        from router import binding
+        from router import outbound
+        from router.tests.helpers import read_json, result_path, write_request
         self.issued()
         self.entry(self.control_raw())
         self.poll()
         notice_id = self.inbox_notices()[0].name[len("notice-"):-len(".json")]
-        rec = json.loads(binding.ledger_path(self.state_dir, "bob", notice_id,
-                                             state_key=self.lid).read_text())
-        self.assertEqual((rec["from_instance"], rec.get("authored_by")), (None, "router"),
-                         "a router-authored record: a reply to it is unresolved_reply")
+        write_request(self.cfg, "bob", "00000001", to=[OWN], body_text="why?",
+                      in_reply_to=notice_id)
+        outbound.drain_instance(self.cfg, "bob", transport=None)
+        p = result_path(self.cfg, "bob", "00000001")
+        result = read_json(p) if p.exists() else {}
+        self.assertEqual((result.get("outcome"), result.get("reason_code")),
+                         ("rejected", "unresolved_reply"), "a reply to it is refused at submit")
 
     def test_a_late_control_after_expires_at_still_finds_its_record(self):
         self.issued(expires="2026-10-13T11:00:00Z")
@@ -254,6 +258,18 @@ class DuplicateTests(_ControlIn):
         self.poll()
         self.assertEqual(self.outcome(CID2), ("done", "dropped", "duplicate", None))
         self.assertEqual(len(self.inbox_notices()), 1)
+
+    def test_a_replay_under_new_bytes_is_a_duplicate_even_once_about_is_gone(self):
+        """Check 4 before check 5, as the spec oracle orders them: the
+        (runtime, id) is already reserved, so it is a duplicate, never
+        unknown_about."""
+        self.issued()
+        self.entry(self.control_raw())
+        self.poll()
+        (self.state_dir / self.lid / "peer-ledger" / f"{ABOUT}.json").unlink()
+        self.entry(self.control_raw(cause="policy", policy_code="x"), ident=CID2)
+        self.poll()
+        self.assertEqual(self.outcome(CID2), ("done", "dropped", "duplicate", None))
 
     def test_a_second_control_about_the_same_message_is_dropped(self):
         self.issued()

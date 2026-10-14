@@ -620,6 +620,26 @@ class AttemptTests(_Control):
         self.assertEqual(len(lines), 1)
         self.assertIn(planned, lines[0].get("result", ""))
 
+    def test_new_whose_pin_write_fails_after_the_planned_record_is_completed(self):
+        a = "a" * 32
+        self.tree.gens[a] = "live"
+        peercontrol.record_generation(self.cfg, a, now=NOW)
+        pin_before = self.pin_path()
+        self.assertTrue(pin_before.is_file())
+        from router import hoplink
+        with self.fail_once(peercontrol, "atomic_write",
+                            lambda path, *_a, **_k: Path(path).name == hoplink.PIN_FILE):
+            code, err = self.cli("new")
+        self.assertEqual(code, 3, err)
+        self.assertIn("COMMITTED", err)
+        planned = self.marker()["detail"]["minted"]
+        self.assertEqual(self.recorded(), planned, "the planned record committed")
+        self.assertFalse(self.pin_path().exists(), "its pin did not")
+        self.send()                               # an empty-queue pass completes it
+        self.assertTrue(self.pin_path().is_file(), "the pin is written by the completion")
+        self.assertIsNone(self.marker())
+        self.assertEqual(len(self.acts(peercontrol.NEW_VERB)), 1)
+
     def test_new_whose_record_removal_fails_mid_rotation_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
@@ -635,6 +655,55 @@ class AttemptTests(_Control):
         self.assertEqual(self.recorded(), planned)
         self.assertEqual(self.tree.gens[a], "retired")
         self.assertEqual(len(self.acts(peercontrol.NEW_VERB)), 1)
+
+    def pending_new_plan(self):
+        """`new` with A live: the retire commits, then B goes live before the
+        mint, so the plan cannot complete (Committed, pending)."""
+        a, b = "a" * 32, "b" * 32
+        self.tree.gens[a] = "live"
+        peercontrol.record_generation(self.cfg, a, now=NOW)
+        real = peercontrol._retire_idempotent
+
+        def retire_then_b_live(*args, **kwargs):
+            out = real(*args, **kwargs)
+            self.tree.gens[b] = "live"
+            return out
+        with mock.patch.object(peercontrol, "_retire_idempotent", retire_then_b_live):
+            code, err = self.cli("new")
+        self.assertEqual(code, 3, err)
+        marker = self.marker()
+        self.assertEqual((marker or {}).get("verb"), peercontrol.NEW_VERB)
+        return a, b, marker
+
+    def test_no_verb_overwrites_a_pending_plan(self):
+        a, b, marker = self.pending_new_plan()
+        code, err = self.cli("adopt", gen=b)
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"a {peercontrol.NEW_VERB} plan is pending", err)
+        self.assertIn("abandon-plan", err, "the refusal names the exit")
+        self.assertEqual(self.marker(), marker, "the plan is untouched")
+        self.assertEqual(self.acts(peercontrol.ADOPT_VERB), [])
+        code, err = self.cli("abandon-plan")
+        self.assertEqual(code, 0, err)
+        lines = [l for l in self.audit() if l.get("audit_id") == marker["id"]]
+        self.assertEqual(len(lines), 1, "the NEW plan's line, exactly once")
+        self.assertEqual(lines[0].get("act"), peercontrol.NEW_VERB)
+        self.assertIn(f"retired {a}", lines[0].get("committed", ""))
+        self.assertIsNone(self.marker())
+        code, err = self.cli("adopt", gen=b)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1)
+        self.assertEqual(len([l for l in self.audit() if l.get("audit_id") == marker["id"]]), 1)
+
+    def test_every_verb_refuses_while_a_plan_is_pending(self):
+        a, b, marker = self.pending_new_plan()
+        for command, args in (("adopt", {"gen": b}), ("retire", {"gen": b}), ("new", {})):
+            with self.subTest(command=command):
+                code, err = self.cli(command, **args)
+                self.assertEqual(code, 1, err)
+                self.assertIn("plan is pending", err)
+                self.assertEqual(self.marker(), marker)
+                self.assertEqual(self.tree.gens[b], "live", "nothing retired")
 
     def test_a_blocked_store_is_a_clean_refusal(self):
         key = self.held_beside_live_b()
