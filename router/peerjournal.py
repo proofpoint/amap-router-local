@@ -57,7 +57,7 @@ import shutil
 import stat
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import logging
 
@@ -579,9 +579,6 @@ def _check_bookkeeping(state_dir: Path, meta: Mapping[str, Any]) -> None:
                                "cannot pass")
 
 
-#: The operations `pending_op` names (every writer of it in this package).
-PENDING_OPS = frozenset({"register_root", "take", "snapshot", "record", "reserve", "done",
-                         "prune", "epoch", "epoch_prune", "epoch_recount"})
 _ROOT_MEMBERS = frozenset({"token", "live", "high_seq", "content_sum", "rev_total"})
 _DELTA_MEMBERS = frozenset({"store", "owner", "sum", "rev", "live"})
 _DIGITS = re.compile(r"[0-9]+\Z")
@@ -591,13 +588,47 @@ def _is_count(v: Any) -> bool:
     return type(v) is int and v >= 0
 
 
+def _is_str(v: Any) -> bool:
+    return isinstance(v, str) and bool(v)
+
+
+def _is_key(v: Any) -> bool:
+    return isinstance(v, str) and bool(_KEY_RE.fullmatch(v))
+
+
+def _is_seq(v: Any) -> bool:
+    return type(v) is int and v >= 1
+
+
+#: Every `pending_op` this package writes, EXACTLY (each writer's literal):
+#: its members beyond `op` and `owner`, each member's check, the owner's
+#: form (`str`: the op's own owner; None: always null), and the stores its
+#: `delta` list holds, in order (None: the op has no delta).
+PENDING_OP_FORMS: Dict[str, Tuple[Dict[str, Callable[[Any], bool]], str, Optional[Tuple[str, ...]]]] = {
+    "register_root": ({}, "str", None),
+    "take": ({"key": _is_key, "seq": _is_seq}, "str", ("root",)),
+    "snapshot": ({"key": _is_key, "name": _is_str}, "str", ("root",)),
+    "record": ({"key": _is_key, "rev": _is_seq}, "str", ("root",)),
+    "reserve": ({"rt": _is_str, "idk": _is_str, "seq": _is_seq}, "none", ("replay",)),
+    "done": ({"rt": _is_str, "idk": _is_str}, "none", ("replay",)),
+    "prune": ({"key": _is_key, "replay_ref": lambda v: v is None or _is_str(v)}, "str",
+              ("root", "replay")),
+    "epoch": ({"target": _is_str}, "none", ("epochs",)),
+    "epoch_prune": ({"target": _is_str}, "none", ("epochs",)),
+    "epoch_recount": ({"targets": lambda v: type(v) is list and all(_is_str(t) for t in v)},
+                      "none", None),
+}
+#: The operation names, for readers that need only the set.
+PENDING_OPS = frozenset(PENDING_OP_FORMS)
+
+
 def _check_meta_shape(meta: Mapping[str, Any]) -> None:
     """The bookkeeping `_check_bookkeeping` relies on, validated EXACTLY,
     before any conversion or truthiness fallback: `roots` a mapping of owner
     to the closed root entry `_root_entry` writes, and `pending_op` null or
-    one of `PENDING_OPS` with a well-formed `delta` list when it has one.
-    Anything else (an empty list for a mapping, `false` or `[]` for no
-    operation, an operation without its name) is `JournalBlind`."""
+    EXACTLY one of the forms its writers emit (`PENDING_OP_FORMS`): the
+    name's type first, then every member, then the delta's stores in order.
+    Anything else is `JournalBlind`."""
     def bad(what: str) -> JournalBlind:
         return JournalBlind(f"the store bookkeeping is not the shape this router writes ({what}), "
                             "so this check cannot pass")
@@ -614,20 +645,33 @@ def _check_meta_shape(meta: Mapping[str, Any]) -> None:
     op = meta.get("pending_op")
     if op is None:
         return
-    if not (type(op) is dict and op.get("op") in PENDING_OPS and "owner" in op
-            and (op["owner"] is None or isinstance(op["owner"], str))):
+    if type(op) is not dict:
         raise bad("pending_op is neither null nor an operation")
-    if "delta" in op:
-        delta = op["delta"]
-        if type(delta) is not list:
-            raise bad("pending_op's delta is not a list")
-        for d in delta:
-            if not (type(d) is dict and set(d) == _DELTA_MEMBERS
-                    and d["store"] in ("root", "replay", "epochs")
-                    and (d["owner"] is None or isinstance(d["owner"], str))
-                    and isinstance(d["sum"], str) and _DIGITS.fullmatch(d["sum"])
-                    and type(d["rev"]) is int and type(d["live"]) is int):
-                raise bad("an entry of pending_op's delta")
+    name = op.get("op")
+    if not isinstance(name, str) or name not in PENDING_OP_FORMS:
+        raise bad("pending_op names no operation this router writes")
+    members, owner_form, stores = PENDING_OP_FORMS[name]
+    want = {"op", "owner"} | set(members) | ({"delta"} if stores is not None else set())
+    if set(op) != want:
+        raise bad(f"pending_op {name} has members {sorted(op)}, not {sorted(want)}")
+    owner = op["owner"]
+    if not (owner is None if owner_form == "none" else _is_str(owner)):
+        raise bad(f"pending_op {name}'s owner")
+    for member, check in members.items():
+        if not check(op[member]):
+            raise bad(f"pending_op {name}'s {member}")
+    if stores is None:
+        return
+    delta = op["delta"]
+    if type(delta) is not list or len(delta) != len(stores):
+        raise bad(f"pending_op {name}'s delta is not {len(stores)} entr"
+                  f"{'y' if len(stores) == 1 else 'ies'}")
+    for d, store in zip(delta, stores):
+        if not (type(d) is dict and set(d) == _DELTA_MEMBERS and d["store"] == store
+                and d["owner"] == (owner if store == "root" else None)
+                and isinstance(d["sum"], str) and _DIGITS.fullmatch(d["sum"])
+                and type(d["rev"]) is int and type(d["live"]) is int):
+            raise bad(f"an entry of pending_op {name}'s delta")
 
 
 def _strict_walk(state_dir: Path) -> List[Dict[str, Any]]:

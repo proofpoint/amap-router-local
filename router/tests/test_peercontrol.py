@@ -1246,6 +1246,32 @@ class StrictJournalGuardTests(_Control):
                                                               "delta": {}}),
             "pending_op's delta entry incomplete": dict(pending_op={"op": "take", "owner": owner,
                                                                     "delta": [{"store": "root"}]}),
+            # Codex's probes: an unhashable name, and named operations
+            # missing what their writers always write.
+            "an unhashable op name": dict(pending_op={"op": [], "owner": owner}),
+            "take without key, seq and delta": dict(pending_op={"op": "take", "owner": owner}),
+            "record without key, rev and its delta": dict(pending_op={"op": "record",
+                                                                      "owner": owner,
+                                                                      "delta": []}),
+            "an extra member": dict(pending_op={"op": "register_root", "owner": owner,
+                                                "x": 1}),
+            "a null owner where the writer names one": dict(pending_op={"op": "register_root",
+                                                                        "owner": None}),
+            # The owner is right for take, so only the store check refuses it.
+            "take's delta for another store": dict(pending_op={
+                "op": "take", "owner": owner, "key": "a" * 64, "seq": 1,
+                "delta": [{"store": "replay", "owner": owner, "sum": "0", "rev": 0,
+                           "live": 1}]}),
+            "take's delta for another owner": dict(pending_op={
+                "op": "take", "owner": owner, "key": "a" * 64, "seq": 1,
+                "delta": [{"store": "root", "owner": "someone-else", "sum": "0", "rev": 0,
+                           "live": 1}]}),
+            "take with a seq of zero": dict(pending_op={
+                "op": "take", "owner": owner, "key": "a" * 64, "seq": 0,
+                "delta": [{"store": "root", "owner": owner, "sum": "0", "rev": 0, "live": 1}]}),
+            "prune with one delta, not two": dict(pending_op={
+                "op": "prune", "owner": owner, "key": "a" * 64, "replay_ref": None,
+                "delta": [{"store": "root", "owner": owner, "sum": "0", "rev": 0, "live": -1}]}),
         }
         for label, changes in rows.items():
             with self.subTest(row=label):

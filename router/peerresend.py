@@ -459,10 +459,11 @@ def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
 def gate(cfg: Any, name: str, record: Mapping[str, Any], now: datetime) -> Optional[Tuple[str, str]]:
     """Before a retransmit record's FIRST hand-over: every dynamic refusal
     again, the copy's re-checks included. `(code, detail)` cancels it,
-    unless the code is in `HOLD_CODES`, which hold it instead. (The
-    drain holds a record BEFORE this, unhanded and unsettled, while the clock
-    is untrusted or the receive journal cannot be read reliably:
-    `outbound._advance_one`.) (A
+    unless the code is in `HOLD_CODES` (the clock untrusted, the receive
+    journal unreadable: router states), which the caller turns into a hold,
+    unhanded and unsettled, gated again next poll
+    (`outbound._recheck_retransmit`, `inflight.Recheck.hold`). This is the
+    one read that decides; nothing gates before it. (A
     record in a fenced generation never reaches it: under the hop a fenced
     generation advances only once its tree is retired, and an unhanded
     record there settles `rejected/no_route` first, `inflight.advance`.)"""

@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from router import config as config_mod
@@ -479,6 +479,48 @@ class TrustVerbTests(_Epochs):
         doc["store"]["roots"] = []
         path.write_text(json.dumps(doc))
         self.assert_not_reseeded("not the shape this router writes")
+
+    def test_every_pending_op_the_real_writers_emit_passes_the_shape_check(self):
+        """Positive witnesses from the WRITERS themselves: every pending_op
+        written during a real take, evaluation (reservation, done marker,
+        epoch), trust verb and retention prune is captured as written, and
+        each passes `_check_meta_shape`. A form the check refuses would be a
+        refusal of a live router's own state."""
+        import copy
+        from unittest import mock
+        seen = []
+        real = peerjournal._write_meta
+
+        def capture(state_dir, meta):
+            if meta.get("pending_op") is not None:
+                seen.append(copy.deepcopy(meta))
+            return real(state_dir, meta)
+        with mock.patch.object(peerjournal, "_write_meta", capture):
+            rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+            peerepochs.set_untrusted(self.state_dir, "test")
+            peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+            # A newer sender_since for the same sender prunes the older epoch.
+            self.decide(payload(sender_since=ts(-2 * DAY)))
+            # The retention sweep past the record's horizon prunes it.
+            rt, idk = rec["replay_ref"].split("/")
+            stamp = json.loads((self.state_dir / peerjournal.REPLAY_DIR / rt
+                                / f"{idk}.json").read_text())["ts"]
+            horizon = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc) + timedelta(seconds=3600 + 300 + 1)
+            peerjournal.advance_frontier(self.state_dir)
+            peerclock.advance(self.state_dir, horizon)
+            peerjournal.sweep(self.state_dir, horizon, enabled=True)
+        ops = sorted({m["pending_op"]["op"] for m in seen})
+        for m in seen:
+            with self.subTest(op=m["pending_op"]["op"]):
+                try:
+                    peerjournal._check_meta_shape(m)
+                    refused = None
+                except peerjournal.JournalBlind as e:
+                    refused = str(e)
+                self.assertIsNone(refused, "a real writer's own form refused")
+        self.assertEqual(set(ops), set(peerjournal.PENDING_OP_FORMS),
+                         "every form the check knows was emitted by a real writer here")
 
     def test_a_never_journaled_store_still_clears(self):
         self.assertFalse(peerjournal.journal_present(self.state_dir))

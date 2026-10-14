@@ -1055,9 +1055,24 @@ class StrictJournalAnsweredTests(_Retransmit):
         self.record_path(other).write_text("{")
         port = self.plugin.ports[-1]
         before = dict(port.pending)
-        with mock.patch.object(peerresend, "journal_blind", return_value=None), \
-                self.assertNoLogs("amap_router_local.outbound", level="ERROR"):
-            k, _ = self.drain()            # a clean hold: nothing isolated as an error
+        import logging
+        records = []
+        handler = logging.Handler(level=logging.DEBUG)
+        handler.emit = records.append
+        loggers = [logging.getLogger("amap_router_local.outbound"),
+                   logging.getLogger("amap_router_local.inflight")]
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            with mock.patch.object(peerresend, "journal_blind", return_value=None):
+                k, _ = self.drain()
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+        # A clean hold: nothing isolated as an error, and the hold itself said.
+        self.assertEqual([r.getMessage() for r in records if r.levelno >= logging.ERROR], [])
+        self.assertTrue(any("held, not published" in r.getMessage() for r in records),
+                        [r.getMessage() for r in records])
         self.assertEqual(port.pending, before, "nothing handed")
         d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
         self.assertEqual(peerresend.retransmits(d), [], "never cancelled: no settlement")
