@@ -1827,18 +1827,10 @@ def _advance_one(
     new file as `req_id_reused`."""
     from . import peerresend
     if "retransmit" in record:
-        if (not inflight_mod._was_handed(inflight_mod.handed_path(cfg, name, req_id),
-                                         record["transport_req_id"])
-                and (not peerresend.clock_trusted(cfg)
-                     or peerresend.journal_blind(cfg) is not None)):
-            # Before its first hand-over the gate must see a received Result,
-            # which needs the clock and a journal it can read reliably: HELD
-            # (never cancelled) until both hold.
-            if (name, req_id) not in _STALE_WARNED:
-                _STALE_WARNED.add((name, req_id))
-                logger.warning("instance %r: retransmit %r held: the peer clock is untrusted, "
-                               "or the receive journal cannot be read reliably", name, req_id)
-            return inflight_mod.BLOCKED
+        # Before its first hand-over the gate must see a received Result,
+        # which needs the clock and a journal it can read reliably: the gate
+        # (`_recheck_retransmit`) HOLDS it, never cancels, until both hold,
+        # in the one read that decides (`peerresend.HOLD_CODES`).
         # A retransmit settles as ITSELF, from every settle path alike:
         # never the agent's Result, never its anchor (the original in-flight
         # record is their only writer).
@@ -1914,6 +1906,9 @@ def _recheck_retransmit(
                                       record["transport_req_id"])
     if not handed:
         cancel = peerresend.gate(cfg, name, record, clock.now())
+        if cancel is not None and cancel[0] in peerresend.HOLD_CODES:
+            # A router state, not a verdict on the task: held, never cancelled.
+            return inflight_mod.Recheck(False, why=f"{cancel[0]}: {cancel[1]}", hold=True)
         if cancel is not None:
             code, detail = cancel
             return inflight_mod.Recheck(False, why=f"{code}: {detail}", verdict={

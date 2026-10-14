@@ -472,6 +472,14 @@ class TrustVerbTests(_Epochs):
          / peerjournal.RECORD).write_text("[]")
         self.assert_not_reseeded("is not a record")
 
+    def test_a_malformed_roots_reseeds_nothing_and_keeps_the_flag(self):
+        self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"]["roots"] = []
+        path.write_text(json.dumps(doc))
+        self.assert_not_reseeded("not the shape this router writes")
+
     def test_a_never_journaled_store_still_clears(self):
         self.assertFalse(peerjournal.journal_present(self.state_dir))
         peerepochs.set_untrusted(self.state_dir, "test")

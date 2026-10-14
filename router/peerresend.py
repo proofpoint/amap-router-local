@@ -75,6 +75,10 @@ RTX_PREFIX = "rtx."
 PRUNE_GRACE = timedelta(days=7)
 #: The retransmit's terminal outcome before any hand-over.
 CANCELLED = "cancelled"
+#: Dynamic refusals that are ROUTER states, not task states: before the first
+#: hand-over they HOLD a retransmit record (unhanded, unsettled, gated again
+#: next poll), never cancel it. They clear by themselves.
+HOLD_CODES = frozenset({"clock_untrusted", "journal_unreadable"})
 _PEER_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{22}\Z")
 _RTX_RE = re.compile(r"rtx\.[0-9]{8,18}\Z")
 
@@ -454,7 +458,8 @@ def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
 
 def gate(cfg: Any, name: str, record: Mapping[str, Any], now: datetime) -> Optional[Tuple[str, str]]:
     """Before a retransmit record's FIRST hand-over: every dynamic refusal
-    again, the copy's re-checks included. `(code, detail)` cancels it. (The
+    again, the copy's re-checks included. `(code, detail)` cancels it,
+    unless the code is in `HOLD_CODES`, which hold it instead. (The
     drain holds a record BEFORE this, unhanded and unsettled, while the clock
     is untrusted or the receive journal cannot be read reliably:
     `outbound._advance_one`.) (A

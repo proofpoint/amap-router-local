@@ -473,6 +473,8 @@ def all_records(state_dir: Path) -> List[Dict[str, Any]]:
         meta = read_meta(state_dir)
     except (OSError, ValueError, StoreAbsent, peerclock.ClockUntrusted):
         return []
+    if type(meta.get("roots")) is not dict:
+        return []                       # not readable as written; strict_records says why
     out = []
     for owner in sorted(meta["roots"]):
         root = journal_root(state_dir, owner)
@@ -554,32 +556,78 @@ def _check_bookkeeping(state_dir: Path, meta: Mapping[str, Any]) -> None:
     """Every journal root the bookkeeping lists is on disk and holds exactly
     what the bookkeeping says: a record deleted whole, or a root gone,
     leaves nothing on disk for the walk to see. An operation still pending
-    on a root may have run or not. A bookkeeping entry not of the shape this
-    module writes is `JournalBlind` too, never a bare exception."""
-    try:
-        roots = dict(meta["roots"])
-        op = meta.get("pending_op") or {}
-        deltas = [x for x in (op.get("delta") or ()) if x.get("store") == "root"]
-        for owner, entry in sorted(roots.items()):
-            want = (int(entry["live"]), str(entry["content_sum"]), int(entry["rev_total"]))
-            if not journal_root(state_dir, owner).is_dir():
-                raise JournalBlind(f"the journal root {owner} the bookkeeping lists is missing, "
-                                   "so this check cannot pass")
-            try:
-                live, _high, total, revs, _seqs = _scan_root(state_dir, owner)
-            except (OSError, ValueError, KeyError, TypeError) as e:
-                raise JournalBlind(f"the journal root {owner} cannot be read "
-                                   f"({type(e).__name__}), so this check cannot pass") from None
-            d = next((x for x in deltas if x.get("owner") == owner), None)
-            if not ((live, str(total), revs) == want or _rolled(entry, d, live, total, revs)):
-                raise JournalBlind(f"the journal root {owner} does not match its bookkeeping (a "
-                                   "record lost or changed outside the router), so this check "
-                                   "cannot pass")
-    except (KeyError, TypeError, AttributeError, ValueError) as e:
-        if isinstance(e, JournalBlind):
-            raise
-        raise JournalBlind(f"the store bookkeeping is not the shape this router writes "
-                           f"({type(e).__name__}), so this check cannot pass") from None
+    on a root may have run or not. The bookkeeping's shape is validated
+    first (`_check_meta_shape`), so nothing below converts or guesses."""
+    _check_meta_shape(meta)
+    roots = meta["roots"]
+    op = meta["pending_op"]
+    deltas = [x for x in (op.get("delta", []) if op is not None else []) if x["store"] == "root"]
+    for owner, entry in sorted(roots.items()):
+        want = (entry["live"], entry["content_sum"], entry["rev_total"])
+        if not journal_root(state_dir, owner).is_dir():
+            raise JournalBlind(f"the journal root {owner} the bookkeeping lists is missing, "
+                               "so this check cannot pass")
+        try:
+            live, _high, total, revs, _seqs = _scan_root(state_dir, owner)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise JournalBlind(f"the journal root {owner} cannot be read "
+                               f"({type(e).__name__}), so this check cannot pass") from None
+        d = next((x for x in deltas if x["owner"] == owner), None)
+        if not ((live, str(total), revs) == want or _rolled(entry, d, live, total, revs)):
+            raise JournalBlind(f"the journal root {owner} does not match its bookkeeping (a "
+                               "record lost or changed outside the router), so this check "
+                               "cannot pass")
+
+
+#: The operations `pending_op` names (every writer of it in this package).
+PENDING_OPS = frozenset({"register_root", "take", "snapshot", "record", "reserve", "done",
+                         "prune", "epoch", "epoch_prune", "epoch_recount"})
+_ROOT_MEMBERS = frozenset({"token", "live", "high_seq", "content_sum", "rev_total"})
+_DELTA_MEMBERS = frozenset({"store", "owner", "sum", "rev", "live"})
+_DIGITS = re.compile(r"[0-9]+\Z")
+
+
+def _is_count(v: Any) -> bool:
+    return type(v) is int and v >= 0
+
+
+def _check_meta_shape(meta: Mapping[str, Any]) -> None:
+    """The bookkeeping `_check_bookkeeping` relies on, validated EXACTLY,
+    before any conversion or truthiness fallback: `roots` a mapping of owner
+    to the closed root entry `_root_entry` writes, and `pending_op` null or
+    one of `PENDING_OPS` with a well-formed `delta` list when it has one.
+    Anything else (an empty list for a mapping, `false` or `[]` for no
+    operation, an operation without its name) is `JournalBlind`."""
+    def bad(what: str) -> JournalBlind:
+        return JournalBlind(f"the store bookkeeping is not the shape this router writes ({what}), "
+                            "so this check cannot pass")
+    roots = meta.get("roots")
+    if type(roots) is not dict:
+        raise bad("roots is not a mapping")
+    for owner, entry in roots.items():
+        if not (isinstance(owner, str) and type(entry) is dict and set(entry) == _ROOT_MEMBERS
+                and isinstance(entry["token"], str) and _is_count(entry["live"])
+                and _is_count(entry["high_seq"]) and _is_count(entry["rev_total"])
+                and isinstance(entry["content_sum"], str)
+                and _DIGITS.fullmatch(entry["content_sum"])):
+            raise bad(f"the root entry for {owner!r}")
+    op = meta.get("pending_op")
+    if op is None:
+        return
+    if not (type(op) is dict and op.get("op") in PENDING_OPS and "owner" in op
+            and (op["owner"] is None or isinstance(op["owner"], str))):
+        raise bad("pending_op is neither null nor an operation")
+    if "delta" in op:
+        delta = op["delta"]
+        if type(delta) is not list:
+            raise bad("pending_op's delta is not a list")
+        for d in delta:
+            if not (type(d) is dict and set(d) == _DELTA_MEMBERS
+                    and d["store"] in ("root", "replay", "epochs")
+                    and (d["owner"] is None or isinstance(d["owner"], str))
+                    and isinstance(d["sum"], str) and _DIGITS.fullmatch(d["sum"])
+                    and type(d["rev"]) is int and type(d["live"]) is int):
+                raise bad("an entry of pending_op's delta")
 
 
 def _strict_walk(state_dir: Path) -> List[Dict[str, Any]]:

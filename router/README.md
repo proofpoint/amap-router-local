@@ -1798,7 +1798,7 @@ transport id, no record):
 | `not_preserved`, `ambiguous`, `preservation_damaged` | no committed copy, one under two identities, or a copy that fails its re-checks |
 | `retransmit_pending` | a retransmit of this id is already claimed |
 | `clock_untrusted` | the peer clock is untrusted: a received signed Result lives in the receive journal, readable only under it |
-| `journal_unreadable` | the receive journal cannot be read reliably, so a received signed Result cannot be ruled out: the clock holds no store bookkeeping beside a journal, a record is unreadable, not a record or missing from its directory, a journal root is missing or does not match its bookkeeping, a journal directory cannot be listed, or a placed statement's snapshot cannot be read. Read through `peerjournal.strict_records`, never as "not answered" |
+| `journal_unreadable` | the receive journal cannot be read reliably, so a received signed Result cannot be ruled out: the clock holds no store bookkeeping beside a journal, the bookkeeping is not the exact shape the router writes (its roots, a root entry, or a pending operation), a record is unreadable, not a record or missing from its directory, a journal root is missing or does not match its bookkeeping, a journal directory cannot be listed, or a placed statement's snapshot cannot be read. Read through `peerjournal.strict_records`, never as "not answered" |
 | `peer_lane_inactive`, `key_rotated` | no delegation configured, or the copy was signed under another key than the CONFIGURED signing key (conservative: a receiver in a rotation overlap might still accept it) |
 | `outside_window` | now is past the statement's `ts + P + F` |
 | `answered` | a control notice (the one-per-message `notified/` marker) or a signed Result replying to it was received |
@@ -1824,8 +1824,10 @@ downstream outcome, so `retransmit_cancelled` in status is never the
 downstream runtime's verdict. While the
 peer clock is untrusted, or the receive journal cannot be read reliably
 (`journal_unreadable` above), the record is HELD instead (never handed,
-never cancelled), and so is a claim not yet begun; `show` reports
-`answered` as unknown rather than "not answered". Once handed nothing cancels it. It settles as ITSELF, from
+never cancelled): those two are router states, not verdicts on the task
+(`peerresend.HOLD_CODES`), so the gate's own read holds it and it is gated
+again next poll. A claim not yet begun is held the same way; `show`
+reports `answered` as unknown rather than "not answered". Once handed nothing cancels it. It settles as ITSELF, from
 every settle path, at `peer-sent/<id>/retransmits/<generation>-<n>.json`,
 never as the agent's Result or anchor: the original is their only writer.
 Then its record goes, then `peer-request retransmit settled` is audited

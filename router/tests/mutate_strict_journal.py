@@ -25,6 +25,7 @@ OUT = "router/outbound.py"
 E = "router.tests.test_peerepochs.TrustVerbTests."
 G = "router.tests.test_peercontrol.StrictJournalGuardTests."
 PR, PE, PJ = "router/peerresend.py", "router/peerepochs.py", "router/peerjournal.py"
+INF = "router/inflight.py"
 
 M = [
  ("S1 answered reads the lenient journal", PR,
@@ -44,10 +45,6 @@ M = [
   '    except peerjournal.JournalBlind as e:\n        raise Refused("journal_unreadable"',
   '    except KeyError as e:\n        raise Refused("journal_unreadable"',
   [A + "test_an_unreadable_record_refuses"]),
- ("S5 the drain hands a retransmit while the journal cannot be read", OUT,
-  '                and (not peerresend.clock_trusted(cfg)\n                     or peerresend.journal_blind(cfg) is not None)):\n',
-  '                and (not peerresend.clock_trusted(cfg))):\n',
-  [A + "test_a_claim_is_held_never_handed_while_the_journal_is_unreadable"]),
  ("S6 a claim never begun is not held", PR,
   '        if settled is None and live is None and (not clock_trusted(cfg) or journal_blind(cfg)):\n',
   '        if settled is None and live is None and not clock_trusted(cfg):\n',
@@ -65,11 +62,35 @@ M = [
   '        except pj.JournalBlind as e:\n            # Nothing reseeded from a partial view; the flag stays.\n',
   '        except KeyError as e:\n            # Nothing reseeded from a partial view; the flag stays.\n',
   [E + "test_a_record_that_is_not_a_record_reseeds_nothing"]),
- ("S10 a malformed bookkeeping entry escapes as a bare error", PJ,
-  '    except (KeyError, TypeError, AttributeError, ValueError) as e:\n        if isinstance(e, JournalBlind):\n',
-  '    except (ValueError,) as e:\n        if isinstance(e, JournalBlind):\n',
-  [G + "test_a_malformed_root_entry_refuses_never_a_bare_error",
-   G + "test_a_malformed_pending_op_refuses_never_a_bare_error"]),
+ ("S10a a roots that is not a mapping is converted", PJ,
+  '    if type(roots) is not dict:\n        raise bad("roots is not a mapping")\n', '',
+  [G + "test_each_wrong_bookkeeping_shape_refuses_before_any_conversion"]),
+ ("S10b a root entry's shape is not checked", PJ,
+  '            raise bad(f"the root entry for {owner!r}")\n', '            pass\n',
+  [G + "test_each_wrong_bookkeeping_shape_refuses_before_any_conversion"]),
+ ("S10c a pending_op that is not an operation is accepted", PJ,
+  '        raise bad("pending_op is neither null nor an operation")\n', '        return\n',
+  [G + "test_each_wrong_bookkeeping_shape_refuses_before_any_conversion",
+   A + "test_a_falsy_wrong_pending_op_refuses"]),
+ ("S10d a delta's shape is not checked", PJ,
+  '                raise bad("an entry of pending_op\'s delta")\n', '                pass\n',
+  [G + "test_each_wrong_bookkeeping_shape_refuses_before_any_conversion"]),
+ ("S10e the trust verb reseeds over malformed roots", PJ,
+  '    if type(roots) is not dict:\n        raise bad("roots is not a mapping")\n', '    if type(roots) is not dict:\n        return\n',
+  [E + "test_a_malformed_roots_reseeds_nothing_and_keeps_the_flag"]),
+ ("S11 a router state at the gate cancels the retransmit", OUT,
+  '        if cancel is not None and cancel[0] in peerresend.HOLD_CODES:\n',
+  '        if False:\n',
+  [A + "test_a_journal_blind_only_at_the_gate_holds_never_cancels",
+   A + "test_each_router_state_at_the_gate_is_a_hold_not_a_verdict"]),
+ ("S12 an untrusted clock at the gate cancels", PR,
+  'HOLD_CODES = frozenset({"clock_untrusted", "journal_unreadable"})',
+  'HOLD_CODES = frozenset({"journal_unreadable"})',
+  [A + "test_each_router_state_at_the_gate_is_a_hold_not_a_verdict"]),
+ ("S13 the in-flight table settles a hold", INF,
+  '        if rc.hold:\n            logger.warning("instance %r req %r: held, not published: %s", name, req_id, rc.why)\n            return BLOCKED\n',
+  '',
+  [A + "test_a_journal_blind_only_at_the_gate_holds_never_cancels"]),
 ]
 
 

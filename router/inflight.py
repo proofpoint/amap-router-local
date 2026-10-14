@@ -181,6 +181,10 @@ class Recheck:
     why: str = ""
     #: When permitted: the request's route now (`classify.REMOTE_ROUTES`).
     route: Optional[str] = None
+    #: Not permitted THIS pass, and not a verdict: a router state (the peer
+    #: clock untrusted, the receive journal unreadable) that clears by
+    #: itself. The record is left unhanded and unsettled (BLOCKED).
+    hold: bool = False
 
 
 def withdraw_capable(port: Any) -> bool:
@@ -1333,6 +1337,9 @@ def _advance(
         return BLOCKED
     if recheck is not None:
         rc = recheck(record)
+        if rc.hold:
+            logger.warning("instance %r req %r: held, not published: %s", name, req_id, rc.why)
+            return BLOCKED
         if not rc.permitted:
             logger.warning("instance %r req %r: not published: %s", name, req_id, rc.why)
             _effect("settle", settle, rc.verdict, record.get("digest"))
@@ -1466,6 +1473,8 @@ def _check_revocation(
             "still be sent", name, req_id, since, how)
         return
     rc = recheck(record)
+    if rc.hold:
+        return                          # a router state, never a revocation
     if rc.permitted:
         if record.get("route") is None and _repin(name, req_id, record, rc):
             _write_record(cfg, name, req_id, record, "repin")

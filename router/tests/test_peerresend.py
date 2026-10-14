@@ -944,6 +944,16 @@ class StrictJournalAnsweredTests(_Retransmit):
         peerclock.read(self.state_dir)              # the clock itself is trusted
         self.refused(k, pid, "journal_unreadable")
 
+    def test_a_falsy_wrong_pending_op_refuses(self):
+        from router import peerclock
+        k, pid = self.unknown()
+        self.received(pid)
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"]["pending_op"] = []
+        path.write_text(json.dumps(doc))
+        self.refused(k, pid, "journal_unreadable")
+
     def test_an_unreadable_record_refuses(self):
         k, pid = self.unknown()
         key = self.received(pid)
@@ -1035,6 +1045,50 @@ class StrictJournalAnsweredTests(_Retransmit):
         k, _ = self.drain()
         self.assertIsNotNone(inflight.read_record(k, "alpha", peerresend.rtx_name(n))
                              or peerresend.retransmits(d), "begun once the journal reads")
+
+    def test_a_journal_blind_only_at_the_gate_holds_never_cancels(self):
+        # The drain's pre-check reads the journal once and passes; the gate's
+        # own read (answered) is blind: a router state, so the record HOLDS.
+        k, pid = self.unknown()
+        other = self.received("someone-else")
+        n = self.retransmit(k, pid)["n"]
+        self.record_path(other).write_text("{")
+        port = self.plugin.ports[-1]
+        before = dict(port.pending)
+        with mock.patch.object(peerresend, "journal_blind", return_value=None), \
+                self.assertNoLogs("amap_router_local.outbound", level="ERROR"):
+            k, _ = self.drain()            # a clean hold: nothing isolated as an error
+        self.assertEqual(port.pending, before, "nothing handed")
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        self.assertEqual(peerresend.retransmits(d), [], "never cancelled: no settlement")
+        self.assertIsNotNone(inflight.read_record(k, "alpha", peerresend.rtx_name(n)),
+                             "the record stays")
+
+    def test_each_router_state_at_the_gate_is_a_hold_not_a_verdict(self):
+        from router import outbound
+        k, pid = self.unknown()
+        n = self.retransmit(k, pid)["n"]
+        record = inflight.read_record(k, "alpha", peerresend.rtx_name(n))
+        other = self.received("someone-else", entry="e2")
+        for name, patches in (
+                ("clock_untrusted", [mock.patch.object(peerresend, "clock_trusted",
+                                                       return_value=False)]),
+                ("journal_unreadable", [])):
+            with self.subTest(code=name):
+                good = self.record_path(other).read_bytes()
+                if name == "journal_unreadable":
+                    self.record_path(other).write_text("{")
+                try:
+                    for p in patches:
+                        p.start()
+                    rc = outbound._recheck_retransmit(k, "alpha", peerresend.rtx_name(n),
+                                                      record, None, None)
+                finally:
+                    for p in patches:
+                        p.stop()
+                    self.record_path(other).write_bytes(good)
+                self.assertEqual((rc.hold, rc.verdict), (True, None), rc)
+                self.assertIn(name, rc.why)
 
     def test_a_router_that_never_journaled_retransmits_as_before(self):
         from router import peerjournal

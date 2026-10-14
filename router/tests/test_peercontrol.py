@@ -1219,6 +1219,47 @@ class StrictJournalGuardTests(_Control):
         self.bookkeeping(pending_op="garbage")
         self.assert_refused("retire", gen, "not the shape this router writes", gen=gen)
 
+    def test_each_wrong_bookkeeping_shape_refuses_before_any_conversion(self):
+        """Falsy wrong types and incomplete objects included: a conversion or
+        a truthiness fallback would read each as "no operation" or "no
+        roots", and let the act through."""
+        key, gen = self.frozen_in_live_a()
+        path = self.state_dir / peerclock.CLOCK_FILE
+        good = path.read_text()
+        store = json.loads(good)["store"]
+        owner = sorted(store["roots"])[0]
+        entry = store["roots"][owner]
+        rows = {
+            "roots []": dict(roots=[]),
+            "roots null": dict(roots=None),
+            "a root entry's live a string": dict(roots={owner: dict(entry, live="1")}),
+            "a root entry missing a member": dict(roots={owner: {k: v for k, v in entry.items()
+                                                                if k != "high_seq"}}),
+            "pending_op []": dict(pending_op=[]),
+            "pending_op {}": dict(pending_op={}),
+            "pending_op false": dict(pending_op=False),
+            "pending_op 0": dict(pending_op=0),
+            "pending_op empty string": dict(pending_op=""),
+            "pending_op without its name": dict(pending_op={"delta": []}),
+            "pending_op of an unknown kind": dict(pending_op={"op": "nope", "owner": None}),
+            "pending_op's delta not a list": dict(pending_op={"op": "take", "owner": owner,
+                                                              "delta": {}}),
+            "pending_op's delta entry incomplete": dict(pending_op={"op": "take", "owner": owner,
+                                                                    "delta": [{"store": "root"}]}),
+        }
+        for label, changes in rows.items():
+            with self.subTest(row=label):
+                path.write_text(good)
+                self.bookkeeping(**changes)
+                self.assert_refused("retire", gen, "not the shape this router writes", gen=gen)
+        path.write_text(good)
+
+    def test_a_null_pending_op_and_exact_shapes_still_read(self):
+        key, gen = self.frozen_in_live_a()
+        self.assertIsNone(json.loads((self.state_dir / peerclock.CLOCK_FILE).read_text())
+                          ["store"]["pending_op"])
+        self.assertIn(key, [r["key"] for r in peercontrol._guard_records(self.cfg)])
+
     def test_the_bookkeeping_matching_the_disk_passes(self):
         """The companion: an intact journal is compared and accepted, so the
         refusals above are the comparison's, not a guard that always fails.
