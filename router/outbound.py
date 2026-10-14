@@ -1862,6 +1862,13 @@ def _advance_one(
                  if rec.get("attachments") else [])
         peerresend.preserve(cfg, name, req_id, rec, blobs)
 
+    def found_handed(rec: Dict[str, Any]) -> None:
+        if peerresend.preservable(cfg, name, rec) and not peerresend.has_copy(cfg, name, rec):
+            # Handed over before preservation existed (an upgrade): the record
+            # IS the record as handed, so it is preserved now.
+            preserve(rec)
+        peerresend.note_handed(cfg, name, rec)
+
     anchor = _private_result_path(cfg, name, req_id)
     return inflight_mod.advance(
         cfg, name, req_id, record, transport, settle=settle,
@@ -1870,7 +1877,7 @@ def _advance_one(
         publish_blocked=cfg.reload_failed, fenced_retired=fenced_retired,
         # Only a signed peer task is preserved: no other record has the effect.
         preserve=preserve if peerresend.preservable(cfg, name, record) else None,
-        found_handed=lambda rec: peerresend.note_handed(cfg, name, rec),
+        found_handed=found_handed,
     )
 
 
@@ -3857,6 +3864,12 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
                 continue
             if done:
                 inflight_summary[what] = done
+        if peerresend.enabled(cfg):
+            # The preserved copies, for status (`last_summary.peer_sent`).
+            try:
+                inflight_summary["peer_sent"] = peerresend.status(cfg, name)
+            except Exception:  # noqa: BLE001 -- a report, never fails the drain
+                logger.exception("instance %r: the preserved-copy report failed", name)
 
     _sweep_answered_pending(cfg, name)
     filenames, skipped_symlinks = list_outbound(cfg, name)

@@ -753,3 +753,57 @@ class FencedGenerationTests(_Retransmit):
         self.assertEqual((doc["outcome"], doc["reason_code"]),
                          (peerresend.CANCELLED, "generation_unavailable"))
         self.assertFalse((d / peerresend.CLAIM).exists())
+
+
+class StatusTests(_Retransmit):
+
+    def test_the_drain_summary_reports_the_copies(self):
+        k, pid = self.unknown()
+        self.retransmit(k, pid)
+        k, summary = self.drain()
+        self.assertEqual({key: summary.get("peer_sent", {}).get(key) for key in
+                          ("preserved", "settled", "in_flight", "claimed")},
+                         {"preserved": 1, "settled": 1, "in_flight": 0, "claimed": 1}, summary)
+        self.plugin.ports[-1].send(next(iter(self.plugin.ports[-1].pending)),
+                                   outcome="accepted", reason_code="allowlisted")
+        k, summary = self.drain()
+        self.assertEqual(summary.get("peer_sent", {}).get("retransmit_accepted"), 1, summary)
+        self.assertEqual(summary.get("peer_sent", {}).get("claimed"), 0)
+
+
+class UpgradeTests(_Retransmit):
+
+    def test_a_record_handed_before_preservation_is_preserved_on_its_next_pass(self):
+        with mock.patch.object(peerresend, "preservable", return_value=False):
+            k, _ = self.send()                    # the old layout: handed, no copy
+        root = peerresend.sent_root(self.state_dir, LIDS["alpha"])
+        self.assertFalse(root.is_dir() and any(root.iterdir()))
+        self.assertEqual(self.plugin.ports[-1].writes, ["00000001"])
+        k, _ = self.drain()
+        dirs = list(root.iterdir()) if root.is_dir() else []
+        self.assertEqual(len(dirs), 1, "preserved on its next pass")
+        d = dirs[0]
+        self.assertTrue(peerresend.committed(d))
+        self.assertEqual((d / peerresend.RECORD).read_bytes(),
+                         peerresend._canonical(inflight.read_record(k, "alpha", "00000001")))
+        self.assertTrue((d / peerresend.HANDED).is_file())
+        self.assertEqual(self.plugin.ports[-1].writes, ["00000001"], "never handed again")
+
+    def test_one_cleaned_before_preservation_is_not_preserved(self):
+        with mock.patch.object(peerresend, "preservable", return_value=False):
+            k, _ = self.send()
+            env = json.loads(self.plugin.ports[-1].pending["00000001"])["envelope"]
+            self.plugin.ports[-1].send("00000001", outcome="queued_for_human",
+                                       reason_code="delivery_unknown")
+            k, _ = self.drain()
+        self.assertIsNone(inflight.read_record(k, "alpha", "00000001"), "cleaned")
+        stmt = env["peer"]["statement_header"]
+        from router.tests import peer_standin as si2
+        _kind, _k, statement, _sig = si2.check1([(peerlane.STATEMENT_FIELD, stmt)])
+        pid = json.loads(statement)["id"]
+        try:
+            self.retransmit(k, pid)
+        except peerresend.Refused as e:
+            self.assertEqual(e.code, "not_preserved")
+        else:
+            self.fail("a cleaned original was retransmitted")

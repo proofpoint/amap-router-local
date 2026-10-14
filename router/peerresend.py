@@ -221,6 +221,12 @@ def _compare_committed(d: Path, record: Mapping[str, Any], origin: Mapping[str, 
         raise PreservationConflict(f"{d}: a committed copy differs")
 
 
+def has_copy(cfg: Any, name: str, record: Mapping[str, Any]) -> bool:
+    """Whether `record`'s original has a committed copy."""
+    lid, _gen = _gen_of(cfg, name)
+    return committed(copy_dir(cfg.state_dir, lid, record["peer"]["id"]))
+
+
 def note_handed(cfg: Any, name: str, record: Mapping[str, Any]) -> bool:
     """`handed.json`, linked once by a pass that FINDS the handed marker."""
     from . import clock

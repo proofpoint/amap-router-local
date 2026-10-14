@@ -151,6 +151,14 @@ M = [
   '                if fenced:\n                    raise Refused("generation_unavailable", "its generation is fenced")\n',
   '',
   [T + "FencedGenerationTests.test_a_claim_never_begun_in_a_fenced_generation_is_cancelled"]),
+ ("a record handed before preservation never preserved", OUT,
+  '            preserve(rec)\n        peerresend.note_handed(cfg, name, rec)\n',
+  '            pass\n        peerresend.note_handed(cfg, name, rec)\n',
+  [T + "UpgradeTests.test_a_record_handed_before_preservation_is_preserved_on_its_next_pass"]),
+ ("the preserved copies not reported", OUT,
+  '                inflight_summary["peer_sent"] = peerresend.status(cfg, name)\n',
+  '                pass\n',
+  [T + "StatusTests.test_the_drain_summary_reports_the_copies"]),
 ]
 
 
