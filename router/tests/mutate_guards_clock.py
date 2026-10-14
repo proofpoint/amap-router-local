@@ -20,8 +20,9 @@ import subprocess
 import sys
 
 T = "router.tests.test_peercontrol."
-U, C, N, B = (T + "UntrustedClockGuardTests.", T + "CorruptClockGuardTests.",
-              T + "NoPeerStoreGuardTests.", T + "UnreadableBookkeepingGuardTests.")
+U, C, N, B, K = (T + "UntrustedClockGuardTests.", T + "CorruptClockGuardTests.",
+                 T + "NoPeerStoreGuardTests.", T + "UnreadableBookkeepingGuardTests.",
+                 T + "UnkeptJournalGuardTests.")
 PC = "router/peercontrol.py"
 
 M = [
@@ -33,11 +34,11 @@ M = [
    U + "test_retire_is_refused_untrusted_where_it_is_refused_trusted",
    C + "test_new_is_refused_untrusted_even_with_nothing_frozen"]),
  ("G2 a lost clock file reads as no journal", PC,
-  '        if not peerclock.path(sd).exists() and not _journal_dirs(sd):\n',
+  '        if not journaled and not peerclock.path(sd).exists():\n',
   '        if not peerclock.path(sd).exists():\n',
   [U + "test_new_is_refused_untrusted_where_it_is_refused_trusted"]),
  ("G3 no journal at all is refused too", PC,
-  '        if not peerclock.path(sd).exists() and not _journal_dirs(sd):\n',
+  '        if not journaled and not peerclock.path(sd).exists():\n',
   '        if False:\n',
   [N + "test_new_runs_with_no_clock_and_no_journal"]),
  ("G4 unreadable bookkeeping reads as an empty journal", PC,
@@ -66,6 +67,29 @@ M = [
   '    except JournalBlind:\n        # No evidence either way is not "no traffic": held, never restored.\n',
   '    except KeyError:\n        # No evidence either way is not "no traffic": held, never restored.\n',
   [U + "test_an_unlisted_generation_is_not_restored_while_untrusted"]),
+ ("G10 a clock without bookkeeping reads as an empty journal", PC,
+  '        if not journaled:\n            return []\n        raise JournalBlind(JOURNAL_UNKEPT) from None\n',
+  '        return []\n',
+  [K + "test_new_is_refused_after_a_bound_rebuilt_the_clock_without_its_bookkeeping",
+   K + "test_new_is_refused_with_the_store_member_nulled_in_a_valid_clock",
+   K + "test_retire_is_refused_with_the_store_member_nulled_in_a_valid_clock"]),
+ ("G11 a clock without bookkeeping and no journal is refused too", PC,
+  '        if not journaled:\n            return []\n        raise JournalBlind(JOURNAL_UNKEPT) from None\n',
+  '        if False:\n            return []\n        raise JournalBlind(JOURNAL_UNKEPT) from None\n',
+  [N + "test_new_runs_with_a_clock_holding_no_store_and_no_journal"]),
+ ("G12 the guard walks the bookkeeping's records, not the disk's", PC,
+  '    return _strict_records(sd)\n',
+  '    return peerjournal.all_records(sd)\n',
+  [K + "test_an_unreadable_record_refuses_where_all_records_skips_it",
+   K + "test_a_frozen_attempt_under_an_unlisted_owner_still_refuses"]),
+ ("G13 an unreadable record is skipped", PC,
+  '            except (OSError, ValueError) as e:\n                raise JournalBlind(f"a journal record cannot be read',
+  '            except (OSError, ValueError) as e:\n                continue\n                raise JournalBlind(f"a journal record cannot be read',
+  [K + "test_an_unreadable_record_refuses_where_all_records_skips_it"]),
+ ("G14 an unlistable state directory escapes as an OSError", PC,
+  '    except FileNotFoundError:\n        return False\n    except OSError as e:\n',
+  '    except FileNotFoundError:\n        return False\n    except KeyError as e:\n',
+  [K + "test_an_unlistable_state_dir_is_journal_blind_never_a_bare_os_error"]),
 ]
 
 

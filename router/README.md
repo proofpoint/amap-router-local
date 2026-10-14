@@ -2487,8 +2487,13 @@ without one it is empty, which would pass every such check vacuously. So
 nothing (the runtime tree is unavailable, with the same reason), a lost
 record is not restored into a generation that was never listed, and a
 pending `new` plan's mint stays pending. The same holds when the clock
-verifies but its store bookkeeping is unreadable. A router that never
-journaled anything (no clock file and no journal directory) is not blocked.
+verifies but its store bookkeeping is unreadable, or ABSENT while a journal
+is on disk: a clock rebuilt by a bound before its bookkeeping (`router
+peer-bound` does both) is trusted, and these guards still refuse until the
+bookkeeping is rebuilt. The guards read every record on disk, under every
+owner, and refuse on one they cannot read, where a plain journal read
+would skip it. Only a router that never journaled anything (no journal
+directory, and the clock absent or holding no store) is not blocked.
 
 ### Runtime tree repair
 

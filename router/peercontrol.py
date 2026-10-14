@@ -392,25 +392,73 @@ JOURNAL_BLIND = ("the peer clock is untrusted, so the journal's frozen attempts 
                  "seen and this check cannot pass; recover the clock first")
 
 
+#: The same, when the clock is trusted but holds no store bookkeeping while a
+#: journal is on disk (a clock rebuilt by a bound, before its bookkeeping).
+JOURNAL_UNKEPT = ("the peer clock holds no store bookkeeping beside a journal on disk, so the "
+                  "journal's frozen attempts cannot be seen and this check cannot pass; rebuild "
+                  "the bookkeeping first (`router peer-bound` records the bound and rebuilds it)")
+
+
 def _guard_records(cfg: Any) -> List[Dict[str, Any]]:
     """Every journal record, for a guard: `peerjournal.all_records` answers
-    `[]` while the clock is untrusted or the bookkeeping unreadable, which a
-    guard must never read as "nothing there". `[]` only when nothing was
-    ever journaled: the clock file holds no store, or it is absent and no
-    journal directory exists. Otherwise `JournalBlind`."""
+    `[]` while the clock is untrusted, the bookkeeping is unreadable or
+    absent, and it skips an unreadable record or an owner the bookkeeping
+    does not list, any of which a guard must never read as "nothing there".
+    `[]` only when nothing was ever journaled: no journal directory on disk,
+    and the clock either absent or holding no store. Otherwise every record
+    on disk, read strictly (`_strict_records`), or `JournalBlind`."""
     sd = Path(cfg.state_dir)
+    journaled = _journal_dirs(sd)
     try:
         peerjournal.read_meta(sd)
     except peerjournal.StoreAbsent:
-        return []
+        if not journaled:
+            return []
+        raise JournalBlind(JOURNAL_UNKEPT) from None
     except peerclock.ClockUntrusted as e:
-        if not peerclock.path(sd).exists() and not _journal_dirs(sd):
+        if not journaled and not peerclock.path(sd).exists():
             return []
         raise JournalBlind(f"{JOURNAL_BLIND} ({e})") from None
     except (OSError, ValueError) as e:
         raise JournalBlind(f"{JOURNAL_BLIND} (the bookkeeping is unreadable: "
                            f"{type(e).__name__}: {e})") from None
-    return peerjournal.all_records(sd)
+    return _strict_records(sd)
+
+
+def _strict_records(state_dir: Path) -> List[Dict[str, Any]]:
+    """Every record under every owner's journal directory ON DISK, whether
+    or not the bookkeeping lists the owner (`peerjournal._find`'s layout);
+    `JournalBlind` naming the first that cannot be read, where
+    `all_records` would skip it."""
+    out = []
+    try:
+        children = sorted(state_dir.iterdir())
+    except OSError as e:
+        raise JournalBlind(f"the state directory cannot be listed ({type(e).__name__}), so "
+                           "this check cannot pass") from None
+    for child in children:
+        root = child / peerjournal.JOURNAL_DIR
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError as e:
+            raise JournalBlind(f"a journal directory cannot be listed ({child.name}: "
+                               f"{type(e).__name__}), so this check cannot pass") from None
+        for d in entries:
+            if not (d.is_dir() and peerjournal._KEY_RE.fullmatch(d.name)
+                    and (d / peerjournal.RECORD).is_file()):
+                continue
+            try:
+                rec = json.loads((d / peerjournal.RECORD).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
+                                   f"{type(e).__name__}), so this check cannot pass") from None
+            if not isinstance(rec, dict):
+                raise JournalBlind(f"a journal record is not an object ({child.name}/{d.name}), "
+                                   "so this check cannot pass")
+            out.append(rec)
+    return out
 
 
 def _journal_dirs(state_dir: Path) -> bool:
@@ -420,6 +468,10 @@ def _journal_dirs(state_dir: Path) -> bool:
         children = list(state_dir.iterdir())
     except FileNotFoundError:
         return False
+    except OSError as e:
+        # Unlistable is not "no journal": the guard cannot tell, so it refuses.
+        raise JournalBlind(f"the state directory cannot be listed ({type(e).__name__}), so "
+                           "this check cannot pass") from None
     return any((c / peerjournal.JOURNAL_DIR).exists() for c in children)
 
 

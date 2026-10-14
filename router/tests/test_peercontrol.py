@@ -1057,6 +1057,104 @@ class UnreadableBookkeepingGuardTests(_Control):
         self.assertEqual(self.tree.gens[gen], "live", "nothing retired")
 
 
+class UnkeptJournalGuardTests(_Control):
+    """A TRUSTED clock that holds no store bookkeeping while a journal is on
+    disk: the clock rebuilt by a bound before the bookkeeping is (the
+    documented recovery's first half), or a store member lost. `all_records`
+    answers `[]`; the guard refuses, saying to rebuild the bookkeeping. And
+    the strict walk: a record `all_records` would skip, unreadable or under
+    an owner the bookkeeping does not list, still counts."""
+
+    cli = AttemptTests.cli
+    frozen_in_live_a = AttemptTests.frozen_in_live_a
+    acts = AttemptTests.acts
+    audit = AttemptTests.audit
+    recorded = AttemptTests.recorded
+
+    def clock_doc(self, **changes):
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc.update(changes)
+        path.write_text(json.dumps(doc))
+
+    def assert_unkept_refusal(self, command, live, **args):
+        peerclock.read(self.state_dir)          # the clock itself is trusted
+        with self.assertRaises(peerjournal.StoreAbsent):
+            peerjournal.read_meta(self.state_dir)
+        self.assertEqual(peerjournal.all_records(self.state_dir), [])
+        code, err = self.cli(command, **args)
+        self.assertEqual(code, 1, err)
+        self.assertIn("refused", err)
+        self.assertIn("rebuild the bookkeeping first", err)
+        self.assertEqual(self.tree.gens[live], "live", "nothing retired")
+        self.assertEqual(self.recorded(), live, "generation.json intact")
+        self.assertEqual(self.acts(peercontrol.NEW_VERB) + self.acts(peercontrol.RETIRE_VERB), [])
+
+    def test_new_is_refused_after_a_bound_rebuilt_the_clock_without_its_bookkeeping(self):
+        # The exact sequence: a journal on disk; the clock file lost (blind,
+        # refused); then the bound, the first step of "recover the clock":
+        # the clock is open again but the bookkeeping is not rebuilt yet.
+        key, gen = self.frozen_in_live_a()
+        (self.state_dir / peerclock.CLOCK_FILE).unlink()
+        code, err = self.cli("new")
+        self.assertEqual((code, "recover the clock first" in err), (1, True), err)
+        peerclock.record_bound(self.state_dir, NOW + timedelta(hours=1),
+                               at=NOW + timedelta(minutes=30), evidence="a measured bound",
+                               not_from_wall_clock=True, observed=[])
+        self.assert_unkept_refusal("new", gen)
+
+    def test_new_is_refused_with_the_store_member_nulled_in_a_valid_clock(self):
+        key, gen = self.frozen_in_live_a()
+        self.clock_doc(store=None)
+        self.assert_unkept_refusal("new", gen)
+
+    def test_retire_is_refused_with_the_store_member_nulled_in_a_valid_clock(self):
+        key, gen = self.frozen_in_live_a()
+        self.clock_doc(store=None)
+        self.assert_unkept_refusal("retire", gen, gen=gen)
+
+    def test_an_unreadable_record_refuses_where_all_records_skips_it(self):
+        key, gen = self.frozen_in_live_a()
+        path = peerjournal.record_dir(self.state_dir, tpe.OWNER, key) / peerjournal.RECORD
+        path.write_text("{")
+        self.assertEqual([r["key"] for r in peerjournal.all_records(self.state_dir)
+                          if r["key"] == key], [], "all_records skips it")
+        code, err = self.cli("retire", gen=gen)
+        self.assertEqual(code, 1, err)
+        self.assertIn("a journal record cannot be read", err)
+        self.assertEqual(self.tree.gens[gen], "live", "nothing retired")
+
+    def test_a_frozen_attempt_under_an_unlisted_owner_still_refuses(self):
+        key, gen = self.frozen_in_live_a()
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        roots = doc["store"]["roots"]
+        doc["store"]["roots"] = type(roots)()
+        path.write_text(json.dumps(doc))
+        self.assertEqual(peerjournal.all_records(self.state_dir), [], "the owner is not listed")
+        code, err = self.cli("retire", gen=gen)
+        self.assertEqual(code, 1, err)
+        self.assertIn("frozen control attempt", err)
+        self.assertEqual(self.tree.gens[gen], "live", "nothing retired")
+
+    def test_an_unlistable_state_dir_is_journal_blind_never_a_bare_os_error(self):
+        key, gen = self.frozen_in_live_a()
+        sd = Path(self.state_dir)
+        real = Path.iterdir
+
+        def iterdir(p):
+            if Path(p) == sd:
+                raise PermissionError(13, "denied")
+            return real(p)
+        with mock.patch.object(Path, "iterdir", iterdir):
+            try:
+                got = peercontrol._frozen_elsewhere(self.cfg, None)
+            except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+                got = e
+        self.assertIsInstance(got, peercontrol.JournalBlind)
+        self.assertIn("cannot be listed", str(got))
+
+
 class CorruptClockGuardTests(UntrustedClockGuardTests):
     """The same, with the clock file present and not a clock record."""
 
@@ -1078,6 +1176,20 @@ class NoPeerStoreGuardTests(_Control):
         clock = self.state_dir / peerclock.CLOCK_FILE
         if clock.exists():
             clock.unlink()
+        journals = [c for c in self.state_dir.iterdir() if (c / peerjournal.JOURNAL_DIR).exists()]
+        self.assertEqual(journals, [], "no journal on disk")
+        code, err = self.cli("new")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.tree.gens[live], "retired")
+
+    def test_new_runs_with_a_clock_holding_no_store_and_no_journal(self):
+        live = "f" * 32
+        self.tree.gens[live] = "live"
+        peercontrol.record_generation(self.cfg, live, admitted_at="2026-01-01T00:00:00Z")
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"] = None
+        path.write_text(json.dumps(doc))
         journals = [c for c in self.state_dir.iterdir() if (c / peerjournal.JOURNAL_DIR).exists()]
         self.assertEqual(journals, [], "no journal on disk")
         code, err = self.cli("new")
