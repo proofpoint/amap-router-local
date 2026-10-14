@@ -2207,6 +2207,26 @@ the registry is read without recording its seq. Retention is
 `ingress_quarantine_days` (default 14, 1-365). `status` reports a count per
 agent under a registry.
 
+## The one clock (`router/clock.py`)
+
+Every wall-clock read in the package is `clock.now()`, an aware UTC datetime;
+`util.utc_ts()` formats it. `router/tests/test_one_clock.py` holds every other
+module to that: direct, aliased, re-exported, reflective and import-time reads
+all fail it. Exactly one other time source is allowed: `hoplink._clock`
+(`time.monotonic`), whose consumers are status ages and retry log levels,
+never a decision. A time passed in as data (a statement's `ts`, a record's
+`recorded_ts`, an operator's bound) and a file time (`st_mtime`, stamped by the
+kernel) are not clock reads.
+
+Tests and conformance drivers may `clock.install(source, strict=True)` a
+callable that returns an aware datetime (`clock.fixed`, `clock.Stepper`), and
+every read then returns it. Strict means a read with the source gone raises
+`ClockNotInstalled` instead of falling back to real time. The source is
+environment, not process state: it survives `hoplink.reset_process_state()`,
+which models a restart, and only `clock.reset()` clears it. Nothing in the
+router installs one, and no config key, environment variable or CLI flag
+reaches it.
+
 ## Retention / deletion rights (v2.2.0)
 
 AMAP v2.2.0 §2 names, for the first time, who may delete each artifact class

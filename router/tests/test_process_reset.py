@@ -44,6 +44,16 @@ CONSTANTS = {
     "validate": {"_TOP_KEYS", "_DRAFT_KEYS", "_ATTACHMENT_KEYS"},
 }
 
+#: Module-level containers that are ENVIRONMENT: they survive a modelled
+#: restart, as the filesystem does, so the reset must NOT empty them. The
+#: installed clock source is the one: `reset_process_state` models a process
+#: end in the middle of a scenario, and a fixed clock dropped there would put
+#: the recovery half of every crash case back on real time. Only
+#: `clock.reset()` clears it.
+ENVIRONMENT = {
+    "clock": {"_INSTALLED", "_STRICT"},
+}
+
 ROUTER = pathlib.Path(router.__file__).parent
 
 
@@ -69,14 +79,22 @@ class CompletenessTests(unittest.TestCase):
         declared = {m: set(n) for m, n in hoplink.PROCESS_STATE.items()}
         for module, names in found.items():
             with self.subTest(module=module):
-                unclassified = names - declared.get(module, set()) - CONSTANTS.get(module, set())
+                unclassified = (names - declared.get(module, set()) - CONSTANTS.get(module, set())
+                                - ENVIRONMENT.get(module, set()))
                 self.assertEqual(unclassified, set(),
-                                 "a container in neither PROCESS_STATE nor CONSTANTS")
+                                 "a container in neither PROCESS_STATE, CONSTANTS nor ENVIRONMENT")
         for module, names in declared.items():
             with self.subTest(declared=module):
                 self.assertEqual(names - found.get(module, set()), set(),
                                  "PROCESS_STATE names a container that does not exist")
                 self.assertEqual(names & CONSTANTS.get(module, set()), set())
+                self.assertEqual(names & ENVIRONMENT.get(module, set()), set(),
+                                 "an ENVIRONMENT container registered as process state: "
+                                 "a modelled restart would drop it")
+        for module, names in ENVIRONMENT.items():
+            with self.subTest(environment=module):
+                self.assertEqual(names - found.get(module, set()), set(),
+                                 "ENVIRONMENT names a container that does not exist")
 
 
 class ResetTests(unittest.TestCase):

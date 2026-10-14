@@ -489,8 +489,8 @@ def prepare(cfg: Any, report: Any, *, write: bool) -> AliasView:
 
 
 def _now():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc)
+    from . import clock
+    return clock.now()
 
 
 def attach(cfg: Any, report: Any) -> Any:

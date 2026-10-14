@@ -68,7 +68,6 @@ import os
 import re
 import secrets
 import stat as stat_mod
-import time
 import dataclasses
 import types
 from dataclasses import dataclass
@@ -76,6 +75,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from . import audit as audit_mod
+from . import clock
 from .util import atomic_write, utc_ts
 
 logger = logging.getLogger("amap_router_local.generations")
@@ -712,7 +712,7 @@ def damaged_anchors(state_dir: Path, logical_id: str) -> Dict[str, List[Dict[str
     if doc is None:
         return {}
     out: Dict[str, List[Dict[str, Any]]] = {}
-    now = time.time()
+    now = clock.now().timestamp()
     for g in doc["gens"]:
         if g["gen"] == doc["current"]:
             continue
@@ -2180,14 +2180,13 @@ def reuse_pending(cfg: Any, name: str) -> List[Dict[str, Any]]:
     generation (a DIFFERENT request under an id whose in-flight or pending
     work is unsettled), with its age from the live file's mtime. Read only;
     a fault reading an entry skips it (it is shown next poll)."""
-    import time
     from . import outbound as outbound_mod
     out: List[Dict[str, Any]] = []
     try:
         owned = outbound_mod._owned_digests(cfg, name)
     except Exception:  # noqa: BLE001 -- status never fails a poll
         return out
-    now = time.time()
+    now = clock.now().timestamp()
     for req_id, digest in owned:
         if digest is None:
             continue    # a record that cannot be read cannot show a reuse

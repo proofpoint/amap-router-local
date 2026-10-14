@@ -180,7 +180,7 @@ PUBLIC_MODULES = ("attachments", "binding", "config", "deliver", "exposure",
                   "validate")
 
 #: Implementation. May change shape without notice.
-INTERNAL_MODULES = ("__main__", "aliases", "audit", "classify", "console", "fsops",
+INTERNAL_MODULES = ("__main__", "aliases", "audit", "classify", "clock", "console", "fsops",
                     "generations", "hoplink", "inflight", "ingress", "outcomes", "peerclock",
                     "peerjournal", "peerlane", "provision", "quarantine",
                     "registry", "reset", "roster", "service", "status")

@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
+from . import clock
+
 DEFAULT_READ_CAP = 1 * 1024 * 1024  # 1 MiB
 
 
@@ -217,7 +219,7 @@ _UTC_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 def utc_ts() -> str:
     """ISO-8601 UTC timestamp, second precision, `Z` suffix."""
-    return datetime.now(timezone.utc).strftime(_UTC_TS_FORMAT)
+    return format_utc_ts(clock.now())
 
 
 def format_utc_ts(dt: datetime) -> str:
