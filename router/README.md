@@ -390,6 +390,11 @@ python3 -m router --config C quarantine list [NAME] [--control-dir DIR]   # --co
 python3 -m router --config C quarantine show NAME SOURCE GEN ID [--control-dir DIR]
                                                                       # read-only inspection of the ingress quarantine — see
                                                                       # "The ingress quarantine" below
+python3 -m router --config C peer-request show ID                   # read-only: a signed peer id's preserved copy, settlement,
+                                                                      # claim, retransmits, and each action with why it is refused
+python3 -m router --config C peer-request retransmit ID --evidence TEXT [--allow-pending]
+                                                                      # the original bytes under a new transport id, never re-signed —
+                                                                      # see "Resending a signed peer task" below
 ```
 
 `matrix` is kept as an exact alias for `peers` (same output) so nothing
@@ -1748,6 +1753,124 @@ router's own kind, rooted at the hop root, with a private `.stage/`. The
 candidate journal writes them (below), and creates and checks each
 `.stage/` at startup.
 
+### Resending a signed peer task (`router/peerresend.py`)
+
+A signed peer task is never signed again: its peer id is minted once, and
+nothing on the resend path calls the signer, the statement builder, the id
+minter, the Message-ID builder or the issued-record writer (a static test
+and a runtime spy pin both). Nothing is exactly-once either: a resend is
+the same bytes again, and the receiver's duplicate check decides.
+
+**Hop configs only.** The workflow keys every copy by `(generation, n)`, so
+it exists only where a config has both `registry_dir` and `hop`, the only
+one with an external leg to resend over. Elsewhere nothing is preserved and
+`retransmit` refuses `not_preserved`.
+
+**Preservation.** Every signed peer task is copied, COMMITTED, before its
+handed marker is written, so a copy exists before any byte can reach the
+transport: `state_dir/<logical_id>/peer-sent/<peer id>/` holds
+`record.json` (the in-flight record as handed), `origin.json`
+(`{v, id, logical_id, generation, transport_req_id, req_id,
+preserved_ts}`; `req_id` is the agent's request id), `attachments/<i>`, and
+`COMMIT`, linked last. An uncommitted directory is never read and is written
+again. A committed copy is compared on every field but `preserved_ts`; one
+that differs holds the hand-over, never silently replaced. A copy that
+cannot be written holds the record unhanded as
+`peer_preservation_failed`, retried next poll. `handed.json` is linked by
+the first pass that FINDS the handed marker (never the pass that writes
+it), and `settled.json` by the original's settlement. A record handed over
+before this existed is preserved by the next pass that finds its marker;
+one already cleaned up is `not_preserved`.
+
+**`peer-request show ID`** is read-only, for any issued id: the copy's
+header fields (never the body), its settlement, the claim, every
+retransmit, whether the agent has its Result, whether a signed Result or a
+control notice was received, and each action with whether it is refused and
+why.
+
+**`peer-request retransmit ID --evidence TEXT [--allow-pending]`**, under
+the drain lock. Every refusal writes nothing (no claim, no audit line, no
+transport id, no record):
+
+| code | why |
+|---|---|
+| `evidence_required` | no evidence given |
+| `not_preserved`, `ambiguous`, `preservation_damaged` | no committed copy, one under two identities, or a copy that fails its re-checks |
+| `retransmit_pending` | a retransmit of this id is already claimed |
+| `clock_untrusted` | the peer clock is untrusted: a received signed Result lives in the receive journal, readable only under it |
+| `peer_lane_inactive`, `key_rotated` | no delegation configured, or the copy was signed under another key than the CONFIGURED signing key (conservative: a receiver in a rotation overlap might still accept it) |
+| `outside_window` | now is past the statement's `ts + P + F` |
+| `answered` | a control notice (the one-per-message `notified/` marker) or a signed Result replying to it was received |
+| `not_eligible`, `not_yet_stale` | trigger 1 is a settlement with reason `delivery_unknown`; trigger 2 (no answer yet, still pending or `accepted`) needs `--allow-pending` and `STALE_AFTER_S` since `handed.json`; any other settlement is not eligible |
+| `generation_unavailable` | no current generation for the identity |
+| `policy_changed` | the sender's own peer re-check refuses it now |
+
+Then it reserves a transport id `n`, links a claim (`retransmit.json`:
+generation, `n`, time, `by`, evidence verbatim), appends `peer-request
+retransmit requested` to the operator audit, and begins an in-flight record
+`rtx.<n>` from the copy alone: the same request, recipients, from address,
+attachments and peer block, a fresh `written_ts`, its own route.
+
+At the defaults (`P` 3600 s, `F` 300 s, `STALE_AFTER_S` 3600 s) trigger 2 is
+reachable only when the hand-over was found within 300 s of the statement's
+`ts`: past that, `ts + P + F` has already gone by.
+
+**The first hand-over, and after.** Before an `rtx.<n>` record's FIRST
+hand-over the drain re-runs every dynamic refusal; a failure is a terminal
+cancellation, settled `cancelled/<code>` with nothing handed. That outcome is
+this router's own: no transaction exists for it downstream and no
+downstream outcome, so `retransmit_cancelled` in status is never the
+downstream runtime's verdict. While the
+peer clock is untrusted the record is HELD instead (never handed, never
+cancelled). Once handed nothing cancels it. It settles as ITSELF, from
+every settle path, at `peer-sent/<id>/retransmits/<generation>-<n>.json`,
+never as the agent's Result or anchor: the original is their only writer.
+Then its record goes, then `peer-request retransmit settled` is audited
+(its inputs from the claim), then, LAST, the claim. A crash anywhere is
+completed by the next pass (`peerresend.finish`), with one hand-over, one
+settlement and each audit line exactly once. A claim belongs to its
+generation: a generation fenced since is finished by its own fenced pass,
+and a claim never begun there is cancelled `generation_unavailable`. (An
+unhanded record in a fenced, retired generation settles `rejected/no_route`
+by the shared rule first: never a first hand-over into a retired tree.)
+After the cleanup a retransmit's settlement is read from
+`peer-sent/<id>/retransmits/` (`show` lists them): its in-flight record is
+gone by design.
+
+A task can be handed over, settled and cleaned up in the pass that first
+finds its handed marker: `handed.json` is linked first in that pass, so it
+always exists beside `settled.json`, and the two may carry almost the same
+time. That is a fast answer, not a missing hand-over.
+
+**Control notices.** A retransmit the receiver demotes emits a failure
+notice about the same id; the one-per-message `notified/<id>` marker caps
+the agent at one notice per id, so a second is dropped. A notice is not a
+Result.
+
+**Retention.** A copy is pruned when it is settled, unclaimed, without a
+live retransmit record, and past `ts + P + F + 7 days`: a prune claim, then
+the directory bottom-up, then the claim. On by default; `peer_sent_prune:
+false` keeps every copy.
+
+**Status.** Each drain summary carries `peer_sent`: `preserved`,
+`in_flight` (no `settled.json`), `settled`, `claimed`, and
+`retransmit_<outcome>` counts.
+
+**Against the real downstream runtime: PENDING, by name.** Two rows wait
+for that runtime's peer carriage and its resend carve-out, and are not
+skipped silently: `realre_check2_duplicate_silent` (an exact copy that
+already arrived is dropped by the receiver's duplicate check, silently) and
+`realre_first_arrival_placed` (a retransmit that is the first arrival is
+placed). Until then a retransmit there settles `rejected/hop_invalid_request`
+(no peer carriage), or holds as `held_index_collision` in the same
+generation.
+
+**Runbook**, after `delivery_unknown` or a task with no answer: (1) `show
+<id>`, and the receiving router's own status; (2) `retransmit` while `ts` is
+inside the window, knowing an exact copy that already arrived is dropped
+silently as a duplicate; (3) otherwise a NEW task: a new agent request and a
+new peer id, with its own Result.
+
 ## The candidate journal (`router/peerjournal.py`, `router/peerclock.py`)
 
 Every signed candidate this router takes gets one durable record BEFORE any
@@ -2379,7 +2502,10 @@ plugin's rows run in `router/tests/run_realhop.py --plugin <file>`: adopt,
 retire, new, both restores, abandon-attempt, abandon-plan, the
 `generation_retired` settlement and the hold before any hand-over, and the
 crash and exactly-once audit seams, against the real runtime sender and
-lister over this router's real filesystem port. The file must hash to the
+lister over this router's real filesystem port; and one resend row
+(`peer_block_republished_under_new_n`): a signed peer task handed over
+through the real AGENT sender, then retransmitted under a new transport id,
+the hub publishing the identical peer block both times. The file must hash to the
 pinned artifact digest (`ARTIFACT_SHA256`); without it the run is refused,
 never skipped. Its evidence is a recorded run with the plugin file's
 sha256, not continuous integration, which has no copy of the plugin.

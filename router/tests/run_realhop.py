@@ -40,6 +40,8 @@ ROWS = (
     "settle_generation_retired", "hold_before_hand_over",
     "crash_adopt_audited_once", "crash_retire_audited_once", "crash_new_audited_once",
 )
+#: The resend workflow's rows, through the plugin's REAL agent sender.
+RESEND_ROWS = ("peer_block_republished_under_new_n",)
 
 _PLUGIN_PATH: Optional[str] = None
 
@@ -376,6 +378,70 @@ class _Result(unittest.TextTestResult):
         self.rows.append((test._testMethodName[5:], "FAIL", f"skipped: {reason}"))
 
 
+def _resend_cases():
+    """The resend workflow against the plugin's real agent sender: a signed
+    peer task handed over, then retransmitted under a new transport id, the
+    hub publishing both (it has no cross-`n` Message-ID check)."""
+    import dataclasses
+    import datetime
+    import json
+    from router import config as config_mod
+    from router import fsops as fsops_mod
+    from router import hoplink, inflight, peerresend, service
+    from router.tests import test_peerresend as tpr
+    from router.util import parse_utc_ts
+
+    class ResendMatrix(tpr._Retransmit):
+
+        def setUp(self):
+            super().setUp()
+            root = Path(self.cfg.hop.root)
+            root.mkdir(mode=0o750, exist_ok=True)
+            self.cfg = dataclasses.replace(self.cfg, hop=dataclasses.replace(
+                self.cfg.hop, caps=tuple(REAL_CAPS.items()), peer_uid=os.getuid()))
+            self.real = load(_PLUGIN_PATH)
+            self.fs = fsops_mod.FsOps(hop_root=str(root))
+            self.addCleanup(self.fs.close)
+            self.rt = service.HopRuntime(plugin=self.real, fsops=self.fs, hop=self.cfg.hop)
+
+        def downstream(self, k):
+            lid, gen = hoplink.split_gen_key(config_mod.gen_key(k, "alpha"))
+            store = self.real.namespace["make_marker_store"](
+                {"hop_root": str(self.cfg.hop.root), "logical_id": lid, "generation": gen,
+                 "peer_uid": self.cfg.hop.peer_uid}, self.fs)
+            store.first_sight()
+            store.write_versions([1], version_write=1)
+            return Path(self.cfg.hop.root) / lid / gen / "outbound"
+
+        def published(self, outbound, n):
+            path = outbound / f"req-{n}.hop.json"
+            self.assertTrue(path.is_file(), f"the hub published req-{n}")
+            return json.loads(path.read_text())
+
+        def test_peer_block_republished_under_new_n(self):
+            k, _ = self.send()
+            outbound = self.downstream(k)
+            k, _ = self.drain()                   # handed over through the real sender
+            k, _ = self.drain()                   # the pass that finds the marker
+            first = self.published(outbound, "00000001")
+            pid = next(peerresend.sent_root(self.state_dir, tpr.LIDS["alpha"]).iterdir()).name
+            d = peerresend.copy_dir(self.state_dir, tpr.LIDS["alpha"], pid)
+            handed = parse_utc_ts(json.loads((d / peerresend.HANDED).read_text())["handed_ts"])
+            later = handed + datetime.timedelta(seconds=inflight.STALE_AFTER_S + 1)
+            from router import clock as clock_mod
+            n = peerresend.operator_retransmit(k, pid, now=later, evidence="row",
+                                               allow_pending=True)["n"]
+            with mock.patch.object(clock_mod, "now", return_value=later):
+                k, _ = self.drain()
+            again = self.published(outbound, n)
+            self.assertNotEqual(n, "00000001")
+            self.assertEqual(again.get("peer"), first.get("peer"), "the identical peer block")
+            self.assertIsNotNone(first.get("peer"), "a peer block was published")
+            self.assertEqual(again.get("from_address"), first.get("from_address"))
+
+    return ResendMatrix
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _PLUGIN_PATH
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -391,8 +457,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"run_realhop: REFUSED: the loader refused the plugin: {type(e).__name__}: {e}",
               file=sys.stderr)
         return 2
-    matrix = _cases()
-    suite = unittest.TestSuite(matrix(f"test_{row}") for row in ROWS)
+    matrix, resend = _cases(), _resend_cases()
+    suite = unittest.TestSuite([matrix(f"test_{row}") for row in ROWS]
+                               + [resend(f"test_{row}") for row in RESEND_ROWS])
     runner = unittest.TextTestRunner(stream=open(os.devnull, "w"), resultclass=_Result,
                                      verbosity=0)
     result = runner.run(suite)
@@ -402,8 +469,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if detail:
             print("    " + detail.strip().splitlines()[-1])
     passed = sum(1 for _n, v, _d in result.rows if v == "PASS")
-    print(f"{passed}/{len(ROWS)} rows PASS")
-    return 0 if passed == len(ROWS) == len(result.rows) else 1
+    total = len(ROWS) + len(RESEND_ROWS)
+    print(f"{passed}/{total} rows PASS")
+    return 0 if passed == total == len(result.rows) else 1
 
 
 if __name__ == "__main__":

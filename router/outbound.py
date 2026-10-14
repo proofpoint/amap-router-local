@@ -1825,6 +1825,29 @@ def _advance_one(
     would answer the new file with the old verdict and archive it unsent.
     The listing then finds the anchor, compares digests, and refuses the
     new file as `req_id_reused`."""
+    from . import peerresend
+    if "retransmit" in record:
+        if (not inflight_mod._was_handed(inflight_mod.handed_path(cfg, name, req_id),
+                                         record["transport_req_id"])
+                and not peerresend.clock_trusted(cfg)):
+            # Before its first hand-over the gate must see a received Result,
+            # which needs the clock: HELD (never cancelled) until it recovers.
+            if (name, req_id) not in _STALE_WARNED:
+                _STALE_WARNED.add((name, req_id))
+                logger.warning("instance %r: retransmit %r held: the peer clock is untrusted",
+                               name, req_id)
+            return inflight_mod.BLOCKED
+        # A retransmit settles as ITSELF, from every settle path alike:
+        # never the agent's Result, never its anchor (the original in-flight
+        # record is their only writer).
+        return inflight_mod.advance(
+            cfg, name, req_id, record, transport,
+            settle=lambda verdict, _d: peerresend.settle_retransmit(cfg, name, record, verdict),
+            already_settled=peerresend.retransmit_settled(cfg, name, record), anchor=None,
+            recheck=lambda rec: _recheck_retransmit(cfg, name, req_id, rec, transport,
+                                                    cold_policy),
+            publish_blocked=cfg.reload_failed, fenced_retired=fenced_retired)
+
     def settle(verdict: Dict[str, Any], digest: Optional[str]) -> str:
         result = _result_doc(req_id, **verdict)
         # A FENCED generation's record publishes only into the root it
@@ -1839,8 +1862,22 @@ def _advance_one(
             _write_anchor(cfg, name, req_id, result, req_digest=digest,
                           transport_req_id=record.get("transport_req_id"))
             return result["outcome"]
-        return _finish(cfg, name, req_id, result, req_digest=digest,
-                       transport_req_id=record.get("transport_req_id"))
+        out = _finish(cfg, name, req_id, result, req_digest=digest,
+                      transport_req_id=record.get("transport_req_id"))
+        _note(peerresend.note_settled, cfg, name, record, result)
+        return out
+
+    def preserve(rec: Dict[str, Any]) -> None:
+        blobs = (inflight_mod.read_snapshot(cfg, name, req_id, rec["attachments"])
+                 if rec.get("attachments") else [])
+        peerresend.preserve(cfg, name, req_id, rec, blobs)
+
+    def found_handed(rec: Dict[str, Any]) -> None:
+        if peerresend.preservable(cfg, name, rec) and not peerresend.has_copy(cfg, name, rec):
+            # Handed over before preservation existed (an upgrade): the record
+            # IS the record as handed, so it is preserved now.
+            preserve(rec)
+        peerresend.note_handed(cfg, name, rec)
 
     anchor = _private_result_path(cfg, name, req_id)
     return inflight_mod.advance(
@@ -1848,7 +1885,39 @@ def _advance_one(
         already_settled=anchor.is_file(), anchor=anchor,
         recheck=lambda rec: _recheck(cfg, name, rec, transport, cold_policy),
         publish_blocked=cfg.reload_failed, fenced_retired=fenced_retired,
+        # Only a signed peer task is preserved: no other record has the effect.
+        preserve=preserve if peerresend.preservable(cfg, name, record) else None,
+        found_handed=found_handed,
     )
+
+
+def _note(fn: Any, *args: Any) -> None:
+    """A preservation note after the settlement: never fails the settlement."""
+    try:
+        fn(*args)
+    except Exception:  # noqa: BLE001 -- the copy's own bookkeeping
+        logger.exception("noting a preserved original's settlement failed")
+
+
+def _recheck_retransmit(
+    cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
+    transport: Optional[inflight_mod.TransportPort], cold_policy: Optional[ColdPolicy],
+) -> inflight_mod.Recheck:
+    """A retransmit's re-check: before its FIRST hand-over, the gate re-runs
+    every dynamic refusal, and a failure is a terminal cancellation
+    (`cancelled/<code>`, nothing handed); then, always, the sender's own
+    re-check of a peer task."""
+    from . import clock, peerresend
+    handed = inflight_mod._was_handed(inflight_mod.handed_path(cfg, name, req_id),
+                                      record["transport_req_id"])
+    if not handed:
+        cancel = peerresend.gate(cfg, name, record, clock.now())
+        if cancel is not None:
+            code, detail = cancel
+            return inflight_mod.Recheck(False, why=f"{code}: {detail}", verdict={
+                "outcome": peerresend.CANCELLED, "reason_code": code,
+                "detail": f"cancelled before any hand-over: {detail}", "recipients": []})
+    return _recheck(cfg, name, record, transport, cold_policy)
 
 
 def _canonical_or_none(raw: Any) -> Optional[str]:
@@ -1919,7 +1988,7 @@ DETAIL_KEY_ROTATED = "signed under a signing key no longer configured; never re-
 
 def _recheck_peer(
     cfg: RouterConfig, name: str, record: Dict[str, Any],
-    refused: Callable[[str], inflight_mod.Recheck],
+    refused: Callable[[str], inflight_mod.Recheck], *, key_id: Optional[str] = None,
 ) -> inflight_mod.Recheck:
     """`_recheck` for a signed peer task. Permitted only while delegation is
     active, the recipient is still a trusted fleet host, `task_deny` still
@@ -1927,16 +1996,23 @@ def _recheck_peer(
     handed over is also refused when its signing key is no longer the
     configured one: it is never re-signed. A handed record is pending
     downstream and validly signed, so rotation alone never refuses it.
-    Exposure and `sender_since` are in the signed bytes: never re-evaluated."""
+    Exposure and `sender_since` are in the signed bytes: never re-evaluated.
+
+    `key_id`: an operator command's CONFIGURED signing key. Such a process
+    never activates delegation (only the drain's startup and reload do), so
+    it passes the key instead of requiring an active delegation; the drain
+    re-checks the active one before the first hand-over."""
     from . import peerlane
-    delegation = peerlane.active(cfg)
-    if delegation is None:
-        return refused("delegation is not active")
+    if key_id is None:
+        delegation = peerlane.active(cfg)
+        if delegation is None:
+            return refused("delegation is not active")
+        key_id = delegation.key_id
     pin = record["peer"]
     rid = record.get("request", {}).get("req_id")
     handed = isinstance(rid, str) and inflight_mod._was_handed(
         inflight_mod.handed_path(cfg, name, rid), record["transport_req_id"])
-    if not handed and pin["key_id"] != delegation.key_id:
+    if not handed and pin["key_id"] != key_id:
         return refused(DETAIL_KEY_ROTATED)
     recipient = record["recipients"][0]
     try:
@@ -2067,7 +2143,9 @@ def _advance_inflight(
                 )
                 errored += 1
                 continue
-            if state == inflight_mod.SETTLED:
+            if state == inflight_mod.SETTLED and "retransmit" in record:
+                settled += 1                 # its own settlement; no agent Result
+            elif state == inflight_mod.SETTLED:
                 settled += 1
                 result = json.loads(
                     _private_result_path(cfg, name, req_id).read_text(encoding="utf-8")
@@ -3467,6 +3545,14 @@ def _drain_fenced(
             except Exception:
                 logger.exception("instance %r: error stepping fenced in-flight work — "
                                  "isolated, its files stay claimed", name)
+            # The resend workflow's claims in this generation: finished here,
+            # by its own generation's pass (a claim never moves generation).
+            try:
+                from . import clock, peerresend
+                peerresend.finish(view, name, clock.now(), fenced=True)
+            except Exception:  # noqa: BLE001 -- retried next poll
+                logger.exception("instance %r: finishing a fenced generation's retransmit "
+                                 "claims failed; retried next poll", name)
         # Its orphan attachment snapshots, records or not (`_sweep_snapshots`);
         # what could not be decided joins the drain summary's count.
         n_uncertain = _sweep_snapshots(view, name)
@@ -3781,6 +3867,26 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     if sum(fenced_uncertain):
         inflight_summary["snapshot_sweep_uncertain"] = (
             inflight_summary.get("snapshot_sweep_uncertain", 0) + sum(fenced_uncertain))
+    if transport is not None and not isinstance(transport, hoplink.Held):
+        # The resend workflow's own bookkeeping, after every record stepped:
+        # a claimed retransmit recovered or finished (its audit, then its
+        # claim), and preserved originals past their retention pruned.
+        from . import clock, peerresend
+        for what, fn in (("retransmit_finished", peerresend.finish),
+                         ("peer_sent_pruned", peerresend.sweep)):
+            try:
+                done = fn(cfg, name, clock.now())
+            except Exception:  # noqa: BLE001 -- retried next poll, never fails the drain
+                logger.exception("instance %r: %s failed; retried next poll", name, what)
+                continue
+            if done:
+                inflight_summary[what] = done
+        if peerresend.enabled(cfg):
+            # The preserved copies, for status (`last_summary.peer_sent`).
+            try:
+                inflight_summary["peer_sent"] = peerresend.status(cfg, name)
+            except Exception:  # noqa: BLE001 -- a report, never fails the drain
+                logger.exception("instance %r: the preserved-copy report failed", name)
 
     _sweep_answered_pending(cfg, name)
     filenames, skipped_symlinks = list_outbound(cfg, name)

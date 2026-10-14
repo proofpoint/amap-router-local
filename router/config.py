@@ -236,7 +236,7 @@ DEFAULT_CONNECTOR_OUTCOME_IDS: Tuple[str, ...] = ("claude-code",)
 _TOP_KEYS = {
     "state_dir", "instances", "connector_outcome_ids",
     "attachment_max_bytes", "attachment_max_count", "attachment_max_total_bytes",
-    "fleet_domain", "intake_dir",
+    "fleet_domain", "intake_dir", "peer_sent_prune",
     "sender_exposure_window_seconds", "peer_reply_window_seconds",
     "mail_reply_window_seconds",
     "task_graph", "mail_graph",
@@ -606,6 +606,11 @@ class RouterConfig:
     #: good config kept in its place. While it is set the external leg fails
     #: closed: nothing new is published and no revocation is enacted.
     reload_failed: bool = field(default=False, compare=False)
+    #: `peer_sent_prune`: whether preserved signed peer tasks (`peerresend`)
+    #: are pruned once settled, unclaimed and past ts + P + F + 7 days. ON by
+    #: default (decided 2026-10-14): the copies, attachments included, would
+    #: otherwise grow without bound.
+    peer_sent_prune: bool = True
 
 
 @dataclass(frozen=True)
@@ -1389,6 +1394,9 @@ def load_obj(
             )
         fleet_domain = fd
 
+    peer_sent_prune = top.get("peer_sent_prune", True)
+    if type(peer_sent_prune) is not bool:
+        raise ConfigError("config.peer_sent_prune: true or false")
     intake_dir: Optional[Path] = None
     if "intake_dir" in top:
         intake_dir = _require_absolute(top["intake_dir"], "config.intake_dir")
@@ -1781,7 +1789,7 @@ def load_obj(
         attachment_max_bytes=attachment_max_bytes,
         attachment_max_count=attachment_max_count,
         attachment_max_total_bytes=attachment_max_total_bytes,
-        fleet_domain=fleet_domain, intake_dir=intake_dir,
+        fleet_domain=fleet_domain, intake_dir=intake_dir, peer_sent_prune=peer_sent_prune,
         sender_exposure_window_seconds=sender_exposure_window_seconds,
         peer_reply_window_seconds=peer_reply_window_seconds,
         mail_reply_window_seconds=mail_reply_window_seconds,

@@ -44,6 +44,10 @@
                                  record an operator bound B after a lost clock: refused below any
                                  receiver time the router can see; floor = B + Fmax + 1 s, then
                                  admission opens. The evidence is recorded, NOT verified.
+  peer-request show ID | retransmit ID --evidence TEXT [--allow-pending]
+                                 a signed peer task this router sent (router/peerresend.py):
+                                 reconcile it, or hand its ORIGINAL bytes over again under a new
+                                 transport id; never re-signed, never a second Result
   runtime-generation adopt GEN --evidence TEXT | retire GEN --evidence TEXT | new --evidence TEXT
                     | abandon-attempt KEY --evidence TEXT | abandon-plan --evidence TEXT
                                  the router's own runtime control tree (router/peercontrol.py),
@@ -228,6 +232,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pet = pe_sub.add_parser("trust", help="reseed, recount and verify the epoch store, then "
                                             "clear its untrusted flag")
     p_pet.add_argument("--evidence", required=True)
+    p_pr = sub.add_parser("peer-request", help="reconcile or retransmit a signed peer task "
+                                                "this router sent")
+    pr_sub = p_pr.add_subparsers(dest="peer_request_command", required=True)
+    p_prs = pr_sub.add_parser("show", help="read-only: the issued record, the preserved original, "
+                                          "its settlement and retransmits, and the actions open")
+    p_prs.add_argument("id")
+    p_prr = pr_sub.add_parser("retransmit", help="hand the ORIGINAL signed bytes over again under "
+                                                "a new transport id (never re-signed)")
+    p_prr.add_argument("id")
+    p_prr.add_argument("--evidence", required=True)
+    p_prr.add_argument("--allow-pending", action="store_true",
+                       help="retransmit beside an original still without a Result, past the "
+                            "pending threshold")
     p_pb = sub.add_parser("peer-bound", help="record an operator bound B after a lost clock")
     p_pb.add_argument("--at", required=True, help="B, as YYYY-MM-DDTHH:MM:SSZ (no default)")
     p_pb.add_argument("--evidence", required=True,
@@ -330,6 +347,46 @@ def _peer_operator(cfg, args) -> int:
             out = peerjournal.operator_restore_key(cfg, now, source=args.source)
     except (peerjournal.StoreRefused, peerjournal.DropRefused, peerclock.BoundRefused,
             peerclock.ClockUntrusted, peerjournal.StoreBlocked, OSError, ValueError) as e:
+        print(f"router: {verb}: refused: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lk.release()
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def _peer_request(cfg, args) -> int:
+    """`peer-request show|retransmit` (router/peerresend.py). `show` is
+    read-only: no lock, the registry read without recording its seq.
+    `retransmit` takes the drain lock, resolves this poll's inputs as the
+    router does, and is audited."""
+    from . import clock, peerresend, registry as registry_mod, service
+    if args.peer_request_command == "show":
+        view = cfg
+        if cfg.registry_dir is not None:
+            report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
+                                             persist=False)
+            view = registry_mod.keyed_config(cfg, report)
+        print(json.dumps(peerresend.show(view, args.id, now=clock.now()), sort_keys=True))
+        return 0
+    verb = "peer-request retransmit"
+    try:
+        lk = acquire_lock(cfg.state_dir)
+    except LockHeldError as e:
+        print(f"router: refusing to run '{verb}': {e}", file=sys.stderr)
+        return 1
+    try:
+        # No delegation activation here (only the drain's startup and reload
+        # activate it): the verb checks the CONFIGURED signing key, and the
+        # drain checks again before the first hand-over.
+        inputs = service.poll_inputs(cfg)
+        out = peerresend.operator_retransmit(inputs.cfg, args.id, now=clock.now(),
+                                             evidence=args.evidence,
+                                             allow_pending=args.allow_pending)
+    except peerresend.Refused as e:
+        print(f"router: {verb}: refused: {e.code}: {e.detail}", file=sys.stderr)
+        return 1
+    except (ValueError, OSError, StateKeyUnresolved) as e:
         print(f"router: {verb}: refused: {e}", file=sys.stderr)
         return 1
     finally:
@@ -813,6 +870,8 @@ def main(argv=None) -> int:
         return _peer_operator(cfg, args)
     if args.command == "runtime-generation":
         return _runtime_generation(cfg, args)
+    if args.command == "peer-request":
+        return _peer_request(cfg, args)
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover — argparse prevents this
     return 2
