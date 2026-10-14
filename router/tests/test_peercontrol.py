@@ -957,15 +957,21 @@ class GenerationClassifiedTests(_Control):
         self.tree.gens["a" * 32] = "live"
         self.assertEqual(peercontrol.generation(self.cfg, self.cap(), now=NOW), "a" * 32)
 
-    def test_an_attempt_whose_generation_was_retired_is_not_handed_over(self):
+    def not_handed_over_when(self, state):
         key = self.refused()
         with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
             self.send()
         gen = self.record(key)["control"]["attempt"]["gen"]
-        self.tree.gens[gen] = "retired"
+        self.tree.gens[gen] = state
         self.assertEqual(self.send(), {peercontrol.UNAVAILABLE: 1})
         port = self.tree.senders.get(gen)
         self.assertEqual(port.writes if port is not None else [], [], "nothing handed over")
+
+    def test_an_attempt_whose_generation_was_retired_is_not_handed_over(self):
+        self.not_handed_over_when("retired")
+
+    def test_an_attempt_whose_generation_is_unreadable_is_not_handed_over(self):
+        self.not_handed_over_when("unreadable")
 
 
 class DeferralHorizonTests(_Control):

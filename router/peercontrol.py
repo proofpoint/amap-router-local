@@ -1028,7 +1028,10 @@ def pin(cfg: Any, attempt: Mapping[str, Any]) -> Dict[str, Any]:
 def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """Status `peer_store.controls`: pending, sent (settled with an outcome
     in `SENT_OUTCOMES`), failed (any other settled outcome, by outcome),
-    suppressed by reason, held by reason, deferred, stuck (by reason, each with its age),
+    suppressed by reason, held by reason, deferred, stuck (by reason; each
+    record's `since` is when it was first marked stuck, and its `age_s` is
+    measured from the attempt's signing time, `attempt.ts`, falling back to
+    the intent time `attempt.at` when nothing was signed),
     and the runtime tree: `unavailable` without the capability; otherwise
     the recorded generation and, read through the read-only lister, every
     listed generation with its state, so a lost record shows what an
