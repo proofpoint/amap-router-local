@@ -112,33 +112,110 @@ class InstalledSourceTests(unittest.TestCase):
         self.assertGreaterEqual(len(distinct), 2, "one value everywhere: a cached read")
 
     def test_writes_within_an_operation_never_go_backwards(self):
-        """In fsync order, inside each operation, no write's earliest added
-        time is earlier than the earliest of the write before it: a value
-        read early and written after a later one would show here, where the
-        operation-level check above cannot see it."""
-        data = self.data()
-        events = 0
-        for r in self.ops():
-            # Only the times this operation is known to have written to its
-            # JSON documents (and that were judged above); a temp or snapshot
-            # file can also carry data, such as a fixture's own date.
-            written = {v[2] for v in r["values"]} - data
-            prev = None
-            for added in r["trace"]:
-                vals = [v for v in added if v in written]
-                if not vals:
-                    continue
-                events += 1
-                if prev is not None:
-                    with self.subTest(flow=r["flow"], op=r["label"]):
-                        self.assertGreaterEqual(min(vals), prev, "a write stamped an earlier time")
-                prev = min(vals)
+        """In the order writes became visible, inside each operation, no
+        stamp is earlier than the latest stamp of any earlier write unless
+        it is a reading an earlier write already stamped (`backwards`): a
+        value read early and written after a later one shows here, where
+        the operation-level check cannot see it."""
+        emitted, data = self.doc["emitted"], self.data()
+        events, log_high = 0, {}
+        for r in sorted(self.ops(), key=lambda r: (r["flow"], r["op"])):
+            bad = backwards(r["trace"], set(emitted) - data, set(emitted[:r["pre"]]), log_high)
+            events += sum(1 for e in r["trace"] if e[1])
+            with self.subTest(flow=r["flow"], op=r["label"]):
+                self.assertEqual(bad, [], "a write stamped a time earlier than an earlier write")
         self.assertGreater(events, 10, "the write trace saw almost nothing: not tracing")
 
     def test_the_exposure_follows_the_file_time_set_from_the_installed_clock(self):
         [rec] = [r for r in self.doc["records"] if "exposure" in r]
         self.assertIs(rec["exposure"]["external_mail_delivered"], True)
         self.assertEqual(rec["exposure"]["last_external_delivery_ts"], rec["written"])
+
+
+def backwards(trace, valid, before, log_high=None):
+    """The stamps in `trace` (`[kind, stamps]` per write, in order) that are
+    earlier than the HIGHEST stamp of an earlier write, and are not a
+    reading this operation already stamped in an earlier write.
+
+    Only values the source emitted count (`valid`). A document value the
+    source emitted before the operation began (`before`) was carried from
+    earlier state, not stamped now. An appended line's values always count,
+    so an append repeating a stamp from before the operation is caught.
+
+    Re-using one reading across a pass is deliberate (the ingress pump's
+    `Pump.now` stamps the notice and its ledger record after the journal
+    record took fresh reads), so a value an earlier write of the same
+    operation already stamped is the same reading, not a step back. A value
+    read early, never written, and written after a later one is the defect
+    this catches. And on one append-only path (`[kind, stamps, path]`), a
+    line stamped earlier than an earlier line of that path is backwards
+    even when it repeats a reading; pass the same `log_high` to successive
+    operations and the rule holds over the log's whole life."""
+    bad, high, stamped = [], None, set()
+    log_high = {} if log_high is None else log_high
+    for kind, stamps, *where in trace:
+        vals = [v for v in stamps if v in valid and (kind == "jsonl" or v not in before)]
+        if high is not None:
+            bad += [v for v in vals if v < high and v not in stamped]
+        if kind == "jsonl" and where:
+            # An append-only log never steps back on its own path, reuse or not.
+            last = log_high.get(where[0])
+            bad += [v for v in vals if last is not None and v < last and v not in bad]
+            if vals:
+                log_high[where[0]] = max([last] + vals) if last else max(vals)
+        if vals:
+            high = max(vals) if high is None else max(high, max(vals))
+            stamped.update(vals)
+    return bad
+
+
+class BackwardsTests(unittest.TestCase):
+    """The order judge on traces built by hand, through the same
+    `stamps_added` the child uses."""
+
+    def setUp(self):
+        from router.tests import clock_child_flows as f
+        self.f = f
+
+    def test_a_multi_valued_write_then_an_earlier_one_is_backwards(self):
+        trace = [["json", ["t1", "t5"]], ["json", ["t3"]]]
+        self.assertEqual(backwards(trace, {"t1", "t3", "t5"}, set()), ["t3"])
+
+    def test_reusing_a_reading_this_operation_already_stamped_is_not_backwards(self):
+        trace = [["json", ["t1", "t2"]], ["json", ["t3"]], ["json", ["t1", "t1"]]]
+        self.assertEqual(backwards(trace, {"t1", "t2", "t3"}, set()), [])
+
+    def test_in_order_writes_pass_and_carried_values_do_not_count(self):
+        trace = [["json", ["t2"]], ["json", ["t1", "t3"]], ["jsonl", ["t3"]]]
+        self.assertEqual(backwards(trace, {"t1", "t2", "t3"}, {"t1"}), [])
+
+    def test_an_append_repeating_an_older_stamp_on_the_same_path_is_backwards(self):
+        first = json.dumps({"ts": "2001-02-03T04:05:06Z"})
+        later = json.dumps({"ts": "2001-02-03T04:05:09Z"})
+        state, s1 = self.f.stamps_added(None, first + "\n", True)
+        state, s2 = self.f.stamps_added(state, first + "\n" + later + "\n", True)
+        state, s3 = self.f.stamps_added(state, first + "\n" + later + "\n" + first + "\n", True)
+        self.assertEqual((s1, s2, s3), (["2001-02-03T04:05:06Z"], ["2001-02-03T04:05:09Z"],
+                                        ["2001-02-03T04:05:06Z"]))
+        valid = {"2001-02-03T04:05:06Z", "2001-02-03T04:05:09Z"}
+        log = "/x/audit.jsonl"
+        # The repeat on the same path is backwards even inside one operation...
+        self.assertEqual(backwards([["jsonl", s1, log], ["jsonl", s2, log], ["jsonl", s3, log]],
+                                   valid, set()), ["2001-02-03T04:05:06Z"])
+        # ...and when the repeated stamp is from an earlier operation.
+        highs: dict = {}
+        self.assertEqual(backwards([["jsonl", s1, log], ["jsonl", s2, log]], valid, set(), highs),
+                         [])
+        self.assertEqual(backwards([["jsonl", s3, log]], valid,
+                                   {"2001-02-03T04:05:06Z", "2001-02-03T04:05:09Z"}, highs),
+                         ["2001-02-03T04:05:06Z"])
+
+    def test_a_document_rewrite_carrying_a_member_is_not_a_new_stamp(self):
+        a = json.dumps({"first_seen_ts": "2001-02-03T04:05:06Z", "state_ts": "2001-02-03T04:05:07Z"})
+        b = json.dumps({"first_seen_ts": "2001-02-03T04:05:06Z", "state_ts": "2001-02-03T04:05:09Z"})
+        state, _ = self.f.stamps_added(None, a, False)
+        _state, stamps = self.f.stamps_added(state, b, False)
+        self.assertEqual(stamps, ["2001-02-03T04:05:09Z"])
 
 
 class CompanionTests(unittest.TestCase):

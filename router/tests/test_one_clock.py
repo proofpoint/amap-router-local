@@ -19,7 +19,7 @@
 - R3, reflective and dynamic access: `getattr`/`setattr`/`hasattr`/`delattr`/
   `vars` on a clock base or naming a banned member, `__dict__` of a clock
   base, `operator.attrgetter`/`methodcaller` naming a banned member, any
-  `importlib.import_module` or `__import__` call, any `sys.modules` reference
+  `importlib.import_module` or `__import__`, called or taken as a value, any `sys.modules` reference
   (allowed, exactly, as `hoplink`'s two `sys.modules.get(f"{__package__}…")`
   lookups of its own package), and `from <clock base or this package> import *`.
 - R4, re-export imports and rebinding: `from .<module> import datetime|date|
@@ -232,6 +232,12 @@ def scan(source: str, module: str, package: str = "router"):
         if isinstance(node, ast.Attribute) and node.attr == "__dict__" \
                 and _qual(node.value, aliases) in CLOCK_BASES:
             hit(node, "R3")
+        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load) \
+                and id(node) not in bases and not (isinstance(parents.get(id(node)), ast.Call)
+                                                   and parents[id(node)].func is node) \
+                and (_qual(node, aliases) in ("importlib.import_module", "builtins.__import__")
+                     or (isinstance(node, ast.Name) and node.id == "__import__")):
+            hit(node, "R3")     # a dynamic importer taken as a value, to be called later
         if isinstance(node, ast.Attribute) and node.attr == "__dict__" \
                 and _qual(node.value, aliases) == CLOCK_OWN:
             hit(node, "isolation")
@@ -386,6 +392,9 @@ class ControlTests(unittest.TestCase):
         "sys.modules.get, not the package": "import sys\ndef f():\n    return sys.modules.get('time')\n",
         "star import": "from time import *\ndef f():\n    g = monotonic\n    return g()\n",
         "star import of this package": "from .util import *\n",
+        "import_module as a value": "import importlib\nf = importlib.import_module\n",
+        "__import__ as a value": "f = __import__\n",
+        "builtins.__import__": "import builtins\nf = builtins.__import__\n",
         "getattr on clock": "from . import clock\ndef f():\n    return getattr(clock, 'install')\n",
         "vars of clock": "from . import clock\ndef f():\n    return vars(clock)['reset']\n",
         "__dict__ of clock": "from . import clock\ndef f():\n    return clock.__dict__['_INSTALLED']\n",
@@ -435,25 +444,32 @@ class ControlTests(unittest.TestCase):
 def unreset_installs(source: str):
     """`(line, name)` for each top-level class or function of a test module
     that calls `router.clock.install` (resolved through its imports) without
-    resetting it where a reset always runs: `clock.reset` in `tearDown` or
-    `tearDownClass`, as an `addCleanup` argument, or in a `finally` body."""
+    resetting it where a reset always runs: `clock.reset()` as a top-level
+    statement of `tearDown`, `tearDownClass` or a `finally` body, or
+    `clock.reset` passed to `addCleanup`."""
     tree = ast.parse(source)
     aliases = _aliases(tree, "router.tests")
     parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
 
     def always_runs(node):
-        child, n = node, parents.get(id(node))
-        while n is not None:
-            if isinstance(n, ast.Call) and _call_name(n.func) == "addCleanup" \
-                    and child in n.args:
-                return True
-            if isinstance(n, ast.Try) and child in n.finalbody:
-                return True
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                    and n.name in ("tearDown", "tearDownClass"):
-                return True
-            child, n = n, parents.get(id(n))
-        return False
+        """Guaranteed to run: passed directly to `addCleanup`, or called as
+        a TOP-LEVEL statement of `tearDown`/`tearDownClass` or of a
+        `finally` body. Nested under `if`, `while`, `for`, `try` or `with`,
+        it might not run, and does not count."""
+        call = parents.get(id(node))
+        if isinstance(call, ast.Call) and _call_name(call.func) == "addCleanup" \
+                and node in call.args:
+            return True
+        if not (isinstance(call, ast.Call) and call.func is node):
+            return False
+        stmt = parents.get(id(call))
+        owner = parents.get(id(stmt))
+        if not isinstance(stmt, ast.Expr):
+            return False
+        if isinstance(owner, ast.Try) and stmt in owner.finalbody:
+            return True
+        return (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and owner.name in ("tearDown", "tearDownClass") and stmt in owner.body)
 
     bad = []
     for top in tree.body:
@@ -488,6 +504,16 @@ class TestsResetWhatTheyInstallTests(unittest.TestCase):
         "another object's reset": ("from router import clock\nclass T:\n"
                                    "    def test(self):\n        clock.install(f)\n"
                                    "    def tearDown(self):\n        other.reset()\n"),
+        "conditional in tearDown": ("from router import clock\nclass T:\n"
+                                    "    def test(self):\n        clock.install(f)\n"
+                                    "    def tearDown(self):\n        if False:\n"
+                                    "            clock.reset()\n"),
+        "conditional in finally": ("from router import clock\ndef f():\n    try:\n"
+                                   "        clock.install(g)\n    finally:\n"
+                                   "        if False:\n            clock.reset()\n"),
+        "reset referenced, not called": ("from router import clock\nclass T:\n"
+                                         "    def test(self):\n        clock.install(f)\n"
+                                         "    def tearDown(self):\n        clock.reset\n"),
     }
     GOOD = {
         "aliased, tearDown": ("from router import clock as c\nclass T:\n"

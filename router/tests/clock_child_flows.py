@@ -11,13 +11,20 @@ carry a time passed in as DATA, or one derived from the clock by arithmetic
 (`DERIVED`), are not clock reads and are skipped. The parent judges the
 records; the flows only drive and observe.
 
-Write ORDER is observed too: `install_write_trace()` wraps `os.fsync`, which
-every durable write in the package calls on the file it has just written
-(before a rename into place, or after an append). At each fsync of a regular
-file under the flow's tree the file is read back through `/proc/self/fd`, and
-the timestamps that write ADDED (not in that path's previous content) are
-appended to `TRACE` in call order. Each operation records its slice, so the
-parent can check that no write stamps a time earlier than the write before it.
+Write ORDER is observed too. `install_write_trace()` wraps the calls that
+make a write visible at its final path: `os.replace`, `os.rename` and
+`os.link` (a temp file put in place) and, for an append-only `.jsonl` file,
+`os.fsync` on that file or the `os.close` of its descriptor (an append that
+is not durable is not fsynced, but it is complete when its fd closes). Each such event under the flow's tree reads the file
+at its final path and records, in call order, the timestamps that write
+STAMPED (`stamps_added`):
+- for a `.jsonl` file, every value on each line the write appended, repeats
+  included, so an append that repeats an older stamp is seen;
+- for a JSON document, each (member, value) that is not the same member with
+  the same value in that path's previous content: a value carried forward on
+  a rewrite is not a new stamp.
+Each operation records its slice, plus how many values the installed source
+had emitted before it began; the parent judges the order (`backwards`).
 
 The flows:
 - `mail_once`: an outbound mail request through `router once` (the CLI's
@@ -57,49 +64,102 @@ DERIVED = frozenset({"window_start", "expires_at", "floor", "B", "at", "deferred
 
 OUT = os.environ.get("CLOCK_W2_OUT")
 RECORDS: list = []
-#: (path, added timestamps) per fsync of a regular file, in call order.
+#: (kind, stamps, path) per visible write under the flow's tree, in call order.
 TRACE: list = []
-_SEEN_BY_PATH: dict = {}
+_PREV_BY_PATH: dict = {}
 _ROOTS: list = []
 
 
-def _values_in(text: str, suffix: str) -> set:
-    out: set = set()
-    docs = text.splitlines() if suffix == ".jsonl" else [text]
-    for line in docs:
-        try:
-            _walk(json.loads(line), (), out, "")
-        except ValueError:
-            continue
-    return {v for _r, _k, v in out}
+def _pairs(value, path=()):
+    """(member path, timestamp) for every timestamp-shaped string, DERIVED
+    members skipped."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k not in DERIVED:
+                yield from _pairs(v, path + (str(k),))
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            yield from _pairs(v, path + (str(i),))
+    elif isinstance(value, str) and TS.match(value):
+        yield ("/".join(path), value)
+
+
+def _parse(line):
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
+
+
+def stamps_added(prev, text: str, jsonl: bool):
+    """`(state, stamps)` for one visible write of a file whose previous state
+    was `prev` (None the first time). For an append-only file, every value on
+    every appended line, repeats included; for a document, each member whose
+    value differs from that member's previous value."""
+    if jsonl:
+        lines = text.splitlines()
+        old = prev or 0
+        return len(lines), [v for line in lines[old:] for _k, v in _pairs(_parse(line))]
+    pairs = set(_pairs(_parse(text)))
+    return pairs, sorted(v for _k, v in pairs - (prev or set()))
+
+
+def _record(path: str) -> None:
+    if not any(path.startswith(r) for r in _ROOTS):
+        return
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    jsonl = path.endswith(".jsonl")
+    state, stamps = stamps_added(_PREV_BY_PATH.get(path), text, jsonl)
+    _PREV_BY_PATH[path] = state
+    if stamps:
+        TRACE.append(["jsonl" if jsonl else "json", stamps, path])
+
+
+def _dst(dst, dir_fd):
+    if dir_fd is None:
+        return os.path.realpath(dst)
+    return os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), os.fsdecode(dst))
 
 
 def install_write_trace() -> None:
-    import stat as stat_mod
-    real = os.fsync
+    real_replace, real_rename, real_link = os.replace, os.rename, os.link
+    real_fsync, real_close = os.fsync, os.close
+
+    def put_in_place(real):
+        def wrapper(src, dst, *a, **kw):
+            out = real(src, dst, *a, **kw)
+            try:
+                _record(_dst(dst, kw.get("dst_dir_fd")))
+            except OSError:
+                pass
+            return out
+        return wrapper
 
     def fsync(fd):
-        real(fd)
+        real_fsync(fd)
         try:
-            st = os.fstat(fd)
             path = os.readlink(f"/proc/self/fd/{fd}")
         except OSError:
             return
-        if not stat_mod.S_ISREG(st.st_mode) or not any(path.startswith(r) for r in _ROOTS):
-            return
-        try:
-            with open(f"/proc/self/fd/{fd}", "rb") as f:
-                text = f.read().decode("utf-8")
-        except (OSError, UnicodeDecodeError):
-            return
-        suffix = ".jsonl" if ".jsonl" in path else ".json"
-        now = _values_in(text, suffix)
-        added = sorted(now - _SEEN_BY_PATH.get(path, set()))
-        _SEEN_BY_PATH[path] = now
-        if added:
-            TRACE.append([path, added])
+        if path.endswith(".jsonl"):
+            _record(path)
 
-    os.fsync = fsync
+    def close(fd):
+        # An append that is not fsynced is still complete when its fd closes.
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            path = ""
+        if path.endswith(".jsonl"):
+            _record(path)
+        real_close(fd)
+
+    os.replace, os.rename, os.link = (put_in_place(real_replace), put_in_place(real_rename),
+                                      put_in_place(real_link))
+    os.fsync, os.close = fsync, close
 
 
 def _walk(value, path, out, rel):
@@ -143,13 +203,16 @@ class _Observe:
 
     def op(self, label, fn):
         start = len(TRACE)
+        src = clock._INSTALLED[0] if clock._INSTALLED else None
+        pre = len(getattr(src, "emitted", ()))
         out = fn()
-        trace = [added for _p, added in TRACE[start:]]
+        trace = TRACE[start:]
         now = snapshot(self.root)
         new = sorted(now - self.seen)
         self.seen = now
         RECORDS.append({"flow": self.flow, "op": self.n, "label": label,
-                        "values": [list(v) for v in new], "trace": trace})
+                        "values": [list(v) for v in new], "trace": trace,
+                        "pre": pre})
         self.n += 1
         return out
 

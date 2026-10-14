@@ -159,6 +159,43 @@ M = [
   "    return format_utc_ts(_H[-3] if len(_H) % 2 == 0 and len(_H) > 2 else _H[-1])\n\n\n"
   "_H = []\n",
   [W2 + "test_writes_within_an_operation_never_go_backwards"]),
+ ("C30 a read held back, then written after a later one", "router/util.py",
+  "    return format_utc_ts(clock.now())\n",
+  "    a, b = clock.now(), clock.now()\n    _Q.append(a)\n"
+  "    return format_utc_ts(b if len(_Q) % 2 else _Q[-2])\n\n\n_Q = []\n",
+  [W2 + "test_writes_within_an_operation_never_go_backwards"]),
+ ("C31 an append repeats a stamp from an earlier operation", "router/peerjournal.py",
+  "    line = json.dumps(dict(fields, ts=format_utc_ts(now), act=act, by=peerclock.operator_by()),\n",
+  "    first = globals().setdefault(\"_FIRST_TS\", format_utc_ts(now))\n"
+  "    line = json.dumps(dict(fields, ts=first, act=act, by=peerclock.operator_by()),\n",
+  [W2 + "test_writes_within_an_operation_never_go_backwards"]),
+ ("C32 the judge keeps the lowest stamp as its high-water", "router/tests/test_clock_child.py",
+  "            high = max(vals) if high is None else max(high, max(vals))\n",
+  "            high = min(vals) if high is None else max(high, min(vals))\n",
+  ["router.tests.test_clock_child.BackwardsTests."
+   "test_a_multi_valued_write_then_an_earlier_one_is_backwards"]),
+ ("C33 appended lines diffed as a set, hiding a repeat", "router/tests/clock_child_flows.py",
+  "        return len(lines), [v for line in lines[old:] for _k, v in _pairs(_parse(line))]\n",
+  "        seen = {v for line in lines[:old] for _k, v in _pairs(_parse(line))}\n"
+  "        return len(lines), [v for line in lines[old:] for _k, v in _pairs(_parse(line))\n"
+  "                            if v not in seen]\n",
+  ["router.tests.test_clock_child.BackwardsTests."
+   "test_an_append_repeating_an_older_stamp_on_the_same_path_is_backwards"]),
+ ("C34 the reset rule accepts a conditional reset", "router/tests/test_one_clock.py",
+  "        if not isinstance(stmt, ast.Expr):\n            return False\n",
+  "        while stmt is not None and not isinstance(stmt, ast.Expr):\n"
+  "            stmt = parents.get(id(stmt))\n"
+  "        owner = parents.get(id(stmt))\n"
+  "        while owner is not None and not isinstance(\n"
+  "                owner, (ast.Try, ast.FunctionDef, ast.AsyncFunctionDef)):\n"
+  "            stmt, owner = owner, parents.get(id(owner))\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C35 a dynamic importer taken as a value", "router/outcomes.py",
+  "def outcomes_rel(connector_id: str) -> Path:",
+  "def _imp():\n    import importlib\n    return importlib.import_module\n\n\n"
+  "def outcomes_rel(connector_id: str) -> Path:",
+  [ONE]),
 ]
 
 
