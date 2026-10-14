@@ -366,7 +366,10 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     if others:
         raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: "
                                        f"{_exit_for(others, adopt=True)}")
-    frozen = _frozen_elsewhere(cfg, recorded)
+    try:
+        frozen = _frozen_elsewhere(cfg, recorded)
+    except JournalBlind as e:
+        raise Unavailable(UNAVAILABLE, str(e)) from None
     if frozen:
         # A frozen attempt still names a generation of its own: a new one
         # would split the runtime tree. It is restored, adopted or abandoned.
@@ -377,13 +380,144 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     return gen
 
 
+class JournalBlind(ValueError):
+    """The journal cannot be read, so a guard that reads it cannot answer:
+    an empty answer would read as "nothing frozen" and let the act through.
+    A `ValueError`, so an operator verb is refused before any effect, and a
+    pending plan stays pending."""
+
+
+#: How every runtime-generation guard that reads the journal says it cannot.
+JOURNAL_BLIND = ("the peer clock is untrusted, so the journal's frozen attempts cannot be "
+                 "seen and this check cannot pass; recover the clock first")
+
+
+#: The same, when the clock is trusted but holds no store bookkeeping while a
+#: journal is on disk (a clock rebuilt by a bound, before its bookkeeping).
+JOURNAL_UNKEPT = ("the peer clock holds no store bookkeeping beside a journal on disk, so the "
+                  "journal's frozen attempts cannot be seen and this check cannot pass; rebuild "
+                  "the bookkeeping first (`router peer-bound` records the bound and rebuilds it)")
+
+
+def _guard_records(cfg: Any) -> List[Dict[str, Any]]:
+    """Every journal record, for a guard: `peerjournal.all_records` answers
+    `[]` while the clock is untrusted, the bookkeeping is unreadable or
+    absent, and it skips an unreadable record or an owner the bookkeeping
+    does not list, any of which a guard must never read as "nothing there".
+    `[]` only when nothing was ever journaled: no journal directory on disk,
+    and the clock either absent or holding no store. Otherwise every record
+    on disk, read strictly (`_strict_records`), or `JournalBlind`."""
+    sd = Path(cfg.state_dir)
+    journaled = _journal_dirs(sd)
+    try:
+        meta = peerjournal.read_meta(sd)
+    except peerjournal.StoreAbsent:
+        if not journaled:
+            return []
+        raise JournalBlind(JOURNAL_UNKEPT) from None
+    except peerclock.ClockUntrusted as e:
+        if not journaled and not peerclock.path(sd).exists():
+            return []
+        raise JournalBlind(f"{JOURNAL_BLIND} ({e})") from None
+    except (OSError, ValueError) as e:
+        raise JournalBlind(f"{JOURNAL_BLIND} (the bookkeeping is unreadable: "
+                           f"{type(e).__name__}: {e})") from None
+    records = _strict_records(sd)
+    _check_bookkeeping(sd, meta)
+    return records
+
+
+def _check_bookkeeping(state_dir: Path, meta: Mapping[str, Any]) -> None:
+    """Every journal root the bookkeeping lists is on disk and holds exactly
+    what the bookkeeping says (`peerjournal._scan_root`, the comparison
+    `reconcile` makes, read only): a record deleted whole, or a root gone,
+    leaves nothing on disk for the walk to see. An operation still pending
+    on a root may have run or not; anything else is `JournalBlind`."""
+    op = meta.get("pending_op") or {}
+    for owner, entry in sorted(meta["roots"].items()):
+        if not peerjournal.journal_root(state_dir, owner).is_dir():
+            raise JournalBlind(f"the journal root {owner} the bookkeeping lists is missing, so "
+                               "this check cannot pass")
+        try:
+            live, _high, total, revs, _seqs = peerjournal._scan_root(state_dir, owner)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise JournalBlind(f"the journal root {owner} cannot be read ({type(e).__name__}), "
+                               "so this check cannot pass") from None
+        d = next((x for x in op.get("delta") or () if x.get("store") == "root"
+                  and x.get("owner") == owner), None)
+        exact = (live, str(total), revs) == (entry["live"], entry["content_sum"], entry["rev_total"])
+        if not (exact or peerjournal._rolled(entry, d, live, total, revs)):
+            raise JournalBlind(f"the journal root {owner} does not match its bookkeeping (a "
+                               "record lost or changed outside the router), so this check "
+                               "cannot pass")
+
+
+def _strict_records(state_dir: Path) -> List[Dict[str, Any]]:
+    """Every record under every owner's journal directory ON DISK, whether
+    or not the bookkeeping lists the owner (`peerjournal._find`'s layout);
+    `JournalBlind` naming the first that cannot be read, where
+    `all_records` would skip it."""
+    out = []
+    try:
+        children = sorted(state_dir.iterdir())
+    except OSError as e:
+        raise JournalBlind(f"the state directory cannot be listed ({type(e).__name__}), so "
+                           "this check cannot pass") from None
+    for child in children:
+        root = child / peerjournal.JOURNAL_DIR
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError as e:
+            raise JournalBlind(f"a journal directory cannot be listed ({child.name}: "
+                               f"{type(e).__name__}), so this check cannot pass") from None
+        for d in entries:
+            if not (d.is_dir() and peerjournal._KEY_RE.fullmatch(d.name)):
+                continue
+            path = d / peerjournal.RECORD
+            if path.is_symlink() or not path.is_file():
+                # A record directory without its record: a crash mid-take
+                # (reconcile removes it at startup) or a record lost. Either
+                # way this check cannot see what it held.
+                raise JournalBlind(f"a journal record directory has no regular record "
+                                   f"({child.name}/{d.name}), so this check cannot pass")
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
+                                   f"{type(e).__name__}), so this check cannot pass") from None
+            if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec
+                    and (rec["control"] is None or isinstance(rec["control"], dict))):
+                raise JournalBlind(f"a journal record is not a record ({child.name}/{d.name}: "
+                                   "its key or its control is not what the router writes), so "
+                                   "this check cannot pass")
+            out.append(rec)
+    return out
+
+
+def _journal_dirs(state_dir: Path) -> bool:
+    """Whether any owner's journal directory exists (`peerjournal._find`'s
+    layout: `state_dir/<owner>/<JOURNAL_DIR>`)."""
+    try:
+        children = list(state_dir.iterdir())
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        # Unlistable is not "no journal": the guard cannot tell, so it refuses.
+        raise JournalBlind(f"the state directory cannot be listed ({type(e).__name__}), so "
+                           "this check cannot pass") from None
+    return any((c / peerjournal.JOURNAL_DIR).exists() for c in children)
+
+
 def _frozen_elsewhere(cfg: Any, recorded: Optional[str]) -> List[str]:
     """The record keys of unsent, unsuppressed attempts frozen in a
     generation other than `recorded` (any generation, when none is
     recorded). Read from the journal's state, so the answer does not depend
-    on which records a pass has visited."""
+    on which records a pass has visited. `JournalBlind` when it cannot be
+    read (`_guard_records`)."""
     out = []
-    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+    for rec in _guard_records(cfg):
         c = rec.get("control") or {}
         gen = (c.get("attempt") or {}).get("gen")
         if gen is not None and gen != recorded and not c.get("sent") and not c.get("suppressed"):
@@ -1013,9 +1147,10 @@ def _check_mint_after_retire(cfg: Any, cap: Capability, gen: str) -> None:
 
 
 def _frozen_in(cfg: Any, gen: str) -> List[str]:
-    """The record keys of unsent, unsuppressed attempts frozen in `gen`."""
+    """The record keys of unsent, unsuppressed attempts frozen in `gen`
+    (`JournalBlind` when the journal cannot be read)."""
     out = []
-    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+    for rec in _guard_records(cfg):
         c = rec.get("control") or {}
         if ((c.get("attempt") or {}).get("gen") == gen and not c.get("sent")
                 and not c.get("suppressed")):
@@ -1025,9 +1160,10 @@ def _frozen_in(cfg: Any, gen: str) -> List[str]:
 
 def _named_elsewhere(cfg: Any, gen: str, key: str) -> List[str]:
     """Every OTHER journal record whose attempt names `gen`, whatever became
-    of it: evidence that `gen` carried traffic."""
+    of it: evidence that `gen` carried traffic (`JournalBlind` when the
+    journal cannot be read)."""
     out = []
-    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+    for rec in _guard_records(cfg):
         if rec["key"] != key and ((rec.get("control") or {}).get("attempt") or {}).get("gen") == gen:
             out.append(rec["key"])
     return out
@@ -1354,8 +1490,12 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
     # no other journal record naming it (a settled attempt leaves no in-flight
     # file behind). A generation that carried traffic and lost both its tree
     # and its record is held.
-    unlisted_ok = (listed.get(gen) is None and not _inflight_entries(cfg, gen)
-                   and not _named_elsewhere(cfg, gen, record["key"]))
+    try:
+        unlisted_ok = (listed.get(gen) is None and not _inflight_entries(cfg, gen)
+                       and not _named_elsewhere(cfg, gen, record["key"]))
+    except JournalBlind:
+        # No evidence either way is not "no traffic": held, never restored.
+        unlisted_ok = False
     if (listed.get(gen) == "live" or unlisted_ok) and not others:
         admitted_at = _admitted_at_for_restore(cfg, cap, gen, listed.get(gen), now)
         record = _begin_audit(cfg, record, RESTORE_VERB, now, key=record["key"], generation=gen,

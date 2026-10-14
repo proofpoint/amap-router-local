@@ -2479,6 +2479,24 @@ audited, only when its generation is the sole live one, or was never
 admitted while no other generation is live or unreadable; nothing is minted
 while such an attempt is held. These verbs and the restore rule are final.
 
+**While the peer clock is untrusted these guards refuse rather than pass.**
+A frozen attempt, and traffic in an unlisted generation, are read from the
+journal, and the journal is readable only under a trusted clock: read
+without one it is empty, which would pass every such check vacuously. So
+`retire` and `new` are refused ("recover the clock first"), the drain mints
+nothing (the runtime tree is unavailable, with the same reason), a lost
+record is not restored into a generation that was never listed, and a
+pending `new` plan's mint stays pending. The same holds when the clock
+verifies but its store bookkeeping is unreadable, or ABSENT while a journal
+is on disk: a clock rebuilt by a bound before its bookkeeping (`router
+peer-bound` does both) is trusted, and these guards still refuse until the
+bookkeeping is rebuilt. The guards read every record on disk, under every
+owner, and refuse on one they cannot read or that is not a record, on a
+record directory without its record, and on a journal root that is missing
+or does not match its bookkeeping (the comparison startup's reconcile
+makes, read only), where a plain journal read would skip each of them. Only a router that never journaled anything (no journal
+directory, and the clock absent or holding no store) is not blocked.
+
 ### Runtime tree repair
 
 - **An unreadable generation** stops sending in it. The plugin never deletes
