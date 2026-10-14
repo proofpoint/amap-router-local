@@ -390,7 +390,9 @@ def activate(cfg: RouterConfig, plugin: Any, *, now: Any) -> Delegation:
         raise DelegationRefused("duplicate_key_id",
                                 f"the signing key_id {dc.signing_key_id!r} is also a peer's")
     own_domain = cfg.fleet_domain or ""
-    own = gate([{"name": "self", "runtime": f"{config_mod.ROUTER_LOCAL_PART}@{own_domain}",
+    own_runtime = (config_mod.router_address(cfg.fleet_domain)
+                   or config_mod.ROUTER_LOCAL_PART + "@")
+    own = gate([{"name": "self", "runtime": own_runtime,
                  "domains": [own_domain],
                  "keys": [{"key_id": dc.signing_key_id, "public_key": dc.signing_public_key}]}],
                "delegation.signing_key")

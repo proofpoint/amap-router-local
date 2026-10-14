@@ -1099,7 +1099,8 @@ class ControlStatusTests(_Control):
         self.assertEqual(doc["runtime_tree"], {
             "generation": None,
             "generations": [["1" * 32, "live"], ["2" * 32, "unreadable"],
-                            ["3" * 32, "retired"]]})
+                            ["3" * 32, "retired"]],
+            "repair": {"unreadable": ["2" * 32], "exit": peercontrol.REPAIR_EXIT}})
 
     def test_a_settled_failure_is_counted_as_failed_never_as_sent(self):
         ok, bad = self.refused(), self.refused(id="qB2c3D4e5F6g7H8i9J0kLmx")

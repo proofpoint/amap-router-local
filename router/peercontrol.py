@@ -124,6 +124,12 @@ SUPPRESS_ABANDONED = "attempt_abandoned"
 RESTORE_VERB = "runtime-generation restore (automatic)"
 ABANDON_VERB = "runtime-generation abandon-attempt"
 UNAVAILABLE = "runtime_tree_unavailable"
+#: The exit for an `unreadable` runtime generation. The plugin never deletes
+#: a generation and `retire` refuses an unreadable one (its identity cannot
+#: be read), so neither adopt, retire nor abandon applies: the operator
+#: repairs the tree out of band (README, "Runtime tree repair"), then retries.
+REPAIR_EXIT = ("repair it out of band (README, \"Runtime tree repair\"); adopt, retire and "
+               "abandon cannot act on an unreadable generation")
 STUCK_HANDED = "handed_without_record"
 STUCK_UNSETTLED = "unsettled_past_horizon"
 #: A pending notice with no `about` or no `to` cannot be addressed: HELD,
@@ -163,8 +169,13 @@ class Unavailable(Exception):
 
 
 def runtime_address(cfg: Any) -> str:
-    """This router's own runtime address."""
-    return f"amap.router@{cfg.fleet_domain}"
+    """This router's own runtime address: `config.router_address`, the one
+    canonical construction (`Unavailable` without a fleet domain: the
+    runtime tree needs one)."""
+    address = config_mod.router_address(cfg.fleet_domain)
+    if address is None:
+        raise Unavailable(UNAVAILABLE, "no fleet_domain: the runtime has no address")
+    return address
 
 
 def runtime_dir(cfg: Any) -> Path:
@@ -341,16 +352,17 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     if recorded is not None:
         state = states.get(recorded)
         if state == "unreadable":
-            raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} is unreadable")
+            raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} is unreadable: "
+                                           f"{REPAIR_EXIT}")
         if state in ("live", None):
             if others:
                 raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} beside "
-                                               f"{others}: retire one (router runtime-generation)")
+                                               f"{others}: {_exit_for(others)}")
             return recorded
         # Retired: never written again, whatever the record says.
     if others:
-        raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: adopt "
-                                       "or retire one (router runtime-generation)")
+        raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: "
+                                       f"{_exit_for(others, adopt=True)}")
     frozen = _frozen_elsewhere(cfg, recorded)
     if frozen:
         # A frozen attempt still names a generation of its own: a new one
@@ -724,8 +736,10 @@ def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
         raise ValueError(f"{key} has no frozen, unsent control attempt")
     gen = attempt["gen"]
     state = dict(cap.generations()).get(gen)
-    if state in ("live", "unreadable"):
-        raise ValueError(f"the attempt's generation {gen} is {state}: adopt or retire it")
+    if state == "unreadable":
+        raise ValueError(f"the attempt's generation {gen} is unreadable: {REPAIR_EXIT}")
+    if state == "live":
+        raise ValueError(f"the attempt's generation {gen} is live: adopt or retire it")
     for name in (f"{attempt['id']}.json", f"{attempt['id']}{inflight.HANDED_SUFFIX}"):
         if name in _inflight_entries(cfg, gen):
             raise ValueError(f"the attempt {attempt['id']} is in flight in {gen}")
@@ -804,6 +818,16 @@ NEW_VERB = "runtime-generation new"
 VERB_AUDIT_FILE = "verb-audit-pending.json"
 
 
+def _exit_for(others: List[Tuple[str, str]], *, adopt: bool = False) -> str:
+    """The operator's exit named for what is listed: the out-of-band repair
+    for an unreadable generation, never `retire` (which refuses it)."""
+    unreadable = [g for g, st in others if st == "unreadable"]
+    if unreadable:
+        return f"{unreadable[0]} is unreadable: {REPAIR_EXIT}"
+    return ("adopt or retire one (router runtime-generation)" if adopt
+            else "retire one (router runtime-generation)")
+
+
 def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: datetime,
                    evidence: str) -> Dict[str, Any]:
     """`router runtime-generation adopt <gen>`: the only live generation
@@ -853,6 +877,11 @@ def _check_retirable(cfg: Any, cap: Capability, gen: str) -> None:
     if gen not in listed:
         # Never construct a sender for a generation the lister does not show.
         raise ValueError(f"{gen} is not a listed runtime generation: {sorted(listed.items())}")
+    if listed[gen] == "unreadable":
+        # Refused BEFORE any durable plan, for retire and for `new` alike:
+        # the plugin's retire raises on an unreadable identity, so a plan to
+        # retire it could never complete.
+        raise ValueError(f"{gen} is unreadable: {REPAIR_EXIT}")
 
 
 def _retire_idempotent(cfg: Any, cap: Capability, gen: str, now: datetime) -> str:
@@ -1373,6 +1402,10 @@ def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dic
     except Exception as e:  # noqa: BLE001 -- status never fails on the lister
         tree["generations"] = None
         tree["lister_error"] = f"{type(e).__name__}: {e}"
+    else:
+        unreadable = [g for g, st in tree["generations"] if st == "unreadable"]
+        if unreadable:
+            tree["repair"] = {"unreadable": unreadable, "exit": REPAIR_EXIT}
     doc["runtime_tree"] = tree
     return doc
 
