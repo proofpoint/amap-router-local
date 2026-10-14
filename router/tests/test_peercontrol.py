@@ -927,6 +927,164 @@ class SuppressionTests(_Control):
         self.assertEqual(self.tree.calls, [])
 
 
+class UntrustedClockGuardTests(_Control):
+    """While the peer clock is untrusted, `peerjournal.all_records` answers
+    `[]`. Every runtime-generation guard that reads the journal (a frozen
+    attempt in the generation, a frozen attempt anywhere, traffic in an
+    unlisted one) must then REFUSE, saying to recover the clock first,
+    rather than read that empty answer as "nothing frozen". Here the clock
+    file is lost while the journal is still on disk; the subclass corrupts
+    it instead."""
+
+    cli = AttemptTests.cli
+    frozen_in_live_a = AttemptTests.frozen_in_live_a
+    frozen_then_record_lost = AttemptTests.frozen_then_record_lost
+    acts = AttemptTests.acts
+    audit = AttemptTests.audit
+    recorded = AttemptTests.recorded
+
+    def untrust(self):
+        (self.state_dir / peerclock.CLOCK_FILE).unlink()
+
+    def assert_untrusted(self):
+        with self.assertRaises(peerclock.ClockUntrusted):
+            peerclock.read(self.state_dir)
+        self.assertEqual(peerjournal.all_records(self.state_dir), [],
+                         "the journal reads as empty: the guard's blind spot")
+
+    def assert_blind_refusal(self, command, live, **args):
+        code, err = self.cli(command, **args)
+        self.assertEqual(code, 1, err)
+        self.assertIn("refused", err)
+        self.assertIn("recover the clock first", err)
+        self.assertEqual(self.tree.gens[live], "live", "nothing retired")
+        self.assertEqual(self.recorded(), live, "generation.json intact")
+        self.assertEqual(self.acts(peercontrol.NEW_VERB) + self.acts(peercontrol.RETIRE_VERB), [])
+
+    def test_new_is_refused_untrusted_where_it_is_refused_trusted(self):
+        key, gen = self.frozen_in_live_a()
+        code, err = self.cli("new")
+        self.assertEqual(code, 1, err)
+        self.assertIn("frozen control attempt", err, "trusted: the frozen attempt refuses it")
+        self.untrust()
+        self.assert_untrusted()
+        self.assert_blind_refusal("new", gen)
+
+    def test_retire_is_refused_untrusted_where_it_is_refused_trusted(self):
+        key, gen = self.frozen_in_live_a()
+        code, err = self.cli("retire", gen=gen)
+        self.assertEqual(code, 1, err)
+        self.assertIn("frozen control attempt", err)
+        self.untrust()
+        self.assert_untrusted()
+        self.assert_blind_refusal("retire", gen, gen=gen)
+
+    def test_new_is_refused_untrusted_even_with_nothing_frozen(self):
+        """The guard cannot tell "nothing frozen" from "cannot see": with
+        the journal on disk and unreadable it refuses whatever is in it."""
+        key, gen = self.frozen_in_live_a()
+        self.send()
+        n, _doc = AttemptTests.handover(self, key)
+        self.port().send(n)
+        self.send()
+        self.send()
+        self.untrust()
+        self.assert_blind_refusal("new", gen)
+
+    def test_the_drain_mints_nothing_while_untrusted(self):
+        key, attempt = self.frozen_then_record_lost()
+        self.untrust()
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        try:
+            got = peercontrol.generation(self.cfg, cap, now=NOW)
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+            got = e
+        self.assertIsInstance(got, peercontrol.Unavailable)
+        self.assertIn("recover the clock first", got.detail)
+        self.assertEqual(list(self.tree.gens), [], "nothing minted")
+
+    def test_an_unlisted_generation_is_not_restored_while_untrusted(self):
+        """Traffic in an unlisted generation is read from the journal: with
+        it unreadable the generation is held, never re-admitted."""
+        key, attempt = self.frozen_then_record_lost()
+        record = self.record(key)
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        self.untrust()
+        try:
+            got = peercontrol._attempt_generation(self.cfg, cap, attempt["gen"], now=NOW,
+                                                  record=record)
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+            got = e
+        self.assertEqual(got, peercontrol.HELD_GENERATION_UNRECORDED)
+        self.assertIsNone(self.recorded(), "nothing restored")
+        self.assertEqual(self.acts(peercontrol.RESTORE_VERB), [])
+
+    def test_a_planned_mint_stays_pending_while_untrusted(self):
+        """A `new` plan whose mint is checked again on completion: the
+        re-check cannot see the journal, so the plan stays pending and
+        nothing is minted."""
+        key, attempt = self.frozen_then_record_lost()
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        marker = peercontrol._audit_marker(peercontrol.NEW_VERB, NOW, retired="0" * 32,
+                                           minted="e" * 32, evidence="x")
+        self.untrust()
+        with mock.patch.object(peercontrol, "_retire_idempotent", return_value="retired"):
+            with self.assertRaises(peercontrol.JournalBlind):
+                peercontrol._complete_plan(self.cfg, cap, marker, NOW)
+        self.assertIsNone(self.recorded(), "nothing minted")
+
+
+class UnreadableBookkeepingGuardTests(_Control):
+    """The clock itself verifies but the store's bookkeeping in it is not a
+    closed record: `all_records` answers `[]` for this too, and the guard
+    refuses it the same way."""
+
+    cli = AttemptTests.cli
+    frozen_in_live_a = AttemptTests.frozen_in_live_a
+
+    def test_retire_is_refused_with_the_bookkeeping_unreadable(self):
+        key, gen = self.frozen_in_live_a()
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"] = {"v": 2}
+        path.write_text(json.dumps(doc))
+        peerclock.read(self.state_dir)          # the clock itself is trusted
+        self.assertEqual(peerjournal.all_records(self.state_dir), [])
+        code, err = self.cli("retire", gen=gen)
+        self.assertEqual(code, 1, err)
+        self.assertIn("recover the clock first", err)
+        self.assertIn("the bookkeeping is unreadable", err)
+        self.assertEqual(self.tree.gens[gen], "live", "nothing retired")
+
+
+class CorruptClockGuardTests(UntrustedClockGuardTests):
+    """The same, with the clock file present and not a clock record."""
+
+    def untrust(self):
+        (self.state_dir / peerclock.CLOCK_FILE).write_text("{")
+
+
+class NoPeerStoreGuardTests(_Control):
+    """A router that never journaled anything: no clock file and no journal
+    directory. The guards answer "nothing frozen" and the verbs run; they
+    refuse only what they cannot see."""
+
+    cli = AttemptTests.cli
+
+    def test_new_runs_with_no_clock_and_no_journal(self):
+        live = "f" * 32
+        self.tree.gens[live] = "live"
+        peercontrol.record_generation(self.cfg, live, admitted_at="2026-01-01T00:00:00Z")
+        clock = self.state_dir / peerclock.CLOCK_FILE
+        if clock.exists():
+            clock.unlink()
+        journals = [c for c in self.state_dir.iterdir() if (c / peerjournal.JOURNAL_DIR).exists()]
+        self.assertEqual(journals, [], "no journal on disk")
+        code, err = self.cli("new")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.tree.gens[live], "retired")
+
+
 class RateTests(_Control):
 
     def test_over_the_limit_defers_then_suppresses_after_24_hours_of_h(self):

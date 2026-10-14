@@ -366,7 +366,10 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     if others:
         raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: "
                                        f"{_exit_for(others, adopt=True)}")
-    frozen = _frozen_elsewhere(cfg, recorded)
+    try:
+        frozen = _frozen_elsewhere(cfg, recorded)
+    except JournalBlind as e:
+        raise Unavailable(UNAVAILABLE, str(e)) from None
     if frozen:
         # A frozen attempt still names a generation of its own: a new one
         # would split the runtime tree. It is restored, adopted or abandoned.
@@ -377,13 +380,57 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     return gen
 
 
+class JournalBlind(ValueError):
+    """The journal cannot be read, so a guard that reads it cannot answer:
+    an empty answer would read as "nothing frozen" and let the act through.
+    A `ValueError`, so an operator verb is refused before any effect, and a
+    pending plan stays pending."""
+
+
+#: How every runtime-generation guard that reads the journal says it cannot.
+JOURNAL_BLIND = ("the peer clock is untrusted, so the journal's frozen attempts cannot be "
+                 "seen and this check cannot pass; recover the clock first")
+
+
+def _guard_records(cfg: Any) -> List[Dict[str, Any]]:
+    """Every journal record, for a guard: `peerjournal.all_records` answers
+    `[]` while the clock is untrusted or the bookkeeping unreadable, which a
+    guard must never read as "nothing there". `[]` only when nothing was
+    ever journaled: the clock file holds no store, or it is absent and no
+    journal directory exists. Otherwise `JournalBlind`."""
+    sd = Path(cfg.state_dir)
+    try:
+        peerjournal.read_meta(sd)
+    except peerjournal.StoreAbsent:
+        return []
+    except peerclock.ClockUntrusted as e:
+        if not peerclock.path(sd).exists() and not _journal_dirs(sd):
+            return []
+        raise JournalBlind(f"{JOURNAL_BLIND} ({e})") from None
+    except (OSError, ValueError) as e:
+        raise JournalBlind(f"{JOURNAL_BLIND} (the bookkeeping is unreadable: "
+                           f"{type(e).__name__}: {e})") from None
+    return peerjournal.all_records(sd)
+
+
+def _journal_dirs(state_dir: Path) -> bool:
+    """Whether any owner's journal directory exists (`peerjournal._find`'s
+    layout: `state_dir/<owner>/<JOURNAL_DIR>`)."""
+    try:
+        children = list(state_dir.iterdir())
+    except FileNotFoundError:
+        return False
+    return any((c / peerjournal.JOURNAL_DIR).exists() for c in children)
+
+
 def _frozen_elsewhere(cfg: Any, recorded: Optional[str]) -> List[str]:
     """The record keys of unsent, unsuppressed attempts frozen in a
     generation other than `recorded` (any generation, when none is
     recorded). Read from the journal's state, so the answer does not depend
-    on which records a pass has visited."""
+    on which records a pass has visited. `JournalBlind` when it cannot be
+    read (`_guard_records`)."""
     out = []
-    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+    for rec in _guard_records(cfg):
         c = rec.get("control") or {}
         gen = (c.get("attempt") or {}).get("gen")
         if gen is not None and gen != recorded and not c.get("sent") and not c.get("suppressed"):
@@ -1013,9 +1060,10 @@ def _check_mint_after_retire(cfg: Any, cap: Capability, gen: str) -> None:
 
 
 def _frozen_in(cfg: Any, gen: str) -> List[str]:
-    """The record keys of unsent, unsuppressed attempts frozen in `gen`."""
+    """The record keys of unsent, unsuppressed attempts frozen in `gen`
+    (`JournalBlind` when the journal cannot be read)."""
     out = []
-    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+    for rec in _guard_records(cfg):
         c = rec.get("control") or {}
         if ((c.get("attempt") or {}).get("gen") == gen and not c.get("sent")
                 and not c.get("suppressed")):
@@ -1025,9 +1073,10 @@ def _frozen_in(cfg: Any, gen: str) -> List[str]:
 
 def _named_elsewhere(cfg: Any, gen: str, key: str) -> List[str]:
     """Every OTHER journal record whose attempt names `gen`, whatever became
-    of it: evidence that `gen` carried traffic."""
+    of it: evidence that `gen` carried traffic (`JournalBlind` when the
+    journal cannot be read)."""
     out = []
-    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+    for rec in _guard_records(cfg):
         if rec["key"] != key and ((rec.get("control") or {}).get("attempt") or {}).get("gen") == gen:
             out.append(rec["key"])
     return out
@@ -1354,8 +1403,12 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
     # no other journal record naming it (a settled attempt leaves no in-flight
     # file behind). A generation that carried traffic and lost both its tree
     # and its record is held.
-    unlisted_ok = (listed.get(gen) is None and not _inflight_entries(cfg, gen)
-                   and not _named_elsewhere(cfg, gen, record["key"]))
+    try:
+        unlisted_ok = (listed.get(gen) is None and not _inflight_entries(cfg, gen)
+                       and not _named_elsewhere(cfg, gen, record["key"]))
+    except JournalBlind:
+        # No evidence either way is not "no traffic": held, never restored.
+        unlisted_ok = False
     if (listed.get(gen) == "live" or unlisted_ok) and not others:
         admitted_at = _admitted_at_for_restore(cfg, cap, gen, listed.get(gen), now)
         record = _begin_audit(cfg, record, RESTORE_VERB, now, key=record["key"], generation=gen,
