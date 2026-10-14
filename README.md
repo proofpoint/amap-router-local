@@ -90,7 +90,13 @@ python3 -m router --config <config.json> run --interval 5
 python3 -m router --config <config.json> peers      # who may cold-initiate to whom
 python3 -m router --config <config.json> status
 python3 -m pytest router/tests -q
+python3 -B router/tests/run_realhop.py --plugin <file>   # the transport plugin's real rows
 ```
+
+The real-plugin rows need a copy of the optional transport plugin, pinned by
+its digest; they run where one is available and are recorded with its
+sha256. Continuous integration does not run them (router/README.md,
+"Testing against the plugin").
 
 ## Where it sits
 
