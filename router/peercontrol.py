@@ -122,6 +122,7 @@ SUPPRESS_RATE = "rate_limited"
 SUPPRESS_COALESCED = "coalesced"
 SUPPRESS_ABANDONED = "attempt_abandoned"
 RESTORE_VERB = "runtime-generation restore (automatic)"
+ABANDON_VERB = "runtime-generation abandon-attempt"
 UNAVAILABLE = "runtime_tree_unavailable"
 STUCK_HANDED = "handed_without_record"
 STUCK_UNSETTLED = "unsettled_past_horizon"
@@ -311,6 +312,91 @@ def _frozen_elsewhere(cfg: Any, recorded: Optional[str]) -> List[str]:
     return out
 
 
+class AuditPending(Exception):
+    """An audited operator act COMMITTED, but its audit line could not be
+    appended: the record carries `control.audit_pending`, and the next pass
+    or verb appends it. Never a refusal."""
+
+    def __init__(self, result: str, cause: BaseException):
+        super().__init__(f"{result}; COMMITTED, but the audit line is pending "
+                         f"({type(cause).__name__}: {cause})")
+        self.result = result
+
+
+def _audit_marker(verb: str, now: datetime, **detail: Any) -> Dict[str, Any]:
+    return {"id": secrets.token_hex(16), "verb": verb, "at": format_utc_ts(now),
+            "detail": detail}
+
+
+def _begin_audit(cfg: Any, record: Dict[str, Any], verb: str, now: datetime,
+                 **detail: Any) -> Dict[str, Any]:
+    """The pending-audit marker, durable on the record before the act."""
+    return _update(Path(cfg.state_dir), record,
+                   audit_pending=_audit_marker(verb, now, **detail))
+
+
+def _audit_lines(state_dir: Path) -> List[Dict[str, Any]]:
+    p = Path(state_dir) / peerjournal.REPLAY_DIR / peerjournal.OPERATOR_AUDIT
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in text.splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def _finish_audit(cfg: Any, record: Dict[str, Any]) -> Dict[str, Any]:
+    """Append the record's pending audit line (once: keyed by the marker's
+    id), then clear the marker."""
+    sd = Path(cfg.state_dir)
+    marker = (record.get("control") or {}).get("audit_pending")
+    if not marker:
+        return record
+    if not any(line.get("audit_id") == marker["id"] for line in _audit_lines(sd)):
+        peerjournal._audit(sd, marker["verb"], parse_utc_ts(marker["at"]),
+                           audit_id=marker["id"], **marker["detail"])
+    return _update(sd, record, audit_pending=None)
+
+
+def _audited_effect_present(cfg: Any, record: Mapping[str, Any]) -> bool:
+    """Whether the act a pending marker announces took effect: the restore
+    recorded its generation; the abandonment suppressed the notice."""
+    c = record.get("control") or {}
+    marker = c.get("audit_pending") or {}
+    if marker.get("verb") == RESTORE_VERB:
+        try:
+            return config_mod.runtime_generation(cfg) == marker["detail"].get("generation")
+        except config_mod.StateKeyUnresolved:
+            return False
+    if marker.get("verb") == ABANDON_VERB:
+        return c.get("suppressed") == SUPPRESS_ABANDONED
+    return False
+
+
+def repair_audits(cfg: Any) -> int:
+    """Every record with a pending audit marker: its audit line appended (once)
+    when the act took effect, then the marker cleared; a marker whose act did
+    not take effect (a crash between the marker and the act) is cleared with
+    no line, and the act is re-tried in the ordinary way. Returns how many
+    lines were appended."""
+    sd = Path(cfg.state_dir)
+    n = 0
+    for rec in peerjournal.all_records(sd):
+        if not (rec.get("control") or {}).get("audit_pending"):
+            continue
+        if _audited_effect_present(cfg, rec):
+            _finish_audit(cfg, rec)
+            n += 1
+        else:
+            _update(sd, rec, audit_pending=None)
+    return n
+
+
 def _inflight_dir(cfg: Any, gen: str) -> Path:
     """The runtime in-flight directory of generation `gen`, keyed by `gen`
     itself (inflight's own path helpers resolve through the RECORDED
@@ -355,8 +441,16 @@ def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
     for name in (f"{attempt['id']}.json", f"{attempt['id']}{inflight.HANDED_SUFFIX}"):
         if name in _inflight_entries(cfg, gen):
             raise ValueError(f"the attempt {attempt['id']} is in flight in {gen}")
-    _update(sd, record, suppressed=SUPPRESS_ABANDONED, held=None)
-    return {"result": f"abandoned the control attempt {attempt['id']} of {key}"}
+    marker = _audit_marker(ABANDON_VERB, now, key=key, evidence=evidence,
+                           attempt=attempt["id"], generation=gen)
+    # The suppression and its pending audit in ONE journal write.
+    record = _update(sd, record, suppressed=SUPPRESS_ABANDONED, held=None, audit_pending=marker)
+    result = f"abandoned the control attempt {attempt['id']} of {key}"
+    try:
+        _finish_audit(cfg, record)
+    except Exception as e:  # noqa: BLE001 -- committed; the audit is repaired later
+        raise AuditPending(result, e) from e
+    return {"result": result, "audited": True}
 
 
 def record_generation(cfg: Any, gen: str, *, now: datetime) -> None:
@@ -527,6 +621,15 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
         # No signing key: nothing can be signed, so nothing is tried.
         n = len(pending(state_dir))
         return {DELEGATION_INACTIVE: n} if n else {}
+    # An audited transition whose audit line is not yet appended is repaired
+    # BEFORE anything is attempted or handed over.
+    try:
+        repaired = repair_audits(cfg)
+        if repaired:
+            counts["audit_repaired"] = repaired
+    except Exception:  # noqa: BLE001 -- retried next pass; nothing is attempted meanwhile
+        logger.exception("control notices: an audit repair failed; nothing attempted this pass")
+        return dict(counts, audit_repair_failed=1)
     cap = capability(cfg, runtime)
     # Frozen attempts first: their generation is reconciled before any fresh
     # notice could need one.
@@ -597,7 +700,8 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
         # The attempt is frozen in ITS generation, whose private counter
         # holds its `n`: reconcile that generation first, never select (or
         # mint) another and read the counter through it.
-        held = _attempt_generation(cfg, cap, attempt["gen"], now=now, key=record["key"])
+        held = _attempt_generation(cfg, cap, attempt["gen"], now=now, record=record)
+        record = peerjournal.read_record(sd, record["owner"], record["key"])
         if held is not None:
             if record["control"].get("held") != held:
                 _update(sd, record, held=held)
@@ -657,13 +761,16 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
 
 
 def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
-                        key: str) -> Optional[str]:
+                        record: Dict[str, Any]) -> Optional[str]:
     """None when a frozen attempt's generation `gen` is the recorded one, or
     when the record is lost and `gen` may be restored: the lister shows it
     `live`, or does not list it at all (minted and never admitted, so nothing
     was handed over in it), AND shows no other generation `live` or
     `unreadable`. A restore is audited (`RESTORE_VERB`, naming the attempt's
-    record key). Otherwise the reason the attempt is HELD, visibly:
+    record key), intent first: the record's `control.audit_pending` marker
+    is durable before the generation is recorded, the audit line is
+    appended, then the marker is cleared (`repair_audits` finishes it after
+    a failure). Otherwise the reason the attempt is HELD, visibly:
     `HELD_GENERATION_UNRECORDED` (no record, and `gen` cannot be restored),
     or `HELD_GENERATION_MISMATCH` (another generation is recorded). Nothing
     is minted here."""
@@ -682,9 +789,10 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
     # carried traffic and lost both its tree and its record is held.
     unlisted_ok = listed.get(gen) is None and not _inflight_entries(cfg, gen)
     if (listed.get(gen) == "live" or unlisted_ok) and not others:
+        record = _begin_audit(cfg, record, RESTORE_VERB, now, key=record["key"], generation=gen,
+                              listed=listed.get(gen) or "not listed")
         record_generation(cfg, gen, now=now)
-        peerjournal._audit(cfg.state_dir, RESTORE_VERB, now, key=key, generation=gen,
-                           listed=listed.get(gen) or "not listed")
+        _finish_audit(cfg, record)
         return None
     return HELD_GENERATION_UNRECORDED
 

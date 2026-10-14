@@ -333,6 +333,8 @@ def _runtime_generation(cfg, args) -> int:
         runtime = service.start_transport(cfg) if cfg.transport_plugin is not None else None
         cap = peercontrol.capability(cfg, runtime)
         now = clock.now()
+        # An earlier act's pending audit line is appended before anything else.
+        peercontrol.repair_audits(cfg)
         if args.runtime_generation_command == "adopt":
             out = peercontrol.operator_adopt(cfg, cap, args.gen, now=now, evidence=args.evidence)
         elif args.runtime_generation_command == "retire":
@@ -342,12 +344,18 @@ def _runtime_generation(cfg, args) -> int:
                                                        evidence=args.evidence)
         else:
             out = peercontrol.operator_new(cfg, cap, now=now, evidence=args.evidence)
-        peerjournal._audit(cfg.state_dir, verb, now, evidence=args.evidence,
-                           result=out["result"])
+        if not out.get("audited"):
+            peerjournal._audit(cfg.state_dir, verb, now, evidence=args.evidence,
+                               result=out["result"])
+    except peercontrol.AuditPending as e:
+        # Committed: never reported as a refusal.
+        print(f"router: {verb}: {e}", file=sys.stderr)
+        return 3
     except peercontrol.Unavailable as e:
         print(f"router: {verb}: refused: {e.reason}: {e.detail}", file=sys.stderr)
         return 1
-    except (ValueError, OSError, StateKeyUnresolved, peerjournal.StoreRefused) as e:
+    except (ValueError, OSError, StateKeyUnresolved, peerjournal.StoreRefused,
+            peerjournal.StoreBlocked) as e:
         print(f"router: {verb}: refused: {e}", file=sys.stderr)
         return 1
     finally:

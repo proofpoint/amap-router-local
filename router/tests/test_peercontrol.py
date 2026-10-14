@@ -335,6 +335,119 @@ class AttemptTests(_Control):
         self.assertEqual(self.audit(), [])
         self.assertEqual(self.tree.senders, {}, "no sender for it")
 
+    def restores(self):
+        return [a for a in self.audit() if a.get("act") == peercontrol.RESTORE_VERB]
+
+    def test_a_restore_whose_audit_fails_is_repaired_before_any_hand_over(self):
+        key, attempt = self.frozen_then_record_lost()
+        with mock.patch.object(peerjournal, "_audit", side_effect=OSError("disk full")):
+            self.assertEqual(self.send(), {"errored": 1})
+        control = self.record(key)["control"]
+        self.assertEqual((control.get("audit_pending") or {}).get("verb"), peercontrol.RESTORE_VERB)
+        self.assertEqual(self.restores(), [])
+        real = inflight.begin_reserved
+        seen = []
+
+        def begin(*a, **k):
+            seen.append(len(self.restores()))
+            return real(*a, **k)
+        with mock.patch.object(inflight, "begin_reserved", begin):
+            self.send()
+        self.assertEqual(seen, [1], "the audit line was there before the hand-over began")
+        self.assertEqual([r.get("key") for r in self.restores()], [key])
+        self.assertIsNone(self.record(key)["control"].get("audit_pending"))
+        n, _doc = self.handover(key)
+        self.assertEqual(n, attempt["n"])
+
+    def test_a_crash_between_the_marker_and_the_restore_audits_once(self):
+        key, attempt = self.frozen_then_record_lost()
+        with mock.patch.object(peercontrol, "record_generation", side_effect=OSError("crash")):
+            self.send()
+        self.assertIsNotNone(self.record(key)["control"].get("audit_pending"))
+        self.send()
+        self.assertEqual(len(self.restores()), 1, "one line, for the restore that happened")
+        self.assertIsNone(self.record(key)["control"].get("audit_pending"))
+
+    def test_an_audit_line_is_appended_once_when_clearing_the_marker_fails(self):
+        key, attempt = self.frozen_then_record_lost()
+        real = peercontrol._update
+
+        def update(sd, record, **changes):
+            if "audit_pending" in changes and changes["audit_pending"] is None and not update.done:
+                update.done = True
+                raise OSError("crash after the audit line")
+            return real(sd, record, **changes)
+        update.done = False
+        with mock.patch.object(peercontrol, "_update", update):
+            self.send()
+        self.assertEqual(len(self.restores()), 1)
+        self.send()
+        self.assertEqual(len(self.restores()), 1, "repaired without a second line")
+        self.assertIsNone(self.record(key)["control"].get("audit_pending"))
+
+    def held_beside_live_b(self):
+        key, attempt = self.frozen_then_record_lost()
+        self.tree.gens["b" * 32] = "live"
+        self.send()
+        return key
+
+    def abandons(self):
+        return [a for a in self.audit() if a.get("act") == peercontrol.ABANDON_VERB]
+
+    def test_an_abandon_whose_audit_fails_is_committed_and_repaired_by_the_next_pass(self):
+        key = self.held_beside_live_b()
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        with mock.patch.object(peerjournal, "_audit", side_effect=OSError("disk full")):
+            with self.assertRaises(peercontrol.AuditPending):
+                peercontrol.operator_abandon_attempt(self.cfg, cap, key, now=NOW, evidence="x")
+        control = self.record(key)["control"]
+        self.assertEqual(control.get("suppressed"), peercontrol.SUPPRESS_ABANDONED)
+        self.assertEqual((control.get("audit_pending") or {}).get("verb"), peercontrol.ABANDON_VERB)
+        got = self.send()
+        self.assertEqual(got.get("audit_repaired"), 1, got)
+        self.assertEqual([a.get("key") for a in self.abandons()], [key])
+        self.assertIsNone(self.record(key)["control"].get("audit_pending"))
+
+    def cli(self, **args):
+        import contextlib
+        import io
+        from router import __main__ as cli
+        ns = types.SimpleNamespace(runtime_generation_command="abandon-attempt",
+                                   evidence="operator evidence", **args)
+        err = io.StringIO()
+        with mock.patch.object(peercontrol, "capability",
+                               return_value=peercontrol.Capability(
+                                   self.runtime.plugin, self.runtime.fsops, self.cfg)), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                code = cli._runtime_generation(self.cfg, ns)
+            except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+                code = f"raised {type(e).__name__}"
+        return code, err.getvalue()
+
+    def test_the_cli_reports_a_committed_abandon_with_its_audit_pending_never_refused(self):
+        key = self.held_beside_live_b()
+        with mock.patch.object(peerjournal, "_audit", side_effect=OSError("disk full")):
+            code, err = self.cli(key=key)
+        self.assertEqual(code, 3)
+        self.assertIn("COMMITTED", err)
+        self.assertNotIn("refused", err)
+        self.assertEqual(self.abandons(), [])
+        # The next verb invocation repairs it first (this one is then refused:
+        # the attempt is already abandoned).
+        code, err = self.cli(key=key)
+        self.assertEqual(code, 1)
+        self.assertEqual([a.get("key") for a in self.abandons()], [key])
+        self.assertIsNone(self.record(key)["control"].get("audit_pending"))
+
+    def test_a_blocked_store_is_a_clean_refusal(self):
+        key = self.held_beside_live_b()
+        with mock.patch.object(peercontrol, "operator_abandon_attempt",
+                               side_effect=peerjournal.StoreBlocked("an operation is unreconciled")):
+            code, err = self.cli(key=key)
+        self.assertEqual(code, 1)
+        self.assertIn("refused", err)
+
     def test_a_lost_record_beside_another_live_generation_holds_and_restores_nothing(self):
         key, attempt = self.frozen_then_record_lost()
         self.tree.gens.update({attempt["gen"]: "live", "b" * 32: "live"})
