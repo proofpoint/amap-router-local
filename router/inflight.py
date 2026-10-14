@@ -151,6 +151,8 @@ DETAIL_PREFIX = "transport: "
 #: Age past which a record counts as stale in `summarize`. Reporting only:
 #: nothing is ever settled on age (module docstring, NO TIMEOUT).
 STALE_AFTER_S = 3600
+#: The hold a hand-over shows when its original could not be preserved.
+PRESERVATION_FAILED = "peer_preservation_failed"
 
 _OUTCOMES = ("accepted", "queued_for_human", "rejected")
 _COUNTER_RE = re.compile(r"^[1-9][0-9]{0,17}\Z")
@@ -565,8 +567,12 @@ _RECORD_KEYS = {
     "digest": False, "transport_req_id": True, "recipients": True, "request": True,
     "written_ts": True, "policy_digest": False, "route": False,
     "revocation_unenforceable": False, "from_address": False, "attachments": False,
-    "bound_reply": False, "peer": False,
+    "bound_reply": False, "peer": False, "retransmit": False,
 }
+#: A retransmit's pin (`peerresend`): the original it carries, by its
+#: generation, transport id and peer id. Its settlement is the retransmit's
+#: own, never the agent's Result.
+_RETRANSMIT_KEYS = frozenset({"of_generation", "of_n", "id"})
 #: A signed kind's pin (`begin`'s `peer`): the statement, its signature and
 #: header, and the envelope's `peer` members, exactly as signed at begin.
 _PEER_KEYS = frozenset({"kind", "id", "message_id", "key_id", "statement", "signature",
@@ -621,6 +627,11 @@ def check_record(doc: Any, *, runtime: bool = False) -> Dict[str, Any]:
         _check_record_attachments(doc)
     if "bound_reply" in doc:
         _check_record_bound_reply(doc)
+    if "retransmit" in doc:
+        rt = doc["retransmit"]
+        if not (isinstance(rt, dict) and set(rt) == _RETRANSMIT_KEYS
+                and all(isinstance(v, str) for v in rt.values()) and "peer" in doc):
+            raise RecordDamaged("retransmit is not {of_generation, of_n, id} beside a peer pin")
     if "peer" in doc:
         _check_record_peer(doc)
         if (doc["peer"]["kind"] in RUNTIME_ONLY_KINDS) != runtime:
@@ -778,6 +789,7 @@ def begin_reserved(
     bound_reply: Optional[Dict[str, Any]] = None,
     peer: Optional[Dict[str, Any]] = None,
     before_record: Optional[Callable[[], None]] = None,
+    retransmit: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Put `req_id` in flight under the reserved transport id `n`: write the
     record. Returns the record. Under `begin`, a crash between the
@@ -826,6 +838,8 @@ def begin_reserved(
         record["bound_reply"] = bound_reply
     if peer is not None:
         record["peer"] = peer
+    if retransmit is not None:
+        record["retransmit"] = dict(retransmit)
     check_record(record, runtime=name == config_mod.RUNTIME_NS)
     if before_record is not None:
         _effect("ledger", before_record)
@@ -1117,6 +1131,8 @@ def advance(
     recheck: Optional[Callable[[Dict[str, Any]], Recheck]] = None,
     publish_blocked: bool = False,
     fenced_retired: bool = False,
+    preserve: Optional[Callable[[Dict[str, Any]], None]] = None,
+    found_handed: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     """One step for one record (module docstring's table). `settle(verdict,
     digest)` writes the agent's one result; `already_settled` says the
@@ -1159,7 +1175,8 @@ def advance(
     try:
         state = _advance(cfg, name, req_id, record, port, settle=settle,
                          already_settled=already_settled, anchor=anchor, recheck=recheck,
-                         publish_blocked=publish_blocked, fenced_retired=fenced_retired)
+                         publish_blocked=publish_blocked, fenced_retired=fenced_retired,
+                         preserve=preserve, found_handed=found_handed)
         if _is_hop(cfg) and "transport_req_id" in record:
             hoplink.clear_retry(cfg, name, n=record["transport_req_id"], prefix=PROBE_FAILED)
         return state
@@ -1231,6 +1248,8 @@ def _advance(
     recheck: Optional[Callable[[Dict[str, Any]], Recheck]],
     publish_blocked: bool,
     fenced_retired: bool,
+    preserve: Optional[Callable[[Dict[str, Any]], None]] = None,
+    found_handed: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     writer = port
     port = _Probed(port)
@@ -1274,6 +1293,15 @@ def _advance(
                 "detail": DETAIL_FENCED_UNHANDED, "recipients": []}, record.get("digest"))
             _effect("unlink", _cleanup, path, handed)
             return SETTLED
+
+    if found_handed is not None and _was_handed(handed, n):
+        # A pass that FINDS the handed marker (never the pass that writes it):
+        # the hand-over time it records is never earlier than the true one.
+        try:
+            found_handed(record)
+        except Exception:  # noqa: BLE001 -- a bookkeeping note, never a verdict
+            logger.exception("instance %r req %r: noting the hand-over failed; retried next "
+                             "poll", name, req_id)
 
     def from_result() -> str:
         verdict = verdict_from_result(port.read_result(n), n, record)
@@ -1356,6 +1384,19 @@ def _advance(
         logger.error("instance %r req %r: hand-overs for this generation are HELD (%s): %s",
                      name, req_id, hold, e)
         return BLOCKED
+    if preserve is not None:
+        # The original is preserved, committed, BEFORE the handed marker: a
+        # copy exists before any byte can reach the transport. A failure
+        # holds the record unhanded, retried next poll, visibly.
+        try:
+            _effect("preserve", preserve, record)
+        except Exception as e:  # noqa: BLE001 -- held, never handed without its copy
+            if _is_hop(cfg):
+                hoplink.note_retry(cfg, name, PRESERVATION_FAILED, f"{type(e).__name__}: {e}", n)
+            logger.error("instance %r req %r: NOT handed over: the original could not be "
+                         "preserved (%s: %s); retried next poll", name, req_id,
+                         type(e).__name__, e)
+            return BLOCKED
     _effect("handed", atomic_write, handed, n.encode("ascii"),
             durable_root=cfg.state_dir)
     try:

@@ -1825,6 +1825,19 @@ def _advance_one(
     would answer the new file with the old verdict and archive it unsent.
     The listing then finds the anchor, compares digests, and refuses the
     new file as `req_id_reused`."""
+    from . import peerresend
+    if "retransmit" in record:
+        # A retransmit settles as ITSELF, from every settle path alike:
+        # never the agent's Result, never its anchor (the original in-flight
+        # record is their only writer).
+        return inflight_mod.advance(
+            cfg, name, req_id, record, transport,
+            settle=lambda verdict, _d: peerresend.settle_retransmit(cfg, name, record, verdict),
+            already_settled=peerresend.retransmit_settled(cfg, name, record), anchor=None,
+            recheck=lambda rec: _recheck_retransmit(cfg, name, req_id, rec, transport,
+                                                    cold_policy),
+            publish_blocked=cfg.reload_failed, fenced_retired=fenced_retired)
+
     def settle(verdict: Dict[str, Any], digest: Optional[str]) -> str:
         result = _result_doc(req_id, **verdict)
         # A FENCED generation's record publishes only into the root it
@@ -1839,8 +1852,15 @@ def _advance_one(
             _write_anchor(cfg, name, req_id, result, req_digest=digest,
                           transport_req_id=record.get("transport_req_id"))
             return result["outcome"]
-        return _finish(cfg, name, req_id, result, req_digest=digest,
-                       transport_req_id=record.get("transport_req_id"))
+        out = _finish(cfg, name, req_id, result, req_digest=digest,
+                      transport_req_id=record.get("transport_req_id"))
+        _note(peerresend.note_settled, cfg, name, record, result)
+        return out
+
+    def preserve(rec: Dict[str, Any]) -> None:
+        blobs = (inflight_mod.read_snapshot(cfg, name, req_id, rec["attachments"])
+                 if rec.get("attachments") else [])
+        peerresend.preserve(cfg, name, req_id, rec, blobs)
 
     anchor = _private_result_path(cfg, name, req_id)
     return inflight_mod.advance(
@@ -1848,7 +1868,39 @@ def _advance_one(
         already_settled=anchor.is_file(), anchor=anchor,
         recheck=lambda rec: _recheck(cfg, name, rec, transport, cold_policy),
         publish_blocked=cfg.reload_failed, fenced_retired=fenced_retired,
+        # Only a signed peer task is preserved: no other record has the effect.
+        preserve=preserve if peerresend.preservable(cfg, name, record) else None,
+        found_handed=lambda rec: peerresend.note_handed(cfg, name, rec),
     )
+
+
+def _note(fn: Any, *args: Any) -> None:
+    """A preservation note after the settlement: never fails the settlement."""
+    try:
+        fn(*args)
+    except Exception:  # noqa: BLE001 -- the copy's own bookkeeping
+        logger.exception("noting a preserved original's settlement failed")
+
+
+def _recheck_retransmit(
+    cfg: RouterConfig, name: str, req_id: str, record: Dict[str, Any],
+    transport: Optional[inflight_mod.TransportPort], cold_policy: Optional[ColdPolicy],
+) -> inflight_mod.Recheck:
+    """A retransmit's re-check: before its FIRST hand-over, the gate re-runs
+    every dynamic refusal, and a failure is a terminal cancellation
+    (`cancelled/<code>`, nothing handed); then, always, the sender's own
+    re-check of a peer task."""
+    from . import clock, peerresend
+    handed = inflight_mod._was_handed(inflight_mod.handed_path(cfg, name, req_id),
+                                      record["transport_req_id"])
+    if not handed:
+        cancel = peerresend.gate(cfg, name, record, clock.now())
+        if cancel is not None:
+            code, detail = cancel
+            return inflight_mod.Recheck(False, why=f"{code}: {detail}", verdict={
+                "outcome": peerresend.CANCELLED, "reason_code": code,
+                "detail": f"cancelled before any hand-over: {detail}", "recipients": []})
+    return _recheck(cfg, name, record, transport, cold_policy)
 
 
 def _canonical_or_none(raw: Any) -> Optional[str]:
@@ -2067,7 +2119,9 @@ def _advance_inflight(
                 )
                 errored += 1
                 continue
-            if state == inflight_mod.SETTLED:
+            if state == inflight_mod.SETTLED and "retransmit" in record:
+                settled += 1                 # its own settlement; no agent Result
+            elif state == inflight_mod.SETTLED:
                 settled += 1
                 result = json.loads(
                     _private_result_path(cfg, name, req_id).read_text(encoding="utf-8")
@@ -3781,6 +3835,20 @@ FIRST SIGHT (`router/firstsight.py`): the first time this router sees an
     if sum(fenced_uncertain):
         inflight_summary["snapshot_sweep_uncertain"] = (
             inflight_summary.get("snapshot_sweep_uncertain", 0) + sum(fenced_uncertain))
+    if transport is not None and not isinstance(transport, hoplink.Held):
+        # The resend workflow's own bookkeeping, after every record stepped:
+        # a claimed retransmit recovered or finished (its audit, then its
+        # claim), and preserved originals past their retention pruned.
+        from . import clock, peerresend
+        for what, fn in (("retransmit_finished", peerresend.finish),
+                         ("peer_sent_pruned", peerresend.sweep)):
+            try:
+                done = fn(cfg, name, clock.now())
+            except Exception:  # noqa: BLE001 -- retried next poll, never fails the drain
+                logger.exception("instance %r: %s failed; retried next poll", name, what)
+                continue
+            if done:
+                inflight_summary[what] = done
 
     _sweep_answered_pending(cfg, name)
     filenames, skipped_symlinks = list_outbound(cfg, name)
