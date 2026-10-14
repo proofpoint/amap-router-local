@@ -270,18 +270,92 @@ class AttemptTests(_Control):
         (self.state_dir / config_mod.RUNTIME_NS / config_mod.RUNTIME_GENERATION_FILE).unlink()
         return key, attempt
 
-    def test_a_frozen_attempt_with_its_generation_record_lost_is_held_never_minted(self):
+    def audit(self):
+        p = self.state_dir / peerjournal.REPLAY_DIR / peerjournal.OPERATOR_AUDIT
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.is_file() else []
+
+    def test_a_never_admitted_generation_is_restored_and_no_other_is_minted(self):
+        """The exact sequence over two passes, a second notice arriving: A
+        (frozen, never admitted, its record lost) is restored, audited; the
+        attempt is handed over under its n, signed once; B is never minted."""
         key, attempt = self.frozen_then_record_lost()
+        second = self.refused(id="qSecond0123456789abcde")
+        self.send()
+        self.assertEqual(self.gen(), attempt["gen"], "A restored, never another")
+        self.assertEqual(list(self.tree.gens), [attempt["gen"]], "no B minted")
+        n, doc = self.handover(key)
+        self.assertEqual(n, attempt["n"])
+        self.assertEqual(doc["envelope"]["peer"]["statement_header"], attempt["header"])
+        self.assertEqual(self.record(second)["control"]["attempt"]["gen"], attempt["gen"])
+        self.assertEqual(len(self.signs), 2, "the frozen attempt signed once, the second once")
+        restores = [a for a in self.audit() if a.get("act") == peercontrol.RESTORE_VERB]
+        self.assertEqual([(a.get("key"), a.get("generation")) for a in restores],
+                         [(key, attempt["gen"])])
+
+    def test_a_lost_record_beside_another_live_generation_holds_and_restores_nothing(self):
+        key, attempt = self.frozen_then_record_lost()
+        self.tree.gens.update({attempt["gen"]: "live", "b" * 32: "live"})
         got = self.send()
         self.assertEqual(got, {"held_" + peercontrol.HELD_GENERATION_UNRECORDED: 1})
-        self.assertEqual(self.record(key)["control"].get("held"),
-                         peercontrol.HELD_GENERATION_UNRECORDED)
         self.assertFalse((self.state_dir / config_mod.RUNTIME_NS
-                          / config_mod.RUNTIME_GENERATION_FILE).exists(), "nothing minted")
-        self.assertEqual(self.tree.senders, {}, "nothing handed over")
+                          / config_mod.RUNTIME_GENERATION_FILE).exists(), "nothing restored")
+        self.assertEqual(self.audit(), [])
         doc = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)
         self.assertEqual(doc["held"], {peercontrol.HELD_GENERATION_UNRECORDED: 1})
         self.assertEqual(self.send(), got, "the same visible hold, never an error")
+
+    def test_no_generation_is_minted_while_an_attempt_is_held_unrecorded(self):
+        key, attempt = self.frozen_then_record_lost()
+        self.tree.gens[attempt["gen"]] = "retired"
+        second = self.refused(id="qSecond0123456789abcde")
+        got = self.send()
+        self.assertEqual(got.get("held_" + peercontrol.HELD_GENERATION_UNRECORDED), 1, got)
+        self.assertEqual(got.get(peercontrol.UNAVAILABLE), 1, got)
+        self.assertEqual(list(self.tree.gens), [attempt["gen"]], "nothing minted")
+        self.assertNotIn("attempt", self.record(second)["control"])
+        # The audited exit, then the second notice goes out in a new generation.
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        peercontrol.operator_abandon_attempt(self.cfg, cap, key, now=NOW, evidence="lost")
+        control = self.record(key)["control"]
+        self.assertEqual((control.get("suppressed"), control.get("held")),
+                         (peercontrol.SUPPRESS_ABANDONED, None))
+        self.send()
+        self.assertNotEqual(self.record(second)["control"]["attempt"]["gen"], attempt["gen"])
+        self.assertEqual(self.tree.senders[attempt["gen"]].writes
+                         if attempt["gen"] in self.tree.senders else [], [],
+                         "the abandoned attempt was never handed over")
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)
+        self.assertEqual(doc["suppressed"].get(peercontrol.SUPPRESS_ABANDONED), 1)
+
+    def test_abandon_ends_a_held_attempt_never_resent(self):
+        key, attempt = self.frozen_then_record_lost()
+        self.tree.gens["b" * 32] = "live"                  # another generation was live
+        self.send()
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        out = peercontrol.operator_abandon_attempt(self.cfg, cap, key, now=NOW, evidence="x")
+        self.assertIn("abandoned", out["result"])
+        self.assertEqual(self.record(key)["control"].get("suppressed"),
+                         peercontrol.SUPPRESS_ABANDONED)
+        self.send()
+        self.assertEqual(len(self.signs), 1, "never re-signed")
+        self.assertNotIn(attempt["gen"], self.tree.senders, "never handed over")
+
+    def test_abandon_refuses_a_live_or_unreadable_generation_and_an_attempt_in_flight(self):
+        key, attempt = self.frozen_then_record_lost()
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        for state in ("live", "unreadable"):
+            with self.subTest(state=state):
+                self.tree.gens[attempt["gen"]] = state
+                with self.assertRaises(ValueError):
+                    peercontrol.operator_abandon_attempt(self.cfg, cap, key, now=NOW,
+                                                         evidence="x")
+        del self.tree.gens[attempt["gen"]]
+        d = self.state_dir / config_mod.RUNTIME_NS / attempt["gen"] / inflight.INFLIGHT_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{attempt['id']}{inflight.HANDED_SUFFIX}").write_text(attempt["n"])
+        with self.assertRaises(ValueError):
+            peercontrol.operator_abandon_attempt(self.cfg, cap, key, now=NOW, evidence="x")
+        self.assertIsNone(self.record(key)["control"].get("suppressed"))
 
     def test_a_lost_record_beside_its_live_generation_is_restored_under_the_same_n(self):
         key, attempt = self.frozen_then_record_lost()

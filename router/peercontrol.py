@@ -49,12 +49,16 @@ THE ATTEMPT (one per pending notice), each step durable before the next:
      `delivery_unknown`, `rejected` and `halted` are recorded, never retried.
 Recovery resumes at the step reached: after 2 and before 3 the id is burned
 (nothing was signed); after 3 the frozen bytes are begun under the recorded
-id, in the attempt's OWN generation, reconciled before anything else: a
-lost generation record is restored only when the lister shows that
-generation live, and otherwise the attempt is held visibly
-(`attempt_generation_unrecorded`, or `attempt_generation_not_recorded_one`
-when another is recorded); no other generation is ever selected or minted
-for it. After 4 the in-flight machinery drives it. A handed marker with no
+id, in the attempt's OWN generation, reconciled before anything else. A
+lost generation record is restored to it, AUDITED, when the lister shows it
+live or does not list it at all (never admitted, so nothing was handed over
+in it) and shows no other generation live or unreadable. Otherwise the
+attempt is held visibly (`attempt_generation_unrecorded`, or
+`attempt_generation_not_recorded_one` when another is recorded); no other
+generation is ever selected for it, and while one is held unrecorded none is
+minted. Its exits are `adopt`, or the audited `abandon-attempt`, which
+suppresses the notice (`attempt_abandoned`). After 4 the in-flight machinery
+drives it. A handed marker with no
 record holds, recorded on the record as `control.stuck` (reason
 `handed_without_record`), never re-sent. An attempt with no result past the
 settle horizon (`SETTLE_HORIZON_S`) is recorded stuck too (reason
@@ -114,6 +118,8 @@ DEFER_LIMIT_S = 86400
 SUPPRESS_UNCONFIGURED = "unconfigured_runtime"
 SUPPRESS_RATE = "rate_limited"
 SUPPRESS_COALESCED = "coalesced"
+SUPPRESS_ABANDONED = "attempt_abandoned"
+RESTORE_VERB = "runtime-generation restore (automatic)"
 UNAVAILABLE = "runtime_tree_unavailable"
 STUCK_HANDED = "handed_without_record"
 STUCK_UNSETTLED = "unsettled_past_horizon"
@@ -123,7 +129,11 @@ HELD_NO_DESTINATION = "destination_unknown"
 DELEGATION_INACTIVE = "delegation_inactive"
 #: A frozen attempt whose generation cannot be used as recorded: held
 #: visibly (status `held`), never re-signed, never moved to another
-#: generation. An operator adopts the generation, or retires it.
+#: generation. The exits: `router runtime-generation adopt <gen>` when the
+#: lister shows that generation as the only live one, or
+#: `router runtime-generation abandon-attempt <record key>`, which ends the
+#: notice suppressed `attempt_abandoned`. While one is held unrecorded no new
+#: generation is minted.
 HELD_GENERATION_UNRECORDED = "attempt_generation_unrecorded"
 HELD_GENERATION_MISMATCH = "attempt_generation_not_recorded_one"
 GENERATION_HOLDS = frozenset({HELD_GENERATION_UNRECORDED, HELD_GENERATION_MISMATCH})
@@ -274,9 +284,57 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     if others:
         raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: adopt "
                                        "or retire one (router runtime-generation)")
+    held = _held_unrecorded(cfg)
+    if held:
+        # A frozen attempt still names a generation of its own: a new one
+        # would split the runtime tree. Adopt it, or abandon the attempt.
+        raise Unavailable(UNAVAILABLE, f"a frozen attempt's generation is unrecorded ({held[0]}):"
+                                       " adopt it, or abandon the attempt")
     gen = secrets.token_hex(16)
     record_generation(cfg, gen, now=now)
     return gen
+
+
+def _held_unrecorded(cfg: Any) -> List[str]:
+    """The record keys of unsent attempts held `attempt_generation_unrecorded`."""
+    out = []
+    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+        c = rec.get("control") or {}
+        if (c.get("held") == HELD_GENERATION_UNRECORDED and not c.get("sent")
+                and not c.get("suppressed")):
+            out.append(rec["key"])
+    return out
+
+
+def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
+                             now: datetime, evidence: str) -> Dict[str, Any]:
+    """`router runtime-generation abandon-attempt <record key>`: end a frozen
+    control attempt whose generation can be neither restored nor adopted.
+    The notice is suppressed `attempt_abandoned`: never re-signed, never
+    sent. Refused while the lister shows the attempt's generation live or
+    unreadable (adopt or retire it instead), or while the attempt has an
+    in-flight record or a handed marker in that generation."""
+    from . import inflight
+    if cap is None:
+        raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
+    if not evidence:
+        raise ValueError("evidence is required")
+    sd = Path(cfg.state_dir)
+    record = peerjournal._find(sd, key)
+    control = record.get("control") or {}
+    attempt = control.get("attempt") or {}
+    if "gen" not in attempt or control.get("sent") or control.get("suppressed"):
+        raise ValueError(f"{key} has no frozen, unsent control attempt")
+    gen = attempt["gen"]
+    state = dict(cap.generations()).get(gen)
+    if state in ("live", "unreadable"):
+        raise ValueError(f"the attempt's generation {gen} is {state}: adopt or retire it")
+    d = sd / config_mod.RUNTIME_NS / gen / inflight.INFLIGHT_DIR
+    for name in (f"{attempt['id']}.json", f"{attempt['id']}{inflight.HANDED_SUFFIX}"):
+        if os.path.lexists(d / name):
+            raise ValueError(f"the attempt {attempt['id']} is in flight in {gen}")
+    _update(sd, record, suppressed=SUPPRESS_ABANDONED, held=None)
+    return {"result": f"abandoned the control attempt {attempt['id']} of {key}"}
 
 
 def record_generation(cfg: Any, gen: str, *, now: datetime) -> None:
@@ -513,7 +571,7 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
         # The attempt is frozen in ITS generation, whose private counter
         # holds its `n`: reconcile that generation first, never select (or
         # mint) another and read the counter through it.
-        held = _attempt_generation(cfg, cap, attempt["gen"], now=now)
+        held = _attempt_generation(cfg, cap, attempt["gen"], now=now, key=record["key"])
         if held is not None:
             if record["control"].get("held") != held:
                 _update(sd, record, held=held)
@@ -572,14 +630,17 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
     return f"attempt_{state}"
 
 
-def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime
-                        ) -> Optional[str]:
+def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
+                        key: str) -> Optional[str]:
     """None when a frozen attempt's generation `gen` is the recorded one, or
-    the record is lost and the lister shows `gen` live (the record is then
-    restored to it). Otherwise the reason the attempt is HELD, visibly:
-    `HELD_GENERATION_UNRECORDED` (no record, and `gen` not live), or
-    `HELD_GENERATION_MISMATCH` (another generation is recorded). Nothing is
-    minted here."""
+    when the record is lost and `gen` may be restored: the lister shows it
+    `live`, or does not list it at all (minted and never admitted, so nothing
+    was handed over in it), AND shows no other generation `live` or
+    `unreadable`. A restore is audited (`RESTORE_VERB`, naming the attempt's
+    record key). Otherwise the reason the attempt is HELD, visibly:
+    `HELD_GENERATION_UNRECORDED` (no record, and `gen` cannot be restored),
+    or `HELD_GENERATION_MISMATCH` (another generation is recorded). Nothing
+    is minted here."""
     try:
         recorded: Optional[str] = config_mod.runtime_generation(cfg)
     except config_mod.StateKeyUnresolved:
@@ -588,8 +649,12 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime
         return None
     if recorded is not None:
         return HELD_GENERATION_MISMATCH
-    if dict(cap.generations()).get(gen) == "live":
+    listed = dict(cap.generations())
+    others = [g for g, st in listed.items() if st in ("live", "unreadable") and g != gen]
+    if listed.get(gen) in ("live", None) and not others:
         record_generation(cfg, gen, now=now)
+        peerjournal._audit(cfg.state_dir, RESTORE_VERB, now, key=key, generation=gen,
+                           listed=listed.get(gen) or "not listed")
         return None
     return HELD_GENERATION_UNRECORDED
 
