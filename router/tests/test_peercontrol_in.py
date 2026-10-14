@@ -306,6 +306,24 @@ class ControlCrashTests(_ControlIn):
         self.assertEqual(self.outcome(), ("done", "placed", None, None))
         self.assertEqual(len(self.inbox_notices()), 1)
 
+    def test_a_crash_after_the_notice_is_placed_re_places_it_under_the_same_id(self):
+        self.issued()
+        self.entry(self.control_raw())
+        real = deliver.deliver_router_notice
+
+        def place_then_crash(*a, **k):
+            real(*a, **k)
+            if not place_then_crash.done:
+                place_then_crash.done = True
+                raise SystemExit("crash after the notice was placed")
+        place_then_crash.done = False
+        with mock.patch.object(deliver, "deliver_router_notice", place_then_crash):
+            with self.assertRaises(SystemExit):
+                self.poll()
+            self.poll()
+        self.assertEqual(self.outcome(), ("done", "placed", None, None))
+        self.assertEqual(len(self.inbox_notices()), 1, "re-placed under its own id, once")
+
     def test_a_changed_issued_record_is_recovery_corrupt_never_placed(self):
         self.issued()
         self.entry(self.control_raw())

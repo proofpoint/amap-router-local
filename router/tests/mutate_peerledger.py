@@ -574,7 +574,7 @@ M = [
   '            preset=(res["notice_id"], res["notice_ts"]),\n',
   '            preset=None,\n',
   ["router.tests.test_peercontrol_in.AcceptedControlTests.test_the_notice_is_placed_under_the_reservations_id_and_time",
-   "router.tests.test_peercontrol_in.ControlCrashTests.test_a_crash_between_the_marker_and_the_notice_places_once"]),
+   "router.tests.test_peercontrol_in.ControlCrashTests.test_a_crash_after_the_notice_is_placed_re_places_it_under_the_same_id"]),
  ("L104 a policy code interpreted, not escaped", PC,
   '    return "".join(out)\n',
   '    return text\n',
