@@ -441,6 +441,43 @@ class TrustVerbTests(_Epochs):
         self.assertEqual(self.accepted(), ts(-3 * DAY))
         self.assertFalse(self.meta()["epochs_untrusted"])
 
+    def assert_not_reseeded(self, needle):
+        peerepochs.set_untrusted(self.state_dir, "test")
+        try:
+            out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+            out = {"cleared": f"raised {type(e).__name__}: {e}", "problems": []}
+        self.assertIs(out["cleared"], False, out)
+        self.assertTrue(any("cannot be read reliably" in p and needle in p
+                            for p in out["problems"]), out["problems"])
+        self.assertIsNone(self.accepted(), "nothing reseeded from a partial view")
+        self.assertTrue(self.meta()["epochs_untrusted"], "the flag stays")
+
+    def test_an_unreadable_record_reseeds_nothing_and_keeps_the_flag(self):
+        rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        (peerjournal.record_dir(self.state_dir, rec["owner"], rec["key"])
+         / peerjournal.RECORD).write_text("{")
+        self.assertEqual(peerjournal.all_records(self.state_dir), [], "a plain read skips it")
+        self.assert_not_reseeded("cannot be read")
+
+    def test_a_record_directory_without_its_record_reseeds_nothing(self):
+        rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        (peerjournal.record_dir(self.state_dir, rec["owner"], rec["key"])
+         / peerjournal.RECORD).unlink()
+        self.assert_not_reseeded("has no regular record")
+
+    def test_a_record_that_is_not_a_record_reseeds_nothing(self):
+        rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        (peerjournal.record_dir(self.state_dir, rec["owner"], rec["key"])
+         / peerjournal.RECORD).write_text("[]")
+        self.assert_not_reseeded("is not a record")
+
+    def test_a_never_journaled_store_still_clears(self):
+        self.assertFalse(peerjournal.journal_present(self.state_dir))
+        peerepochs.set_untrusted(self.state_dir, "test")
+        out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        self.assertTrue(out["cleared"], out)
+
     def test_an_inconsistent_record_is_never_reseeded(self):
         key = self.take(self.raw(sender_since=ts(-DAY * 9), id="qIncons0123456789abcde"))
         self.evaluate(key, hk=tpe.hooks(

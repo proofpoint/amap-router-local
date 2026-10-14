@@ -329,24 +329,44 @@ def answered(cfg: Any, lid: str, peer_id: str) -> Optional[str]:
     """Why the original is answered, or None: a control notice received for
     `peer_id` (the one-per-message `notified/` marker), or a signed Result:
     a placed peer statement whose signed `in_reply_to` is `peer_id`, found
-    in the receive journal (its record outlives the original's window)."""
+    in the receive journal (its record outlives the original's window).
+
+    The journal is read strictly (`peerjournal.strict_records`): a journal
+    that cannot be read reliably, or a placed statement whose snapshot is
+    missing or unreadable, is `peerjournal.JournalBlind`, never "not
+    answered". No journal at all (never journaled) is "not answered"."""
     from . import peerjournal, peerledger
     if peerledger.notified_path(cfg.state_dir, lid, peer_id).exists():
         return "a control notice was received for it"
-    try:
-        records = peerjournal.all_records(Path(cfg.state_dir))
-    except Exception:  # noqa: BLE001 -- no receive journal: nothing received
-        records = []
-    for rec in records:
+    for rec in peerjournal.strict_records(Path(cfg.state_dir)):
         if rec.get("disposed") != "placed":
             continue
-        raw = peerjournal.read_snapshot(Path(cfg.state_dir), rec, peerjournal.SNAPSHOT_STATEMENT)
         try:
+            raw = peerjournal.read_snapshot(Path(cfg.state_dir), rec,
+                                            peerjournal.SNAPSHOT_STATEMENT)
             doc = json.loads(raw) if raw is not None else None
-        except ValueError:
-            doc = None
-        if isinstance(doc, dict) and doc.get("in_reply_to") == peer_id:
+        except (OSError, ValueError) as e:
+            raise peerjournal.JournalBlind(
+                f"a placed statement's snapshot cannot be read ({rec.get('key')}: "
+                f"{type(e).__name__}), so whether it answers this task cannot be told") from None
+        if not isinstance(doc, dict):
+            raise peerjournal.JournalBlind(
+                f"a placed statement's snapshot is missing or not a statement "
+                f"({rec.get('key')}), so whether it answers this task cannot be told")
+        if doc.get("in_reply_to") == peer_id:
             return "a signed Result was received for it"
+    return None
+
+
+def journal_blind(cfg: Any) -> Optional[str]:
+    """Why the receive journal cannot be read reliably, or None: every
+    resend step that needs `answered` holds while it is (never "not
+    answered", never a hand-over)."""
+    from . import peerjournal
+    try:
+        peerjournal.strict_records(Path(cfg.state_dir))
+    except peerjournal.JournalBlind as e:
+        return str(e)
     return None
 
 
@@ -382,7 +402,7 @@ def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
     startup and reload do), so it checks the CONFIGURED key, which is the
     one activation signs with, and the drain checks again before the first
     hand-over."""
-    from . import inflight, peerlane
+    from . import inflight, peerjournal, peerlane
     pin = copy["record"]["peer"]
     if not clock_trusted(cfg):
         raise Refused("clock_untrusted", "the peer clock is untrusted: a received Result "
@@ -404,7 +424,10 @@ def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
     end = window_end(cfg, copy["statement"])
     if end is None or now > end:
         raise Refused("outside_window", f"ts {copy['statement'].get('ts')} is past ts + P + F")
-    why = answered(cfg, lid, pin["id"])
+    try:
+        why = answered(cfg, lid, pin["id"])
+    except peerjournal.JournalBlind as e:
+        raise Refused("journal_unreadable", f"a received Result cannot be ruled out: {e}") from None
     if why:
         raise Refused("answered", why)
     settled = copy.get("settled")
@@ -431,7 +454,10 @@ def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
 
 def gate(cfg: Any, name: str, record: Mapping[str, Any], now: datetime) -> Optional[Tuple[str, str]]:
     """Before a retransmit record's FIRST hand-over: every dynamic refusal
-    again, the copy's re-checks included. `(code, detail)` cancels it. (A
+    again, the copy's re-checks included. `(code, detail)` cancels it. (The
+    drain holds a record BEFORE this, unhanded and unsettled, while the clock
+    is untrusted or the receive journal cannot be read reliably:
+    `outbound._advance_one`.) (A
     record in a fenced generation never reaches it: under the hop a fenced
     generation advances only once its tree is retired, and an unhanded
     record there settles `rejected/no_route` first, `inflight.advance`.)"""
@@ -596,8 +622,8 @@ def finish(cfg: Any, name: str, now: datetime, *, fenced: bool = False) -> int:
         if gen != gen_now:
             continue                          # its generation's own pass finishes it
         live = inflight.read_record(cfg, name, rtx_name(n))
-        if settled is None and live is None and not clock_trusted(cfg):
-            continue                          # held, never cancelled, until the clock recovers
+        if settled is None and live is None and (not clock_trusted(cfg) or journal_blind(cfg)):
+            continue                          # held, never cancelled, until the journal reads
         if settled is None and live is None:
             try:
                 if fenced:
@@ -669,8 +695,14 @@ def show(cfg: Any, peer_id: str, *, now: datetime) -> Dict[str, Any]:
     out["agent_result"] = _origin_result(cfg, lid, origin)
     # A received signed Result is readable only under a trusted clock: never
     # report "not answered" when it cannot be known.
-    out["answered"] = (answered(cfg, lid, peer_id) if clock_trusted(cfg)
-                       else "unknown (clock untrusted)")
+    from . import peerjournal
+    if not clock_trusted(cfg):
+        out["answered"] = "unknown (clock untrusted)"
+    else:
+        try:
+            out["answered"] = answered(cfg, lid, peer_id)
+        except peerjournal.JournalBlind as e:
+            out["answered"] = f"unknown (journal unreadable: {e})"
     try:
         check_dynamic(cfg, name, lid, copy, allow_pending=True, now=now, configured=True)
         rc = _sender_recheck(cfg, name, copy)

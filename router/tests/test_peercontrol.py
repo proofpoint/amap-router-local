@@ -1202,6 +1202,23 @@ class StrictJournalGuardTests(_Control):
         (self.record_dir(key) / peerjournal.RECORD).write_text("{}")
         self.assert_refused("retire", gen, "is not a record", gen=gen)
 
+    def bookkeeping(self, **changes):
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"].update(changes)
+        path.write_text(json.dumps(doc))
+
+    def test_a_malformed_root_entry_refuses_never_a_bare_error(self):
+        key, gen = self.frozen_in_live_a()
+        roots = json.loads((self.state_dir / peerclock.CLOCK_FILE).read_text())["store"]["roots"]
+        self.bookkeeping(roots={owner: {} for owner in roots})
+        self.assert_refused("retire", gen, "not the shape this router writes", gen=gen)
+
+    def test_a_malformed_pending_op_refuses_never_a_bare_error(self):
+        key, gen = self.frozen_in_live_a()
+        self.bookkeeping(pending_op="garbage")
+        self.assert_refused("retire", gen, "not the shape this router writes", gen=gen)
+
     def test_the_bookkeeping_matching_the_disk_passes(self):
         """The companion: an intact journal is compared and accepted, so the
         refusals above are the comparison's, not a guard that always fails.
