@@ -395,8 +395,10 @@ M = [
   "",
   [C + "RetireListedOnlyTests.test_retire_makes_the_record_removal_durable"]),
  ("L84 a missing destination labelled unconfigured", PC,
-  '    if control.get("about") is None or control.get("to") is None:\n',
-  '    if False:\n',
+  '    if control.get("about") is None or control.get("to") is None:\n'
+  '        if control.get("held") != HELD_NO_DESTINATION:\n',
+  '    if False:\n'
+  '        if control.get("held") != HELD_NO_DESTINATION:\n',
   [C + "DestinationUnknownTests.test_a_notice_without_about_or_to_is_held_never_unconfigured"]),
  ("L85 no delegation errors per record", PC,
   "    if delegation is None:\n        # No signing key",
@@ -513,6 +515,14 @@ M = [
   "    if False:\n        result = _result_doc(\n"
   "            req_id, \"rejected\", reason_code=classify_mod.REASON_NO_ROUTE, recipients=[],\n",
   [T + "ResultSubmitTests.test_a_remote_no_longer_trusted_gets_nothing_signed_and_no_issued_record"]),
+ ("L89 a misaddressed suppression stays suppressed", PC,
+  "    return (control.get(\"suppressed\") == SUPPRESS_UNCONFIGURED\n",
+  "    return False and (control.get(\"suppressed\") == SUPPRESS_UNCONFIGURED\n",
+  ["router.tests.test_peercarries.DemotionDestinationTests.test_a_misaddressed_suppression_is_pending_again_with_its_destination"]),
+ ("L90 the destination not read back from the snapshot", PC,
+  "        if filled is not None:\n",
+  "        if False:\n",
+  ["router.tests.test_peercarries.DemotionDestinationTests.test_a_misaddressed_suppression_is_pending_again_with_its_destination"]),
 ]
 
 

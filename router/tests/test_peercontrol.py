@@ -1011,7 +1011,9 @@ class DestinationUnknownTests(_Control):
         rec = self.record(key)
         peerjournal.write_record(self.state_dir, dict(rec, control=dict(
             rec["control"], about=None, to=None)))
-        self.assertEqual(self.send(), {"held_" + peercontrol.HELD_NO_DESTINATION: 1})
+        # No statement snapshot to read them back from either.
+        with mock.patch.object(peerjournal, "read_snapshot", return_value=None):
+            self.assertEqual(self.send(), {"held_" + peercontrol.HELD_NO_DESTINATION: 1})
         control = self.record(key)["control"]
         self.assertIsNone(control.get("suppressed"), "never suppressed")
         self.assertEqual(control.get("held"), peercontrol.HELD_NO_DESTINATION)

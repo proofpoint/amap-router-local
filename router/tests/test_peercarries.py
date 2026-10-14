@@ -9,8 +9,9 @@ import json
 import unittest
 from datetime import timedelta
 
-from router import peerbind, peerjournal, peerlane
+from router import peerbind, peercontrol, peerjournal, peerlane
 from router.tests import peer_standin as si
+from router.tests import test_peercontrol as tpc
 from router.tests import test_peerevaluate as tpe
 from router.tests.test_peerbind import STATEMENT_ID, T1
 
@@ -106,6 +107,41 @@ class ObservedTimesTests(tpe._Eval):
         self.assertIn(parse_utc_ts("2026-10-13T12:40:00Z"), times, "the runtime's in-flight record")
         self.assertIn(parse_utc_ts("2026-10-13T13:00:00Z"), times, "the issued record's issue time")
         self.assertTrue(any("issued" in src for _t, src in got), "each source is named")
+
+
+class DemotionDestinationTests(tpc._Control):
+    """A 5(b) demotion's control reaches the sender with its destination,
+    and one an earlier build suppressed without one is pending again."""
+
+    def demoted(self):
+        self.lane = dataclasses.replace(
+            self.lane, codec=_ValueRefusing(self.lane.codec, "statement_value"))
+        key = self.take(self.raw())
+        self.assertEqual(self.evaluate(key)["cause"], "statement_value")
+        return key
+
+    def attempts(self, got):
+        return sum(v for k, v in got.items() if k.startswith("attempt_"))
+
+    def test_a_value_demotions_control_is_attempted_not_suppressed(self):
+        key = self.demoted()
+        got = self.send()
+        self.assertEqual(self.attempts(got), 1, got)
+        self.assertIsNone(self.record(key)["control"].get("suppressed"))
+
+    def test_a_misaddressed_suppression_is_pending_again_with_its_destination(self):
+        key = self.demoted()
+        rec = self.record(key)
+        peerjournal.write_record(self.state_dir, dict(rec, control=dict(
+            rec["control"], about=None, to=None, suppressed=peercontrol.SUPPRESS_UNCONFIGURED)))
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=tpc.NOW)
+        self.assertEqual((doc["pending"], doc["suppressed"]), (1, {}),
+                         "counted as pending, not as suppressed")
+        got = self.send()
+        control = self.record(key)["control"]
+        self.assertEqual((control.get("about"), control.get("to"), control.get("suppressed")),
+                         (STATEMENT_ID, tpc.DEST, None))
+        self.assertEqual(self.attempts(got), 1, got)
 
 
 if __name__ == "__main__":

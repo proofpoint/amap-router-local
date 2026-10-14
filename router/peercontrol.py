@@ -753,13 +753,22 @@ def coalesce_owner(cfg: Any, destination: str, control: Mapping[str, Any], key: 
 # The pass
 # ---------------------------------------------------------------------------
 
+def _misaddressed(control: Mapping[str, Any]) -> bool:
+    """Suppressed `unconfigured_runtime` with no `about` or no `to`: the
+    label an earlier build gave a 5(b) demotion it wrote without either. It
+    was never a finding about the runtime, so the notice is pending again."""
+    return (control.get("suppressed") == SUPPRESS_UNCONFIGURED
+            and (control.get("about") is None or control.get("to") is None))
+
+
 def pending(state_dir: Path) -> List[Dict[str, Any]]:
     """Every journal record with an unsent, unsuppressed control notice, in
-    take order."""
+    take order (a misaddressed suppression counts as pending)."""
     out = []
     for rec in peerjournal.all_records(state_dir):
         c = rec.get("control")
-        if c and not c.get("sent") and not c.get("suppressed") and not c.get("coalesced_with"):
+        if c and not c.get("sent") and not c.get("coalesced_with") and (
+                not c.get("suppressed") or _misaddressed(c)):
             out.append(rec)
     return sorted(out, key=lambda r: r["take_seq"])
 
@@ -820,6 +829,14 @@ def _one(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, delegat
     if control.get("attempt"):
         return _resume(cfg, cap, record, delegation=delegation, now=now)
     if control.get("about") is None or control.get("to") is None:
+        filled = _destination_from_snapshot(cfg, delegation, record)
+        if filled is not None:
+            # Re-pended: the statement's id and its key owner's runtime,
+            # read from the snapshot taken with the disposition.
+            record = _update(sd, record, about=filled[0], to=filled[1], held=None,
+                             suppressed=None)
+            control = record["control"]
+    if control.get("about") is None or control.get("to") is None:
         if control.get("held") != HELD_NO_DESTINATION:
             _update(sd, record, held=HELD_NO_DESTINATION)
         return "held_" + HELD_NO_DESTINATION
@@ -848,6 +865,21 @@ def _one(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, delegat
         return "deferred"
     record = _update(sd, record, attempt={"id": _mint_id(), "at": format_utc_ts(now)})
     return _resume(cfg, cap, record, delegation=delegation, now=now, gen=gen)
+
+
+def _destination_from_snapshot(cfg: Any, delegation: Any, record: Mapping[str, Any]
+                               ) -> Optional[Tuple[str, str]]:
+    """(about, to) from the record's statement snapshot and the configured
+    runtime that owns its key, or None when either cannot be read."""
+    sd = Path(cfg.state_dir)
+    raw = peerjournal.read_snapshot(sd, record, peerjournal.SNAPSHOT_STATEMENT)
+    about = peerjournal._statement_id(raw) if raw is not None else None
+    key_id = peerjournal._snapshot_key_id(sd, record)
+    dc = getattr(delegation, "config", None) or getattr(cfg, "delegation", None)
+    owner = peerbind.runtime_for_key(dc, key_id) if (dc is not None and key_id) else None
+    if about is None or owner is None:
+        return None
+    return about, owner.runtime
 
 
 def _mint_id() -> str:
@@ -1016,7 +1048,7 @@ def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dic
             else:
                 key = outcome if isinstance(outcome, str) else "unknown"
                 doc["failed"][key] = doc["failed"].get(key, 0) + 1
-        elif c.get("suppressed"):
+        elif c.get("suppressed") and not _misaddressed(c):
             doc["suppressed"][c["suppressed"]] = doc["suppressed"].get(c["suppressed"], 0) + 1
         elif c.get("coalesced_with"):
             doc["suppressed"][SUPPRESS_COALESCED] = doc["suppressed"].get(SUPPRESS_COALESCED, 0) + 1
