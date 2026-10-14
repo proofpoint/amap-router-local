@@ -145,8 +145,8 @@ M = [
   "        peerjournal.apply_window(cfg.state_dir, clock.now(), cfg.delegation)",
   [ONE]),
  ("C27 the reset rule accepts a reset anywhere", "router/tests/test_one_clock.py",
-  "and _raw_qual(n, aliases) == f\"{CLOCK_OWN}.reset\" and always_runs(n)]",
-  "and _raw_qual(n, aliases) == f\"{CLOCK_OWN}.reset\"]",
+  "        call = parents.get(id(node))\n        if isinstance(call, ast.Call) and _call_name(call.func) == \"addCleanup\" \\\n",
+  "        return \"class\"\n        call = parents.get(id(node))\n        if isinstance(call, ast.Call) and _call_name(call.func) == \"addCleanup\" \\\n",
   ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
    "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
  ("C28 re-exports not resolved", "router/tests/test_one_clock.py",
@@ -182,7 +182,7 @@ M = [
   ["router.tests.test_clock_child.BackwardsTests."
    "test_an_append_repeating_an_older_stamp_on_the_same_path_is_backwards"]),
  ("C34 the reset rule accepts a conditional reset", "router/tests/test_one_clock.py",
-  "        if not isinstance(stmt, ast.Expr):\n            return False\n",
+  "        if not isinstance(stmt, ast.Expr):\n            return None\n",
   "        while stmt is not None and not isinstance(stmt, ast.Expr):\n"
   "            stmt = parents.get(id(stmt))\n"
   "        owner = parents.get(id(stmt))\n"
@@ -204,8 +204,33 @@ M = [
   ["router.tests.test_clock_child.BackwardsTests."
    "test_the_declared_pump_reuse_passes_and_only_there"]),
  ("C38 an addCleanup registration accepted wherever it is", "router/tests/test_one_clock.py",
-  "            return (isinstance(stmt, ast.Expr)\n",
-  "            return True or (isinstance(stmt, ast.Expr)\n",
+  "            if not (isinstance(stmt, ast.Expr)\n"
+  "                    and isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))\n"
+  "                    and stmt in owner.body):\n"
+  "                return None\n",
+  "            owner = function_of(call)\n"
+  "            if owner is None:\n"
+  "                return None\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C39 a test method's registration covers its siblings", "router/tests/test_one_clock.py",
+  "            return (\"fn\", owner) if owner.name.startswith(\"test\") else None\n",
+  "            return \"class\" if owner.name.startswith(\"test\") else None\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C40 a finally reset covers every install", "router/tests/test_one_clock.py",
+  "            return (\"try\", owner)\n",
+  "            return \"class\"\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C41 coverage aggregated across the class again", "router/tests/test_one_clock.py",
+  "            if not any(covers(sc, inst, fn) for sc in scopes):\n",
+  "            if not any(sc is not None for sc in scopes):\n",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C42 any receiver's addCleanup accepted", "router/tests/test_one_clock.py",
+  "                    and call.func.value.id == \"self\"):\n                return None\n",
+  "                    and call.func.value.id == \"self\") and False:\n                return None\n",
   ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
    "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
  ("C35 a dynamic importer taken as a value", "router/outcomes.py",

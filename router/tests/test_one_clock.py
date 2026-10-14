@@ -442,46 +442,84 @@ class ControlTests(unittest.TestCase):
 
 
 def unreset_installs(source: str):
-    """`(line, name)` for each top-level class or function of a test module
-    that calls `router.clock.install` (resolved through its imports) without
-    resetting it where a reset always runs: `clock.reset()` as a top-level
-    statement of `tearDown`, `tearDownClass` or a `finally` body, or
-    `clock.reset` passed to an `addCleanup` that is a top-level statement of
-    `setUp`, a test method or `install_clock`."""
+    """`(line, where)` for each `router.clock.install` call in a test module
+    (resolved through its imports) that no guaranteed reset covers THAT
+    install (see `reset_scope`): a class-wide reset (in `setUp`, `tearDown`
+    or `tearDownClass`, or `self.addCleanup(clock.reset)` in `setUp`), a
+    `self.addCleanup(clock.reset)` at the top level of the same test method,
+    or a top-level `finally: clock.reset()` whose `try` body holds the
+    install. A reset in a sibling test never counts."""
     tree = ast.parse(source)
     aliases = _aliases(tree, "router.tests")
     parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
 
-    def always_runs(node):
-        """Guaranteed to run: called as a TOP-LEVEL statement of
-        `tearDown`/`tearDownClass` or of a `finally` body, or passed to an
-        `addCleanup` that is itself a top-level statement of `setUp`, a test
-        method or `install_clock`. Nested under `if`, `while`, `for`, `try`
-        or `with`, or registered from any other helper, it might not run,
-        and does not count."""
+    def function_of(node):
+        n = parents.get(id(node))
+        while n is not None and not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n = parents.get(id(n))
+        return n
+
+    def reset_scope(node):
+        """What a `clock.reset` reference is guaranteed to clean up after:
+        "class" (every test of the class), `("fn", f)` (only installs in
+        function `f`), `("try", t)` (only installs inside the body of `try`
+        statement `t`), or None (it might not run, or not for this test).
+
+        - `clock.reset()` as a top-level statement of `setUp`, `tearDown`
+          or `tearDownClass`: "class".
+        - `self.addCleanup(clock.reset)` as a top-level statement of
+          `setUp`: "class"; of a test method: that method only, since it is
+          not registered for its siblings.
+        - `clock.reset()` as a top-level statement of a `finally` body: the
+          installs inside that `try`'s own body.
+        - The receiver must be `self`. Nested under `if`, `while`, `for`,
+          `try` or `with`, or in any other method (one merely named
+          `install_clock` included: the real `ClockMixin.install_clock` is in
+          helpers.py, which registers its own cleanup), it is None."""
         call = parents.get(id(node))
         if isinstance(call, ast.Call) and _call_name(call.func) == "addCleanup" \
                 and node in call.args:
-            # The registration itself must run: a top-level statement of
-            # setUp, of a test method, or of install_clock; never guarded,
-            # never in a helper that might not be called.
+            if not (isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "self"):
+                return None
             stmt = parents.get(id(call))
             owner = parents.get(id(stmt))
-            return (isinstance(stmt, ast.Expr)
+            if not (isinstance(stmt, ast.Expr)
                     and isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and stmt in owner.body
-                    and (owner.name in ("setUp", "install_clock")
-                         or owner.name.startswith("test")))
+                    and stmt in owner.body):
+                return None
+            if owner.name == "setUp":
+                return "class"
+            return ("fn", owner) if owner.name.startswith("test") else None
         if not (isinstance(call, ast.Call) and call.func is node):
-            return False
+            return None
         stmt = parents.get(id(call))
         owner = parents.get(id(stmt))
         if not isinstance(stmt, ast.Expr):
-            return False
+            return None
         if isinstance(owner, ast.Try) and stmt in owner.finalbody:
+            return ("try", owner)
+        if (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and owner.name in ("setUp", "tearDown", "tearDownClass") and stmt in owner.body):
+            return "class"
+        return None
+
+    def inside(node, stmts):
+        n = node
+        while n is not None:
+            if any(n is st for st in stmts):
+                return True
+            n = parents.get(id(n))
+        return False
+
+    def covers(scope, inst, fn):
+        """Whether `scope` (from `reset_scope`) cleans up after `inst`."""
+        if scope == "class":
             return True
-        return (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and owner.name in ("tearDown", "tearDownClass") and stmt in owner.body)
+        if scope is None:
+            return False
+        kind, where = scope
+        return where is fn if kind == "fn" else inside(inst, where.body)
 
     bad = []
     for top in tree.body:
@@ -489,10 +527,13 @@ def unreset_installs(source: str):
             continue
         installs = [n for n in ast.walk(top) if isinstance(n, ast.Call)
                     and _raw_qual(n.func, aliases) == f"{CLOCK_OWN}.install"]
-        resets = [n for n in ast.walk(top) if isinstance(n, (ast.Name, ast.Attribute))
-                  and _raw_qual(n, aliases) == f"{CLOCK_OWN}.reset" and always_runs(n)]
-        if installs and not resets:
-            bad.append((top.lineno, top.name))
+        scopes = [reset_scope(n) for n in ast.walk(top) if isinstance(n, (ast.Name, ast.Attribute))
+                  and _raw_qual(n, aliases) == f"{CLOCK_OWN}.reset"]
+        for inst in installs:
+            fn = function_of(inst)
+            if not any(covers(sc, inst, fn) for sc in scopes):
+                bad.append((inst.lineno, top.name + ("." + fn.name if fn is not None
+                                                     and fn is not top else "")))
     return bad
 
 
@@ -531,6 +572,26 @@ class TestsResetWhatTheyInstallTests(unittest.TestCase):
                                                "    def test(self):\n        clock.install(f)\n"
                                                "    def helper(self):\n"
                                                "        self.addCleanup(clock.reset)\n"),
+        "a sibling test's registration": ("from router import clock\nclass T:\n"
+                                          "    def test_a(self):\n"
+                                          "        self.addCleanup(clock.reset)\n"
+                                          "    def test_b(self):\n        clock.install(f)\n"),
+        "a sibling function's finally": ("from router import clock\nclass T:\n"
+                                         "    def test_a(self):\n        try:\n"
+                                         "            pass\n        finally:\n"
+                                         "            clock.reset()\n"
+                                         "    def test_b(self):\n        clock.install(f)\n"),
+        "another object's addCleanup": ("from router import clock\nclass T:\n"
+                                        "    def test(self):\n        clock.install(f)\n"
+                                        "        other.addCleanup(clock.reset)\n"),
+        "an uncalled helper named install_clock": (
+            "from router import clock\nclass T:\n"
+            "    def install_clock(self):\n        self.addCleanup(clock.reset)\n"
+            "    def test(self):\n        clock.install(f)\n"),
+        "a finally whose try does not hold the install": (
+            "from router import clock\nclass T:\n    def test(self):\n"
+            "        clock.install(f)\n        try:\n            pass\n"
+            "        finally:\n            clock.reset()\n"),
         "reset referenced, not called": ("from router import clock\nclass T:\n"
                                          "    def test(self):\n        clock.install(f)\n"
                                          "    def tearDown(self):\n        clock.reset\n"),
@@ -541,6 +602,8 @@ class TestsResetWhatTheyInstallTests(unittest.TestCase):
                               "    def tearDown(self):\n        c.reset()\n"),
         "addCleanup": ("from router import clock\nclass T:\n    def test(self):\n"
                        "        clock.install(f)\n        self.addCleanup(clock.reset)\n"),
+        "reset in setUp": ("from router import clock\nclass T:\n    def setUp(self):\n"
+                           "        clock.reset()\n    def test(self):\n        clock.install(f)\n"),
         "addCleanup in setUp": ("from router import clock\nclass T:\n    def setUp(self):\n"
                                 "        self.addCleanup(clock.reset)\n"
                                 "    def test(self):\n        clock.install(f)\n"),
