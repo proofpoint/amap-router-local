@@ -408,11 +408,11 @@ class AttemptTests(_Control):
         self.assertEqual([a.get("key") for a in self.abandons()], [key])
         self.assertIsNone(self.record(key)["control"].get("audit_pending"))
 
-    def cli(self, **args):
+    def cli(self, command="abandon-attempt", **args):
         import contextlib
         import io
         from router import __main__ as cli
-        ns = types.SimpleNamespace(runtime_generation_command="abandon-attempt",
+        ns = types.SimpleNamespace(runtime_generation_command=command,
                                    evidence="operator evidence", **args)
         err = io.StringIO()
         with mock.patch.object(peercontrol, "capability",
@@ -440,6 +440,91 @@ class AttemptTests(_Control):
         self.assertEqual([a.get("key") for a in self.abandons()], [key])
         self.assertIsNone(self.record(key)["control"].get("audit_pending"))
 
+    def acts(self, verb):
+        return [a for a in self.audit() if a.get("act") == verb]
+
+    def recorded(self):
+        try:
+            return self.gen()
+        except config_mod.StateKeyUnresolved:
+            return None
+
+    def frozen_in_live_a(self):
+        key = self.refused()
+        with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
+            self.send()
+        gen = self.record(key)["control"]["attempt"]["gen"]
+        self.tree.gens[gen] = "live"
+        return key, gen
+
+    def assert_refused_untouched(self, command, live, **args):
+        code, err = self.cli(command, **args)
+        self.assertEqual(code, 1, err)
+        self.assertIn("refused", err)
+        self.assertEqual(self.tree.gens[live], "live", "nothing retired")
+        self.assertEqual(self.recorded(), live, "generation.json intact")
+        self.assertEqual(self.acts(peercontrol.NEW_VERB) + self.acts(peercontrol.RETIRE_VERB), [])
+
+    def test_retire_and_new_refuse_a_frozen_attempt_before_any_effect(self):
+        key, gen = self.frozen_in_live_a()
+        self.assert_refused_untouched("new", gen)
+        self.assert_refused_untouched("retire", gen, gen=gen)
+
+    def test_retire_and_new_refuse_a_handed_marker_without_its_record(self):
+        key = self.refused()
+        self.send()
+        gen = self.gen()
+        n, _doc = self.handover(key)
+        self.port().send(n)
+        self.send()
+        self.send()
+        self.assertTrue(self.record(key)["control"]["sent"])
+        d = peercontrol._inflight_dir(self.cfg, gen)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ("orphan-request" + inflight.HANDED_SUFFIX)).write_text("00000099")
+        self.assert_refused_untouched("new", gen)
+        self.assert_refused_untouched("retire", gen, gen=gen)
+
+    def test_new_succeeds_once_the_attempt_has_settled_and_is_audited_once(self):
+        key, gen = self.frozen_in_live_a()
+        self.send()
+        n, _doc = self.handover(key)
+        self.port().send(n)
+        self.send()
+        self.send()
+        code, err = self.cli("new")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.tree.gens[gen], "retired")
+        self.assertNotIn(self.recorded(), (None, gen))
+        self.assertEqual(len(self.acts(peercontrol.NEW_VERB)), 1)
+
+    def test_new_refuses_before_retiring_when_the_mint_would_be_refused(self):
+        live = "a" * 32
+        self.tree.gens.update({live: "live", "b" * 32: "live"})
+        peercontrol.record_generation(self.cfg, live, now=NOW)
+        self.assert_refused_untouched("new", live)
+
+    def test_every_verb_whose_audit_fails_reports_committed_and_is_repaired(self):
+        a, b = "a" * 32, "b" * 32
+        cases = (("adopt", {"gen": a}, peercontrol.ADOPT_VERB),
+                 ("retire", {"gen": b}, peercontrol.RETIRE_VERB),
+                 ("new", {}, peercontrol.NEW_VERB))
+        self.tree.gens[a] = "live"
+        for command, args, verb in cases:
+            with self.subTest(command=command):
+                if command == "retire":
+                    self.tree.gens[b] = "live"
+                with mock.patch.object(peerjournal, "_audit", side_effect=OSError("disk full")):
+                    code, err = self.cli(command, **args)
+                self.assertEqual(code, 3, err)
+                self.assertIn("COMMITTED", err)
+                self.assertNotIn("refused", err)
+                self.assertEqual(self.acts(verb), [])
+                # The next verb (refused: an unlisted generation) repairs it first.
+                code, _err = self.cli("retire", gen="9" * 32)
+                self.assertEqual(code, 1)
+                self.assertEqual(len(self.acts(verb)), 1, f"{verb} repaired once")
+
     def test_a_blocked_store_is_a_clean_refusal(self):
         key = self.held_beside_live_b()
         with mock.patch.object(peercontrol, "operator_abandon_attempt",
@@ -447,6 +532,28 @@ class AttemptTests(_Control):
             code, err = self.cli(key=key)
         self.assertEqual(code, 1)
         self.assertIn("refused", err)
+
+    def test_an_unlisted_generation_whose_earlier_traffic_settled_is_held(self):
+        """A generation that carried a settled attempt leaves no in-flight
+        file behind; the journal still names it, so it is never re-admitted."""
+        first = self.refused()
+        self.send()
+        gen = self.gen()
+        n, _doc = self.handover(first)
+        self.port().send(n)
+        self.send()
+        self.send()
+        second = self.refused(id="qSecond0123456789abcde")
+        with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
+            self.send()
+        self.assertEqual(self.record(second)["control"]["attempt"]["gen"], gen)
+        self.assertEqual(peercontrol._inflight_entries(self.cfg, gen), [])
+        del self.tree.gens[gen]
+        self.tree.senders.pop(gen, None)
+        (self.state_dir / config_mod.RUNTIME_NS / config_mod.RUNTIME_GENERATION_FILE).unlink()
+        got = self.send()
+        self.assertEqual(got, {"held_" + peercontrol.HELD_GENERATION_UNRECORDED: 1})
+        self.assertIsNone(self.recorded(), "not restored")
 
     def test_a_lost_record_beside_another_live_generation_holds_and_restores_nothing(self):
         key, attempt = self.frozen_then_record_lost()

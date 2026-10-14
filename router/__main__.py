@@ -334,7 +334,7 @@ def _runtime_generation(cfg, args) -> int:
         cap = peercontrol.capability(cfg, runtime)
         now = clock.now()
         # An earlier act's pending audit line is appended before anything else.
-        peercontrol.repair_audits(cfg)
+        peercontrol.repair_audits(cfg, cap)
         if args.runtime_generation_command == "adopt":
             out = peercontrol.operator_adopt(cfg, cap, args.gen, now=now, evidence=args.evidence)
         elif args.runtime_generation_command == "retire":
@@ -347,7 +347,7 @@ def _runtime_generation(cfg, args) -> int:
         if not out.get("audited"):
             peerjournal._audit(cfg.state_dir, verb, now, evidence=args.evidence,
                                result=out["result"])
-    except peercontrol.AuditPending as e:
+    except peercontrol.Committed as e:
         # Committed: never reported as a refusal.
         print(f"router: {verb}: {e}", file=sys.stderr)
         return 3

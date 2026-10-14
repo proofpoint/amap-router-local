@@ -312,15 +312,89 @@ def _frozen_elsewhere(cfg: Any, recorded: Optional[str]) -> List[str]:
     return out
 
 
-class AuditPending(Exception):
+class Committed(Exception):
+    """An operator act COMMITTED its effect and something after it failed.
+    Never a refusal: the CLI says COMMITTED and exits 3."""
+
+
+class AuditPending(Committed):
     """An audited operator act COMMITTED, but its audit line could not be
-    appended: the record carries `control.audit_pending`, and the next pass
-    or verb appends it. Never a refusal."""
+    appended: a pending marker (on the record, or the verb marker file) is
+    left, and the next pass or verb appends it."""
 
     def __init__(self, result: str, cause: BaseException):
         super().__init__(f"{result}; COMMITTED, but the audit line is pending "
                          f"({type(cause).__name__}: {cause})")
         self.result = result
+
+
+def _verb_marker_path(cfg: Any) -> Path:
+    return runtime_dir(cfg) / VERB_AUDIT_FILE
+
+
+def _begin_verb_audit(cfg: Any, verb: str, now: datetime, **detail: Any) -> Dict[str, Any]:
+    """A runtime-generation verb's pending audit marker, durable before the
+    act. Verbs run one at a time under the drain lock, and each repairs any
+    earlier marker first, so there is at most one."""
+    marker = _audit_marker(verb, now, **detail)
+    runtime_dir(cfg).mkdir(parents=True, exist_ok=True)
+    atomic_write(_verb_marker_path(cfg), json.dumps(marker, sort_keys=True).encode("utf-8"),
+                 durable_root=cfg.state_dir)
+    return marker
+
+
+def _finish_verb_audit(cfg: Any, marker: Mapping[str, Any], **extra: Any) -> None:
+    sd = Path(cfg.state_dir)
+    if not any(line.get("audit_id") == marker["id"] for line in _audit_lines(sd)):
+        peerjournal._audit(sd, marker["verb"], parse_utc_ts(marker["at"]),
+                           audit_id=marker["id"], **dict(marker["detail"], **extra))
+    try:
+        os.unlink(_verb_marker_path(cfg))
+    except FileNotFoundError:
+        pass
+    fsync_dir(runtime_dir(cfg))
+
+
+def _complete_verb(cfg: Any, marker: Mapping[str, Any], result: str,
+                   **extra: Any) -> Dict[str, Any]:
+    try:
+        _finish_verb_audit(cfg, marker, result=result, **extra)
+    except Exception as e:  # noqa: BLE001 -- committed; the audit is repaired later
+        raise AuditPending(result, e) from e
+    return {"result": result, "audited": True}
+
+
+def _repair_verb_audit(cfg: Any, cap: Optional[Capability]) -> int:
+    """A verb's pending marker: its line appended (once) when the act took
+    effect, the marker removed with no line when it did not. A retire's
+    effect is read through the capability: without one the marker waits."""
+    try:
+        marker = json.loads(_verb_marker_path(cfg).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return 0
+    verb, detail = marker.get("verb"), marker.get("detail") or {}
+    try:
+        recorded: Optional[str] = config_mod.runtime_generation(cfg)
+    except config_mod.StateKeyUnresolved:
+        recorded = None
+    if verb == ADOPT_VERB:
+        done = recorded == detail.get("generation")
+    elif verb in (RETIRE_VERB, NEW_VERB):
+        if cap is None:
+            return 0
+        gen = detail.get("generation") if verb == RETIRE_VERB else detail.get("retired")
+        done = dict(cap.generations()).get(gen) == "retired"
+    else:
+        done = False
+    if done:
+        extra = {"result": "repaired after the act"}
+        if verb == NEW_VERB:
+            extra["minted"] = recorded
+        _finish_verb_audit(cfg, marker, **extra)
+        return 1
+    os.unlink(_verb_marker_path(cfg))
+    fsync_dir(runtime_dir(cfg))
+    return 0
 
 
 def _audit_marker(verb: str, now: datetime, **detail: Any) -> Dict[str, Any]:
@@ -346,6 +420,9 @@ def _audit_lines(state_dir: Path) -> List[Dict[str, Any]]:
         try:
             out.append(json.loads(line))
         except ValueError:
+            # A torn trailing line (a crash mid-append) is skipped; its marker
+            # is still pending, so a fresh complete line is appended: harmless
+            # for exactly-once, which is keyed by the marker's id.
             continue
     return out
 
@@ -378,7 +455,7 @@ def _audited_effect_present(cfg: Any, record: Mapping[str, Any]) -> bool:
     return False
 
 
-def repair_audits(cfg: Any) -> int:
+def repair_audits(cfg: Any, cap: Optional[Capability] = None) -> int:
     """Every record with a pending audit marker: its audit line appended (once)
     when the act took effect, then the marker cleared; a marker whose act did
     not take effect (a crash between the marker and the act) is cleared with
@@ -394,7 +471,7 @@ def repair_audits(cfg: Any) -> int:
             n += 1
         else:
             _update(sd, rec, audit_pending=None)
-    return n
+    return n + _repair_verb_audit(cfg, cap)
 
 
 def _inflight_dir(cfg: Any, gen: str) -> Path:
@@ -475,10 +552,16 @@ def unsettled_attempts(cfg: Any) -> List[str]:
         return []
 
 
+ADOPT_VERB = "runtime-generation adopt"
+RETIRE_VERB = "runtime-generation retire"
+NEW_VERB = "runtime-generation new"
+VERB_AUDIT_FILE = "verb-audit-pending.json"
+
+
 def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: datetime,
                    evidence: str) -> Dict[str, Any]:
     """`router runtime-generation adopt <gen>`: the only live generation
-    becomes the recorded one again."""
+    becomes the recorded one again. Audited intent first (`_begin_verb_audit`)."""
     if cap is None:
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     if not evidence:
@@ -487,43 +570,127 @@ def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: dateti
     live = [g for g, s in listed.items() if s in ("live", "unreadable")]
     if live != [gen] or listed.get(gen) != "live":
         raise ValueError(f"{gen} is not the only live generation: {sorted(listed.items())}")
+    marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence)
     record_generation(cfg, gen, now=now)
-    return {"result": f"adopted {gen}"}
+    return _complete_verb(cfg, marker, f"adopted {gen}")
 
 
-def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datetime,
-                    evidence: str) -> Dict[str, Any]:
-    """`router runtime-generation retire <gen>`, through the capability."""
-    if cap is None:
-        raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
-    if not evidence:
-        raise ValueError("evidence is required")
+def _check_retirable(cfg: Any, cap: Capability, gen: str) -> None:
+    """Refuse, BEFORE any effect, to retire `gen` while anything of it is
+    unsettled: an unsent attempt frozen in it (read from the journal, as
+    `_frozen_elsewhere` reads it), an in-flight record, or a handed marker
+    without one (read from this router's own state in `gen`'s directory). The operator order: a frozen attempt in a LIVE
+    generation resumes on its own on the next pass, so let it proceed and
+    retire once it has settled; `abandon-attempt` applies only once its
+    generation is no longer live or unreadable."""
+    frozen = _frozen_in(cfg, gen)
+    if frozen:
+        raise ValueError(
+            f"{gen} has a frozen control attempt ({frozen[0]}): an attempt in a live generation "
+            "resumes on its own on the next pass, so let it proceed and retire after it settles; "
+            "abandon-attempt applies only once its generation is no longer live or unreadable")
     try:
         recorded = config_mod.runtime_generation(cfg)
     except config_mod.StateKeyUnresolved:
         recorded = None
     if recorded == gen and unsettled_attempts(cfg):
         raise ValueError(f"{gen} has unsettled control notices; they would settle unsent")
+    entries = _inflight_entries(cfg, gen)
+    if entries:
+        # An in-flight record, or a handed marker without one: rotating would
+        # strand it (held as a mismatch, and abandon refuses a handed one).
+        raise ValueError(f"{gen} has a control attempt in flight ({entries[0]}): let it settle "
+                         "first")
     listed = dict(cap.generations())
     if gen not in listed:
         # Never construct a sender for a generation the lister does not show.
         raise ValueError(f"{gen} is not a listed runtime generation: {sorted(listed.items())}")
+
+
+def _retire(cfg: Any, cap: Capability, gen: str, now: datetime) -> str:
+    try:
+        recorded = config_mod.runtime_generation(cfg)
+    except config_mod.StateKeyUnresolved:
+        recorded = None
     result = cap.retire(gen, format_utc_ts(now))
     if recorded == gen:
         os.unlink(runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
         fsync_dir(runtime_dir(cfg))
-    return {"result": f"retired {gen}: {result}"}
+    return f"retired {gen}: {result}"
+
+
+def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datetime,
+                    evidence: str) -> Dict[str, Any]:
+    """`router runtime-generation retire <gen>`, through the capability;
+    refused before any effect while anything of `gen` is unsettled
+    (`_check_retirable`). Audited intent first."""
+    if cap is None:
+        raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
+    if not evidence:
+        raise ValueError("evidence is required")
+    _check_retirable(cfg, cap, gen)
+    marker = _begin_verb_audit(cfg, RETIRE_VERB, now, generation=gen, evidence=evidence)
+    return _complete_verb(cfg, marker, _retire(cfg, cap, gen, now))
 
 
 def operator_new(cfg: Any, cap: Optional[Capability], *, now: datetime,
                  evidence: str) -> Dict[str, Any]:
-    """`router runtime-generation new`: retire the recorded generation (never
-    while it has unsettled attempts), then mint."""
+    """`router runtime-generation new`: retire the recorded generation, then
+    mint. Everything that could refuse either step is checked BEFORE the
+    retire (`_check_retirable`, and that the mint would be allowed: no other
+    live or unreadable generation, no frozen attempt anywhere), so a refusal
+    never leaves a committed retire behind it. Audited intent first."""
     if cap is None:
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
+    if not evidence:
+        raise ValueError("evidence is required")
     gen = config_mod.runtime_generation(cfg)
-    operator_retire(cfg, cap, gen, now=now, evidence=evidence)
-    return {"result": f"retired {gen}, minted {generation(cfg, cap, now=now)}"}
+    _check_retirable(cfg, cap, gen)
+    _check_mint_after_retire(cfg, cap, gen)
+    marker = _begin_verb_audit(cfg, NEW_VERB, now, retired=gen, evidence=evidence)
+    retired = _retire(cfg, cap, gen, now)
+    try:
+        minted = generation(cfg, cap, now=now)
+    except Exception as e:  # noqa: BLE001 -- the retire is committed: never "refused"
+        try:
+            _finish_verb_audit(cfg, marker, result=retired, minted=None)
+        except Exception:  # noqa: BLE001 -- the marker stays; repaired before the next act
+            pass
+        raise Committed(f"{retired}; COMMITTED, but the mint failed ({type(e).__name__}: {e}); "
+                        "the next pass mints") from e
+    return _complete_verb(cfg, marker, f"{retired}, minted {minted}", minted=minted)
+
+
+def _check_mint_after_retire(cfg: Any, cap: Capability, gen: str) -> None:
+    listed = dict(cap.generations())
+    others = [(g, st) for g, st in listed.items() if st in ("live", "unreadable") and g != gen]
+    if others:
+        raise ValueError(f"after retiring {gen} no generation could be minted beside {others}: "
+                         "retire them first")
+    frozen = _frozen_elsewhere(cfg, None)
+    if frozen:
+        raise ValueError(f"a frozen control attempt ({frozen[0]}) blocks a new generation")
+
+
+def _frozen_in(cfg: Any, gen: str) -> List[str]:
+    """The record keys of unsent, unsuppressed attempts frozen in `gen`."""
+    out = []
+    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+        c = rec.get("control") or {}
+        if ((c.get("attempt") or {}).get("gen") == gen and not c.get("sent")
+                and not c.get("suppressed")):
+            out.append(rec["key"])
+    return out
+
+
+def _named_elsewhere(cfg: Any, gen: str, key: str) -> List[str]:
+    """Every OTHER journal record whose attempt names `gen`, whatever became
+    of it: evidence that `gen` carried traffic."""
+    out = []
+    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+        if rec["key"] != key and ((rec.get("control") or {}).get("attempt") or {}).get("gen") == gen:
+            out.append(rec["key"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -623,14 +790,14 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
         return {DELEGATION_INACTIVE: n} if n else {}
     # An audited transition whose audit line is not yet appended is repaired
     # BEFORE anything is attempted or handed over.
+    cap = capability(cfg, runtime)
     try:
-        repaired = repair_audits(cfg)
+        repaired = repair_audits(cfg, cap)
         if repaired:
             counts["audit_repaired"] = repaired
     except Exception:  # noqa: BLE001 -- retried next pass; nothing is attempted meanwhile
         logger.exception("control notices: an audit repair failed; nothing attempted this pass")
         return dict(counts, audit_repair_failed=1)
-    cap = capability(cfg, runtime)
     # Frozen attempts first: their generation is reconciled before any fresh
     # notice could need one.
     for record in sorted(pending(state_dir),
@@ -785,9 +952,12 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
     listed = dict(cap.generations())
     others = [g for g, st in listed.items() if st in ("live", "unreadable") and g != gen]
     # "Not listed" is read as "never admitted" only while this router's own
-    # state shows nothing in flight in that generation: a generation that
-    # carried traffic and lost both its tree and its record is held.
-    unlisted_ok = listed.get(gen) is None and not _inflight_entries(cfg, gen)
+    # state shows no traffic in that generation: nothing in flight in it, and
+    # no other journal record naming it (a settled attempt leaves no in-flight
+    # file behind). A generation that carried traffic and lost both its tree
+    # and its record is held.
+    unlisted_ok = (listed.get(gen) is None and not _inflight_entries(cfg, gen)
+                   and not _named_elsewhere(cfg, gen, record["key"]))
     if (listed.get(gen) == "live" or unlisted_ok) and not others:
         record = _begin_audit(cfg, record, RESTORE_VERB, now, key=record["key"], generation=gen,
                               listed=listed.get(gen) or "not listed")
