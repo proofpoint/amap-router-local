@@ -960,15 +960,19 @@ class Resolved:
 class DecideHooks:
     """check8 (pre-reservation), reply, edge and policy (post-reservation)
     and control_receive. Every one is required: a caller cannot skip one by
-    omission."""
-    __slots__ = ("check8", "reply", "edge", "policy", "control_receive")
+    omission. `context` is the `peerpolicy.HookContext` the set was built
+    over (`peerpolicy.decide_hooks`), or None for a set built by hand
+    (`absent_hooks`, and tests that drive `evaluate` directly)."""
+    __slots__ = ("check8", "reply", "edge", "policy", "control_receive", "context")
 
-    def __init__(self, *, check8: Any, reply: Any, edge: Any, policy: Any, control_receive: Any):
+    def __init__(self, *, check8: Any, reply: Any, edge: Any, policy: Any, control_receive: Any,
+                 context: Any = None):
         for name, fn in (("check8", check8), ("reply", reply), ("edge", edge),
                          ("policy", policy), ("control_receive", control_receive)):
             if not callable(fn):
                 raise TypeError(f"hook {name} is required and must be callable")
             object.__setattr__(self, name, fn)
+        object.__setattr__(self, "context", context)
 
     def __setattr__(self, name, value):
         raise AttributeError("DecideHooks is immutable")
@@ -1021,6 +1025,11 @@ class Ctx:
                  retired: Any, first_pass: bool = False):
         if not isinstance(hooks, DecideHooks):
             raise TypeError("hooks: a DecideHooks")
+        bound = hooks.context
+        if bound is not None and not (bound.cfg is cfg and bound.delegation is delegation
+                                      and bound.state_dir == Path(state_dir)
+                                      and bound.now is now and bound.clock is clock):
+            raise TypeError("hooks: built over another pass's context")
         self.state_dir, self.cfg, self.delegation, self.hooks = Path(state_dir), cfg, delegation, hooks
         self.now, self.clock, self.view, self.effects, self.retired = now, clock, view, effects, retired
         #: The first pass of this process: unpublishable holds are re-tried
@@ -1236,7 +1245,7 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             return set_hold(sd, record, "key_runtime_changed", None, now)
         return set_hold(sd, record, "undecided", f"stale:{e.detail}", now)
     payload = auth.payload
-    for name, call in (("reply", lambda: ctx.hooks.reply(payload)),
+    for name, call in (("reply", lambda: ctx.hooks.reply(payload, auth.hosted)),
                        ("edge", lambda: ctx.hooks.edge(payload, auth.hosted)),
                        ("policy", lambda: ctx.hooks.policy(payload, auth.hosted))):
         out = call()
@@ -1285,6 +1294,13 @@ def _decided(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     except peerbind.RecoveryCorrupt as e:
         return set_hold(sd, record, "recovery_corrupt", e.reason, now)
     try:
+        _write_placed(ctx, auth)
+    except Exception as e:  # noqa: BLE001 -- a placed record that cannot be written holds
+        from . import peerledger
+        if isinstance(e, peerledger.LedgerConflict):
+            return set_hold(sd, record, "recovery_corrupt", "placed_conflict", now)
+        raise
+    try:
         deliver.deliver_signed_peer(ctx.cfg, sd, auth,
                                     in_reply_to_resolved=auth.payload.get("in_reply_to"))
     except deliver.RecipientHeld:
@@ -1297,6 +1313,28 @@ def _decided(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     except peerbind.RecoveryCorrupt as e:
         return set_hold(sd, record, "recovery_corrupt", e.reason, now)
     return _done(ctx, record, disposed="placed", done_ts=format_utc_ts(now), retry=None)
+
+
+def _write_placed(ctx: Ctx, auth: Any) -> None:
+    """The `placed` ledger record of a decided statement, durable BEFORE its
+    notice (so a reply drafted the moment the notice appears resolves), and
+    written again, idempotently, when a recovery re-places. A recipient no
+    longer configured writes nothing: the placement itself refuses it."""
+    from . import config as config_mod
+    from . import generations as generations_mod
+    from . import peerledger
+    hosted = auth.hosted
+    if hosted not in getattr(ctx.cfg, "instances", {}):
+        return
+    payload = auth.payload
+    expires = parse_utc_ts(payload["ts"]) + timedelta(seconds=ctx.cfg.peer_reply_window_seconds)
+    last = config_mod.gen_key(ctx.cfg, hosted).rsplit("/", 1)[-1]
+    generation = (last[len(generations_mod.GEN_PREFIX):]
+                  if last.startswith(generations_mod.GEN_PREFIX) else last)
+    peerledger.write_placed(ctx.cfg, peerledger.placed_record(
+        record_id=payload["id"], logical_id=config_mod.state_key(ctx.cfg, hosted),
+        local_address=config_mod.address_for(hosted, ctx.cfg.fleet_domain),
+        remote=payload["from"], generation=generation, expires_at=format_utc_ts(expires)))
 
 
 def _finish(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -2127,14 +2165,33 @@ def _poll_tree_entry(ctx: "Ctx", effects: "TreeEffects", reader: Any, count: Any
     count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
 
 
-def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "peerclock.Clock",
+def _pass_hooks(cfg: Any, *, delegation: Any, state_dir: Path, now: datetime, clock: Any,
+                profile_factory: Any) -> DecideHooks:
+    """This pass's hooks: its context built from this pass's own objects (the
+    clock the pass fixed, its `now`), then `profile_factory(context)` (None:
+    `peerpolicy.production_profile`, the router's), whose profile must hold
+    exactly that context, then `peerpolicy.decide_hooks`."""
+    from . import peerpolicy
+    factory = peerpolicy.production_profile if profile_factory is None else profile_factory
+    hctx = peerpolicy.hook_context(cfg, delegation=delegation, state_dir=state_dir, now=now,
+                                   clock=clock)
+    profile = factory(hctx)
+    if getattr(profile, "context", None) is not hctx:
+        raise TypeError("profile_factory: the profile must hold the context it was given")
+    return peerpolicy.decide_hooks(profile)
+
+
+def poll_generation(cfg: Any, *, delegation: Any, clock: "peerclock.Clock",
                     now: datetime, logical_id: str, gen: str, link: str, reader: Any,
                     remover: Any, retired: Any, limit: int = 256,
                     read_refused: Tuple[type, ...] = (), first_pass: bool = False,
-                    current: bool = True, touched: Optional[set] = None) -> Dict[str, int]:
+                    current: bool = True, touched: Optional[set] = None,
+                    profile_factory: Any = None) -> Dict[str, int]:
     """One listing page of a generation's `candidates/`: each entry taken
     once (its bytes read once, into the snapshot) and evaluated; an entry
-    whose record is `done` is settled again (its removal retried)."""
+    whose record is `done` is settled again (its removal retried). The
+    hooks are built here, over this pass's clock and `now`
+    (`_pass_hooks`)."""
     state_dir = Path(cfg.state_dir)
     counts: Dict[str, int] = {}
 
@@ -2143,6 +2200,8 @@ def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "pe
 
     effects = TreeEffects(cfg, logical_id, gen, link, remover)
     view_of = _viewer(delegation)
+    hooks = _pass_hooks(cfg, delegation=delegation, state_dir=state_dir, now=now, clock=clock,
+                        profile_factory=profile_factory)
     ctx = Ctx(state_dir=state_dir, cfg=cfg, delegation=delegation, hooks=hooks, now=now,
               clock=clock, view=view_of, effects=effects, retired=retired, first_pass=first_pass)
     ckey = (str(state_dir), logical_id, gen)
@@ -2162,8 +2221,8 @@ def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "pe
     return counts
 
 
-def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideHooks,
-         now: datetime) -> Dict[str, Any]:
+def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, now: datetime,
+         profile_factory: Any = None) -> Dict[str, Any]:
     """One poll's signed-candidate pass, under the drain lock, ONLY with
     `delegation.inbound`: H advanced first, then every identity's every
     generation's `candidates/` (`poll_generation`, each isolated), then the
@@ -2216,11 +2275,12 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
                 remover = None
             try:
                 out[label] = poll_generation(
-                    cfg, delegation=delegation, hooks=hooks, clock=clock, now=now,
+                    cfg, delegation=delegation, clock=clock, now=now,
                     logical_id=lid, gen=gen, link=link, reader=reader, remover=remover,
                     retired=lambda r: hoplink_mod._is_retired(runtime, cfg, r["owner"], r["gen"]),
                     read_refused=read_refused, first_pass=first,
-                    current=gen == doc["current"], touched=touched)
+                    current=gen == doc["current"], touched=touched,
+                    profile_factory=profile_factory)
             except StoreBlocked:
                 logger.error("peer store blocked: an operation is unreconciled; nothing more "
                              "is taken until the next start")
@@ -2231,9 +2291,9 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
                 out[label] = {"errored": 1}
     for intake in HOST_INTAKES:
         try:
-            out[intake] = poll_host(cfg, fsops, delegation=delegation, hooks=hooks, clock=clock,
+            out[intake] = poll_host(cfg, fsops, delegation=delegation, clock=clock,
                                     now=now, intake=intake, first_pass=first,
-                                    touched=touched)
+                                    touched=touched, profile_factory=profile_factory)
         except DisposedUnavailable as e:
             logger.error("signed candidates %s: not taken: %s", intake, e)
             out[intake] = {"held_disposed_unavailable": 1}
@@ -2246,8 +2306,9 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
             logger.exception("signed candidates %s: isolated, continuing", intake)
             out[intake] = {"errored": 1}
     try:
-        out["recovered"] = recover(cfg, runtime, delegation=delegation, hooks=hooks, clock=clock,
-                                   now=now, first_pass=first, skip=touched)
+        out["recovered"] = recover(cfg, runtime, delegation=delegation, clock=clock,
+                                   now=now, first_pass=first, skip=touched,
+                                   profile_factory=profile_factory)
     except StoreBlocked:
         out["recovered"] = {"store_blocked": 1}
         return out
@@ -2408,9 +2469,10 @@ def _poll_host_entry(ctx: "Ctx", effects: "HostEffects", count: Any, *, intake: 
     count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
 
 
-def poll_host(cfg: Any, fsops: Any, *, delegation: Any, hooks: DecideHooks,
+def poll_host(cfg: Any, fsops: Any, *, delegation: Any,
               clock: "peerclock.Clock", now: datetime, intake: str,
-              first_pass: bool = False, touched: Optional[set] = None) -> Dict[str, int]:
+              first_pass: bool = False, touched: Optional[set] = None,
+              profile_factory: Any = None) -> Dict[str, int]:
     """One pass over a host intake: each committed entry taken once and
     evaluated; a `done` record's tombstone committed again if missing; then,
     after a complete listing, the tombstones of entries no longer listed
@@ -2426,6 +2488,8 @@ def poll_host(cfg: Any, fsops: Any, *, delegation: Any, hooks: DecideHooks,
     disposed_dirs(fsops, hop_root, intake)     # nothing is taken that could not be disposed of
     effects = HostEffects(fsops, hop_root, intake)
     view_of = _viewer(delegation)
+    hooks = _pass_hooks(cfg, delegation=delegation, state_dir=state_dir, now=now, clock=clock,
+                        profile_factory=profile_factory)
     ctx = Ctx(state_dir=state_dir, cfg=cfg, delegation=delegation, hooks=hooks, now=now,
               clock=clock, view=view_of, effects=effects, retired=lambda _r: False,
               first_pass=first_pass)
@@ -2507,9 +2571,9 @@ def operator_quarantine_candidate(cfg: Any, now: datetime, *, key: str,
 
 
 
-def recover(cfg: Any, runtime: Any, *, delegation: Any, hooks: DecideHooks,
+def recover(cfg: Any, runtime: Any, *, delegation: Any,
             clock: "peerclock.Clock", now: datetime, first_pass: bool = False,
-            skip: Iterable[str] = ()) -> Dict[str, int]:
+            skip: Iterable[str] = (), profile_factory: Any = None) -> Dict[str, int]:
     """Every record that is not `done` (and every done tree record whose
     entry's removal never succeeded), BY ITS RECORDED STATE, whether or not
     its entry is listed again: in `take_seq` order, each with the effects of
@@ -2539,6 +2603,8 @@ def recover(cfg: Any, runtime: Any, *, delegation: Any, hooks: DecideHooks,
                 pending.append(rec)
     view_of = _viewer(delegation)
     hop_root = Path(cfg.hop.root) if getattr(cfg, "hop", None) is not None else None
+    hooks = _pass_hooks(cfg, delegation=delegation, state_dir=state_dir, now=now, clock=clock,
+                        profile_factory=profile_factory)
     for rec in sorted(pending, key=lambda r: r["take_seq"]):
         try:
             if rec["intake"] in HOST_INTAKES:

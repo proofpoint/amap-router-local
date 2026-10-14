@@ -275,14 +275,13 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
             logger.exception("error in the inbound pass — isolated")
     # The signed-candidate pass, ONLY with `delegation.inbound` (refused at
     # load in this build): same lock, its own log line and status, never
-    # `summary`. The production hooks hold every candidate they would decide.
+    # `summary`. The production profile holds every statement at check8 and policy.
     if (cfg.delegation is not None and cfg.delegation.inbound
             and hoplink.is_runtime(transport) and report.state != "off"):
         from . import peerjournal, peerlane
         try:
             polled = peerjournal.poll(cfg, transport, report,
                                       delegation=peerlane.current(cfg),
-                                      hooks=peerjournal.absent_hooks(),
                                       now=clock.now())
             if polled:
                 logger.info("signed candidates: %s", polled)

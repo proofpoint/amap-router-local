@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from router import config as config_mod
-from router import deliver, peerbind, peerclock, peerjournal, peerlane
+from router import deliver, peerbind, peerclock, peerjournal, peerlane, peerpolicy
 from router.tests import peer_standin as si
 from router.tests.test_peerbind import FD, KEY_ID, STATEMENT_ID, T1, _Base, statement
 
@@ -64,8 +64,15 @@ class Effects:
         return self.remove_result
 
 
+def permissive(hctx):
+    """The test fleet's pass profile: the trusted-host edge (the production
+    edge code) and the interim permissive policy part."""
+    return peerpolicy.Profile(context=hctx, edges=peerpolicy.TRUSTED_HOST_DEFAULT,
+                              policy=peerpolicy.PERMISSIVE)
+
+
 def hooks(**over):
-    parts = dict(check8=ok, reply=lambda _p: peerjournal.Resolved(None), edge=ok, policy=ok,
+    parts = dict(check8=ok, reply=lambda _p, _h: peerjournal.Resolved(None), edge=ok, policy=ok,
                  control_receive=lambda *_a: peerjournal.Hold("hook_absent", "control_receive"))
     parts.update(over)
     return peerjournal.DecideHooks(**parts)
@@ -265,7 +272,7 @@ class HookTests(_Eval):
         """Reserved, held on the reply hook for longer than P + F; the hook
         arrives and row 2 decides it: never demoted by check 7."""
         key = self.take(self.raw())
-        rec = self.evaluate(key, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
+        rec = self.evaluate(key, hk=hooks(reply=lambda _p, _h: peerjournal.Hold("hook_absent", "reply")))
         self.assertEqual((rec["state"], hold(rec)), ("reserved", ("hook_absent", "reply")))
         later = NOW + timedelta(seconds=3600 + 300 + 60)
         rec = self.evaluate(key, now=later)
@@ -339,7 +346,7 @@ class RecoveryTests(_Eval):
 
     def test_decided_sticky_without_a_decision_holds(self):
         key = self.take(self.raw())
-        rec = self.evaluate(key, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
+        rec = self.evaluate(key, hk=hooks(reply=lambda _p, _h: peerjournal.Hold("hook_absent", "reply")))
         rec = peerjournal.write_record(self.state_dir, dict(rec, decided_sticky=True))
         rec = self.evaluate(key)
         self.assertEqual((rec["state"], hold(rec)),
@@ -347,7 +354,7 @@ class RecoveryTests(_Eval):
 
     def test_a_runtime_changed_while_down_holds_visibly(self):
         key = self.take(self.raw())
-        self.evaluate(key, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
+        self.evaluate(key, hk=hooks(reply=lambda _p, _h: peerjournal.Hold("hook_absent", "reply")))
         rt = self.dc.runtimes[0]
         renamed = dataclasses.replace(self.dc, runtimes=(dataclasses.replace(
             rt, runtime=f"amap.router@{rt.domains[1]}"),))
@@ -473,7 +480,7 @@ class SupersedeTests(_Eval):
     def test_the_drop_refuses_a_runtime_changed_hold(self):
         """Not key loss: the hold stays explicit, and nothing is written."""
         key = self.take(self.raw())
-        self.evaluate(key, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
+        self.evaluate(key, hk=hooks(reply=lambda _p, _h: peerjournal.Hold("hook_absent", "reply")))
         rt = self.dc.runtimes[0]
         cfg = dataclasses.replace(self.cfg, delegation=dataclasses.replace(
             self.dc, runtimes=(dataclasses.replace(rt, runtime=f"amap.router@{rt.domains[1]}"),)))
@@ -485,7 +492,7 @@ class SupersedeTests(_Eval):
 
     def test_a_reserved_record_under_key_loss_is_dropped(self):
         key = self.take(self.raw())
-        rec = self.evaluate(key, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
+        rec = self.evaluate(key, hk=hooks(reply=lambda _p, _h: peerjournal.Hold("hook_absent", "reply")))
         self.assertEqual(rec["state"], "reserved")
         self.lose_the_key()
         rec = self.evaluate(key)
@@ -746,7 +753,7 @@ class RetentionTests(_Eval):
 
     def test_out_of_order_settlement_prunes_only_the_contiguous_prefix(self):
         held = self.take(self.raw(signed=True, subject="first"))
-        self.evaluate(held, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
+        self.evaluate(held, hk=hooks(reply=lambda _p, _h: peerjournal.Hold("hook_absent", "reply")))
         doc_id = "qB2c3D4e5F6g7H8i9J0kLm"
         later = self.evaluate(self.take(self.raw(id=doc_id + "x", subject="second")))
         self.assertEqual(later["disposed"], "placed")
@@ -835,7 +842,7 @@ class _Polling(_Eval):
     def poll(self, port, remover="default", lane="default", limit=256, hk=None, now=NOW):
         rem = FakeRemover(port) if remover == "default" else remover
         return peerjournal.poll_generation(
-            self.cfg, delegation=self.lane if lane == "default" else lane, hooks=hk or hooks(),
+            self.cfg, delegation=self.lane if lane == "default" else lane, profile_factory=permissive,
             clock=peerclock.advance(self.state_dir, now), now=now, logical_id=OWNER, gen=GEN,
             link="hub", reader=types.SimpleNamespace(port=port), remover=rem,
             retired=lambda _r: False, limit=limit)
@@ -905,7 +912,7 @@ class PollTests(_Polling):
     def test_a_candidate_first_seen_in_a_superseded_generation_is_late_inbound(self):
         port = FakePort({"c1": self.raw()})
         got = peerjournal.poll_generation(
-            self.cfg, delegation=self.lane, hooks=hooks(),
+            self.cfg, delegation=self.lane, profile_factory=permissive,
             clock=peerclock.advance(self.state_dir, NOW), now=NOW, logical_id=OWNER, gen=GEN,
             link="hub", reader=types.SimpleNamespace(port=port), remover=FakeRemover(port),
             retired=lambda _r: False, current=False)
@@ -927,7 +934,7 @@ class PollTests(_Polling):
         self.assertEqual(self.poll(port), {"removed": 0, "remove_held": 0})
         with mock.patch("router.ingress.pump_link", return_value="hub"):
             got = peerjournal.recover(self.cfg, types.SimpleNamespace(), delegation=self.lane,
-                                      hooks=hooks(), clock=peerclock.read(self.state_dir),
+                                      profile_factory=permissive, clock=peerclock.read(self.state_dir),
                                       now=NOW)
         rec = peerjournal.read_record(self.state_dir, OWNER, self.key("c1"))
         self.assertEqual((got.get("state_done"), rec["disposed"]), (1, "placed"))
@@ -946,10 +953,13 @@ class PollTests(_Polling):
     def test_the_cursor_passes_a_page_of_held_candidates(self):
         port = FakePort({"c1": self.raw(signed=True), "c2": self.raw(id="qB2c3D4e5F6g7H8i9J0kLmx",
                                                                        subject="two")})
-        hold_c1 = hooks(check8=lambda p, _k: peerjournal.Hold("hook_absent", "check8")
-                        if p["subject"] == "Run it" else None)
-        self.poll(port, limit=1, hk=hold_c1)
-        got = self.poll(port, limit=1, hk=hold_c1)
+        # The builder's own check8, made to hold c1 only: the profile is data,
+        # so the hold is injected where decide_hooks builds the member.
+        hold_c1 = lambda _profile: (lambda p, _k: peerjournal.Hold("hook_absent", "check8")  # noqa: E731
+                                    if p["subject"] == "Run it" else None)
+        with mock.patch.object(peerpolicy, "_check8", hold_c1):
+            self.poll(port, limit=1)
+            got = self.poll(port, limit=1)
         self.assertEqual(got.get("state_done"), 1, "the second page reached c2")
         self.assertEqual(sorted(port.entries), ["c1"])
 
@@ -962,14 +972,14 @@ class PollGateTests(_Eval):
         cfg = dataclasses.replace(self.cfg, hop=types.SimpleNamespace())
         (self.state_dir / peerclock.CLOCK_FILE).unlink()
         self.assertEqual(peerjournal.poll(cfg, None, None, delegation=self.lane,
-                                          hooks=hooks(), now=NOW), {})
+                                          profile_factory=permissive, now=NOW), {})
 
     def test_an_untrusted_clock_takes_nothing(self):
         from router import config as config_mod
         cfg = dataclasses.replace(self.cfg, delegation=dataclasses.replace(self.dc, inbound=True),
                                   hop=types.SimpleNamespace())
         (self.state_dir / peerclock.CLOCK_FILE).unlink()
-        self.assertEqual(peerjournal.poll(cfg, None, None, delegation=self.lane, hooks=hooks(),
+        self.assertEqual(peerjournal.poll(cfg, None, None, delegation=self.lane, profile_factory=permissive,
                                           now=NOW), {"held": "clock_untrusted"})
 
 
@@ -1003,7 +1013,7 @@ class HostIntakeTests(_Eval):
         return self.hop / ".disposed" / intake / ident
 
     def poll(self, intake=".unresolved", hk=None, now=NOW):
-        return peerjournal.poll_host(self.cfg, self.ops, delegation=self.lane, hooks=hk or hooks(),
+        return peerjournal.poll_host(self.cfg, self.ops, delegation=self.lane, profile_factory=permissive,
                                      clock=peerclock.advance(self.state_dir, now), now=now,
                                      intake=intake)
 
@@ -1225,7 +1235,7 @@ class HostIntakeTests(_Eval):
         self.assertEqual(self.poll().get("taken"), None, "nothing listed")
         self.assertEqual(self.rec()["state"], "decided")
         got = peerjournal.recover(self.cfg, types.SimpleNamespace(fsops=self.ops),
-                                  delegation=self.lane, hooks=hooks(),
+                                  delegation=self.lane, profile_factory=permissive,
                                   clock=peerclock.read(self.state_dir), now=NOW)
         self.assertEqual(got.get("state_done"), 1)
         self.assertEqual(self.rec()["state"], "done")
@@ -1421,7 +1431,7 @@ class WindowWiringTests(_Eval):
             self.dc_with(600, 300), inbound=True), hop=types.SimpleNamespace())
         with mock.patch.object(peerjournal, "read_meta",
                                side_effect=peerjournal.StoreAbsent("stop here")):
-            peerjournal.poll(cfg, None, None, delegation=self.lane, hooks=hooks(), now=NOW)
+            peerjournal.poll(cfg, None, None, delegation=self.lane, profile_factory=permissive, now=NOW)
         self.assertEqual(peerclock.read(self.state_dir).p, 600)
 
     def test_startup_applies_it(self):
