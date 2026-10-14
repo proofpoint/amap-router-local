@@ -33,11 +33,11 @@ import os
 import time
 import dataclasses
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import aliases as aliases_mod
+from . import clock
 from . import ingress as ingress_mod
 from . import inflight as inflight_mod, quarantine as quarantine_mod
 from . import generations, hoplink, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
@@ -283,7 +283,7 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
             polled = peerjournal.poll(cfg, transport, report,
                                       delegation=peerlane.current(cfg),
                                       hooks=peerjournal.absent_hooks(),
-                                      now=datetime.now(timezone.utc))
+                                      now=clock.now())
             if polled:
                 logger.info("signed candidates: %s", polled)
                 LAST_PEER_POLL.clear()
@@ -335,7 +335,7 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
         if cfg.delegation is not None:
             from . import peerjournal
             try:
-                peer_doc = peerjournal.status_doc(cfg.state_dir, datetime.now(timezone.utc),
+                peer_doc = peerjournal.status_doc(cfg.state_dir, clock.now(),
                                                   PEER_STARTUP.get(str(cfg.state_dir)))
                 peer_doc["inbound"] = bool(cfg.delegation.inbound)
                 if LAST_PEER_POLL:
@@ -456,7 +456,7 @@ def activate_delegation(cfg: RouterConfig, runtime: Any) -> None:
         # no seed read, no backend self-test and no probe on every poll.
         peerlane.install(cfg, current)
         return
-    delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))
+    delegation = peerlane.activate(cfg, plugin, now=clock.now())
     # The durable decision key a decided signed placement is MAC'd under:
     # created once, made durable before it is accepted (`peerbind`). A key
     # that cannot be established refuses the activation.
@@ -486,8 +486,8 @@ def peer_startup(cfg: RouterConfig, transport: Any = None) -> Optional[Dict[str,
         return None
     from . import peerjournal
     try:
-        peerjournal.apply_window(cfg.state_dir, datetime.now(timezone.utc), cfg.delegation)
-        rep = peerjournal.startup(cfg.state_dir, datetime.now(timezone.utc))
+        peerjournal.apply_window(cfg.state_dir, clock.now(), cfg.delegation)
+        rep = peerjournal.startup(cfg.state_dir, clock.now())
     except Exception as e:  # noqa: BLE001 -- isolated, recorded
         logger.exception("peer store startup check failed")
         rep = {"admission": "unknown", "why": "startup_failed",

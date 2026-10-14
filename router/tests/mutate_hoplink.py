@@ -1649,9 +1649,9 @@ M = [
   '        if False:\n',
   [PT + "CodecFactoryErrorTests.test_the_plugins_config_error_is_a_codec_refusal"]),
  ('PS52 a startup activation fault swallowed as a refusal', SV,
-  '    delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))\n',
+  '    delegation = peerlane.activate(cfg, plugin, now=clock.now())\n',
   '    try:\n'
-  '        delegation = peerlane.activate(cfg, plugin, now=datetime.now(timezone.utc))\n'
+  '        delegation = peerlane.activate(cfg, plugin, now=clock.now())\n'
   '    except Exception as e:\n'
   '        raise peerlane.DelegationRefused("codec", str(e)) from None\n',
   [PT + "CodecFactoryErrorTests.test_at_startup_it_propagates"]),

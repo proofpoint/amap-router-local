@@ -104,6 +104,20 @@ def _mark_seen(cfg: RouterConfig) -> None:
         )
 
 
+class ClockMixin:
+    """`install_clock(source)` installs a test clock (strict by default: a
+    lost source raises rather than reading real time) and registers
+    `clock.reset()` as a cleanup, so no installed source outlives its test.
+    `reset_process_state` does NOT clear it (the clock is environment), so
+    every test that installs one goes through here or resets it itself."""
+
+    def install_clock(self, source, *, strict: bool = True):
+        from router import clock
+        clock.install(source, strict=strict)
+        self.addCleanup(clock.reset)
+        return source
+
+
 class RouterTestCase(unittest.TestCase):
     """Base class: sets up `self.tmp` (a `TemporaryDirectory`), `self.state_dir`,
     and a `make_config(instances)` helper that creates each instance's

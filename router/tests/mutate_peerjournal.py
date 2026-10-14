@@ -411,7 +411,7 @@ M = [
   [("router/peerjournal.py", "        apply_window(cfg.state_dir, now, dc)\n        clock = peerclock.advance(cfg.state_dir, now)\n", "        clock = peerclock.advance(cfg.state_dir, now)\n")],
   ["router.tests.test_peerevaluate.WindowWiringTests.test_the_poll_applies_it"]),
  ("K5 startup ignores the configured window",
-  [("router/service.py", "        peerjournal.apply_window(cfg.state_dir, datetime.now(timezone.utc), cfg.delegation)\n", "")],
+  [("router/service.py", "        peerjournal.apply_window(cfg.state_dir, clock.now(), cfg.delegation)\n", "")],
   ["router.tests.test_peerevaluate.WindowWiringTests.test_startup_applies_it"]),
  ("V31 sweep prunes with a control pending",
   [("router/peerjournal.py", "            if rec.get(\"control\") and not rec[\"control\"].get(\"sent\"):\n                continue        # kept while its control notice is pending\n", "")],

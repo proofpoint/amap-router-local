@@ -39,11 +39,12 @@ import re
 import secrets
 import shutil
 import stat
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import aliases as aliases_mod
+from . import clock
 from . import attachments as attachments_mod
 from . import binding as binding_mod
 from . import classify as classify_mod
@@ -2094,7 +2095,7 @@ class Pump:
         self.runtime_classes = runtime_classes
         self.counts: Dict[str, int] = {}
         self.horizon_s = 30 * 86400
-        self.now = datetime.now(timezone.utc)
+        self.now = clock.now()
 
     @property
     def state_dir(self) -> Path:
@@ -2749,7 +2750,7 @@ def pump_generation(pump: Pump, *, listing_too_large: Any = (),
     read past it this pump. `pump.link` must be the generation's PIN
     (`pinned_link`), never the live config value."""
     pump.horizon_s = horizon_s
-    pump.now = now or _utcnow()
+    pump.now = now or clock.now()
     pump.recover()
     key = (str(pump.state_dir), pump.logical_id, pump.gen)
     if _CURSOR_PORT.get(key) != id(pump.reader.port):
@@ -2791,8 +2792,6 @@ def pump_generation(pump: Pump, *, listing_too_large: Any = (),
     return pump.counts
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def identities(cfg: Any, report: Any) -> List[Dict[str, Any]]:

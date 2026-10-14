@@ -71,6 +71,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import clock
 from . import firstsight as firstsight_mod
 from . import generations as generations_mod
 from . import attachments as attachments_mod
@@ -174,7 +175,7 @@ def _age_seconds(value: Any) -> Optional[float]:
     parsed = _parse_ts(value)
     if parsed is None:
         return None
-    return (datetime.now(timezone.utc) - parsed).total_seconds()
+    return (clock.now() - parsed).total_seconds()
 
 
 def _human_age(seconds: Optional[float]) -> str:

@@ -255,8 +255,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _peer_operator(cfg, args) -> int:
     """The signed-peer store's operator verbs, under the drain lock
     (fail-fast: the router must be stopped)."""
-    from datetime import datetime, timezone
-    from . import peerclock, peerjournal
+    from . import clock, peerclock, peerjournal
     from .util import parse_utc_ts
     verb = " ".join(v for v in (args.command, getattr(args, "peer_store_command", None),
                                 getattr(args, "peer_decision_command", None),
@@ -266,7 +265,7 @@ def _peer_operator(cfg, args) -> int:
     except LockHeldError as e:
         print(f"router: refusing to run '{verb}': {e}", file=sys.stderr)
         return 1
-    now = datetime.now(timezone.utc)
+    now = clock.now()
     try:
         if verb == "peer-store init":
             out = peerjournal.operator_init(cfg, now,

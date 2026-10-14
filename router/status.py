@@ -376,12 +376,13 @@ def _age_seconds(ts: Optional[str]) -> Optional[float]:
     if not ts:
         return None
     from datetime import datetime, timezone
+    from . import clock
 
     try:
         then = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
-    return (datetime.now(timezone.utc) - then).total_seconds()
+    return (clock.now() - then).total_seconds()
 
 
 def render_discovery(report) -> List[str]:
