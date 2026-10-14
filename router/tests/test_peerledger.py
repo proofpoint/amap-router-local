@@ -492,5 +492,118 @@ class FactoryThroughAPassTests(tpe._Polling):
         self.assertEqual((rec["hold"] or {}).get("reason"), "hook_absent")
 
 
+from router.tests import test_peerlane as tpl  # noqa: E402
+from router.tests.helpers import ClockMixin, write_request  # noqa: E402
+
+
+class ResultSubmitTests(ClockMixin, tpl._Send):
+    """Step 4a: a reply to a placed statement is a signed RESULT, resolved
+    in the agent's peer ledger and sent to the record's remote."""
+
+    REMOTE = tpl.TRUSTED
+
+    def placed_for_alice(self, rid, *, remote=None, expires=LATER):
+        peerledger.write_placed(self.cfg_, peerledger.placed_record(
+            record_id=rid, logical_id="alice", local_address=f"alice@{tpl.FD}",
+            remote=remote or self.REMOTE, generation="alice", expires_at=expires))
+
+    def setUp(self):
+        super().setUp()
+        self.install_clock(lambda: NOW)
+        self.cfg_ = self.cfg()
+        self.activate(self.cfg_)
+
+    def send_reply(self, rid, *, to=("someone@else.example",), cfg=None):
+        cfg = cfg or self.cfg_
+        write_request(cfg, "alice", "00000001", to=list(to), body_text="done",
+                      in_reply_to=rid)
+        self.drain(cfg)
+        return self.result(cfg)     # None while a signed result is in flight
+
+    def test_a_reply_to_a_placed_task_is_a_signed_result_to_its_remote(self):
+        self.placed_for_alice("task-1")
+        self.assertIsNone(self.send_reply("task-1"), "a sent result is in flight, not settled")
+        doc = self.handover()
+        peer = doc["envelope"]["peer"]
+        self.assertIsNone(peer["in_reply_to"], "the envelope never carries the peer id")
+        kind, _k, statement, _sig = tpl.si.check1([(peerlane.STATEMENT_FIELD,
+                                                    peer["statement_header"])])
+        st = json.loads(statement)
+        self.assertEqual((st["to"], st["in_reply_to"]), (self.REMOTE, "task-1"))
+        self.assertEqual(doc["request"]["draft"]["to"], [self.REMOTE],
+                         "the draft's own recipient is discarded")
+        issued = peerlane.read_ledger(self.cfg_, "alice", st["id"])
+        self.assertIsNotNone(issued, "the result gets its own issued record")
+        self.assertEqual((issued["direction"], issued["remote"]), ("issued", self.REMOTE))
+
+    def test_an_unresolved_reply_is_rejected_and_nothing_is_signed(self):
+        r = self.send_reply("nowhere")
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "unresolved_reply"))
+        self.assertEqual(self.port.writes, [])
+
+    def test_an_expired_placed_record_is_peer_reply_window_expired(self):
+        self.placed_for_alice("old", expires="2026-10-13T11:00:00Z")
+        r = self.send_reply("old")
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "peer_reply_window_expired"))
+        self.assertEqual(self.port.writes, [])
+
+    def test_two_remotes_with_the_same_id_is_unresolved_and_nothing_is_signed(self):
+        self.placed_for_alice("twice")
+        self.placed_for_alice("twice", remote=f"dave@{tpl.T1}")
+        r = self.send_reply("twice")
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "unresolved_reply"))
+        self.assertEqual(self.port.writes, [])
+
+    def test_an_agent_under_24_hours_old_is_refused_and_nothing_is_signed(self):
+        self.placed_for_alice("task-1")
+        young = tpl.with_age(self.cfg_, "2026-10-13T11:00:00Z")
+        r = self.send_reply("task-1", cfg=young)
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "peer_quarantined"))
+        self.assertEqual(self.port.writes, [])
+
+    def test_an_unavailable_exposure_is_refused_and_nothing_is_signed(self):
+        from router import exposure
+        self.placed_for_alice("task-1")
+        with mock.patch.object(exposure, "assess", return_value=None):
+            r = self.send_reply("task-1")
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "exposure_unavailable"))
+        self.assertEqual(self.port.writes, [])
+
+    def test_the_agents_own_deny_refuses_the_result(self):
+        self.placed_for_alice("task-1")
+        inst = dataclasses.replace(self.cfg_.instances["alice"], task_deny=(self.REMOTE,))
+        denied = dataclasses.replace(self.cfg_, instances={**self.cfg_.instances, "alice": inst})
+        r = self.send_reply("task-1", cfg=denied)
+        self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "peer_denied"))
+
+
+class ResultRecheckTests(ClockMixin, tpl._Send):
+    """A result is re-resolved before hand-over."""
+
+    def test_a_window_closed_before_hand_over_is_refused_not_sent(self):
+        from router import outbound
+        self.install_clock(lambda: NOW)
+        cfg = self.cfg()
+        self.activate(cfg)
+        peerledger.write_placed(cfg, peerledger.placed_record(
+            record_id="task-1", logical_id="alice", local_address=f"alice@{tpl.FD}",
+            remote=tpl.TRUSTED, generation="alice", expires_at="2026-10-13T12:00:30Z"))
+        import base64
+        st = base64.b64encode(json.dumps({"in_reply_to": "task-1"}).encode()).decode()
+        record = {"peer": {"key_id": tpl.KEY_ID, "statement": st},
+                  "recipients": [tpl.TRUSTED], "transport_req_id": "1",
+                  "request": {"req_id": "00000001"}}
+
+        def refused(why):
+            from router import inflight
+            return inflight.Recheck(False, verdict={"reason_code": "refused"}, why=why)
+        ok = outbound._recheck_peer(cfg, "alice", record, refused)
+        self.assertTrue(ok.permitted)
+        self.install_clock(lambda: NOW + timedelta(minutes=5))
+        late = outbound._recheck_peer(cfg, "alice", record, refused)
+        self.assertFalse(late.permitted)
+        self.assertEqual(late.verdict["reason_code"], "peer_reply_window_expired")
+
+
 if __name__ == "__main__":
     unittest.main()

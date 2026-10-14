@@ -644,6 +644,15 @@ def _drain_reply(
     to the SMTP branch. Returns the governing `outcome` string."""
     record = binding.read_ledger_record(cfg.state_dir, name, str(in_reply_to),
                                         state_key=state_key(cfg, name))
+    if record is None or (record.get("tree") == deliver_mod.TREE_PEER
+                          and not record.get("from_instance")):
+        # Step 4a (contract 3.1): no delivery record, or a SIGNED placement
+        # (a peer notice with no fleet sender): the reply resolves in the
+        # PEER ledger, its recipient fixed by the record.
+        return _drain_peer_result(
+            cfg, name, req_id, doc, str(in_reply_to), req_digest=req_digest,
+            attachments=attachments, transport=transport, cold_policy=cold_policy,
+        )
     bound_instance = None
     if record is not None:
         from_instance = record.get("from_instance")
@@ -1530,11 +1539,59 @@ def _generation_id(cfg: RouterConfig, name: str) -> str:
         generations_mod.GEN_PREFIX) else last
 
 
+def _drain_peer_result(
+    cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], in_reply_to: str,
+    *, req_digest: Optional[str],
+    attachments: Optional[List[attachments_mod.VerifiedAttachment]],
+    transport: Optional[inflight_mod.TransportPort], cold_policy: Optional[ColdPolicy],
+) -> str:
+    """Step 4a: an endpoint-bound signed RESULT. `in_reply_to` resolves in
+    the submitting agent's peer ledger (`peerledger.resolve`, the same
+    function the receiver uses), with the remote unknown until it does: more
+    than one placed match is unresolved, never a guess. Unresolved is
+    `unresolved_reply`; a closed reply window is `peer_reply_window_expired`.
+    The recipient is the record's `remote`, whatever the draft said. The
+    result then runs the task path's own order (`classify._trusted`: the
+    deny, the sender's age, its exposure, the lane, the size), because the
+    receiver applies its full policy to results too, and begins as a signed
+    peer request on the agent's tree with its own `issued` record. The hop
+    envelope never carries the peer id: correlation is the statement's own
+    `in_reply_to`."""
+    from . import clock, peerledger
+    now = clock.now()
+    got = peerledger.resolve(cfg, in_reply_to=in_reply_to, local_logical_id=state_key(cfg, name),
+                             local_address=address_for(name, cfg.fleet_domain), remote=None,
+                             now=now)
+    if isinstance(got, peerledger.Expired):
+        result = _result_doc(req_id, "rejected", reason_code=REASON_PEER_REPLY_WINDOW_EXPIRED,
+                             detail=f"in_reply_to {in_reply_to!r}: the reply window has closed")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    if not isinstance(got, peerledger.Resolved):
+        result = _result_doc(
+            req_id, "rejected", reason_code=REASON_UNRESOLVED_REPLY,
+            detail=f"in_reply_to {in_reply_to!r} does not resolve to a delivery this "
+                   f"router made to {name!r}")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    remote = got.record["remote"]
+    draft = {k: v for k, v in (doc.get("draft") or {}).items() if k not in ("to", "cc", "bcc")}
+    draft["to"] = [remote]
+    classified = classify_mod._trusted(cfg, name, draft, [classify_mod.parse_address(remote)],
+                                       now=format_utc_ts(now), in_reply_to=in_reply_to)
+    if isinstance(classified, classify_mod.Refuse):
+        result = _result_doc(req_id, classified.outcome, reason_code=classified.reason_code,
+                             recipients=[], detail=classified.detail)
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
+    return _begin_peer(cfg, name, req_id, doc, draft, classified, req_digest=req_digest,
+                       attachments=attachments, transport=transport, cold_policy=cold_policy,
+                       in_reply_to=in_reply_to)
+
+
 def _begin_peer(
     cfg: RouterConfig, name: str, req_id: str, doc: Dict[str, Any], draft: Dict[str, Any],
     peer: "classify_mod.PeerRemote", *, req_digest: Optional[str],
     attachments: Optional[List[attachments_mod.VerifiedAttachment]],
     transport: Optional[inflight_mod.TransportPort], cold_policy: Optional[ColdPolicy],
+    in_reply_to: Optional[str] = None,
 ) -> str:
     """A signed peer task (`router/peerlane.py`): build the statement, check
     its exact size and its encoding, sign it, and begin it as kind `peer`.
@@ -1552,7 +1609,8 @@ def _begin_peer(
     peer_id, ts = peerlane.mint_peer_id(), utc_ts()
     try:
         raw = classify_mod.peer_statement(cfg, name, draft, peer.recipient, peer.exposure,
-                                          delegation, peer_id=peer_id, ts=ts)
+                                          delegation, peer_id=peer_id, ts=ts,
+                                          in_reply_to=in_reply_to)
     except peerlane.StatementRefused as e:
         result = _result_doc(req_id, "rejected", reason_code=REASON_MALFORMED, recipients=[],
                              detail=str(e))
@@ -1865,7 +1923,33 @@ def _recheck_peer(
         return refused(f"now {classify_mod.REASON_PEER_DENIED}")
     if classify_mod.sender_age_refusal(cfg, name, utc_ts()) is not None:
         return refused(f"now {classify_mod.REASON_PEER_QUARANTINED}")
+    reply_to = _statement_in_reply_to(pin)
+    if reply_to is not None and not handed:
+        # A result is re-resolved before it is handed over: a record whose
+        # reply window closed in between is refused, never sent late.
+        from . import clock, peerledger
+        got = peerledger.resolve(cfg, in_reply_to=reply_to, local_logical_id=state_key(cfg, name),
+                                 local_address=address_for(name, cfg.fleet_domain),
+                                 remote=recipient, now=clock.now())
+        if isinstance(got, peerledger.Expired):
+            return inflight_mod.Recheck(False, verdict={
+                "outcome": "rejected", "reason_code": REASON_PEER_REPLY_WINDOW_EXPIRED,
+                "detail": f"in_reply_to {reply_to!r}: the reply window closed before "
+                          "hand-over", "recipients": []}, why="the reply window closed")
+        if not isinstance(got, peerledger.Resolved):
+            return refused("the result's in_reply_to no longer resolves")
     return inflight_mod.Recheck(True, route=classify_mod.CLASS_TRUSTED)
+
+
+def _statement_in_reply_to(pin: Mapping[str, Any]) -> Optional[str]:
+    """The signed statement's own `in_reply_to` (None for a task, or a
+    statement that cannot be read: the recheck then decides as for a task)."""
+    try:
+        doc = json.loads(base64.b64decode(pin["statement"], validate=True))
+    except (KeyError, TypeError, ValueError):
+        return None
+    value = doc.get("in_reply_to") if isinstance(doc, dict) else None
+    return value if isinstance(value, str) else None
 
 
 def _recheck_bound(

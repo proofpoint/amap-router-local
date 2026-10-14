@@ -345,21 +345,23 @@ def sender_since(cfg: "config_mod.RouterConfig", sender: str) -> Optional[str]:
 
 def peer_statement(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str, Any],
                    recipient: str, exposure: Dict[str, Any], delegation: Any, *,
-                   peer_id: str, ts: str) -> bytes:
+                   peer_id: str, ts: str, in_reply_to: Optional[str] = None) -> bytes:
     """The statement `draft` makes from `sender` to `recipient`, with
-    `peer_id` and `ts` (`peerlane.build_statement`). `StatementRefused` for
-    a draft the encoding refuses."""
+    `peer_id` and `ts` (`peerlane.build_statement`), answering `in_reply_to`
+    when it is a result. `StatementRefused` for a draft the encoding
+    refuses."""
     from . import peerlane
     return peerlane.build_statement(
         key_id=delegation.key_id, peer_id=peer_id,
         from_address=config_mod.address_for(sender, cfg.fleet_domain), to_address=recipient,
         ts=ts, subject=draft.get("subject") or "", body_text=draft.get("body_text") or "",
         attachments=draft.get("attachments") or [], sender_exposure=exposure,
-        sender_since=sender_since(cfg, sender))
+        sender_since=sender_since(cfg, sender), in_reply_to=in_reply_to)
 
 
 def statement_size(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str, Any],
-                   exposure: Dict[str, Any], recipient: str = "") -> int:
+                   exposure: Dict[str, Any], recipient: str = "",
+                   in_reply_to: Optional[str] = None) -> int:
     """Item 5f: the EXACT size of the signed statement this draft makes. The
     minted id and the `ts` have fixed lengths, so building it with stand-ins
     of those lengths gives the size of the statement signed later.
@@ -368,7 +370,7 @@ def statement_size(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str,
     try:
         return len(peer_statement(cfg, sender, draft, recipient, exposure,
                                   peerlane.active(cfg), peer_id=peerlane.SIZE_ID,
-                                  ts=peerlane.SIZE_TS))
+                                  ts=peerlane.SIZE_TS, in_reply_to=in_reply_to))
     except peerlane.StatementRefused as e:
         raise Malformed(str(e)) from None
 
@@ -485,8 +487,10 @@ def sender_age_refusal(cfg: "config_mod.RouterConfig", sender: str,
 
 
 def _trusted(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str, Any],
-             addrs: List[Address], *, now: str) -> Decision:
-    """Item 5, in its frozen order (module docstring, a-f)."""
+             addrs: List[Address], *, now: str, in_reply_to: Optional[str] = None) -> Decision:
+    """Item 5, in its frozen order (module docstring, a-f). A signed RESULT
+    (`in_reply_to`, its recipient fixed by the peer ledger) runs the same
+    order: the receiver applies its full policy to results too."""
     # `addrs` is to ∪ cc, so any cc makes it more than one.
     if len(addrs) != 1:
         return Refuse("rejected", REASON_FLEET_MAIL_DISABLED,
@@ -509,7 +513,8 @@ def _trusted(cfg: "config_mod.RouterConfig", sender: str, draft: Dict[str, Any],
         return Refuse("rejected", REASON_RECIPIENT_UNKNOWN,
                       detail="the cross-host peer lane is not available on this router")
     try:
-        size = statement_size(cfg, sender, draft, stamp, addr.canonical())
+        size = statement_size(cfg, sender, draft, stamp, addr.canonical(),
+                              in_reply_to=in_reply_to)
     except Malformed as e:
         return Refuse("rejected", REASON_MALFORMED, detail=str(e))
     if size > STATEMENT_MAX_BYTES:
