@@ -355,6 +355,57 @@ def _finish_verb_audit(cfg: Any, marker: Mapping[str, Any], **extra: Any) -> Non
     fsync_dir(runtime_dir(cfg))
 
 
+class PlanPending(Exception):
+    """A verb's durable plan cannot be completed yet; it stays pending."""
+
+
+def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any],
+                   now: datetime) -> str:
+    """Carry a runtime-generation verb's durable plan forward, idempotently,
+    and return its result: every step is checked against the state it
+    produces and skipped once done. `PlanPending` when it cannot complete
+    yet (no capability; a planned mint whose conditions do not hold)."""
+    verb, d = marker["verb"], marker["detail"]
+    if verb == ADOPT_VERB:
+        record_generation(cfg, d["generation"], now=now)   # the record and the pin, rewritten
+        return f"adopted {d['generation']}"
+    if cap is None:
+        raise PlanPending("the plugin declares no runtime capability")
+    if verb == RETIRE_VERB:
+        return _retire_idempotent(cfg, cap, d["generation"], now)
+    if verb == NEW_VERB:
+        retired = _retire_idempotent(cfg, cap, d["retired"], now)
+        try:
+            recorded: Optional[str] = config_mod.runtime_generation(cfg)
+        except config_mod.StateKeyUnresolved:
+            recorded = None
+        if recorded is None:
+            listed = dict(cap.generations())
+            others = [g for g, st in listed.items() if st in ("live", "unreadable")]
+            frozen = _frozen_elsewhere(cfg, None)
+            if others or frozen:
+                raise PlanPending(f"the planned mint is blocked by {others or frozen}")
+            record_generation(cfg, d["minted"], now=now)
+        elif recorded != d["minted"]:
+            raise PlanPending(f"another generation {recorded} is recorded")
+        return f"{retired}, minted {d['minted']}"
+    raise PlanPending(f"unknown verb {verb!r}")
+
+
+def _run_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any],
+              now: datetime) -> Dict[str, Any]:
+    """Complete a verb's plan now. Once the plan is durable the act is
+    committed: any failure from here on is `Committed` (exit 3), never a
+    refusal, and the next pass or verb completes it."""
+    try:
+        result = _complete_plan(cfg, cap, marker, now)
+    except Exception as e:  # noqa: BLE001 -- the plan is durable: never "refused"
+        raise Committed(f"{marker['verb']}: COMMITTED (its plan is durable); completing it is "
+                        f"pending ({type(e).__name__}: {e}); the next pass or verb completes "
+                        "it") from e
+    return _complete_verb(cfg, marker, result)
+
+
 def _complete_verb(cfg: Any, marker: Mapping[str, Any], result: str,
                    **extra: Any) -> Dict[str, Any]:
     try:
@@ -365,36 +416,20 @@ def _complete_verb(cfg: Any, marker: Mapping[str, Any], result: str,
 
 
 def _repair_verb_audit(cfg: Any, cap: Optional[Capability]) -> int:
-    """A verb's pending marker: its line appended (once) when the act took
-    effect, the marker removed with no line when it did not. A retire's
-    effect is read through the capability: without one the marker waits."""
+    """A verb's pending plan: completed forward (idempotently), then its
+    audit line appended once and the marker removed. A plan that cannot
+    complete yet stays pending, and nothing else is lost."""
     try:
         marker = json.loads(_verb_marker_path(cfg).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return 0
-    verb, detail = marker.get("verb"), marker.get("detail") or {}
     try:
-        recorded: Optional[str] = config_mod.runtime_generation(cfg)
-    except config_mod.StateKeyUnresolved:
-        recorded = None
-    if verb == ADOPT_VERB:
-        done = recorded == detail.get("generation")
-    elif verb in (RETIRE_VERB, NEW_VERB):
-        if cap is None:
-            return 0
-        gen = detail.get("generation") if verb == RETIRE_VERB else detail.get("retired")
-        done = dict(cap.generations()).get(gen) == "retired"
-    else:
-        done = False
-    if done:
-        extra = {"result": "repaired after the act"}
-        if verb == NEW_VERB:
-            extra["minted"] = recorded
-        _finish_verb_audit(cfg, marker, **extra)
-        return 1
-    os.unlink(_verb_marker_path(cfg))
-    fsync_dir(runtime_dir(cfg))
-    return 0
+        result = _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
+    except Exception:  # noqa: BLE001 -- pending; retried by the next pass or verb
+        logger.warning("a runtime-generation plan (%s) is still pending", marker.get("verb"))
+        return 0
+    _finish_verb_audit(cfg, marker, result=result, completed_on_repair=True)
+    return 1
 
 
 def _audit_marker(verb: str, now: datetime, **detail: Any) -> Dict[str, Any]:
@@ -571,8 +606,7 @@ def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: dateti
     if live != [gen] or listed.get(gen) != "live":
         raise ValueError(f"{gen} is not the only live generation: {sorted(listed.items())}")
     marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence)
-    record_generation(cfg, gen, now=now)
-    return _complete_verb(cfg, marker, f"adopted {gen}")
+    return _run_plan(cfg, cap, marker, now)
 
 
 def _check_retirable(cfg: Any, cap: Capability, gen: str) -> None:
@@ -607,16 +641,24 @@ def _check_retirable(cfg: Any, cap: Capability, gen: str) -> None:
         raise ValueError(f"{gen} is not a listed runtime generation: {sorted(listed.items())}")
 
 
-def _retire(cfg: Any, cap: Capability, gen: str, now: datetime) -> str:
+def _retire_idempotent(cfg: Any, cap: Capability, gen: str, now: datetime) -> str:
+    """Retire `gen` through the capability unless the lister already shows
+    it retired, then remove the generation record when it names `gen`. Each
+    step is skipped once done, so a completion repeated after a failure
+    between them finishes the rest."""
+    if dict(cap.generations()).get(gen) != "retired":
+        cap.retire(gen, format_utc_ts(now))
     try:
         recorded = config_mod.runtime_generation(cfg)
     except config_mod.StateKeyUnresolved:
         recorded = None
-    result = cap.retire(gen, format_utc_ts(now))
     if recorded == gen:
-        os.unlink(runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
+        try:
+            os.unlink(runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
+        except FileNotFoundError:
+            pass
         fsync_dir(runtime_dir(cfg))
-    return f"retired {gen}: {result}"
+    return f"retired {gen}"
 
 
 def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datetime,
@@ -630,7 +672,7 @@ def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datet
         raise ValueError("evidence is required")
     _check_retirable(cfg, cap, gen)
     marker = _begin_verb_audit(cfg, RETIRE_VERB, now, generation=gen, evidence=evidence)
-    return _complete_verb(cfg, marker, _retire(cfg, cap, gen, now))
+    return _run_plan(cfg, cap, marker, now)
 
 
 def operator_new(cfg: Any, cap: Optional[Capability], *, now: datetime,
@@ -647,18 +689,11 @@ def operator_new(cfg: Any, cap: Optional[Capability], *, now: datetime,
     gen = config_mod.runtime_generation(cfg)
     _check_retirable(cfg, cap, gen)
     _check_mint_after_retire(cfg, cap, gen)
-    marker = _begin_verb_audit(cfg, NEW_VERB, now, retired=gen, evidence=evidence)
-    retired = _retire(cfg, cap, gen, now)
-    try:
-        minted = generation(cfg, cap, now=now)
-    except Exception as e:  # noqa: BLE001 -- the retire is committed: never "refused"
-        try:
-            _finish_verb_audit(cfg, marker, result=retired, minted=None)
-        except Exception:  # noqa: BLE001 -- the marker stays; repaired before the next act
-            pass
-        raise Committed(f"{retired}; COMMITTED, but the mint failed ({type(e).__name__}: {e}); "
-                        "the next pass mints") from e
-    return _complete_verb(cfg, marker, f"{retired}, minted {minted}", minted=minted)
+    # The generation to mint is chosen IN the plan, so completing it is
+    # idempotent: a repeat records the same one.
+    marker = _begin_verb_audit(cfg, NEW_VERB, now, retired=gen, minted=secrets.token_hex(16),
+                               evidence=evidence)
+    return _run_plan(cfg, cap, marker, now)
 
 
 def _check_mint_after_retire(cfg: Any, cap: Capability, gen: str) -> None:
@@ -793,12 +828,9 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
     if clock.admission != "open":
         # H is untrusted until admission reopens: no token, no mint, no attempt.
         return {"held_admission_closed": len(pending(state_dir))}
-    if delegation is None:
-        # No signing key: nothing can be signed, so nothing is tried.
-        n = len(pending(state_dir))
-        return {DELEGATION_INACTIVE: n} if n else {}
-    # An audited transition whose audit line is not yet appended is repaired
-    # BEFORE anything is attempted or handed over.
+    # A pending audited act (its audit line, or a verb's plan) is completed
+    # BEFORE anything is attempted or handed over, whether or not any notice
+    # is pending.
     cap = capability(cfg, runtime)
     try:
         repaired = repair_audits(cfg, cap)
@@ -807,6 +839,10 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
     except Exception:  # noqa: BLE001 -- retried next pass; nothing is attempted meanwhile
         logger.exception("control notices: an audit repair failed; nothing attempted this pass")
         return dict(counts, audit_repair_failed=1)
+    if delegation is None:
+        # No signing key: nothing can be signed, so nothing is tried.
+        n = len(pending(state_dir))
+        return dict(counts, **({DELEGATION_INACTIVE: n} if n else {}))
     # Frozen attempts first: their generation is reconciled before any fresh
     # notice could need one.
     for record in sorted(pending(state_dir),
