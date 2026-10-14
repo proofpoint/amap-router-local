@@ -23,6 +23,7 @@ import sys
 T = "router.tests.test_peerledger."
 LED, POL, PJ, SVC = ("router/peerledger.py", "router/peerpolicy.py", "router/peerjournal.py",
                      "router/service.py")
+OUT, CLS = "router/outbound.py", "router/classify.py"
 
 M = [
  ("L1 placed keyed by id alone", LED,
@@ -158,6 +159,31 @@ M = [
   "_EDGE_MARKERS = (TRUSTED_HOST_DEFAULT,)\n",
   "_EDGE_MARKERS = (TRUSTED_HOST_DEFAULT,)\n_CACHE = {}\n",
   [T + "SeamRulesTests.test_the_hook_modules_hold_no_mutable_state_and_read_no_clock"]),
+ ("L29 step 4a skipped", OUT,
+  '    if record is None or (record.get("tree") == deliver_mod.TREE_PEER\n',
+  '    if False and (record.get("tree") == deliver_mod.TREE_PEER\n',
+  [T + "ResultSubmitTests.test_a_reply_to_a_placed_task_is_a_signed_result_to_its_remote"]),
+ ("L30 the result sent to the draft's recipient", OUT,
+  "    classified = classify_mod._trusted(cfg, name, draft, [classify_mod.parse_address(remote)],\n",
+  "    remote = ((doc.get(\"draft\") or {}).get(\"to\") or [remote])[0]\n"
+  "    classified = classify_mod._trusted(cfg, name, draft, [classify_mod.parse_address(remote)],\n",
+  [T + "ResultSubmitTests.test_a_reply_to_a_placed_task_is_a_signed_result_to_its_remote"]),
+ ("L31 the statement without its in_reply_to", CLS,
+  "        sender_since=sender_since(cfg, sender), in_reply_to=in_reply_to)\n",
+  "        sender_since=sender_since(cfg, sender))\n",
+  [T + "ResultSubmitTests.test_a_reply_to_a_placed_task_is_a_signed_result_to_its_remote"]),
+ ("L32 the sender's age not checked for a result", CLS,
+  "    age = sender_age_refusal(cfg, sender, now)\n",
+  "    age = sender_age_refusal(cfg, sender, now) if in_reply_to is None else None\n",
+  [T + "ResultSubmitTests.test_an_agent_under_24_hours_old_is_refused_and_nothing_is_signed"]),
+ ("L33 the exposure not checked for a result", CLS,
+  "    if stamp is None:\n",
+  "    if stamp is None and in_reply_to is None:\n",
+  [T + "ResultSubmitTests.test_an_unavailable_exposure_is_refused_and_nothing_is_signed"]),
+ ("L34 a closed window not refused before hand-over", OUT,
+  "        if isinstance(got, peerledger.Expired):\n            return inflight_mod.Recheck(False, verdict={\n",
+  "        if False:\n            return inflight_mod.Recheck(False, verdict={\n",
+  [T + "ResultRecheckTests.test_a_window_closed_before_hand_over_is_refused_not_sent"]),
  ("L28 a router module builds a conformance profile", SVC,
   "def poll_once(",
   "def _conf(h):\n    from . import peerpolicy\n    return peerpolicy.conformance_profile(h, None, [])\n\n\n"

@@ -529,7 +529,7 @@ class ResultSubmitTests(ClockMixin, tpl._Send):
         kind, _k, statement, _sig = tpl.si.check1([(peerlane.STATEMENT_FIELD,
                                                     peer["statement_header"])])
         st = json.loads(statement)
-        self.assertEqual((st["to"], st["in_reply_to"]), (self.REMOTE, "task-1"))
+        self.assertEqual((st.get("to"), st.get("in_reply_to")), (self.REMOTE, "task-1"))
         self.assertEqual(doc["request"]["draft"]["to"], [self.REMOTE],
                          "the draft's own recipient is discarded")
         issued = peerlane.read_ledger(self.cfg_, "alice", st["id"])
