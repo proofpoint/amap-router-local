@@ -460,3 +460,42 @@ class AddressTests(_Repoint):
                 or (isinstance(n.func, ast.Name) and n.func.id == "router_address"))
                 for n in ast.walk(tree))
         self.assertEqual(users, {k: True for k in users})
+
+
+class RealPluginHarnessTests(tpc._Control):
+    """The real-plugin matrix refuses to run, by name, without the pinned
+    plugin: it never skips and never passes vacuously."""
+
+    def run_main(self, argv):
+        import contextlib
+        import io
+        from router.tests import run_realhop
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = run_realhop.main(argv)
+        return code, err.getvalue()
+
+    def test_no_plugin_is_refused(self):
+        code, err = self.run_main([])
+        self.assertEqual(code, 2)
+        self.assertIn("REFUSED: no --plugin given", err)
+
+    def test_a_plugin_of_another_digest_is_refused(self):
+        other = self.tmp / "plugin.py"
+        other.write_text("PLUGIN_API = (3, 5)\n")
+        code, err = self.run_main(["--plugin", str(other)])
+        self.assertEqual(code, 2)
+        self.assertIn("REFUSED: digest mismatch", err)
+
+    def test_the_pin_and_the_rows(self):
+        from router.tests import run_realhop
+        self.assertEqual(run_realhop.ARTIFACT_SHA256,
+                         "f15855c974df021c2ae5c551aff2448d934725a6796fb03434e573305d24fe93")
+        self.assertEqual(run_realhop.PLUGIN_API, (3, 5))
+        self.assertEqual(set(run_realhop.ROWS) >= {
+            "adopt", "retire", "new", "restore_listed_live", "restore_unlisted",
+            "abandon_attempt", "abandon_plan", "settle_generation_retired",
+            "hold_before_hand_over"}, True)
+        matrix = run_realhop._cases()
+        self.assertEqual(sorted(n[5:] for n in dir(matrix) if n.startswith("test_")),
+                         sorted(run_realhop.ROWS), "every row is run, and only these")
