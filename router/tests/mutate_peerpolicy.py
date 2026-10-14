@@ -283,6 +283,21 @@ M = [
   '                EPOCH_COUNTS.get("held:epoch_store_unavailable", 0) + 1\n'
   '        return record\n',
   [E + "SinceStartCountTests.test_counted_when_written_and_forgotten_by_a_new_process"]),
+ ("PP54 a BEHIND migration drops the epoch witness's token", PJ,
+  '    if eroot.is_dir() and not eroot.is_symlink() and peerepochs.is_witness(eroot / WITNESS):\n',
+  '    if not beside and peerepochs.is_witness(eroot / WITNESS):\n',
+  [E + "RootObjectTests.test_a_behind_migration_keeps_the_epoch_stores_own_token"]),
+ ("PP55 scan reads a non-directory root as empty", EP,
+  '    if not root_safe(r):\n        raise EpochFault(f"the epoch root {r} is not a directory")\n', '',
+  [E + "RootObjectTests.test_a_root_that_is_not_a_directory_is_a_scan_fault"]),
+ ("PP56 the trust verb skips a non-directory root", EP,
+  '    if not root_safe(r):\n        return [r]\n', '',
+  [E + "RootObjectTests.test_trust_never_clears_over_a_root_that_is_not_a_directory"]),
+ ("PP57 the trust verb treats the root as a removable file", EP,
+  '        if bad == root(state_dir):\n            problems.append(f"unsafe object {bad}: the epoch root is not a directory")\n'
+  '        elif not bad.is_symlink()',
+  '        if not bad.is_symlink()',
+  [E + "RootObjectTests.test_trust_never_clears_over_a_root_that_is_not_a_directory"]),
 ]
 
 

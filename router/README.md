@@ -1946,9 +1946,12 @@ first), prints one JSON line, and appends to the operator audit:
   records that passed the consistency step; two-file pairs are completed;
   the store is recounted and must equal its bookkeeping; only then is the
   flag cleared, in its own write. Anything else in the epoch root (a
-  directory, a link, another owner's file) keeps the flag, and the verb
-  names it and exits non-zero. A crash anywhere leaves the flag set; run
-  the verb again.
+  directory, a link, another owner's file), or a root that is not itself a
+  directory, keeps the flag, and the verb names it and exits non-zero. A
+  crash anywhere leaves the flag set; run the verb again. The verb adopts
+  every valid file that remains, a rolled-back one included: read the
+  status `epochs` section and the store's pairs BEFORE running it, and
+  remove a file you know to be stale first.
 
 `router reset` never touches any of this: it clears instance state, and
 these stores are not an instance's.

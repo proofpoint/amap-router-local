@@ -578,6 +578,58 @@ class RepairTests(_Epochs):
         self.assertFalse(self.meta()["epochs_untrusted"])
 
 
+class RootObjectTests(_Epochs):
+    """The epoch root itself, and its witness token across a BEHIND
+    migration."""
+
+    def test_a_behind_migration_keeps_the_epoch_stores_own_token(self):
+        import shutil
+        shutil.rmtree(peerepochs.root(self.state_dir))
+        StoreTests.to_v1(self)
+        peerjournal.startup(self.state_dir, NOW)
+        token = self.meta()["epochs"]["token"]
+        self.assertNotEqual(token, self.meta()["replay"]["token"], "distinct tokens")
+        self.decide(payload(sender_since=ts(-2 * DAY)))
+        StoreTests.to_v1(self)                           # the clock restored to v1
+        first = peerjournal.startup(self.state_dir, NOW)
+        self.assertEqual((first["admission"], first["why"]), ("closed", "clock_behind_stores"))
+        self.assertEqual(self.meta()["epochs"]["token"], token, "the witness's token carried")
+        second = peerjournal.startup(self.state_dir, NOW)
+        self.assertFalse([p for p in second["problems"] if "witness" in p], second["problems"])
+
+    def make_root(self, kind):
+        import shutil
+        r = peerepochs.root(self.state_dir)
+        shutil.rmtree(r)
+        if kind == "file":
+            r.write_text("x")
+        else:
+            (self.state_dir / "elsewhere").mkdir()
+            r.symlink_to(self.state_dir / "elsewhere")
+        return r
+
+    def test_a_root_that_is_not_a_directory_is_a_scan_fault(self):
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind):
+                self.make_root(kind)
+                doc = peerjournal.status_doc(self.state_dir, NOW)["epochs"]
+                self.assertIn("not a directory", doc.get("fault") or "", doc)
+                self.setUp()
+
+    def test_trust_never_clears_over_a_root_that_is_not_a_directory(self):
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind):
+                r = self.make_root(kind)
+                peerepochs.set_untrusted(self.state_dir, "test")
+                out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+                self.assertIs(out["cleared"], False, out)
+                self.assertTrue([p for p in out["problems"] if p.startswith("unsafe object")
+                                 and str(r) in p], out["problems"])
+                self.assertTrue(os.path.lexists(r), "never removed")
+                self.assertTrue(self.meta()["epochs_untrusted"])
+                self.setUp()
+
+
 class TrustCrashTests(_Epochs):
     """The trust verb's crash seams: each crash leaves the flag set, and a
     re-run completes and clears it, idempotently."""

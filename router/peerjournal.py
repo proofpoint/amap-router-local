@@ -188,8 +188,11 @@ def migrate_v1(state_dir: Path) -> str:
         beside = True
     else:
         beside = eroot.is_dir() and any(not peerepochs.is_witness(e) for e in eroot.iterdir())
+    # The witness token is carried whenever the root is a real directory
+    # holding the exact witness: a leftover migration's, or (BEHIND) the
+    # epoch store's own, which reconcile compares against the v2 record.
     leftover = None
-    if not beside and peerepochs.is_witness(eroot / WITNESS):
+    if eroot.is_dir() and not eroot.is_symlink() and peerepochs.is_witness(eroot / WITNESS):
         leftover = (eroot / WITNESS).read_text(encoding="ascii")
     if beside:
         peerclock.close(state_dir, peerclock.read(state_dir),

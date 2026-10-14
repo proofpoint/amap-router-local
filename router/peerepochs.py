@@ -145,6 +145,12 @@ def is_witness(entry: Path) -> bool:
     return entry.name == WITNESS and not entry.is_symlink() and entry.is_file()
 
 
+def root_safe(r: Path) -> bool:
+    """The epoch root is absent, or a real directory: never a link, a file
+    or anything else, which no scan may read as an empty store."""
+    return not os.path.lexists(r) or (not r.is_symlink() and r.is_dir())
+
+
 def _real_dir(entry: Path, pattern: "re.Pattern[str]") -> bool:
     return not entry.is_symlink() and entry.is_dir() and bool(pattern.fullmatch(entry.name))
 
@@ -156,6 +162,8 @@ def scan(state_dir: Path, *, skip: frozenset = frozenset()) -> Tuple[int, int, i
     from .peerjournal import _MOD, contribution
     live = total = pairs = midprune = 0
     r = root(state_dir)
+    if not root_safe(r):
+        raise EpochFault(f"the epoch root {r} is not a directory")
     for rtdir in sorted(r.iterdir()) if r.is_dir() else ():
         if is_witness(rtdir) or rtdir in skip:
             continue
@@ -367,6 +375,8 @@ def _reseed_claims(state_dir: Path) -> Dict[Tuple[str, str], str]:
 def _invalid_entries(state_dir: Path) -> List[Path]:
     bad = []
     r = root(state_dir)
+    if not root_safe(r):
+        return [r]
     for rtdir in sorted(r.iterdir()) if r.is_dir() else ():
         if is_witness(rtdir):
             continue
@@ -400,7 +410,9 @@ def operator_trust(state_dir: Path, now: datetime, *, evidence: str) -> Dict[str
     # own transaction; anything else is unsafe and keeps the flag.
     targets = []
     for bad in _invalid_entries(state_dir):
-        if not bad.is_symlink() and bad.is_file() and os.stat(bad).st_uid == os.getuid():
+        if bad == root(state_dir):
+            problems.append(f"unsafe object {bad}: the epoch root is not a directory")
+        elif not bad.is_symlink() and bad.is_file() and os.stat(bad).st_uid == os.getuid():
             targets.append(bad)
         else:
             problems.append(f"unsafe object {bad}")
