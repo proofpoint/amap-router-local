@@ -839,10 +839,11 @@ class _Polling(_Eval):
         super().setUp()
         self.lane = dataclasses.replace(self.lane, candidate_view=lambda raw: json.loads(raw))
 
-    def poll(self, port, remover="default", lane="default", limit=256, hk=None, now=NOW):
+    def poll(self, port, remover="default", lane="default", limit=256, now=NOW,
+             factory=permissive):
         rem = FakeRemover(port) if remover == "default" else remover
         return peerjournal.poll_generation(
-            self.cfg, delegation=self.lane if lane == "default" else lane, profile_factory=permissive,
+            self.cfg, delegation=self.lane if lane == "default" else lane, profile_factory=factory,
             clock=peerclock.advance(self.state_dir, now), now=now, logical_id=OWNER, gen=GEN,
             link="hub", reader=types.SimpleNamespace(port=port), remover=rem,
             retired=lambda _r: False, limit=limit)
@@ -1012,8 +1013,8 @@ class HostIntakeTests(_Eval):
     def tomb(self, ident=HID, intake=".unresolved"):
         return self.hop / ".disposed" / intake / ident
 
-    def poll(self, intake=".unresolved", hk=None, now=NOW):
-        return peerjournal.poll_host(self.cfg, self.ops, delegation=self.lane, profile_factory=permissive,
+    def poll(self, intake=".unresolved", now=NOW, factory=permissive):
+        return peerjournal.poll_host(self.cfg, self.ops, delegation=self.lane, profile_factory=factory,
                                      clock=peerclock.advance(self.state_dir, now), now=now,
                                      intake=intake)
 
@@ -1324,7 +1325,7 @@ class CandidateQuarantineVerbTests(_Polling):
 
     def test_only_a_held_candidate_is_quarantined(self):
         port = FakePort({"c1": self.raw()})
-        self.poll(port, hk=peerjournal.absent_hooks())
+        self.poll(port, factory=None)       # production: held at check8 (hook_absent)
         code, _out, err = self.cli("peer-candidate", "quarantine", self.key("c1"), "--evidence",
                                    "x")
         self.assertEqual(code, 1)

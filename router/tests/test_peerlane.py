@@ -739,6 +739,14 @@ class RecordSchemaTests(_Send):
         self.drain(dataclasses.replace(cfg, reload_failed=True))
         return cfg, inflight.read_record(cfg, "alice", "00000001")
 
+    def test_an_unknown_signed_kind_has_no_producer(self):
+        _cfg, record = self.staged()
+        record["peer"]["kind"] = "bogus"
+        with self.assertRaisesRegex(inflight.RecordDamaged, "no production producer"):
+            inflight.check_record(record, runtime=True)
+        with self.assertRaisesRegex(inflight.RecordDamaged, "no production producer"):
+            inflight.check_record(record)
+
     def test_a_control_pin_is_damage_outside_the_runtime_namespace(self):
         _cfg, record = self.staged()
         record["peer"]["kind"] = "control"

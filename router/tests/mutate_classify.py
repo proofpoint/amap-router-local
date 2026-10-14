@@ -333,7 +333,7 @@ M = [
   '    if extra:\n        raise RecordDamaged(f"unknown member(s) {extra}")\n', '',
   [R + 'RecordSchemaTests.test_an_unknown_member_is_damaged_and_never_handed']),
  ('SC2 records are not checked on read', IF,
-  '    return check_record(doc)\n', '    return doc\n',
+  '    return check_record(doc, runtime=name == config_mod.RUNTIME_NS)\n', '    return doc\n',
   [R + 'RecordSchemaTests.test_an_unknown_member_is_damaged_and_never_handed']),
  ('SC3 local parts fold in the mismatch check', IF,
   '        return {classify_mod.parse_address(a).canonical() for a in addrs}\n',

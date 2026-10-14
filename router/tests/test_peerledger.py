@@ -544,6 +544,24 @@ class ResultSubmitTests(ClockMixin, tpl._Send):
         self.assertIsNotNone(issued, "the result gets its own issued record")
         self.assertEqual((issued["direction"], issued["remote"]), ("issued", self.REMOTE))
 
+    def test_a_reply_by_the_signed_placements_notice_id_resolves_its_statement(self):
+        from router import binding
+        self.placed_for_alice("task-1")
+        notice_id = "a" * 32
+        raw = binding.record_delivery(self.cfg_.state_dir, notice_id=notice_id,
+                                      from_instance=None, from_address=self.REMOTE,
+                                      to_instance="alice", ts="2026-10-13T11:00:00Z", req_id="",
+                                      message_id="task-1", transport="hop", tree="peer")
+        path = binding.ledger_path(self.cfg_.state_dir, "alice", notice_id,
+                                   state_key=config_mod.state_key(self.cfg_, "alice"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        self.assertIsNone(self.send_reply(notice_id))
+        peer = self.handover()["envelope"]["peer"]
+        _kind, _k, statement, _sig = tpl.si.check1([(peerlane.STATEMENT_FIELD,
+                                                     peer["statement_header"])])
+        self.assertEqual(json.loads(statement).get("in_reply_to"), "task-1")
+
     def test_an_unresolved_reply_is_rejected_and_nothing_is_signed(self):
         r = self.send_reply("nowhere")
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "unresolved_reply"))

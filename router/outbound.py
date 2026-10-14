@@ -644,13 +644,16 @@ def _drain_reply(
     to the SMTP branch. Returns the governing `outcome` string."""
     record = binding.read_ledger_record(cfg.state_dir, name, str(in_reply_to),
                                         state_key=state_key(cfg, name))
-    if record is None or (record.get("tree") == deliver_mod.TREE_PEER
-                          and not record.get("from_instance")):
+    if record is None or _signed_placement(record):
         # Step 4a (contract 3.1): no delivery record, or a SIGNED placement
-        # (a peer notice with no fleet sender): the reply resolves in the
-        # PEER ledger, its recipient fixed by the record.
+        # (a peer notice with no fleet sender, placed by the ingress leg):
+        # the reply resolves in the PEER ledger, its recipient fixed by the
+        # record.
+        # A signed placement's record is keyed by its notice id; the peer
+        # ledger by the statement's own id, which the record carries.
+        peer_id = str(record["message_id"]) if record is not None else str(in_reply_to)
         return _drain_peer_result(
-            cfg, name, req_id, doc, str(in_reply_to), req_digest=req_digest,
+            cfg, name, req_id, doc, peer_id, req_digest=req_digest,
             attachments=attachments, transport=transport, cold_policy=cold_policy,
         )
     bound_instance = None
@@ -1537,6 +1540,17 @@ def _generation_id(cfg: RouterConfig, name: str) -> str:
     last = gen_key(cfg, name).rsplit("/", 1)[-1]
     return last[len(generations_mod.GEN_PREFIX):] if last.startswith(
         generations_mod.GEN_PREFIX) else last
+
+
+def _signed_placement(record: Mapping[str, Any]) -> bool:
+    """A delivery record of a signed placement (`deliver.deliver_signed_peer`):
+    tree `peer`, no fleet sender, the hop leg's transport, and NONE of the
+    mail-origin members a hop-leg mail record carries. Any other peer-tree
+    record is not one, and keeps its own path."""
+    from .ingress import LEDGER_TRANSPORT
+    return (record.get("tree") == deliver_mod.TREE_PEER and not record.get("from_instance")
+            and record.get("transport") == LEDGER_TRANSPORT
+            and not any(m in record for m in binding.MAIL_ORIGIN_MEMBERS))
 
 
 def _drain_peer_result(
