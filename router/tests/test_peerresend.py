@@ -42,6 +42,10 @@ class _Resend(_Senders):
         self.cfg = dataclasses.replace(self.cfg, delegation=dconf,
                                        trusted_fleet_hosts=(T1, T2), fleet_hosts=(T1, T2))
         peerlane.install(self.cfg, peerlane.activate(self.cfg, self.signer, now=NOW))
+        # The peer store and its clock: the receive journal (a received
+        # Result) is readable only while the clock is trusted.
+        from router import peerjournal
+        peerjournal.init_store(self.state_dir, NOW, hop_root=None, peer_roots=())
         p = mock.patch.object(exposure, "assess", return_value=STAMP)
         p.start()
         self.addCleanup(p.stop)
@@ -807,3 +811,76 @@ class UpgradeTests(_Retransmit):
             self.assertEqual(e.code, "not_preserved")
         else:
             self.fail("a cleaned original was retransmitted")
+
+
+class UntrustedClockTests(_Retransmit):
+    """While the peer clock is untrusted a received Result cannot be seen:
+    the verb refuses, and a claimed retransmit is HELD, never handed and
+    never cancelled, until it recovers."""
+
+    def untrusted(self):
+        from router import peerclock
+        return mock.patch.object(peerclock, "read",
+                                 side_effect=peerclock.ClockUntrusted("lost"))
+
+    def test_the_verb_refuses_and_writes_nothing(self):
+        k, pid = self.unknown()
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        counter = inflight.counter_path(k, "alpha").read_bytes()
+        with self.untrusted():
+            try:
+                self.retransmit(k, pid)
+            except peerresend.Refused as e:
+                self.assertEqual(e.code, "clock_untrusted")
+            else:
+                self.fail("retransmitted under an untrusted clock")
+        self.assertFalse((d / peerresend.CLAIM).exists())
+        self.assertEqual(inflight.counter_path(k, "alpha").read_bytes(), counter)
+
+    def test_a_claimed_retransmit_is_held_then_handed_once_the_clock_recovers(self):
+        k, pid = self.unknown()
+        n = self.retransmit(k, pid)["n"]
+        port = self.plugin.ports[-1]
+        with self.untrusted():
+            k, _ = self.drain()
+            k, _ = self.drain()
+        self.assertNotIn(n, port.writes, "held: never handed")
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        self.assertFalse((d / peerresend.RETRANSMITS).is_dir()
+                         and any((d / peerresend.RETRANSMITS).iterdir()), "never cancelled")
+        k, _ = self.drain()
+        self.assertIn(n, port.writes, "handed once the clock recovers")
+
+    def test_a_claim_never_begun_is_held_then_recovered(self):
+        k, pid = self.unknown()
+        with mock.patch.object(peerresend, "begin_record", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.retransmit(k, pid)
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        n = json.loads((d / peerresend.CLAIM).read_text())["n"]
+        with self.untrusted():
+            k, _ = self.drain()
+        self.assertIsNone(inflight.read_record(k, "alpha", peerresend.rtx_name(n)))
+        self.assertFalse((d / peerresend.RETRANSMITS).is_dir()
+                         and any((d / peerresend.RETRANSMITS).iterdir()), "never cancelled")
+        k, _ = self.drain()
+        k, _ = self.drain()
+        self.assertIn(n, self.plugin.ports[-1].writes)
+
+
+class SignedResultAnswersTests(_Retransmit):
+
+    def test_a_placed_statement_replying_to_it_answers_it(self):
+        k, pid = self.unknown()
+        from router import peerjournal
+        rec = {"key": "r" * 22, "disposed": "placed"}
+        with mock.patch.object(peerjournal, "all_records", return_value=[rec]), \
+                mock.patch.object(peerjournal, "read_snapshot",
+                                  return_value=json.dumps({"in_reply_to": pid}).encode()):
+            try:
+                self.retransmit(k, pid)
+            except peerresend.Refused as e:
+                self.assertEqual(e.code, "answered")
+                self.assertIn("signed Result", e.detail)
+            else:
+                self.fail("retransmitted an answered task")

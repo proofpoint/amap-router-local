@@ -361,6 +361,18 @@ def window_end(cfg: Any, statement: Mapping[str, Any]) -> Optional[datetime]:
     return ts + timedelta(seconds=dc.window_p + dc.window_f)
 
 
+def clock_trusted(cfg: Any) -> bool:
+    """Whether the peer clock is trusted. The receive journal, and so a
+    received signed Result (`answered`), is readable only under it: while
+    it is untrusted nothing here may conclude "not answered"."""
+    from . import peerclock
+    try:
+        peerclock.read(Path(cfg.state_dir))
+    except peerclock.ClockUntrusted:
+        return False
+    return True
+
+
 def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
                   allow_pending: bool, now: datetime, configured: bool = False) -> None:
     """Every check that can change between the verb and the first hand-over
@@ -372,6 +384,9 @@ def check_dynamic(cfg: Any, name: str, lid: str, copy: Mapping[str, Any], *,
     hand-over."""
     from . import inflight, peerlane
     pin = copy["record"]["peer"]
+    if not clock_trusted(cfg):
+        raise Refused("clock_untrusted", "the peer clock is untrusted: a received Result "
+                                         "cannot be seen; recover the clock first")
     if configured:
         dc = getattr(cfg, "delegation", None)
         key_id = dc.signing_key_id if dc is not None else None
@@ -578,6 +593,8 @@ def finish(cfg: Any, name: str, now: datetime, *, fenced: bool = False) -> int:
         if gen != gen_now:
             continue                          # its generation's own pass finishes it
         live = inflight.read_record(cfg, name, rtx_name(n))
+        if settled is None and live is None and not clock_trusted(cfg):
+            continue                          # held, never cancelled, until the clock recovers
         if settled is None and live is None:
             try:
                 if fenced:
