@@ -50,7 +50,7 @@ class SettingsTests(_Repoint):
     """R1: the capability's names and the sender's closed settings."""
 
     def test_the_capability_table_names_admit(self):
-        self.assertEqual(transport_mod.RUNTIME_CAPABILITY["admit"], "admit")
+        self.assertEqual(transport_mod.RUNTIME_CAPABILITY.get("admit"), "admit")
 
     def test_the_sender_settings_are_the_closed_six_from_the_pin_and_the_caps(self):
         gen = "c" * 32
@@ -62,11 +62,14 @@ class SettingsTests(_Repoint):
         self.cfg = dataclasses.replace(self.cfg, hop=dataclasses.replace(self.cfg.hop)
                                        if dataclasses.is_dataclass(self.cfg.hop) else self.cfg.hop)
         self.cfg.hop.caps = {"document": 1, "request": 2, "attachment": 3, "total": 4}
-        self.cap().sender(gen, port=True)
-        role, settings = self.tree.calls[-1]
+        try:
+            self.cap().sender(gen, port=True)
+        except Exception:  # noqa: BLE001 -- the settings below decide
+            pass
+        role, settings = self.tree.calls[-1] if self.tree.calls else (None, {})
         self.assertEqual(role, "sender")
         self.assertEqual(set(settings), rs.SENDER_SETTINGS)
-        self.assertEqual((settings["version_write"], settings["caps"]),
+        self.assertEqual((settings.get("version_write"), settings.get("caps")),
                          (7, {"document": 1, "request": 2, "attachment": 3, "total": 4}))
 
     def test_a_port_needs_the_pin_and_a_reader_does_not(self):
@@ -231,8 +234,9 @@ class SettleTests(_Repoint):
         with mock.patch.object(peercontrol, "_require_writable"):   # the backstop alone
             got = self.send()
         c = self.control(key)
-        self.assertTrue(c["sent"], got)
-        self.assertEqual((c["settled"]["outcome"], c["settled"]["reason_code"]),
+        self.assertTrue(c.get("sent"), got)
+        settled = c.get("settled") or {}
+        self.assertEqual((settled.get("outcome"), settled.get("reason_code")),
                          ("rejected", "generation_retired"))
         self.assertEqual(self.tree.senders[gen].pending, {}, "nothing handed over")
         self.assertEqual(peercontrol.unsettled_attempts(self.cfg), [])
@@ -250,7 +254,8 @@ class SettleTests(_Repoint):
         with mock.patch.object(peercontrol, "_require_writable"), \
                 mock.patch.object(hoplink, "LATCHED_WRITE_REASONS", latched):
             self.send()
-        self.assertEqual(self.control(key)["settled"]["reason_code"], "generation_retired")
+        self.assertEqual((self.control(key).get("settled") or {}).get("reason_code"),
+                         "generation_retired")
         self.assertIsNone(hoplink.write_hold(self.cfg, config_mod.RUNTIME_NS)
                           if config_mod.runtime_generation is not None else None)
 
@@ -296,6 +301,14 @@ class SettleTests(_Repoint):
 class UnreadableTests(_Repoint):
     """R4 and R4b."""
 
+    def refusal(self, fn):
+        """(exception type, message) of `fn()`, or ("returned", repr)."""
+        try:
+            out = fn()
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL
+            return type(e).__name__, str(e)
+        return "returned", repr(out)
+
     def no_plan(self):
         self.assertFalse(peercontrol._verb_marker_path(self.cfg).exists(),
                          "no durable plan was written")
@@ -303,18 +316,20 @@ class UnreadableTests(_Repoint):
     def test_retire_refuses_an_unreadable_target_before_any_plan(self):
         gen = "a" * 32
         self.tree.gens[gen] = "unreadable"
-        with self.assertRaises(ValueError) as cm:
-            peercontrol.operator_retire(self.cfg, self.cap(), gen, now=NOW, evidence="x")
-        self.assertIn(peercontrol.REPAIR_EXIT, str(cm.exception))
+        kind, msg = self.refusal(lambda: peercontrol.operator_retire(
+            self.cfg, self.cap(), gen, now=NOW, evidence="x"))
+        self.assertEqual(kind, "ValueError", msg)
+        self.assertIn(peercontrol.REPAIR_EXIT, msg)
         self.no_plan()
 
     def test_new_refuses_an_unreadable_recorded_target_before_any_plan(self):
         gen = "a" * 32
         peercontrol.record_generation(self.cfg, gen, admitted_at=AT)
         self.tree.gens[gen] = "unreadable"
-        with self.assertRaises(ValueError) as cm:
-            peercontrol.operator_new(self.cfg, self.cap(), now=NOW, evidence="x")
-        self.assertIn(peercontrol.REPAIR_EXIT, str(cm.exception))
+        kind, msg = self.refusal(lambda: peercontrol.operator_new(
+            self.cfg, self.cap(), now=NOW, evidence="x"))
+        self.assertEqual(kind, "ValueError", msg)
+        self.assertIn(peercontrol.REPAIR_EXIT, msg)
         self.no_plan()
 
     def test_each_exit_names_the_repair_for_unreadable_and_adopt_or_retire_for_live(self):

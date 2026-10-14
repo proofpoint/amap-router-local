@@ -1161,7 +1161,20 @@ class GenerationClassifiedTests(_Control):
             self.send()
         gen = self.record(key)["control"]["attempt"]["gen"]
         self.tree.gens[gen] = state
-        self.assertEqual(self.send(), {peercontrol.UNAVAILABLE: 1})
+        # The admission passes, so the lister's state is the ONLY thing that
+        # can stop the hand-over (an unreadable identity also refuses `admit`).
+        port_calls = []
+        real = rs.RuntimeSender._admitted
+
+        def counted(sender):
+            port_calls.append(sender.generation)
+            return real(sender)
+        with mock.patch.object(peercontrol.Capability, "admit", return_value="exists"), \
+                mock.patch.object(rs.RuntimeSender, "_admitted", counted):
+            self.assertEqual(self.send(), {peercontrol.UNAVAILABLE: 1})
+        # Held from the lister alone, BEFORE any port method: the record is
+        # never trusted, and the port's own refusal is not what stopped it.
+        self.assertEqual(port_calls, [], "no port method was called")
         port = self.tree.senders.get(gen)
         self.assertEqual(port.writes if port is not None else [], [], "nothing handed over")
 
@@ -1190,8 +1203,12 @@ class RetireListedOnlyTests(_Control):
 
     def test_retire_refuses_a_generation_the_lister_does_not_show(self):
         cap = peercontrol.capability(self.cfg, self.runtime)
-        with self.assertRaises(ValueError):
+        try:
             peercontrol.operator_retire(self.cfg, cap, "9" * 32, now=NOW, evidence="x")
+            got = "returned"
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL
+            got = type(e).__name__
+        self.assertEqual(got, "ValueError")
         self.assertEqual([c for c in self.tree.calls if c[0] == "sender"], [],
                          "no sender constructed for an unlisted generation")
 
