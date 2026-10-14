@@ -51,6 +51,11 @@ logger = logging.getLogger("amap_router_local")
 #: The last poll's inbound counts (`ingress.pump_all`), for status: process
 #: state, replaced each poll that pumped.
 LAST_INGRESS: Dict[str, Dict[str, int]] = {}
+#: PROCESS state: the candidate journal's startup report, per state_dir
+#: (`peerjournal.startup`), shown in status's `peer_store`.
+PEER_STARTUP: Dict[str, Dict[str, Any]] = {}
+#: PROCESS state: the last signed-candidate pass's counts (`peerjournal.poll`).
+LAST_PEER_POLL: Dict[str, Any] = {}
 
 
 #: `run_once`'s default: load the configured plugin for this one call.
@@ -268,6 +273,23 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
                 LAST_INGRESS.update(pumped)
         except Exception:
             logger.exception("error in the inbound pass — isolated")
+    # The signed-candidate pass, ONLY with `delegation.inbound` (refused at
+    # load in this build): same lock, its own log line and status, never
+    # `summary`. The production hooks hold every candidate they would decide.
+    if (cfg.delegation is not None and cfg.delegation.inbound
+            and hoplink.is_runtime(transport) and report.state != "off"):
+        from . import peerjournal, peerlane
+        try:
+            polled = peerjournal.poll(cfg, transport, report,
+                                      delegation=peerlane.current(cfg),
+                                      hooks=peerjournal.absent_hooks(),
+                                      now=datetime.now(timezone.utc))
+            if polled:
+                logger.info("signed candidates: %s", polled)
+                LAST_PEER_POLL.clear()
+                LAST_PEER_POLL.update(polled)
+        except Exception:
+            logger.exception("error in the signed-candidate pass — isolated")
     return summary
 
 
@@ -310,6 +332,17 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
                 keyed_cfg, report, None if transport is _LOAD else transport))
         except Exception:
             logger.exception("error reading the cross-host state for status — isolated")
+        if cfg.delegation is not None:
+            from . import peerjournal
+            try:
+                peer_doc = peerjournal.status_doc(cfg.state_dir, datetime.now(timezone.utc),
+                                                  PEER_STARTUP.get(str(cfg.state_dir)))
+                peer_doc["inbound"] = bool(cfg.delegation.inbound)
+                if LAST_PEER_POLL:
+                    peer_doc["last_poll"] = dict(LAST_PEER_POLL)
+                tracker.record_peer_store(peer_doc)
+            except Exception:
+                logger.exception("error reading the peer store for status — isolated")
         if hoplink.is_runtime(transport):
             try:
                 hop_doc = hoplink.status_doc(keyed_cfg, keyed_cfg.instances)
@@ -443,6 +476,37 @@ def activate_delegation(cfg: RouterConfig, runtime: Any) -> None:
 _RELOAD_FAILURE: Dict[str, Dict[str, str]] = {}
 
 
+def peer_startup(cfg: RouterConfig, transport: Any = None) -> Optional[Dict[str, Any]]:
+    """Once at start, under the drain lock, with `delegation` configured:
+    verify the candidate journal and its clock (`peerjournal.startup`),
+    which closes admission or raises the floor and never opens it. A
+    failure is logged and recorded, never fatal: admission then stays as it
+    is on disk, and without a readable clock that is closed."""
+    if cfg.delegation is None:
+        return None
+    from . import peerjournal
+    try:
+        rep = peerjournal.startup(cfg.state_dir, datetime.now(timezone.utc))
+    except Exception as e:  # noqa: BLE001 -- isolated, recorded
+        logger.exception("peer store startup check failed")
+        rep = {"admission": "unknown", "why": "startup_failed",
+               "problems": [f"{type(e).__name__}: {e}"], "digests_repaired": 0}
+    # The disposal stages, created and checked at start (with inbound
+    # intake only): a host-intake candidate is never taken without them.
+    if cfg.delegation.inbound and cfg.hop is not None and hoplink.is_runtime(transport):
+        for intake in peerjournal.HOST_INTAKES:
+            try:
+                peerjournal.disposed_dirs(transport.fsops, Path(cfg.hop.root), intake)
+            except peerjournal.DisposedUnavailable as e:
+                rep.setdefault("problems", []).append(f"disposed: {e}")
+                logger.error("peer store: %s", e)
+    PEER_STARTUP[str(cfg.state_dir)] = rep
+    level = logging.WARNING if rep.get("why") else logging.INFO
+    logger.log(level, "peer store: admission %s%s", rep["admission"],
+               f" ({rep['why']})" if rep.get("why") else "")
+    return rep
+
+
 def _refuse_reload(current: RouterConfig, why: str) -> RouterConfig:
     """`current`, kept, with `reload_failed` set and the refusal recorded
     (its first sighting kept while it persists)."""
@@ -563,6 +627,7 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
     # startup here (`start_transport`).
     transport = start_transport(cfg)
     activate_delegation(cfg, transport)
+    peer_startup(cfg, transport)
     tracker = StatusTracker(interval_s=interval)
     seen_report = None
     seen_names = sorted(cfg.instances)

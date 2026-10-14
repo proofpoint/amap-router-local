@@ -204,6 +204,14 @@ ID_SHAPED_NAME_RE = re.compile(r"[0-9a-fA-F]{32}\Z")
 #: name, the second cannot take over a directory that exists.
 #: `test_state_rekey` pins this set against the modules that own them.
 RESERVED_STATE_NAMES = frozenset({"registry", "status.json", "aliases"})
+#: The peer lane's stores directly under `state_dir`: the decision key
+#: (`peerbind.DECISION_KEY_FILE`), the replay store and its vacant markers
+#: (`peerjournal.REPLAY_DIR`, `VACANT_DIR`), the clock
+#: (`peerclock.CLOCK_FILE`, which also holds the store's bookkeeping). A
+#: reset of an instance by one of these names would clear them.
+PEER_STATE_NAMES = frozenset({"peer-decision.key", "peer-replay", "peer-vacant",
+                              "peer-clock.json"})
+RESERVED_STATE_NAMES = RESERVED_STATE_NAMES | PEER_STATE_NAMES
 
 #: Connector ids for `outbound/ext/<id>/outcomes/` — the directories
 #: `outcomes._consume_dir` scans, in this order. The spec ("The Volume
@@ -1883,6 +1891,13 @@ class DelegationConfig:
     #: attachments: None (absent: every one is `unscanned`, no bytes) or
     #: `ATTACHMENT_BASIS_CLOSED_FLEET`. A signature is never the basis.
     attachment_basis: Optional[str] = None
+    #: Inbound peer intake (`INBOUND_AVAILABLE`); False when absent.
+    inbound: bool = False
+    #: The receiver's window: P (past) and F (future skew), in seconds.
+    window_p: int = 3600
+    window_f: int = 300
+    #: The candidate journal's retention sweeper; off unless configured.
+    retention_sweep: bool = False
 
     def crypto_settings(self) -> Dict[str, str]:
         """The signer's and verifier's settings, exactly."""
@@ -1898,7 +1913,13 @@ class DelegationConfig:
 
 
 _DELEGATION_KEYS = frozenset({"partition_verified", "signing_key", "runtimes", "crypto"})
-_DELEGATION_OPTIONAL = frozenset({"attachment_basis"})
+_DELEGATION_OPTIONAL = frozenset({"attachment_basis", "inbound", "windows", "retention"})
+#: Inbound peer intake (taking signed candidates at all). False in this
+#: build: `delegation.inbound: true` is refused at load until the policy,
+#: edge and reply hooks exist. Tests patch it.
+INBOUND_AVAILABLE = False
+#: The peer-origin profile's window bounds: P in [300, 86400], F at most 900.
+WINDOW_P_BOUNDS, WINDOW_F_MAX = (300, 86400), 900
 #: `delegation.attachment_basis`'s one value: every trusted fleet host is
 #: operator-supervised and no external sender reaches the peer lane.
 ATTACHMENT_BASIS_CLOSED_FLEET = "closed_fleet"
@@ -2032,10 +2053,45 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
         why = _normal_form_problem(openssl)
         if why is not None:
             raise ConfigError(f"{where}.crypto.openssl_path: {why}")
+    inbound = raw.get("inbound", False)
+    if type(inbound) is not bool:
+        raise ConfigError(f"{where}.inbound: absent, or true or false")
+    if inbound and not INBOUND_AVAILABLE:
+        raise ConfigError(f"{where}.inbound: inbound peer intake is not available in this build")
+    window_p, window_f = 3600, 300
+    if "windows" in raw:
+        win = _require_object(raw["windows"], f"{where}.windows")
+        if set(win) != {"p", "f"} or not all(type(win[k]) is int for k in ("p", "f")):
+            raise ConfigError(f"{where}.windows: needs exactly p and f, integers (seconds)")
+        if not (WINDOW_P_BOUNDS[0] <= win["p"] <= WINDOW_P_BOUNDS[1]
+                and 0 <= win["f"] <= WINDOW_F_MAX):
+            raise ConfigError(f"{where}.windows: p in {list(WINDOW_P_BOUNDS)} and f in "
+                              f"[0, {WINDOW_F_MAX}], the profile's bounds")
+        window_p, window_f = win["p"], win["f"]
+    sweep = False
+    if "retention" in raw:
+        ret = _require_object(raw["retention"], f"{where}.retention")
+        if set(ret) != {"sweep"} or type(ret["sweep"]) is not bool:
+            raise ConfigError(f"{where}.retention: needs exactly sweep, true or false")
+        sweep = ret["sweep"]
+        if sweep and not _peer_store_present(cfg.state_dir):
+            raise ConfigError(f"{where}.retention.sweep: refused while the peer store has no "
+                              "settled-through frontier (run `router peer-store init` first)")
     return DelegationConfig(
         partition_verified=partition, signing_key_path=sk["path"], signing_key_id=sk["key_id"],
         signing_public_key=sk["public_key"], runtimes=tuple(parsed), crypto_backend=backend,
-        openssl_path=openssl, forbidden_roots=roots, attachment_basis=basis)
+        openssl_path=openssl, forbidden_roots=roots, attachment_basis=basis, inbound=inbound,
+        window_p=window_p, window_f=window_f, retention_sweep=sweep)
+
+
+def _peer_store_present(state_dir: Path) -> bool:
+    """Whether `peer-clock.json` carries the candidate journal's bookkeeping
+    (its settled-through frontier among it). Read only to gate the sweep."""
+    try:
+        doc = json.loads((Path(state_dir) / "peer-clock.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(doc, dict) and isinstance(doc.get("store"), dict)
 
 
 _CLASSIFY_INSTANCE_KEYS = ("task_deny", "send_to", "remote_fleet")

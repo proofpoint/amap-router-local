@@ -25,7 +25,7 @@ def _methods(proto):
 class ShapeTests(unittest.TestCase):
 
     def test_the_version(self):
-        self.assertEqual(transport.PLUGIN_API, (3, 3))
+        self.assertEqual(transport.PLUGIN_API, (3, 4))
         self.assertEqual(transport.REQUIRED_MINOR, 0)
         self.assertEqual(dict(transport.OPTIONAL_FACTORIES),
                          {"make_intake_remover": ((3, 1), "HopFsOps"),

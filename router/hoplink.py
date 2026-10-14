@@ -670,7 +670,9 @@ PROCESS_STATE: Dict[str, Tuple[str, ...]] = {
     "ingress": ("_CURSORS", "_CYCLE", "LISTING_ENTRIES_HIGH", "_CURSOR_PORT", "_LINK_LATCHED",
                 "REMOVER_STATE", "_LINK_UNSET_LOGGED", "_LAST_CURRENT", "READ_REFUSALS"),
     "outbound": ("_STALE_WARNED",),
-    "service": ("LAST_INGRESS", "_REGISTRY_LOGGED", "_RELOAD_FAILURE"),
+    "service": ("LAST_INGRESS", "_REGISTRY_LOGGED", "_RELOAD_FAILURE", "PEER_STARTUP",
+                "LAST_PEER_POLL"),
+    "peerjournal": ("_CURSORS", "_DISPOSED"),
     "peerlane": ("_ACTIVE",),
     "aliases": ("LAST_TOMBSTONE_ERRORS",),
 }

@@ -119,6 +119,9 @@ class Delegation:
     #: What activation depended on (`fingerprint`), set by the caller that
     #: installs it; None when unknown.
     fingerprint: Any = None
+    #: The codec's `candidate_view` (API 3.4), or None when the plugin does
+    #: not offer it: signed candidates are then held, never guessed at.
+    candidate_view: Any = None
 
     @property
     def key_id(self) -> str:
@@ -299,6 +302,29 @@ def _reason_set(value: Any, what: str) -> frozenset:
     return value
 
 
+def candidate_view_of(codec: Any, api: Tuple[int, int]) -> Any:
+    """The codec's `candidate_view`, None when OFF (below its minor, or
+    absent), or `DelegationRefused` (transport module docstring, API 3.4):
+    a method present but not callable, or `CANDIDATE_REASONS` present but
+    not exactly the (3, 4) set. The view without its vocabulary is OFF.
+    Below the minor neither name is consulted."""
+    since = transport_mod.CODEC_OPTIONAL_METHODS["candidate_view"]
+    asince = transport_mod.CODEC_OPTIONAL_ATTRIBUTES["CANDIDATE_REASONS"]
+    if tuple(api) >= asince and hasattr(codec, "CANDIDATE_REASONS"):
+        got = getattr(codec, "CANDIDATE_REASONS")
+        if not (type(got) is frozenset and got == transport_mod.CANDIDATE_REASONS_3_4):
+            raise DelegationRefused("codec", "the peer codec's CANDIDATE_REASONS is not exactly "
+                                             f"{sorted(transport_mod.CANDIDATE_REASONS_3_4)}")
+    if tuple(api) < since or not hasattr(codec, "candidate_view"):
+        return None
+    view = getattr(codec, "candidate_view")
+    if not callable(view):
+        raise DelegationRefused("codec", "the peer codec's candidate_view is not callable")
+    if tuple(api) < asince or not hasattr(codec, "CANDIDATE_REASONS"):
+        return None     # its vocabulary unproved: OFF, so candidates hold
+    return view
+
+
 def activate(cfg: RouterConfig, plugin: Any, *, now: Any) -> Delegation:
     """Delegation for `cfg` (module docstring, ACTIVATION), or
     `DelegationRefused`. `plugin` is the loaded plugin; `now` is an aware
@@ -320,6 +346,7 @@ def activate(cfg: RouterConfig, plugin: Any, *, now: Any) -> Delegation:
     reasons = _reason_set(getattr(codec, "REASONS", None), "REASONS")
     key_config_reasons = _reason_set(getattr(codec, "KEY_CONFIG_REASONS", None),
                                      "KEY_CONFIG_REASONS")
+    view = candidate_view_of(codec, tuple(plugin.api))
     probe = Delegation(config=dc, signer=None, verifier=None, codec=codec, errors=caps.errors,
                        key_table=None, reasons=reasons, key_config_reasons=key_config_reasons)
 
@@ -381,7 +408,7 @@ def activate(cfg: RouterConfig, plugin: Any, *, now: Any) -> Delegation:
                                 "the configured public_key does not verify the seed's signature")
     return Delegation(config=dc, signer=signer, verifier=verifier, codec=codec,
                       errors=caps.errors, key_table=table, reasons=reasons,
-                      key_config_reasons=key_config_reasons)
+                      key_config_reasons=key_config_reasons, candidate_view=view)
 
 
 # ---------------------------------------------------------------------------

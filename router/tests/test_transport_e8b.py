@@ -20,6 +20,8 @@ SURFACE_3_0 = ['CLASSES', 'CommitResult', 'Dependency', 'EntryKind', 'FACTORY_PO
 ADDED_AT_3_1 = ['HOPFSOPS_OPTIONAL_METHODS', 'IntakeRemover', 'OPTIONAL_FACTORIES', 'REMOVE_DIR_ENTRIES_MAX', 'REMOVE_RESULTS', 'REQUIRED_MINOR', 'RemoveResult']
 #: The names (3, 3) adds: the peer seam (`check_delegation`).
 ADDED_AT_3_3 = ['DELEGATION_FACTORIES', 'DELEGATION_MINOR', 'DelegationCapabilities', 'NO_ARGUMENTS', 'PEER_ERROR_NAMES', 'check_delegation']
+#: The names (3, 4) adds: the candidate view's gate.
+ADDED_AT_3_4 = ['CANDIDATE_REASONS_3_4', 'CODEC_OPTIONAL_ATTRIBUTES', 'CODEC_OPTIONAL_METHODS']
 
 ABSENT = b""
 CALLABLE = (b"\nREMOVER_CALLS = []\n"
@@ -104,7 +106,8 @@ class SurfaceTests(_PluginDir):
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 names.add(node.target.id)
         public = {n for n in names if not n.startswith("_")}
-        self.assertEqual(public, set(SURFACE_3_0) | set(ADDED_AT_3_1) | set(ADDED_AT_3_3))
+        self.assertEqual(public, set(SURFACE_3_0) | set(ADDED_AT_3_1) | set(ADDED_AT_3_3)
+                         | set(ADDED_AT_3_4))
 
     def test_remove_results_are_their_own_vocabulary(self):
         self.assertEqual(transport.REMOVE_RESULTS, ("removed", "absent"))
