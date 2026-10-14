@@ -254,6 +254,13 @@ UNKNOWN_ABOUT = "unknown_about"
 CONTROL_DUPLICATE = "duplicate"
 
 
+def _already_reserved(state_dir: Any, runtime: str, ident: str) -> bool:
+    """Whether (runtime, id) already holds a reservation in the replay store."""
+    from . import peerbind
+    rt, idk = peerbind.replay_keys(runtime, ident)
+    return (Path(state_dir) / "peer-replay" / rt / (idk + peerbind.RESERVATION_SUFFIX)).exists()
+
+
 def _control_receive(profile: Profile) -> Callable:
     from . import config as config_mod
     from . import peerbind, peerclock, peerjournal
@@ -294,8 +301,7 @@ def _control_receive(profile: Profile) -> Callable:
         # Check 4 before check 5 (the spec oracle's order, v2.1 §3.1): a
         # (runtime, id) already reserved is a duplicate, whatever `about`
         # now names. The journal's reservation is the backstop.
-        rt, idk = peerbind.replay_keys(runtime.runtime, payload["id"])
-        if (Path(ctx.state_dir) / "peer-replay" / rt / (idk + peerbind.RESERVATION_SUFFIX)).exists():
+        if _already_reserved(ctx.state_dir, runtime.runtime, payload["id"]):
             return peerjournal.Refuse(CONTROL_DUPLICATE)
         domains = {d.lower() for d in runtime.domains}
         matches = []

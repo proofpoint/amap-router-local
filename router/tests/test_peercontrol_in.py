@@ -271,6 +271,20 @@ class DuplicateTests(_ControlIn):
         self.poll()
         self.assertEqual(self.outcome(CID2), ("done", "dropped", "duplicate", None))
 
+    def test_a_reservation_landing_after_the_hook_looked_is_still_a_duplicate(self):
+        """The journal's reservation is the backstop: when the hook's check
+        misses a reservation (it lands between the two), the collision is a
+        duplicate all the same."""
+        from router import peerpolicy
+        self.issued()
+        self.entry(self.control_raw())
+        self.poll()
+        self.entry(self.control_raw(cause="policy", policy_code="x"), ident=CID2)
+        with mock.patch.object(peerpolicy, "_already_reserved", return_value=False):
+            self.poll()
+        self.assertEqual(self.outcome(CID2), ("done", "dropped", "duplicate", None))
+        self.assertEqual(len(self.inbox_notices()), 1)
+
     def test_a_second_control_about_the_same_message_is_dropped(self):
         self.issued()
         self.entry(self.control_raw())
