@@ -1922,11 +1922,18 @@ makes that pass a FULL walk before anything is evaluated. A full walk,
 which also rebuilds the index, runs at start, after a failed walk, and on a
 monotonic hourly backstop (`FULL_WALK_S`), which catches what validation
 cannot see: an open record with no marker is evaluated within the first
-full walk at or after the hour, while polling continues. A walk that fails
-establishes nothing: the next pass walks fully again, and no marker is
-removed on a partial view. The index is advisory and outside the store's
+full walk at or after the hour, while polling continues. Both the index
+and the full walk read each record with the strict reader's own check (a
+regular file, a record, its key and its control what the router writes).
+A walk that cannot resolve every entry establishes nothing: an owner whose
+journal root cannot be listed, is missing while its bookkeeping counts
+live records, or holds a key directory without a sound record keeps every
+marker, the next pass walks fully again, and the schedule does not
+advance. The records it could read are still recovered. Such damage is
+logged and costs a full walk per pass until it is repaired; it is never
+read as "nothing open". The index is advisory and outside the store's
 content sum; it lives under each owner's directory, so it reserves no
-instance name. Intake-listing truncation is not a trigger: recovery covers
+instance name, and `reset` keeps it with the journal. Intake-listing truncation is not a trigger: recovery covers
 records already taken. A
 candidate first observed in a generation that is not current is
 `late_inbound`: mailed, quarantined to that generation with that cause, and

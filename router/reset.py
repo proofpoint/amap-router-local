@@ -247,6 +247,7 @@ from . import generations as generations_mod
 from . import inflight as inflight_mod
 from . import lock as lock_mod
 from .peerbind import JOURNAL_DIR as PEER_JOURNAL_DIR
+from .peerjournal import OPEN_DIR as PEER_OPEN_DIR
 from .peerlane import PEER_LEDGER_DIR
 from . import registry as registry_mod
 from .config import RouterConfig, instance_state_dir, state_key
@@ -288,9 +289,12 @@ _OUTCOMES = "outcomes"
 # candidate journal (`router/peerbind.py`): a persisted decision is resumed as
 # recorded, so a reset never removes one. (The decision key lives at the top
 # of `state_dir`, outside every instance's directory, where a reset never
-# reaches.)
+# reaches.) And the journal's not-done index beside it (`peerjournal`): the
+# journal survives a reset, so its index does too; a take after a reset that
+# recreated it empty would leave older open records unmarked until the next
+# full walk.
 _STATE_KEEP = (audit_mod.AUDIT_DIR, inflight_mod.TRANSPORT_STATE_DIR, PEER_LEDGER_DIR,
-               PEER_JOURNAL_DIR)
+               PEER_JOURNAL_DIR, PEER_OPEN_DIR)
 
 
 def _kept(cfg: RouterConfig, entry_name: str, *, blocker: bool = False) -> bool:

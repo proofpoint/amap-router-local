@@ -727,6 +727,34 @@ def _check_meta_shape(meta: Mapping[str, Any]) -> None:
             raise bad(f"an entry of pending_op {name}'s delta")
 
 
+class _Unsound(ValueError):
+    """A journal record directory whose record cannot be trusted: `why` is
+    `no_record` (no regular record.json), `unreadable` (with `cause`, the
+    error's type name) or `not_a_record`."""
+
+    def __init__(self, why: str, cause: str = ""):
+        super().__init__(why)
+        self.why, self.cause = why, cause
+
+
+def _strict_record(d: Path) -> Dict[str, Any]:
+    """The record in key directory `d`, read STRICTLY, or `_Unsound`: a
+    regular file (never a symlink), JSON, an object whose key is the
+    directory's name and whose `control` is null or an object. The one
+    per-record check, shared by the strict reader and recovery's index."""
+    path = d / RECORD
+    if path.is_symlink() or not path.is_file():
+        raise _Unsound("no_record")
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise _Unsound("unreadable", type(e).__name__) from None
+    if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec
+            and (rec["control"] is None or isinstance(rec["control"], dict))):
+        raise _Unsound("not_a_record")
+    return rec
+
+
 def _strict_walk(state_dir: Path) -> List[Dict[str, Any]]:
     """Every record under every owner's journal directory ON DISK, whether
     or not the bookkeeping lists the owner; `JournalBlind` naming the first
@@ -750,21 +778,19 @@ def _strict_walk(state_dir: Path) -> List[Dict[str, Any]]:
         for d in entries:
             if not (d.is_dir() and _KEY_RE.fullmatch(d.name)):
                 continue
-            path = d / RECORD
-            if path.is_symlink() or not path.is_file():
-                raise JournalBlind(f"a journal record directory has no regular record "
-                                   f"({child.name}/{d.name}; a restart's reconcile clears a "
-                                   "crash's leftover), so this check cannot pass")
             try:
-                rec = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
-                                   f"{type(e).__name__}), so this check cannot pass") from None
-            if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec
-                    and (rec["control"] is None or isinstance(rec["control"], dict))):
+                rec = _strict_record(d)
+            except _Unsound as u:
+                if u.why == "no_record":
+                    raise JournalBlind(f"a journal record directory has no regular record "
+                                       f"({child.name}/{d.name}; a restart's reconcile clears "
+                                       "a crash's leftover), so this check cannot pass") from None
+                if u.why == "unreadable":
+                    raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
+                                       f"{u.cause}), so this check cannot pass") from None
                 raise JournalBlind(f"a journal record is not a record ({child.name}/{d.name}: "
                                    "its key or its control is not what the router writes), so "
-                                   "this check cannot pass")
+                                   "this check cannot pass") from None
             out.append(rec)
     return out
 
@@ -3503,16 +3529,23 @@ def _recovery_worklist(state_dir: Path, meta: Mapping[str, Any]) -> List[Dict[st
     return sorted(open_recs, key=lambda r: r["take_seq"])
 
 
+#: A marker's content is a take_seq in ASCII decimal; more bytes than this
+#: is damage, read without converting (no unbounded read, and no int() of a
+#: value past the interpreter's digit limit).
+_MARKER_MAX = 20
+
+
 def _read_marker(path: Path) -> int:
     if path.is_symlink() or not path.is_file():
         raise _IndexDamage(f"{path.name}: not a regular file")
     try:
-        text = path.read_text(encoding="ascii")
-    except (OSError, UnicodeDecodeError) as e:
+        with open(path, "rb") as f:
+            raw = f.read(_MARKER_MAX + 1)
+    except OSError as e:
         raise _IndexDamage(f"{path.name}: unreadable ({type(e).__name__})") from None
-    if not text.isdigit():
+    if len(raw) > _MARKER_MAX or not raw.isdigit():
         raise _IndexDamage(f"{path.name}: not a decimal take_seq")
-    return int(text)
+    return int(raw)                         # at most _MARKER_MAX ASCII digits
 
 
 def _indexed(state_dir: Path, meta: Mapping[str, Any]
@@ -3543,13 +3576,11 @@ def _indexed(state_dir: Path, meta: Mapping[str, Any]
                 raise _IndexDamage(f"{owner}/{name}: not a key-named marker")
             seq = _read_marker(d / name)
             try:
-                rec = json.loads((record_dir(state_dir, owner, name) / RECORD)
-                                 .read_text(encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                raise _IndexDamage(f"{owner}/{name}: the record cannot be read "
-                                   f"({type(e).__name__})") from None
-            if not (isinstance(rec, dict) and rec.get("key") == name
-                    and rec.get("owner") == owner and rec.get("take_seq") == seq):
+                rec = _strict_record(record_dir(state_dir, owner, name))
+            except _Unsound as u:
+                raise _IndexDamage(f"{owner}/{name}: the record is unsound "
+                                   f"({u.why})") from None
+            if not (_indexable(rec, owner) and rec["take_seq"] == seq):
                 raise _IndexDamage(f"{owner}/{name}: the marker and its record disagree")
             if is_open(rec):
                 open_recs.append(rec)
@@ -3558,36 +3589,83 @@ def _indexed(state_dir: Path, meta: Mapping[str, Any]
     return open_recs, stale
 
 
+def _indexable(rec: Mapping[str, Any], owner: str) -> bool:
+    """What the index needs of a strictly read record beyond its shape: it
+    is the owner's, and its take_seq is an integer (the marker's content)."""
+    return rec.get("owner") == owner and type(rec.get("take_seq")) is int
+
+
 def _full_walk(state_dir: Path, meta: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
-    """Every record of every owner, read; the open ones returned, and the
-    index REBUILT from what was read: a marker added for every open record
-    without one, and removed for every closed or absent record. Any read
-    failure raises before a single marker is removed (never a removal from a
-    partial view). A marker whose key has a take in progress is the take's
-    own and is left alone."""
+    """Every record of every owner, read strictly; the open ones returned,
+    and the index REBUILT from what was read: a marker added (or rewritten)
+    for every open record, and removed for every key with no record.
+
+    A discovery that cannot be COMPLETED establishes nothing: an owner whose
+    journal root cannot be listed, whose root is missing while the
+    bookkeeping counts live records in it, or which holds a key directory
+    without a sound record (no regular record, unreadable, not a record)
+    is UNRESOLVED. Its markers are all kept, nothing of its index is
+    removed, and the walk is not complete, so the next pass walks fully
+    again and the schedule does not advance. The open records that WERE
+    read are still returned: each is genuinely open. A key directory whose
+    take is in progress (`pending_op` take) is the take's own and is
+    neither damage nor removed."""
     open_recs: List[Dict[str, Any]] = []
     seen_open: Dict[str, set] = {}
+    unresolved: set = set()
     complete = True
+    op = meta.get("pending_op") or {}
+    in_take = (op.get("owner"), op.get("key")) if op.get("op") == "take" else None
     for owner in sorted(meta["roots"]):
         root = journal_root(state_dir, owner)
         seen_open[owner] = set()
-        for d in sorted(root.iterdir()) if root.is_dir() else ():
-            if not (d.is_dir() and _KEY_RE.fullmatch(d.name) and (d / RECORD).is_file()):
+        if not root.is_dir():
+            if (meta["roots"][owner] or {}).get("live"):
+                logger.warning("peer recovery: %s's journal root is missing while %s live "
+                               "record(s) are counted; its index is kept", owner,
+                               meta["roots"][owner]["live"])
+                unresolved.add(owner)
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError as e:
+            logger.warning("peer recovery: %s's journal root cannot be listed (%s); its index "
+                           "is kept", owner, type(e).__name__)
+            unresolved.add(owner)
+            continue
+        for d in entries:
+            if not (d.is_dir() and _KEY_RE.fullmatch(d.name)):
                 continue
-            rec = json.loads((d / RECORD).read_text(encoding="utf-8"))
+            try:
+                rec = _strict_record(d)
+                if not _indexable(rec, owner):
+                    raise _Unsound("not_indexable")
+            except _Unsound as u:
+                if (owner, d.name) == in_take:
+                    continue
+                logger.warning("peer recovery: %s/%s: the record is unsound (%s); %s's index "
+                               "is kept", owner, d.name, u.why, owner)
+                unresolved.add(owner)
+                continue
             if is_open(rec):
                 open_recs.append(rec)
                 seen_open[owner].add(d.name)
     # The rebuild, only after every record was read.
-    op = meta.get("pending_op") or {}
-    in_take = (op.get("owner"), op.get("key")) if op.get("op") == "take" else None
     for owner, keys in seen_open.items():
         od = open_dir(state_dir, owner)
-        present = set(e.name for e in od.iterdir()) if od.is_dir() else set()
-        for rec in (r for r in open_recs if r["owner"] == owner):
-            k = rec["key"]
-            if k not in present or _marker_seq(od / k) != rec["take_seq"]:
-                _mark_open(state_dir, owner, k, rec["take_seq"])
+        try:
+            present = set(e.name for e in od.iterdir()) if od.is_dir() else set()
+            for rec in (r for r in open_recs if r["owner"] == owner):
+                k = rec["key"]
+                if k not in present or _marker_seq(od / k) != rec["take_seq"]:
+                    _mark_open(state_dir, owner, k, rec["take_seq"])
+        except OSError as e:
+            logger.warning("peer recovery: %s's index cannot be rebuilt (%s)", owner, e)
+            complete = False
+            continue
+        if owner in unresolved:
+            complete = False
+            continue
         for k in present - keys:
             if (owner, k) == in_take:
                 continue

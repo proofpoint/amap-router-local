@@ -286,9 +286,9 @@ class DamageTests(_Bound):
         with mock.patch.object(Path, "iterdir", iterdir), \
                 mock.patch.object(peerjournal, "_full_walk",
                                   lambda *a_, **k: calls.append(1) or realf(*a_, **k)):
-            with self.assertRaises(PermissionError):
-                self.worklist()            # the full walk's rebuild cannot list it either
+            got = self.worklist()          # the full walk's rebuild cannot list it either
         self.assertEqual(calls, [1])
+        self.assertEqual(sorted(got), sorted([self.a, self.b]), "recovery still runs")
         self.assertTrue(peerjournal._RECOVERY[os.path.realpath(str(self.state_dir))]["required"],
                         "a failed walk establishes nothing: the next pass walks fully")
 
@@ -304,8 +304,7 @@ class FailedWalkTests(_Bound):
         a = self.take(self.raw(), entry="a")
         b = self.take(self.raw(), entry="b")
         (peerjournal.record_dir(self.state_dir, OWNER, b) / peerjournal.RECORD).write_text("{")
-        with self.assertRaises(ValueError):
-            self.worklist()
+        self.assertEqual(self.worklist(), [a], "what was read is still recovered")
         self.assertTrue(self.state()["required"])
         self.assertIsNone(self.state()["last_full"])
         self.assertTrue(self.marker(a).exists() and self.marker(b).exists(),
@@ -322,6 +321,165 @@ class FailedWalkTests(_Bound):
         (peerjournal.open_dir(self.state_dir, OWNER) / ("e" * 64)).mkdir()
         self.assertEqual(self.worklist(), [a], "recovery still runs")
         self.assertTrue(self.state()["required"], "but the index is not trusted")
+
+
+class UnresolvedDiscoveryTests(_Bound):
+    """A full walk that cannot RESOLVE an entry establishes nothing (Codex
+    B1): its owner keeps every marker, the next pass walks fully and the
+    schedule does not advance. Each with a healthy companion."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = self.take(self.raw(), entry="a")
+        self.b = self.take(self.raw(), entry="b")
+        self.worklist()
+        self.good = self.state()["last_full"]
+        self.clock[0] += 60
+
+    def state(self):
+        return peerjournal._RECOVERY[os.path.realpath(str(self.state_dir))]
+
+    def assert_nothing_established(self):
+        self.assertTrue(self.marker(self.a).exists() and self.marker(self.b).exists(),
+                        "every marker of the unresolved owner is kept")
+        self.assertTrue(self.state()["required"], "the next pass walks fully")
+        self.assertEqual(self.state()["last_full"], self.good, "the schedule did not advance")
+
+    def test_a_key_directory_without_its_record_keeps_its_marker(self):
+        (peerjournal.record_dir(self.state_dir, OWNER, self.b) / peerjournal.RECORD).unlink()
+        self.assertEqual(self.worklist(), [self.a], "what was read is still recovered")
+        self.assert_nothing_established()
+
+    def test_a_missing_journal_root_with_live_records_keeps_every_marker(self):
+        self.assertGreater(self.meta()["roots"][OWNER]["live"], 0)
+        shutil.rmtree(peerjournal.journal_root(self.state_dir, OWNER))
+        self.assertEqual(self.worklist(), [])
+        self.assert_nothing_established()
+
+    def test_an_unlistable_journal_root_keeps_every_marker(self):
+        real = Path.iterdir
+        root = peerjournal.journal_root(self.state_dir, OWNER)
+
+        def iterdir(p):
+            if Path(p) == root:
+                raise PermissionError(13, "denied")
+            return real(p)
+        self.marker(self.a).write_text("999")              # force this pass to walk fully
+        with mock.patch.object(Path, "iterdir", iterdir):
+            self.assertEqual(self.worklist(), [])
+        self.assertTrue(self.marker(self.b).exists())
+        self.assertTrue(self.state()["required"])
+        self.assertEqual(self.state()["last_full"], self.good)
+
+    def test_the_companion_a_proven_orphan_marker_is_removed_and_the_walk_completes(self):
+        ghost = peerjournal.record_key(intake="candidates", gen="g1", owner=OWNER,
+                                       entry_id="ghost")
+        self.marker(self.a).write_text("999")              # force this pass to walk fully
+        self.marker(ghost).write_text("99")
+        self.assertEqual(sorted(self.worklist()), sorted([self.a, self.b]))
+        self.assertFalse(self.marker(ghost).exists(), "no key directory: a proven orphan")
+        self.assertFalse(self.state()["required"])
+        self.assertEqual(self.state()["last_full"], self.clock[0])
+
+
+class StrictShapeTests(_Bound):
+    """Phase 1 validates each record with the strict reader's own check
+    (Codex B2): a malformed record behind a sound earlier entry forces the
+    full walk, and the full walk cannot resolve it either, so its marker is
+    kept and nothing is trusted."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = self.take(self.raw(), entry="a")
+        self.b = self.take(self.raw(), entry="b")
+        self.worklist()
+        self.clock[0] += 60
+
+    def state(self):
+        return peerjournal._RECOVERY[os.path.realpath(str(self.state_dir))]
+
+    def rewrite_b(self, edit):
+        path = peerjournal.record_dir(self.state_dir, OWNER, self.b) / peerjournal.RECORD
+        rec = json.loads(path.read_text())
+        edit(rec)
+        path.write_text(json.dumps(rec))
+
+    def assert_falls_back_and_keeps(self):
+        calls = []
+        real = peerjournal._full_walk
+        with mock.patch.object(peerjournal, "_full_walk",
+                               lambda *a_, **k: calls.append(1) or real(*a_, **k)):
+            got = self.worklist()
+        self.assertEqual(calls, [1], "the damage forces the full walk before any effect")
+        self.assertEqual(got, [self.a], "the unsound record is never evaluated")
+        self.assertTrue(self.marker(self.b).exists(), "its marker is kept")
+        self.assertTrue(self.state()["required"], "and nothing is trusted")
+
+    def test_a_record_without_its_control_member(self):
+        self.rewrite_b(lambda r: r.pop("control"))
+        self.assert_falls_back_and_keeps()
+
+    def test_a_record_whose_control_is_not_an_object(self):
+        self.rewrite_b(lambda r: r.__setitem__("control", "x"))
+        self.assert_falls_back_and_keeps()
+
+    def test_a_take_seq_that_is_not_an_integer(self):
+        self.rewrite_b(lambda r: r.__setitem__("take_seq", float(r["take_seq"])))
+        self.assert_falls_back_and_keeps()
+
+    def test_a_symlinked_record(self):
+        path = peerjournal.record_dir(self.state_dir, OWNER, self.b) / peerjournal.RECORD
+        aside = self.tmp / "aside.json"
+        os.replace(path, aside)
+        os.symlink(aside, path)
+        self.assert_falls_back_and_keeps()
+
+    def test_a_malformed_closed_record_keeps_its_marker(self):
+        self.close(self.b)
+        self.marker(self.b).write_text(str(peerjournal.read_record(
+            self.state_dir, OWNER, self.b)["take_seq"]))   # a crash before the unlink
+        self.rewrite_b(lambda r: r.pop("control"))
+        self.assert_falls_back_and_keeps()
+
+    def test_the_companion_sound_records_stay_indexed(self):
+        calls = []
+        real = peerjournal._full_walk
+        with mock.patch.object(peerjournal, "_full_walk",
+                               lambda *a_, **k: calls.append(1) or real(*a_, **k)):
+            got = self.worklist()
+        self.assertEqual((calls, sorted(got)), ([], sorted([self.a, self.b])))
+
+
+class OverlongMarkerTests(_Bound):
+    """A marker's content is read BOUNDED (Codex B3): a decimal past the
+    bound is index damage, never an unbounded read or an int() past the
+    interpreter's digit limit, and the rebuild repairs it."""
+
+    def test_a_five_thousand_digit_marker_is_damage_and_is_repaired(self):
+        a = self.take(self.raw(), entry="a")
+        b = self.take(self.raw(), entry="b")
+        self.worklist()
+        self.clock[0] += 60
+        self.marker(a).write_text("9" * 5000)
+        calls = []
+        real = peerjournal._full_walk
+        with mock.patch.object(peerjournal, "_full_walk",
+                               lambda *a_, **k: calls.append(1) or real(*a_, **k)):
+            try:
+                got = self.worklist()
+            except ValueError as e:
+                self.fail(f"an overlong marker escaped as {e!r}")
+        self.assertEqual((calls, sorted(got)), ([1], sorted([a, b])))
+        seq = peerjournal.read_record(self.state_dir, OWNER, a)["take_seq"]
+        self.assertEqual(self.marker(a).read_text(), str(seq), "rebuilt from the record")
+        self.assertFalse(peerjournal._RECOVERY[os.path.realpath(str(self.state_dir))]["required"])
+
+
+class ResetKeepsTheIndexTests(_Bound):
+
+    def test_reset_keeps_the_index_beside_the_journal(self):
+        from router import reset as reset_mod
+        self.assertTrue(reset_mod._kept(self.cfg, peerjournal.OPEN_DIR))
 
 
 class UpgradeTests(_Bound):
@@ -386,11 +544,9 @@ class ScheduleTests(_Bound):
         good = self.state()["last_full"]
         (peerjournal.record_dir(self.state_dir, OWNER, b) / peerjournal.RECORD).write_text("{")
         self.clock[0] += peerjournal.FULL_WALK_S
-        with self.assertRaises(ValueError):
-            self.worklist()
+        self.assertEqual(self.worklist(), [a])
         self.assertTrue(self.state()["required"], "the next pass walks fully")
         self.assertEqual(self.state()["last_full"], good, "the schedule did not advance")
-        del a
 
     def test_a_take_in_progress_keeps_its_marker_through_a_full_walk(self):
         key = peerjournal.record_key(intake="candidates", gen="g1", owner=OWNER, entry_id="e1")
