@@ -25,6 +25,7 @@ W, I, D, F, U, R, S = (T + "IndexWriteTests.", T + "IndexedPassTests.", T + "Dam
                        T + "RecoverUsesTheWorklistTests.", T + "ScheduleTests.")
 UD, SS, OL, RK = (T + "UnresolvedDiscoveryTests.", T + "StrictShapeTests.",
                   T + "OverlongMarkerTests.", T + "ResetKeepsTheIndexTests.")
+SC = T + "StaleCleanupLivenessTests."
 PJ = "router/peerjournal.py"
 RS = "router/reset.py"
 
@@ -73,8 +74,8 @@ M = [
   '            return sorted(open_recs, key=lambda r: r["key"])\n',
   [I + "test_an_indexed_pass_evaluates_the_open_set_in_take_seq_order"]),
  ("B12 phase 2 leaves a closed record's marker", PJ,
-  '            for owner, k in stale:\n                _unmark_open(state_dir, owner, k)\n',
-  '            for owner, k in stale:\n                pass\n',
+  '            for owner, k in stale:\n                try:\n                    _unmark_open(state_dir, owner, k)\n',
+  '            for owner, k in stale:\n                try:\n                    pass\n',
   [I + "test_a_closed_records_marker_is_sound_and_unlinked_in_phase_2"]),
  ("B13 a closed record's marker is damage", PJ,
   '            else:\n                stale.append((owner, name))\n',
@@ -149,6 +150,10 @@ M = [
   '            raw = f.read(_MARKER_MAX + 1)\n',
   '            raw = f.read()\n            _MARKER_MAX = len(raw)\n',
   [OL + "test_a_five_thousand_digit_marker_is_damage_and_is_repaired"]),
+ ("B32 a failed stale unlink stops the indexed pass", PJ,
+  '                try:\n                    _unmark_open(state_dir, owner, k)\n                except OSError as e:\n',
+  '                try:\n                    _unmark_open(state_dir, owner, k)\n                except KeyError as e:\n',
+  [SC + "test_a_failed_stale_unlink_still_returns_the_open_records"]),
  ("B31 a reset removes the index", RS,
   '               PEER_JOURNAL_DIR, PEER_OPEN_DIR)', '               PEER_JOURNAL_DIR)',
   [RK + "test_reset_keeps_the_index_beside_the_journal"]),

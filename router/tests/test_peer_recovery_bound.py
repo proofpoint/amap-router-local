@@ -475,6 +475,50 @@ class OverlongMarkerTests(_Bound):
         self.assertFalse(peerjournal._RECOVERY[os.path.realpath(str(self.state_dir))]["required"])
 
 
+class StaleCleanupLivenessTests(_Bound):
+    """An indexed pass's cleanup of a CLOSED record's marker is best effort
+    (Codex B4): a failure to unlink it is logged and the marker kept, and
+    the validated open records are still returned, before any full walk."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = self.take(self.raw(), entry="a")
+        self.b = self.take(self.raw(), entry="b")
+        self.worklist()
+        real = peerjournal._unmark_open
+        with mock.patch.object(peerjournal, "_unmark_open", lambda *a_, **k: None):
+            self.close(self.b)                     # a crash before the close path's unlink
+        self._real_unmark = real
+        self.assertTrue(self.marker(self.b).exists())
+
+    def failing_for_b(self):
+        real = self._real_unmark
+
+        def unmark(state_dir, owner, key, **kw):
+            if key == self.b:
+                raise PermissionError(13, "denied")
+            return real(state_dir, owner, key, **kw)
+        return mock.patch.object(peerjournal, "_unmark_open", unmark)
+
+    def test_a_failed_stale_unlink_still_returns_the_open_records(self):
+        self.clock[0] += 60
+        calls = []
+        realf = peerjournal._full_walk
+        with self.failing_for_b(), mock.patch.object(
+                peerjournal, "_full_walk", lambda *a_, **k: calls.append(1) or realf(*a_, **k)):
+            try:
+                got = self.worklist()
+            except OSError as e:
+                self.fail(f"the advisory cleanup stopped recovery: {e!r}")
+        self.assertEqual((calls, got), ([], [self.a]), "indexed, and the open record returned")
+        self.assertTrue(self.marker(self.b).exists(), "the marker that failed is kept")
+
+    def test_the_companion_the_unlink_succeeds_and_the_marker_goes(self):
+        self.clock[0] += 60
+        self.assertEqual(self.worklist(), [self.a])
+        self.assertFalse(self.marker(self.b).exists())
+
+
 class ResetKeepsTheIndexTests(_Bound):
 
     def test_reset_keeps_the_index_beside_the_journal(self):

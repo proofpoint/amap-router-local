@@ -3519,7 +3519,14 @@ def _recovery_worklist(state_dir: Path, meta: Mapping[str, Any]) -> List[Dict[st
             logger.warning("peer recovery: the not-done index is damaged (%s); walking fully", e)
         else:
             for owner, k in stale:
-                _unmark_open(state_dir, owner, k)
+                try:
+                    _unmark_open(state_dir, owner, k)
+                except OSError as e:
+                    # Advisory cleanup only: a closed record's marker that
+                    # stays is read, found closed and unlinked again next
+                    # pass. It never stops the validated open records.
+                    logger.warning("peer recovery: %s/%s/%s cannot be removed (%s)", owner,
+                                   OPEN_DIR, k, e)
             return sorted(open_recs, key=lambda r: r["take_seq"])
     st["required"] = True                   # cleared only by a COMPLETE walk
     open_recs, complete = _full_walk(state_dir, meta)
