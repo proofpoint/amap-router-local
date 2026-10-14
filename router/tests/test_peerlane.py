@@ -739,11 +739,23 @@ class RecordSchemaTests(_Send):
         self.drain(dataclasses.replace(cfg, reload_failed=True))
         return cfg, inflight.read_record(cfg, "alice", "00000001")
 
-    def test_a_control_pin_has_no_producer(self):
+    def test_an_unknown_signed_kind_has_no_producer(self):
         _cfg, record = self.staged()
-        record["peer"]["kind"] = "control"
+        record["peer"]["kind"] = "bogus"
+        with self.assertRaisesRegex(inflight.RecordDamaged, "no production producer"):
+            inflight.check_record(record, runtime=True)
         with self.assertRaisesRegex(inflight.RecordDamaged, "no production producer"):
             inflight.check_record(record)
+
+    def test_a_control_pin_is_damage_outside_the_runtime_namespace(self):
+        _cfg, record = self.staged()
+        record["peer"]["kind"] = "control"
+        # The kind check runs before the statement's own kind is compared,
+        # so the namespace rule is what refuses it.
+        with self.assertRaisesRegex(inflight.RecordDamaged, "kind|namespace"):
+            inflight.check_record(record)
+        with self.assertRaisesRegex(inflight.RecordDamaged, "wrong namespace"):
+            inflight.check_record(self.staged()[1], runtime=True)
 
     def test_a_pin_naming_another_recipient_is_damage(self):
         _cfg, record = self.staged()
@@ -1100,37 +1112,49 @@ class MintTests(unittest.TestCase):
 
 
 class IssuedIdGrammarTests(_Send):
-    """`write_issued` and `read_ledger` accept exactly this router's own
-    mints: 23 characters, never a leading `-`."""
+    """`write_issued` and `read_ledger` accept a record id in the statement
+    id grammar (`^[A-Za-z0-9_-]+$`, at most 128 characters): this router's
+    own mints, and the foreign shapes a seeded record carries. Only the mint
+    is held to `PEER_ID_RE`."""
 
     def record(self, peer_id):
         return peerlane.issued_record(peer_id=peer_id, logical_id="alice",
                                       local_address=f"alice@{FD}", remote=TRUSTED,
                                       generation="0" * 32, expires_at="2026-10-20T00:00:00Z")
 
-    def test_a_real_mint_is_written_and_read_back(self):
+    def test_a_real_mint_and_foreign_shapes_are_written_and_read_back(self):
         cfg = self.cfg()
-        peer_id = peerlane.mint_peer_id()
-        try:
-            peerlane.write_issued(cfg, self.record(peer_id))
-        except ValueError as e:
-            self.fail(f"a real mint was refused: {e}")
-        self.assertEqual(peerlane.read_ledger(cfg, "alice", peer_id)["id"], peer_id)
+        for peer_id in (peerlane.mint_peer_id(), "0123456789abcdef" * 2, "A" * 24, "x" * 128):
+            with self.subTest(peer_id=peer_id):
+                try:
+                    peerlane.write_issued(cfg, self.record(peer_id))
+                except ValueError as e:
+                    self.fail(f"an id in the statement grammar was refused: {e}")
+                self.assertEqual(peerlane.read_ledger(cfg, "alice", peer_id)["id"], peer_id)
 
-    def test_anything_else_is_refused_and_never_read(self):
+    def test_outside_the_statement_grammar_is_refused_and_never_read(self):
         cfg = self.cfg()
-        good = peerlane.mint_peer_id()
-        for why, peer_id in (("22 characters", good[:22]), ("a leading dash", "-" + good[1:]),
-                             ("24 characters", good + "A"), ("a trailing newline", good + "\n")):
+        for why, peer_id in (("empty", ""), ("a dot", "."), ("a slash", "a/b"),
+                             ("129 characters", "x" * 129), ("a trailing newline", "abc\n"),
+                             ("a space", "a b")):
             with self.subTest(why=why):
                 with self.assertRaises(ValueError):
                     peerlane.write_issued(cfg, self.record(peer_id))
+                if peer_id in ("", ".", "a/b"):
+                    continue    # not a plantable single path component
                 # A well-formed record planted at that id's path: only the
                 # grammar can make read_ledger refuse it.
                 path = peerlane.ledger_path(cfg, "alice", peer_id)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(self.record(peer_id)), encoding="utf-8")
                 self.assertIsNone(peerlane.read_ledger(cfg, "alice", peer_id))
+
+    def test_the_mint_grammar_is_exactly_23_characters_without_a_leading_dash(self):
+        good = "A" * 23
+        self.assertIsNotNone(peerlane.PEER_ID_RE.fullmatch(good))
+        for bad in (good[:22], good + "A", "-" + good[1:], good + "\n"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(peerlane.PEER_ID_RE.fullmatch(bad))
 
 
 class LedgerPathTests(_Send):

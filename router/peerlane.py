@@ -67,6 +67,13 @@ STATEMENT_MAX_BYTES = 8192
 #: id exists anywhere, since no peer signing has ever run live.
 PEER_ID_BYTES = 17
 PEER_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{22}\Z")
+#: A ledger record's id, in EITHER direction: the statement id grammar
+#: (`^[A-Za-z0-9_-]+$`), at most 128 characters, a safe path component. An
+#: `issued` id is this router's mint, a `placed` id another runtime's, and a
+#: seeded record may carry either shape: only the MINT is held to
+#: `PEER_ID_RE`. A mail notice id never resolves here because this is a
+#: different store, never because of its shape.
+RECORD_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 #: The peer ledger's directory under a logical_id's private state.
 PEER_LEDGER_DIR = "peer-ledger"
 #: The peer ledger record's members, exactly: a closed record, keyed by
@@ -528,8 +535,8 @@ def write_issued(cfg: RouterConfig, record: Mapping[str, str]) -> None:
     """Write `record` durably, never replacing one: an existing id is a bug."""
     if set(record) != set(LEDGER_MEMBERS) or record["direction"] != "issued":
         raise ValueError(f"not a closed issued record: {sorted(record)}")
-    if not PEER_ID_RE.fullmatch(record["id"]):
-        raise ValueError("the peer id is not a minted one")
+    if not isinstance(record["id"], str) or not RECORD_ID_RE.fullmatch(record["id"]):
+        raise ValueError("the record id is outside the statement id grammar")
     path = ledger_path(cfg, record["local"], record["id"])
     if os.path.lexists(path):
         raise FileExistsError(f"{path}: a peer id was minted twice")
@@ -540,7 +547,7 @@ def write_issued(cfg: RouterConfig, record: Mapping[str, str]) -> None:
 def read_ledger(cfg: RouterConfig, logical_id: str, peer_id: str) -> Optional[Dict[str, str]]:
     """The ledger record for `peer_id` under `logical_id`, or None (absent,
     unreadable, or not closed)."""
-    if not PEER_ID_RE.fullmatch(peer_id or ""):
+    if not isinstance(peer_id, str) or not RECORD_ID_RE.fullmatch(peer_id):
         return None
     try:
         doc = json.loads(ledger_path(cfg, logical_id, peer_id).read_text(encoding="utf-8"))

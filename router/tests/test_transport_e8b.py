@@ -22,6 +22,9 @@ ADDED_AT_3_1 = ['HOPFSOPS_OPTIONAL_METHODS', 'IntakeRemover', 'OPTIONAL_FACTORIE
 ADDED_AT_3_3 = ['DELEGATION_FACTORIES', 'DELEGATION_MINOR', 'DelegationCapabilities', 'NO_ARGUMENTS', 'PEER_ERROR_NAMES', 'check_delegation']
 #: The names (3, 4) adds: the candidate view's gate.
 ADDED_AT_3_4 = ['CANDIDATE_REASONS_3_4', 'CODEC_OPTIONAL_ATTRIBUTES', 'CODEC_OPTIONAL_METHODS']
+#: The runtime capability's table, provisional until the runtime identity unit freezes.
+ADDED_AT_3_5 = ['RUNTIME_CAPABILITY', 'RUNTIME_MINOR', 'runtime_capability_declared',
+                'runtime_factory']
 
 ABSENT = b""
 CALLABLE = (b"\nREMOVER_CALLS = []\n"
@@ -107,7 +110,7 @@ class SurfaceTests(_PluginDir):
                 names.add(node.target.id)
         public = {n for n in names if not n.startswith("_")}
         self.assertEqual(public, set(SURFACE_3_0) | set(ADDED_AT_3_1) | set(ADDED_AT_3_3)
-                         | set(ADDED_AT_3_4))
+                         | set(ADDED_AT_3_4) | set(ADDED_AT_3_5))
 
     def test_remove_results_are_their_own_vocabulary(self):
         self.assertEqual(transport.REMOVE_RESULTS, ("removed", "absent"))

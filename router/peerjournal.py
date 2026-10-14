@@ -385,6 +385,27 @@ def read_record(state_dir: Path, owner: str, key: str) -> Dict[str, Any]:
     return json.loads((record_dir(state_dir, owner, key) / RECORD).read_text(encoding="utf-8"))
 
 
+def all_records(state_dir: Path) -> List[Dict[str, Any]]:
+    """Every journal record, of every owner (read only; a record that cannot
+    be read is skipped: reconcile reports it)."""
+    state_dir = Path(state_dir)
+    try:
+        meta = read_meta(state_dir)
+    except (OSError, ValueError, StoreAbsent, peerclock.ClockUntrusted):
+        return []
+    out = []
+    for owner in sorted(meta["roots"]):
+        root = journal_root(state_dir, owner)
+        for d in sorted(root.iterdir()) if root.is_dir() else ():
+            if not (d.is_dir() and _KEY_RE.fullmatch(d.name) and (d / RECORD).is_file()):
+                continue
+            try:
+                out.append(json.loads((d / RECORD).read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+    return out
+
+
 def write_record(state_dir: Path, record: Dict[str, Any]) -> Dict[str, Any]:
     """Replace a record with `record`, its revision raised by one, under the
     intent discipline. Returns the record as written."""
@@ -960,15 +981,19 @@ class Resolved:
 class DecideHooks:
     """check8 (pre-reservation), reply, edge and policy (post-reservation)
     and control_receive. Every one is required: a caller cannot skip one by
-    omission."""
-    __slots__ = ("check8", "reply", "edge", "policy", "control_receive")
+    omission. `context` is the `peerpolicy.HookContext` the set was built
+    over (`peerpolicy.decide_hooks`), or None for a set built by hand
+    (`absent_hooks`, and tests that drive `evaluate` directly)."""
+    __slots__ = ("check8", "reply", "edge", "policy", "control_receive", "context")
 
-    def __init__(self, *, check8: Any, reply: Any, edge: Any, policy: Any, control_receive: Any):
+    def __init__(self, *, check8: Any, reply: Any, edge: Any, policy: Any, control_receive: Any,
+                 context: Any = None):
         for name, fn in (("check8", check8), ("reply", reply), ("edge", edge),
                          ("policy", policy), ("control_receive", control_receive)):
             if not callable(fn):
                 raise TypeError(f"hook {name} is required and must be callable")
             object.__setattr__(self, name, fn)
+        object.__setattr__(self, "context", context)
 
     def __setattr__(self, name, value):
         raise AttributeError("DecideHooks is immutable")
@@ -1021,6 +1046,11 @@ class Ctx:
                  retired: Any, first_pass: bool = False):
         if not isinstance(hooks, DecideHooks):
             raise TypeError("hooks: a DecideHooks")
+        bound = hooks.context
+        if bound is not None and not (bound.cfg is cfg and bound.delegation is delegation
+                                      and bound.state_dir == Path(state_dir)
+                                      and bound.now is now and bound.clock is clock):
+            raise TypeError("hooks: built over another pass's context")
         self.state_dir, self.cfg, self.delegation, self.hooks = Path(state_dir), cfg, delegation, hooks
         self.now, self.clock, self.view, self.effects, self.retired = now, clock, view, effects, retired
         #: The first pass of this process: unpublishable holds are re-tried
@@ -1030,11 +1060,35 @@ class Ctx:
 
 
 def _control(outcome: str, cause: str, about: Optional[str],
-             policy_code: Optional[str] = None) -> Dict[str, Any]:
-    c = {"outcome": outcome, "cause": cause, "about": about, "sent": False}
+             policy_code: Optional[str] = None, *, to: Optional[str] = None) -> Dict[str, Any]:
+    """A pending control notice, written in the same journal write as its
+    disposition. `to` is the destination: the configured runtime address of
+    the statement key's owner at this write, or None when no configured
+    runtime owns the key. The send re-checks it and never redirects."""
+    c = {"outcome": outcome, "cause": cause, "about": about, "sent": False, "to": to}
     if policy_code is not None:
         c["policy_code"] = policy_code
     return c
+
+
+def _control_to(ctx: "Ctx", key_id: Any) -> Optional[str]:
+    """The configured runtime address of `key_id`'s owner, or None."""
+    dc = getattr(ctx.delegation, "config", None) or getattr(ctx.cfg, "delegation", None)
+    if dc is None or not isinstance(key_id, str):
+        return None
+    runtime = peerbind.runtime_for_key(dc, key_id)
+    return runtime.runtime if runtime is not None else None
+
+
+def _snapshot_key_id(state_dir: Path, record: Mapping[str, Any]) -> Optional[str]:
+    """The statement's key_id, from the snapshot."""
+    raw = read_snapshot(state_dir, record, SNAPSHOT_STATEMENT)
+    try:
+        doc = json.loads(raw) if raw is not None else None
+    except ValueError:
+        return None
+    key_id = doc.get("key_id") if isinstance(doc, dict) else None
+    return key_id if isinstance(key_id, str) else None
 
 
 def _codec_reason(ctx: Ctx, exc: BaseException) -> Optional[str]:
@@ -1166,6 +1220,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=cause,
                                        control=control))
     about = verdict.payload.get("id") if hasattr(verdict.payload, "get") else None
+    to = _control_to(ctx, verdict.key_id)
     if verdict.kind != "statement":
         out = ctx.hooks.control_receive(view, verdict)
         if isinstance(out, Hold):
@@ -1189,12 +1244,12 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
         return set_hold(ctx.state_dir, record, h.hold.reason, h.hold.detail, now)
     if isinstance(checked, peerbind.Demoted):
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=checked.cause,
-                                       control=_control("demoted", checked.cause, about)))
+                                       control=_control("demoted", checked.cause, about, to=to)))
     try:
         _rcp, record = reserve(ctx.state_dir, checked, record=record)
     except peerbind.ReservationCollision:
         return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE,
-                                       control=_control("dropped", DUPLICATE, about)))
+                                       control=_control("dropped", DUPLICATE, about, to=to)))
     return _reserved(ctx, record)
 
 
@@ -1226,7 +1281,8 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     auth = peerbind.authorise_checked(checked, cfg=ctx.cfg)
     if isinstance(auth, peerbind.NotHosted):
         return _finish(ctx, transition(sd, record, "dropped", now, cause=MISROUTED,
-                                       control=_control("dropped", MISROUTED, about)))
+                                       control=_control("dropped", MISROUTED, about,
+                                                        to=_control_to(ctx, checked.key_id))))
     if isinstance(auth, peerbind.Undecided):
         return set_hold(sd, record, "undecided", auth.reason, now)
     try:
@@ -1236,7 +1292,7 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             return set_hold(sd, record, "key_runtime_changed", None, now)
         return set_hold(sd, record, "undecided", f"stale:{e.detail}", now)
     payload = auth.payload
-    for name, call in (("reply", lambda: ctx.hooks.reply(payload)),
+    for name, call in (("reply", lambda: ctx.hooks.reply(payload, auth.hosted)),
                        ("edge", lambda: ctx.hooks.edge(payload, auth.hosted)),
                        ("policy", lambda: ctx.hooks.policy(payload, auth.hosted))):
         out = call()
@@ -1246,7 +1302,8 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             return _finish(ctx, transition(sd, record, "refused", now, cause=out.cause,
                                            policy_code=out.policy_code,
                                            control=_control("refused", out.cause, about,
-                                                            out.policy_code)))
+                                                            out.policy_code,
+                                                            to=_control_to(ctx, checked.key_id))))
         if name == "reply" and not isinstance(out, Resolved):
             raise TypeError("the reply hook returns Resolved, Refuse or Hold")
         if name != "reply" and out is not None:
@@ -1285,6 +1342,13 @@ def _decided(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     except peerbind.RecoveryCorrupt as e:
         return set_hold(sd, record, "recovery_corrupt", e.reason, now)
     try:
+        _write_placed(ctx, auth)
+    except Exception as e:  # noqa: BLE001 -- a placed record that cannot be written holds
+        from . import peerledger
+        if isinstance(e, peerledger.LedgerConflict):
+            return set_hold(sd, record, "recovery_corrupt", "placed_conflict", now)
+        raise
+    try:
         deliver.deliver_signed_peer(ctx.cfg, sd, auth,
                                     in_reply_to_resolved=auth.payload.get("in_reply_to"))
     except deliver.RecipientHeld:
@@ -1297,6 +1361,28 @@ def _decided(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     except peerbind.RecoveryCorrupt as e:
         return set_hold(sd, record, "recovery_corrupt", e.reason, now)
     return _done(ctx, record, disposed="placed", done_ts=format_utc_ts(now), retry=None)
+
+
+def _write_placed(ctx: Ctx, auth: Any) -> None:
+    """The `placed` ledger record of a decided statement, durable BEFORE its
+    notice (so a reply drafted the moment the notice appears resolves), and
+    written again, idempotently, when a recovery re-places. A recipient no
+    longer configured writes nothing: the placement itself refuses it."""
+    from . import config as config_mod
+    from . import generations as generations_mod
+    from . import peerledger
+    hosted = auth.hosted
+    if hosted not in getattr(ctx.cfg, "instances", {}):
+        return
+    payload = auth.payload
+    expires = parse_utc_ts(payload["ts"]) + timedelta(seconds=ctx.cfg.peer_reply_window_seconds)
+    last = config_mod.gen_key(ctx.cfg, hosted).rsplit("/", 1)[-1]
+    generation = (last[len(generations_mod.GEN_PREFIX):]
+                  if last.startswith(generations_mod.GEN_PREFIX) else last)
+    peerledger.write_placed(ctx.cfg, peerledger.placed_record(
+        record_id=payload["id"], logical_id=config_mod.state_key(ctx.cfg, hosted),
+        local_address=config_mod.address_for(hosted, ctx.cfg.fleet_domain),
+        remote=payload["from"], generation=generation, expires_at=format_utc_ts(expires)))
 
 
 def _finish(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -1369,7 +1455,9 @@ def _refuse_superseded(ctx: Ctx, record: Dict[str, Any], sup: Mapping[str, Any]
         about = _about(ctx.state_dir, record)
         record = transition(ctx.state_dir, record, "refused", ctx.now, cause="policy",
                             policy_code=sup["policy_code"],
-                            control=_control("refused", "policy", about, sup["policy_code"]))
+                            control=_control("refused", "policy", about, sup["policy_code"],
+                                             to=_control_to(ctx, _snapshot_key_id(ctx.state_dir,
+                                                                                  record))))
     return _finish(ctx, record)
 
 
@@ -1443,7 +1531,9 @@ def drop(ctx: Ctx, record: Dict[str, Any], *, by: str) -> Dict[str, Any]:
         return _finish(ctx, transition(sd, record, "refused", ctx.now, cause="policy",
                                        policy_code=DECISION_UNRECOVERABLE,
                                        control=_control("refused", "policy", _about(sd, record),
-                                                        DECISION_UNRECOVERABLE)))
+                                                        DECISION_UNRECOVERABLE,
+                                                        to=_control_to(ctx, _snapshot_key_id(
+                                                            sd, record)))))
     if record["state"] not in ("decided", "reserved") or not has_decision:
         raise DropRefused(f"{record['key']}: {record['state']} with no unrecoverable decision")
     try:
@@ -2127,14 +2217,33 @@ def _poll_tree_entry(ctx: "Ctx", effects: "TreeEffects", reader: Any, count: Any
     count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
 
 
-def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "peerclock.Clock",
+def _pass_hooks(cfg: Any, *, delegation: Any, state_dir: Path, now: datetime, clock: Any,
+                profile_factory: Any) -> DecideHooks:
+    """This pass's hooks: its context built from this pass's own objects (the
+    clock the pass fixed, its `now`), then `profile_factory(context)` (None:
+    `peerpolicy.production_profile`, the router's), whose profile must hold
+    exactly that context, then `peerpolicy.decide_hooks`."""
+    from . import peerpolicy
+    factory = peerpolicy.production_profile if profile_factory is None else profile_factory
+    hctx = peerpolicy.hook_context(cfg, delegation=delegation, state_dir=state_dir, now=now,
+                                   clock=clock)
+    profile = factory(hctx)
+    if getattr(profile, "context", None) is not hctx:
+        raise TypeError("profile_factory: the profile must hold the context it was given")
+    return peerpolicy.decide_hooks(profile)
+
+
+def poll_generation(cfg: Any, *, delegation: Any, clock: "peerclock.Clock",
                     now: datetime, logical_id: str, gen: str, link: str, reader: Any,
                     remover: Any, retired: Any, limit: int = 256,
                     read_refused: Tuple[type, ...] = (), first_pass: bool = False,
-                    current: bool = True, touched: Optional[set] = None) -> Dict[str, int]:
+                    current: bool = True, touched: Optional[set] = None,
+                    profile_factory: Any = None) -> Dict[str, int]:
     """One listing page of a generation's `candidates/`: each entry taken
     once (its bytes read once, into the snapshot) and evaluated; an entry
-    whose record is `done` is settled again (its removal retried)."""
+    whose record is `done` is settled again (its removal retried). The
+    hooks are built here, over this pass's clock and `now`
+    (`_pass_hooks`)."""
     state_dir = Path(cfg.state_dir)
     counts: Dict[str, int] = {}
 
@@ -2143,6 +2252,8 @@ def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "pe
 
     effects = TreeEffects(cfg, logical_id, gen, link, remover)
     view_of = _viewer(delegation)
+    hooks = _pass_hooks(cfg, delegation=delegation, state_dir=state_dir, now=now, clock=clock,
+                        profile_factory=profile_factory)
     ctx = Ctx(state_dir=state_dir, cfg=cfg, delegation=delegation, hooks=hooks, now=now,
               clock=clock, view=view_of, effects=effects, retired=retired, first_pass=first_pass)
     ckey = (str(state_dir), logical_id, gen)
@@ -2162,8 +2273,8 @@ def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "pe
     return counts
 
 
-def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideHooks,
-         now: datetime) -> Dict[str, Any]:
+def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, now: datetime,
+         profile_factory: Any = None) -> Dict[str, Any]:
     """One poll's signed-candidate pass, under the drain lock, ONLY with
     `delegation.inbound`: H advanced first, then every identity's every
     generation's `candidates/` (`poll_generation`, each isolated), then the
@@ -2216,11 +2327,12 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
                 remover = None
             try:
                 out[label] = poll_generation(
-                    cfg, delegation=delegation, hooks=hooks, clock=clock, now=now,
+                    cfg, delegation=delegation, clock=clock, now=now,
                     logical_id=lid, gen=gen, link=link, reader=reader, remover=remover,
                     retired=lambda r: hoplink_mod._is_retired(runtime, cfg, r["owner"], r["gen"]),
                     read_refused=read_refused, first_pass=first,
-                    current=gen == doc["current"], touched=touched)
+                    current=gen == doc["current"], touched=touched,
+                    profile_factory=profile_factory)
             except StoreBlocked:
                 logger.error("peer store blocked: an operation is unreconciled; nothing more "
                              "is taken until the next start")
@@ -2231,9 +2343,9 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
                 out[label] = {"errored": 1}
     for intake in HOST_INTAKES:
         try:
-            out[intake] = poll_host(cfg, fsops, delegation=delegation, hooks=hooks, clock=clock,
+            out[intake] = poll_host(cfg, fsops, delegation=delegation, clock=clock,
                                     now=now, intake=intake, first_pass=first,
-                                    touched=touched)
+                                    touched=touched, profile_factory=profile_factory)
         except DisposedUnavailable as e:
             logger.error("signed candidates %s: not taken: %s", intake, e)
             out[intake] = {"held_disposed_unavailable": 1}
@@ -2246,8 +2358,9 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
             logger.exception("signed candidates %s: isolated, continuing", intake)
             out[intake] = {"errored": 1}
     try:
-        out["recovered"] = recover(cfg, runtime, delegation=delegation, hooks=hooks, clock=clock,
-                                   now=now, first_pass=first, skip=touched)
+        out["recovered"] = recover(cfg, runtime, delegation=delegation, clock=clock,
+                                   now=now, first_pass=first, skip=touched,
+                                   profile_factory=profile_factory)
     except StoreBlocked:
         out["recovered"] = {"store_blocked": 1}
         return out
@@ -2408,9 +2521,10 @@ def _poll_host_entry(ctx: "Ctx", effects: "HostEffects", count: Any, *, intake: 
     count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
 
 
-def poll_host(cfg: Any, fsops: Any, *, delegation: Any, hooks: DecideHooks,
+def poll_host(cfg: Any, fsops: Any, *, delegation: Any,
               clock: "peerclock.Clock", now: datetime, intake: str,
-              first_pass: bool = False, touched: Optional[set] = None) -> Dict[str, int]:
+              first_pass: bool = False, touched: Optional[set] = None,
+              profile_factory: Any = None) -> Dict[str, int]:
     """One pass over a host intake: each committed entry taken once and
     evaluated; a `done` record's tombstone committed again if missing; then,
     after a complete listing, the tombstones of entries no longer listed
@@ -2426,6 +2540,8 @@ def poll_host(cfg: Any, fsops: Any, *, delegation: Any, hooks: DecideHooks,
     disposed_dirs(fsops, hop_root, intake)     # nothing is taken that could not be disposed of
     effects = HostEffects(fsops, hop_root, intake)
     view_of = _viewer(delegation)
+    hooks = _pass_hooks(cfg, delegation=delegation, state_dir=state_dir, now=now, clock=clock,
+                        profile_factory=profile_factory)
     ctx = Ctx(state_dir=state_dir, cfg=cfg, delegation=delegation, hooks=hooks, now=now,
               clock=clock, view=view_of, effects=effects, retired=lambda _r: False,
               first_pass=first_pass)
@@ -2507,9 +2623,9 @@ def operator_quarantine_candidate(cfg: Any, now: datetime, *, key: str,
 
 
 
-def recover(cfg: Any, runtime: Any, *, delegation: Any, hooks: DecideHooks,
+def recover(cfg: Any, runtime: Any, *, delegation: Any,
             clock: "peerclock.Clock", now: datetime, first_pass: bool = False,
-            skip: Iterable[str] = ()) -> Dict[str, int]:
+            skip: Iterable[str] = (), profile_factory: Any = None) -> Dict[str, int]:
     """Every record that is not `done` (and every done tree record whose
     entry's removal never succeeded), BY ITS RECORDED STATE, whether or not
     its entry is listed again: in `take_seq` order, each with the effects of
@@ -2539,6 +2655,8 @@ def recover(cfg: Any, runtime: Any, *, delegation: Any, hooks: DecideHooks,
                 pending.append(rec)
     view_of = _viewer(delegation)
     hop_root = Path(cfg.hop.root) if getattr(cfg, "hop", None) is not None else None
+    hooks = _pass_hooks(cfg, delegation=delegation, state_dir=state_dir, now=now, clock=clock,
+                        profile_factory=profile_factory)
     for rec in sorted(pending, key=lambda r: r["take_seq"]):
         try:
             if rec["intake"] in HOST_INTAKES:

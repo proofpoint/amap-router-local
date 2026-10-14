@@ -182,7 +182,48 @@ OPTIONAL_FACTORIES: Mapping[str, Tuple[Tuple[int, int], Optional[str]]] = {
     "make_intake_remover": ((3, 1), "HopFsOps"),
     "make_peer_codec": ((3, 3), None),
     "make_peer_errors": ((3, 3), NO_ARGUMENTS),
+    "make_runtime_sender": ((3, 5), "HopFsOps"),
+    "make_runtime_lister": ((3, 5), "HopFsOps"),
 }
+
+#: THE RUNTIME CAPABILITY, provisional until HOP-RUNTIME-IDENTITY freezes:
+#: every name this router calls to reach its own runtime control tree
+#: (`router/peercontrol.py`), in this one table, so that re-pointing it to
+#: the final shape is a change here and nowhere else.
+#: - `factory`: bound to one generation, closed settings
+#:   {hop_root, generation, peer_uid, address}; the sender protocol plus
+#:   `retire(retired_at)`, `retired()`, `retired_at()` and `identity()`.
+#: - `lister`: READ-ONLY, closed settings {hop_root, peer_uid};
+#:   `generations()` -> [(generation, "live" | "retired" | "unreadable")],
+#:   an absent runtime tree listing empty.
+#: Both are optional factories at `RUNTIME_MINOR`; a plugin declaring
+#: neither (every plugin today) leaves the runtime tree unavailable.
+RUNTIME_MINOR: Tuple[int, int] = (3, 5)
+RUNTIME_CAPABILITY: Mapping[str, str] = {
+    "factory": "make_runtime_sender",
+    "lister": "make_runtime_lister",
+    "generations": "generations",
+    "retire": "retire",
+    "retired": "retired",
+    "retired_at": "retired_at",
+    "identity": "identity",
+}
+
+
+def runtime_capability_declared(plugin: Any) -> bool:
+    """Whether `plugin` offers the runtime capability: BOTH factories among
+    the optional capabilities this runtime will call (loaded at or above
+    `RUNTIME_MINOR`, declared, callable)."""
+    caps = getattr(plugin, "optional_capabilities", frozenset())
+    return (RUNTIME_CAPABILITY["factory"] in caps and RUNTIME_CAPABILITY["lister"] in caps)
+
+
+def runtime_factory(plugin: Any, role: str) -> Callable[..., Any]:
+    """The plugin's `role` factory ("factory" or "lister") from its own
+    namespace; `AttributeError` when the capability is off."""
+    if not runtime_capability_declared(plugin):
+        raise AttributeError("the transport plugin offers no runtime capability")
+    return plugin.namespace[RUNTIME_CAPABILITY[role]]
 
 #: The minor delegation needs, and the four factories it needs callable.
 DELEGATION_MINOR: Tuple[int, int] = (3, 3)

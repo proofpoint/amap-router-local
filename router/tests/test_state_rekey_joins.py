@@ -328,7 +328,8 @@ class ReservedStateNameTests(RouterTestCase):
                                     peerbind.DECISION_KEY_FILE.casefold(),
                                     peerjournal.REPLAY_DIR.casefold(),
                                     peerjournal.VACANT_DIR.casefold(),
-                                    peerclock.CLOCK_FILE.casefold()}))
+                                    peerclock.CLOCK_FILE.casefold(),
+                                    config_mod.RUNTIME_NS.casefold()}))
         self.assertIsNone(config_mod._NAME_RE.fullmatch(lock.LOCK_NAME),
                           "the lock file's name must stay unrepresentable as an instance")
 

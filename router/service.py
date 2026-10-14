@@ -275,14 +275,13 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
             logger.exception("error in the inbound pass — isolated")
     # The signed-candidate pass, ONLY with `delegation.inbound` (refused at
     # load in this build): same lock, its own log line and status, never
-    # `summary`. The production hooks hold every candidate they would decide.
+    # `summary`. The production profile holds every statement at check8 and policy.
     if (cfg.delegation is not None and cfg.delegation.inbound
             and hoplink.is_runtime(transport) and report.state != "off"):
         from . import peerjournal, peerlane
         try:
             polled = peerjournal.poll(cfg, transport, report,
                                       delegation=peerlane.current(cfg),
-                                      hooks=peerjournal.absent_hooks(),
                                       now=clock.now())
             if polled:
                 logger.info("signed candidates: %s", polled)
@@ -290,6 +289,17 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
                 LAST_PEER_POLL.update(polled)
         except Exception:
             logger.exception("error in the signed-candidate pass — isolated")
+        # Control notices out: the pending ones, through the runtime tree,
+        # which is unavailable (and nothing is attempted) unless the plugin
+        # declares the runtime capability.
+        try:
+            from . import peercontrol
+            sent = peercontrol.send_pending(cfg, transport, delegation=peerlane.current(cfg),
+                                            now=clock.now())
+            if sent:
+                logger.info("control notices: %s", sent)
+        except Exception:
+            logger.exception("error in the control-notice pass — isolated")
     return summary
 
 
@@ -340,6 +350,14 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
                 peer_doc["inbound"] = bool(cfg.delegation.inbound)
                 if LAST_PEER_POLL:
                     peer_doc["last_poll"] = dict(LAST_PEER_POLL)
+                # Control notices out, and the runtime tree as the loaded
+                # plugin's capability shows it (`unavailable` without one).
+                try:
+                    from . import peercontrol
+                    peer_doc["controls"] = peercontrol.status_doc(
+                        cfg, None if transport is _LOAD else transport, now=clock.now())
+                except Exception:
+                    logger.exception("error reading the control notices for status — isolated")
                 tracker.record_peer_store(peer_doc)
             except Exception:
                 logger.exception("error reading the peer store for status — isolated")
