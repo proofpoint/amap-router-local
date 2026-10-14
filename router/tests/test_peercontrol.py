@@ -81,8 +81,11 @@ class _Control(ClockMixin, tpe._Eval):
         return self.tree.senders[self.gen()]
 
     def handover(self, key):
-        n = self.record(key)["control"]["attempt"]["n"]
-        return n, json.loads(self.port().pending[n])
+        attempt = self.record(key)["control"].get("attempt") or {}
+        n = attempt.get("n")
+        pending = self.port().pending if self.tree.senders else {}
+        self.assertIn(n, pending, "nothing was handed over")
+        return n, json.loads(pending[n])
 
 
 class PendingNoticeTests(_Control):
@@ -341,6 +344,28 @@ class VerbTests(_Control):
         self.tree.gens.update({"1" * 32: "live", "2" * 32: "live"})
         with self.assertRaises(ValueError):
             peercontrol.operator_adopt(self.cfg, self.cap(), "1" * 32, now=NOW, evidence="x")
+
+
+class ReservedIdTests(_Control):
+    """inflight.begin_reserved begins only under an id already reserved,
+    and never under a second id for a request in flight."""
+
+    def begin(self, n, req_id="r1"):
+        try:
+            inflight.begin_reserved(self.cfg, "bob", req_id, n, digest=None,
+                                    request_doc={"req_id": req_id, "draft": {"to": ["x@y.example"]}},
+                                    recipients=["x@y.example"])
+            return "begun"
+        except ValueError as e:
+            return str(e)
+
+    def test_an_unallocated_id_and_a_second_id_are_refused(self):
+        self.assertIn("never allocated", self.begin("00000001"))
+        n = inflight.reserve_transport_id(self.cfg, "bob")
+        self.assertEqual(self.begin(n), "begun")
+        m = inflight.reserve_transport_id(self.cfg, "bob")
+        self.assertIn("already in flight", self.begin(m))
+        self.assertEqual(self.begin(m, req_id="r2"), "begun")
 
 
 class StatementTests(unittest.TestCase):
