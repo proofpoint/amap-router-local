@@ -418,6 +418,11 @@ def operator_trust(state_dir: Path, now: datetime, *, evidence: str) -> Dict[str
             problems.append(f"unsafe object {bad}")
     if not problems:
         try:
+            _restore_root_witness(state_dir)
+        except OSError as e:
+            problems.append(f"cannot restore the epoch root or its witness: {e}")
+    if not problems:
+        try:
             _recount_removing(state_dir, targets)
         except EpochFault as e:
             problems.append(e.reason)
@@ -433,17 +438,19 @@ def operator_trust(state_dir: Path, now: datetime, *, evidence: str) -> Dict[str
         except OSError as e:
             problems.append(f"cannot complete a pair: {e}")
     meta = pj.read_meta(state_dir)
+    entry = meta["epochs"]
     try:
         live, total, _pairs, midprune = scan(state_dir)
     except EpochFault as e:
-        problems.append(e.reason)
-        live = total = midprune = -1
-    entry = meta["epochs"]
-    if (live, str(total)) != (entry["live"], entry["content_sum"]):
-        problems.append(f"the epoch store ({live} files) does not equal its bookkeeping "
-                        f"({entry['live']})")
-    if midprune:
-        problems.append(f"{midprune} pair(s) still hold two files")
+        problems.append(e.reason)       # no derived counts after a scan fault
+    else:
+        if (live, str(total)) != (entry["live"], entry["content_sum"]):
+            problems.append(f"the epoch store ({live} files) does not equal its bookkeeping "
+                            f"({entry['live']})")
+        if midprune:
+            problems.append(f"{midprune} pair(s) still hold two files")
+    if not _witness_holds(state_dir, entry["token"]):
+        problems.append("the epoch root does not hold the exact witness with the recorded token")
     if not problems:
         meta = pj.read_meta(state_dir)
         meta["epochs_untrusted"] = False
@@ -452,6 +459,32 @@ def operator_trust(state_dir: Path, now: datetime, *, evidence: str) -> Dict[str
               cleared=not problems, problems=problems[:20])
     return {"cleared": not problems, "problems": problems, "before": before,
             "after": _pairs_report(state_dir)}
+
+
+def _restore_root_witness(state_dir: Path) -> None:
+    """The trust verb's witness repair, durable and idempotent: the epoch
+    root created when absent, and the exact witness (re)written to the
+    token the bookkeeping records, as `_rebase_after_loss` restores it.
+    Runs only once every root entry is known safe (an unsafe `.witness`,
+    a link or a directory, has already kept the flag)."""
+    from . import peerjournal as pj
+    r = root(state_dir)
+    if not os.path.lexists(r):
+        r.mkdir(mode=0o700)
+        fsync_dir(Path(state_dir))
+    pj._restore_witness(state_dir, r / pj.WITNESS, pj.read_meta(state_dir)["epochs"]["token"])
+
+
+def _witness_holds(state_dir: Path, token: str) -> bool:
+    """A real root holding the exact regular witness, its contents `token`."""
+    from .peerjournal import WITNESS
+    r = root(state_dir)
+    if not (root_safe(r) and r.is_dir() and is_witness(r / WITNESS)):
+        return False
+    try:
+        return (r / WITNESS).read_text(encoding="ascii") == token
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 def _recount_removing(state_dir: Path, targets: List[Path]) -> None:

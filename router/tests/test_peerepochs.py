@@ -630,6 +630,62 @@ class RootObjectTests(_Epochs):
                 self.setUp()
 
 
+class TrustWitnessTests(_Epochs):
+    """The trust verb leaves the epoch root holding the exact witness with
+    the recorded token, and the next start finds no witness loss."""
+
+    def shape(self, kind):
+        import shutil
+        r = peerepochs.root(self.state_dir)
+        if kind == "absent root":
+            shutil.rmtree(r)
+        elif kind == "no witness":
+            (r / peerjournal.WITNESS).unlink()
+        else:
+            (r / peerjournal.WITNESS).write_text("f" * 64)
+        peerepochs.set_untrusted(self.state_dir, "test")
+
+    def test_each_witness_shape_is_restored_and_the_next_start_is_clean(self):
+        for kind in ("absent root", "no witness", "another token"):
+            with self.subTest(kind=kind):
+                self.shape(kind)
+                out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+                self.assertIs(out["cleared"], True, out)
+                w = peerepochs.root(self.state_dir) / peerjournal.WITNESS
+                self.assertEqual(w.read_text(), self.meta()["epochs"]["token"])
+                rep = peerjournal.startup(self.state_dir, NOW)
+                self.assertFalse([p for p in rep["problems"] if "witness" in p], rep["problems"])
+                self.assertFalse(self.meta()["epochs_untrusted"], "and stays clear")
+                self.setUp()
+
+    def test_without_the_restore_the_final_check_keeps_the_flag(self):
+        for kind in ("absent root", "no witness", "another token"):
+            with self.subTest(kind=kind):
+                self.shape(kind)
+                with mock.patch.object(peerepochs, "_restore_root_witness", lambda _sd: None):
+                    out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+                self.assertIs(out["cleared"], False, out)
+                self.assertTrue([p for p in out["problems"] if "exact witness" in p], out)
+                self.assertTrue(self.meta()["epochs_untrusted"])
+                self.setUp()
+
+    def test_the_v1_path_with_the_witness_removed_ends_clean(self):
+        self.decide(payload(sender_since=ts(-2 * DAY)))
+        (peerepochs.root(self.state_dir) / peerjournal.WITNESS).unlink()
+        StoreTests.to_v1(self)
+        first = peerjournal.startup(self.state_dir, NOW)
+        self.assertEqual((first["admission"], first["why"]), ("closed", "clock_behind_stores"))
+        self.assertIs(peerepochs.operator_trust(self.state_dir, NOW, evidence="x")["cleared"], True)
+        second = peerjournal.startup(self.state_dir, NOW)
+        self.assertFalse([p for p in second["problems"] if "witness" in p], second["problems"])
+
+    def test_a_scan_fault_reports_no_derived_counts(self):
+        RootObjectTests.make_root(self, "file")
+        peerepochs.set_untrusted(self.state_dir, "test")
+        out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        self.assertFalse([p for p in out["problems"] if "-1" in p or "two files" in p], out)
+
+
 class TrustCrashTests(_Epochs):
     """The trust verb's crash seams: each crash leaves the flag set, and a
     re-run completes and clears it, idempotently."""

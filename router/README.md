@@ -1941,7 +1941,8 @@ first), prints one JSON line, and appends to the operator audit:
 
 - `router peer-epochs trust --evidence TEXT`: the exit from an untrusted
   epoch store (below). Regular files of the router's own that do not
-  validate are removed, in the same bookkept transaction that recounts the
+  validate are removed (once the root and its witness are restored to the
+  token the bookkeeping records), in the same bookkept transaction that recounts the
   store from the files that remain; the store is reseeded from decided
   records that passed the consistency step; two-file pairs are completed;
   the store is recounted and must equal its bookkeeping; only then is the

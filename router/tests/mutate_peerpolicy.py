@@ -298,6 +298,26 @@ M = [
   '        elif not bad.is_symlink()',
   '        if not bad.is_symlink()',
   [E + "RootObjectTests.test_trust_never_clears_over_a_root_that_is_not_a_directory"]),
+ ("PP58 the trust verb restores no witness", EP,
+  '            _restore_root_witness(state_dir)\n', '            pass\n',
+  [E + "TrustWitnessTests.test_each_witness_shape_is_restored_and_the_next_start_is_clean",
+   E + "TrustWitnessTests.test_the_v1_path_with_the_witness_removed_ends_clean"]),
+ ("PP59 the final check skips the witness's existence", EP,
+  '    if not (root_safe(r) and r.is_dir() and is_witness(r / WITNESS)):\n        return False\n'
+  '    try:\n        return (r / WITNESS).read_text(encoding="ascii") == token\n'
+  '    except (OSError, UnicodeDecodeError):\n        return False\n',
+  '    try:\n        return (r / WITNESS).read_text(encoding="ascii") == token\n'
+  '    except (OSError, UnicodeDecodeError):\n        return True\n',
+  [E + "TrustWitnessTests.test_without_the_restore_the_final_check_keeps_the_flag"]),
+ ("PP60 the final check skips the token's equality", EP,
+  '        return (r / WITNESS).read_text(encoding="ascii") == token\n',
+  '        return bool((r / WITNESS).read_text(encoding="ascii"))\n',
+  [E + "TrustWitnessTests.test_without_the_restore_the_final_check_keeps_the_flag"]),
+ ("PP61 derived counts after a scan fault", EP,
+  '        problems.append(e.reason)       # no derived counts after a scan fault\n    else:\n',
+  '        problems.append(e.reason)       # no derived counts after a scan fault\n'
+  '        live = total = midprune = -1\n    if True:\n',
+  [E + "TrustWitnessTests.test_a_scan_fault_reports_no_derived_counts"]),
 ]
 
 
