@@ -9,19 +9,22 @@ of the statement key's owner, as a signed `kind: control` statement in the
 router's own runtime tree `<hop_root>/.runtime/<generation>/`, never through
 an agent's.
 
-THE RUNTIME CAPABILITY (provisional). The runtime tree is reached ONLY through
-the plugin's runtime capability, named in one table, `transport.RUNTIME_CAPABILITY`
-(provisional until HOP-RUNTIME-IDENTITY freezes):
+THE RUNTIME CAPABILITY, PLUGIN_API (3, 5). The runtime tree is reached ONLY
+through the plugin's runtime capability, named in one table,
+`transport.RUNTIME_CAPABILITY`:
 
 - `make_runtime_sender(settings, fsops)`, bound to one generation, with closed
-  settings `{hop_root, generation, peer_uid, address}`: the sender protocol,
-  and `retire(retired_at)`, `retired()`, `retired_at()`, `identity()`.
+  settings `{hop_root, generation, peer_uid, address, version_write, caps}`:
+  `admit(admitted_at)` (called before the first transport method in the
+  generation, on every pass, with the generation's recorded time), the
+  sender protocol, and `retire(retired_at)`, `retired()`, `retired_at()`,
+  `identity()`.
 - `make_runtime_lister(settings, fsops)`, with closed settings
   `{hop_root, peer_uid}`, READ-ONLY: `generations()` lists every runtime
   generation as `(generation, state)`, state `live`, `retired` or
   `unreadable`; an absent tree lists empty.
 
-A plugin that declares neither (every plugin today) leaves the capability OFF:
+A plugin that declares neither leaves the capability OFF:
 pending controls stay pending, status says the runtime tree is unavailable,
 the operator verbs refuse `runtime_tree_unavailable`, and no plugin factory is
 ever called with the runtime tree. Nothing here reads or writes the runtime
