@@ -34,7 +34,7 @@ import time
 import dataclasses
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from . import aliases as aliases_mod
 from . import clock
@@ -144,6 +144,54 @@ def registry_report(cfg: RouterConfig) -> "registry_mod.Report":
     return report
 
 
+class PollInputs(NamedTuple):
+    """What `run_once` hands every pass of one poll: the configuration keyed
+    for this poll, the registry report, and each instance's generation key."""
+    cfg: RouterConfig
+    report: "registry_mod.Report"
+    gen_keys: Dict[str, str]
+
+
+def poll_inputs(cfg: RouterConfig, transport: Any = None, *,
+                report: Optional["registry_mod.Report"] = None,
+                gen_keys: Optional[Dict[str, str]] = None) -> PollInputs:
+    """The (keyed cfg, report, gen_keys) one poll runs on: exactly the four
+    steps `run_once` takes before any pass, and nothing else (no outbox
+    drain, no ingress pump, no signed-candidate poll). `run_once` calls it,
+    so a conformance driver that runs a single pass through it
+    (`peerjournal.poll(inputs.cfg, transport, inputs.report, ...)`) gets the
+    inputs production gets. `transport` is accepted so a caller can pass what
+    it passes `run_once`; the glue reads none of it.
+
+    1. the registry report (`registry_report`), unless one is given;
+    2. every instance's generation resolved (begun, fenced or held) BEFORE
+       any instance drains, so a sender drained first never places into a
+       recipient root that has been replaced this poll (`generations.apply`),
+       unless the generation keys are given;
+    3. under a registry, every resolved instance's private state keyed by
+       its logical_id (`registry.keyed_config`), and its generation-scoped
+       state by its current generation (`generations.keyed`);
+    4. the alias table's decisions for this poll, store settled and expired
+       entries tombstoned, BEFORE any drain (`aliases.attach`)."""
+    if report is None:
+        report = registry_report(cfg)
+    if gen_keys is None:
+        report, gen_keys = generations.apply(cfg, report)
+    cfg = generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys)
+    cfg = aliases_mod.attach(cfg, report)
+    return PollInputs(cfg, report, gen_keys)
+
+
+def send_control_pending(cfg: RouterConfig, transport: Any, *, delegation: Any,
+                         now: Any) -> Dict[str, int]:
+    """The control-notices-out pass (`peercontrol.send_pending`), called with
+    exactly these arguments and its result returned unchanged. `run_once`
+    reaches the pass only through here, so a conformance driver calling this
+    after `peerjournal.poll` runs what production runs."""
+    from . import peercontrol
+    return peercontrol.send_pending(cfg, transport, delegation=delegation, now=now)
+
+
 def run_once(cfg: RouterConfig, transport: Any = _LOAD,
              report: Optional["registry_mod.Report"] = None,
              gen_keys: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, int]]:
@@ -175,20 +223,7 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
     """
     if transport is _LOAD:
         transport = start_transport(cfg)
-    if report is None:
-        report = registry_report(cfg)
-    if gen_keys is None:
-        # Every instance's generation is resolved (begun, fenced or held)
-        # BEFORE any instance drains, so a sender drained first never places
-        # into a recipient root that has been replaced this poll.
-        report, gen_keys = generations.apply(cfg, report)
-    # Under a registry every resolved instance's private state is keyed by
-    # its logical_id from here on (`registry.keyed_config`), and its
-    # generation-scoped state by its current generation.
-    cfg = generations.keyed(registry_mod.keyed_config(cfg, report), gen_keys)
-    # The alias table's decisions for this poll, store settled and expired
-    # entries tombstoned, BEFORE any drain (router/aliases.py).
-    cfg = aliases_mod.attach(cfg, report)
+    cfg, report, gen_keys = poll_inputs(cfg, transport, report=report, gen_keys=gen_keys)
     summary: Dict[str, Dict[str, int]] = {}
     for name in sorted(cfg.instances):
         if report.state != "off" and name not in report.resolved:
@@ -293,9 +328,8 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
         # which is unavailable (and nothing is attempted) unless the plugin
         # declares the runtime capability.
         try:
-            from . import peercontrol
-            sent = peercontrol.send_pending(cfg, transport, delegation=peerlane.current(cfg),
-                                            now=clock.now())
+            sent = send_control_pending(cfg, transport, delegation=peerlane.current(cfg),
+                                        now=clock.now())
             if sent:
                 logger.info("control notices: %s", sent)
         except Exception:
