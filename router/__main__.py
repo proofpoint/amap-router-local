@@ -45,7 +45,7 @@
                                  receiver time the router can see; floor = B + Fmax + 1 s, then
                                  admission opens. The evidence is recorded, NOT verified.
   runtime-generation adopt GEN --evidence TEXT | retire GEN --evidence TEXT | new --evidence TEXT
-                    | abandon-attempt KEY --evidence TEXT
+                    | abandon-attempt KEY --evidence TEXT | abandon-plan --evidence TEXT
                                  the router's own runtime control tree (router/peercontrol.py),
                                  through the plugin's runtime capability; refused
                                  (runtime_tree_unavailable) when the plugin declares none.
@@ -255,6 +255,9 @@ def _build_parser() -> argparse.ArgumentParser:
                               help="end a held control attempt whose generation is gone")
     p_rgx.add_argument("key", help="the candidate record key (64 hex)")
     p_rgx.add_argument("--evidence", required=True)
+    p_rgp = rg_sub.add_parser("abandon-plan",
+                              help="end a runtime-generation plan that cannot complete")
+    p_rgp.add_argument("--evidence", required=True)
 
     p_q = sub.add_parser("quarantine", help="read-only inspection of the ingress quarantine")
     q_sub = p_q.add_subparsers(dest="quarantine_command", required=True)
@@ -339,6 +342,8 @@ def _runtime_generation(cfg, args) -> int:
             out = peercontrol.operator_adopt(cfg, cap, args.gen, now=now, evidence=args.evidence)
         elif args.runtime_generation_command == "retire":
             out = peercontrol.operator_retire(cfg, cap, args.gen, now=now, evidence=args.evidence)
+        elif args.runtime_generation_command == "abandon-plan":
+            out = peercontrol.operator_abandon_plan(cfg, cap, now=now, evidence=args.evidence)
         elif args.runtime_generation_command == "abandon-attempt":
             out = peercontrol.operator_abandon_attempt(cfg, cap, args.key, now=now,
                                                        evidence=args.evidence)

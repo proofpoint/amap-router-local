@@ -18,6 +18,11 @@ Both carry the same closed record (`peerlane.LEDGER_MEMBERS`), and both
 accept the statement id grammar (`peerlane.RECORD_ID_RE`); only the mint is
 held to `peerlane.PEER_ID_RE`.
 
+`notified/<about>` (`claim_notified`, here) is the receive side's one
+failure notice per issued message: a link-once marker under the issuing
+logical_id, whose bytes name the control notice that won it. A later control
+notice about the same message finds another winner and is dropped.
+
 `resolve` answers whether an `in_reply_to` names a record of this agent with
 these participants, and is the same function at submit and at the receiver.
 Possession of an id is never authority: the logical_id comes from the hosting
@@ -33,7 +38,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from . import peerbind, peerlane
 from .classify import Malformed, parse_address
@@ -43,6 +48,9 @@ from .util import parse_utc_ts
 PLACED_DIR = "placed"
 #: The stage prefix of a placed record's link-once write.
 _STAGE = ".placed-stage-"
+#: The failure-notice markers' directory under `peer-ledger/`.
+NOTIFIED_DIR = "notified"
+_NOTIFIED_STAGE = ".notified-stage-"
 
 
 class LedgerConflict(Exception):
@@ -217,3 +225,59 @@ def resolve(cfg: Any, *, in_reply_to: str, local_logical_id: str, local_address:
     if expires is None:
         return None
     return Resolved(rec) if now < expires else Expired(rec)
+
+
+# ---------------------------------------------------------------------------
+# The receive side of control notices: the issued record, the marker
+# ---------------------------------------------------------------------------
+
+def find_issued(state_dir: Union[str, Path], about: str
+                ) -> List[Tuple[str, str, bytes, Dict[str, str]]]:
+    """Every closed `issued` record with id `about`, under any logical_id in
+    `state_dir`: (logical_id, its path relative to `state_dir`, its bytes,
+    the record). `expires_at` is NOT applied: a late control notice still
+    finds its record while the record is retained. The id is this router's
+    own mint, so a caller treats more than one match as no match."""
+    if not isinstance(about, str) or not peerlane.RECORD_ID_RE.fullmatch(about):
+        return []
+    root = Path(state_dir)
+    out = []
+    for d in sorted(root.iterdir()) if root.is_dir() else ():
+        if d.is_symlink() or not d.is_dir():
+            continue
+        rel = f"{d.name}/{peerlane.PEER_LEDGER_DIR}/{about}.json"
+        try:
+            data = (root / rel).read_bytes()
+            doc = json.loads(data)
+            _check(doc, "issued")
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if doc["local"] == d.name:
+            out.append((d.name, rel, data, doc))
+    return out
+
+
+def notified_path(state_dir: Union[str, Path], logical_id: str, about: str) -> Path:
+    return ledger_root(state_dir, logical_id) / NOTIFIED_DIR / about
+
+
+def claim_notified(state_dir: Union[str, Path], logical_id: str, about: str,
+                   data: bytes) -> bytes:
+    """Link-once `notified/<about>` with `data` (the claiming control
+    notice's identity), durable before it returns; returns the bytes the
+    marker holds: `data` when this claim won or had won before, or the
+    earlier winner's."""
+    if not peerlane.RECORD_ID_RE.fullmatch(about):
+        raise ValueError("about is outside the statement id grammar")
+    path = notified_path(state_dir, logical_id, about)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dirfd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            peerbind._link_once(dirfd, path.name, data, stage_prefix=_NOTIFIED_STAGE)
+            return data
+        except peerbind.LinkConflict:
+            pass
+    finally:
+        os.close(dirfd)
+    return path.read_bytes()

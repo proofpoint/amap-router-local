@@ -645,28 +645,43 @@ def _require_clear(meta: Mapping[str, Any]) -> None:
         raise StoreBlocked(f"an operation is unreconciled: {meta['pending_op']}")
 
 
-def known(state_dir: Path, statement_sha256: str) -> Optional[Tuple[str, str]]:
+#: The kinds a digest index entry names: a signed statement's reservation,
+#: or a control notice's (`peercontrol`, the receive side).
+DIGEST_KINDS = ("statement", "control")
+
+
+def known(state_dir: Path, statement_sha256: str, kind: str = "statement"
+          ) -> Optional[Tuple[str, str]]:
     """Check 2's lookup: the (rt, idk) a retained reservation of this exact
-    statement is filed under, or None. The caller excludes its own record's
-    reservation by comparing `candidate_ref`."""
+    signed bytes, of this `kind`, is filed under, or None. An entry of the
+    other kind is not a match. An entry without a kind (the form before the
+    index recorded one) or with an unknown kind is corrupt, never guessed.
+    The caller excludes its own record's reservation by comparing
+    `candidate_ref`."""
     if not _HEX64.fullmatch(statement_sha256):
         raise ValueError("statement_sha256: 64 lower-case hex")
+    if kind not in DIGEST_KINDS:
+        raise ValueError(f"kind: one of {DIGEST_KINDS}")
     try:
         ref = (_replay(state_dir) / DIGESTS_DIR / statement_sha256).read_text(encoding="ascii")
     except FileNotFoundError:
         return None
-    rt, _, idk = ref.partition("/")
-    if not (_HEX32.fullmatch(rt) and _HEX64.fullmatch(idk)):
+    entry_kind, sep, where = ref.partition(" ")
+    rt, _, idk = where.partition("/")
+    if not (sep and entry_kind in DIGEST_KINDS and _HEX32.fullmatch(rt) and _HEX64.fullmatch(idk)):
         raise peerbind.RecoveryCorrupt("digest", statement_sha256)
-    return rt, idk
+    return (rt, idk) if entry_kind == kind else None
 
 
-def _link_digest(state_dir: Path, statement_sha256: str, rt: str, idk: str) -> None:
+def _link_digest(state_dir: Path, statement_sha256: str, rt: str, idk: str,
+                 kind: str = "statement") -> None:
+    if kind not in DIGEST_KINDS:
+        raise ValueError(f"kind: one of {DIGEST_KINDS}")
     ddir = _replay(state_dir) / DIGESTS_DIR
     if not ddir.is_dir():
         ddir.mkdir(mode=0o700)
         fsync_dir(ddir.parent)
-    _write_once(ddir, statement_sha256, f"{rt}/{idk}".encode("ascii"))
+    _write_once(ddir, statement_sha256, f"{kind} {rt}/{idk}".encode("ascii"))
 
 
 def reserve(state_dir: Path, checked: "peerbind.Checked", *, record: Dict[str, Any]
@@ -676,15 +691,32 @@ def reserve(state_dir: Path, checked: "peerbind.Checked", *, record: Dict[str, A
     `reserved` with its `replay_ref`. Returns the receipt and the record as
     written. `peerbind.ReservationCollision` (another candidate holds this
     (runtime, id)) leaves every file as it was."""
+    return _reserve(state_dir, record, lambda seq: peerbind.reservation_record(
+        checked, record_id=record["key"], reserve_seq=seq, state_dir=state_dir))
+
+
+def reserve_control(state_dir: Path, build: Any, *, record: Dict[str, Any]
+                    ) -> Tuple["peerbind.PersistedReservation", Dict[str, Any]]:
+    """Check 4 of a control notice ((runtime, `id`) is new): its reservation,
+    the fourth replay-store record type, through the same steps as a
+    statement's. `build(reserve_seq)` returns the reservation's bytes
+    (`peerbind.control_reservation_record`). The record is written
+    `reserved` with `kind: "control"`."""
+    return _reserve(state_dir, record, build, kind="control")
+
+
+def _reserve(state_dir: Path, record: Dict[str, Any], build: Any, *, kind: str = "statement"
+             ) -> Tuple["peerbind.PersistedReservation", Dict[str, Any]]:
     state_dir = Path(state_dir)
     meta = read_meta(state_dir)
     _require_clear(meta)
     if record["state"] != "pending":
         raise ValueError(f"only a pending record is reserved, not {record['state']!r}")
     seq = meta["reserve_seq"] + 1
-    rec = peerbind.reservation_record(checked, record_id=record["key"], reserve_seq=seq,
-                                      state_dir=state_dir)
+    rec = build(seq)
     doc = json.loads(rec)
+    if peerbind.reservation_kind(doc) != kind:
+        raise ValueError(f"a {peerbind.reservation_kind(doc)} reservation where {kind} is reserved")
     rt, idk = doc["rt"], doc["idk"]
     before = _replay_files(state_dir, rt, idk)
     # A reservation already there (ours, a retried step; or another's, the
@@ -702,13 +734,15 @@ def reserve(state_dir: Path, checked: "peerbind.Checked", *, record: Dict[str, A
         meta["pending_op"] = None
         _write_meta(state_dir, meta)
         raise
-    _link_digest(state_dir, doc["statement_sha256"], rt, idk)
+    _link_digest(state_dir, doc["statement_sha256"], rt, idk, kind)
     if not before:
         _apply(meta, delta)
         meta["replay"]["high_reserve_seq"] = max(meta["replay"]["high_reserve_seq"], seq)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
-    written = write_record(state_dir, dict(record, state="reserved", replay_ref=f"{rt}/{idk}"))
+    fields = {"kind": "control"} if kind == "control" else {}
+    written = write_record(state_dir, dict(record, state="reserved", replay_ref=f"{rt}/{idk}",
+                                           **fields))
     return receipt, written
 
 
@@ -754,13 +788,13 @@ def done_marker(state_dir: Path, rt: str, idk: str) -> Optional[Dict[str, Any]]:
 
 
 def discover(state_dir: Path, record_key: str, statement_sha256: str, *,
-             scan: bool = True) -> Optional[Tuple[str, str]]:
+             scan: bool = True, kind: str = "statement") -> Optional[Tuple[str, str]]:
     """The reservation a `pending` record already owns, found WITHOUT the
     current configuration: the digest index first, then (the gap between a
     reservation and its digest entry) a scan for one whose `candidate_ref`
     is this record. Reservations are read as data here; the caller reopens
     the one found, which verifies its MAC."""
-    hit = known(state_dir, statement_sha256)
+    hit = known(state_dir, statement_sha256, kind)
     if hit is not None:
         rt, idk = hit
         try:
@@ -820,8 +854,9 @@ def repair_digests(state_dir: Path) -> int:
     entry gets one (link-once). Returns how many were repaired."""
     n = 0
     for rt, idk, doc in list(_reservations(state_dir)):
-        if known(state_dir, doc["statement_sha256"]) is None:
-            _link_digest(state_dir, doc["statement_sha256"], rt, idk)
+        kind = peerbind.reservation_kind(doc)
+        if known(state_dir, doc["statement_sha256"], kind) is None:
+            _link_digest(state_dir, doc["statement_sha256"], rt, idk, kind)
             n += 1
     return n
 
@@ -863,7 +898,8 @@ TRANSITIONS: Mapping[str, frozenset] = {
 HOLD_REASONS = frozenset({
     "candidate_view_unavailable", "candidate_view_refused", "candidate_malformed",
     "admission_closed", "undecided", "hook_absent", "key_runtime_changed",
-    "recovery_corrupt", "recipient_gone", "unpublishable"})
+    "recovery_corrupt", "recipient_gone", "unpublishable", "control_plain_mail",
+    "no_fleet_domain"})
 #: Holds only an operator act clears: never re-evaluated by a poll.
 OPERATOR_HOLDS = frozenset({"candidate_view_refused", "candidate_malformed",
                             "recovery_corrupt", "recipient_gone", "unpublishable"})
@@ -880,6 +916,11 @@ OVER_CAP = "over_cap"
 CANDIDATE_OVER_CAP = "candidate_over_cap"
 MISROUTED = "misrouted"
 DUPLICATE = "duplicate"
+#: The host intake control notices arrive in, and the control-only causes.
+CONTROL_INTAKE = ".control"
+CONTROL_PLAIN_MAIL = "control_plain_mail"
+DUPLICATE_ABOUT = "duplicate_about"
+CONTROL_OUTSIDE_INTAKE = "control_outside_intake"
 
 
 class TransitionRefused(ValueError):
@@ -978,6 +1019,17 @@ class Resolved:
         self.in_reply_to = in_reply_to
 
 
+class ControlAccepted:
+    """The control receive hook's checks passed: the configured `runtime`
+    that signed it, and the matched `issued` record, by its logical_id, its
+    path under `state_dir` and the sha256 of its bytes."""
+    __slots__ = ("runtime", "logical_id", "issued_path", "issued_sha256")
+
+    def __init__(self, *, runtime: str, logical_id: str, issued_path: str, issued_sha256: str):
+        self.runtime, self.logical_id = runtime, logical_id
+        self.issued_path, self.issued_sha256 = issued_path, issued_sha256
+
+
 class DecideHooks:
     """check8 (pre-reservation), reply, edge and policy (post-reservation)
     and control_receive. Every one is required: a caller cannot skip one by
@@ -1025,6 +1077,12 @@ class ViewUnavailable(Exception):
 def _retry_due(ctx: "Ctx", record: Mapping[str, Any], hold: Mapping[str, Any]) -> bool:
     if hold["reason"] == "unpublishable":
         return ctx.first_pass
+    if hold["reason"] == "recipient_gone" and record.get("kind") == "control":
+        try:
+            res = _control_reservation(ctx, record)
+        except (OSError, peerbind.RecoveryCorrupt):
+            return False
+        return _instance_for(ctx.cfg, res["logical_id"]) is not None
     if hold["reason"] == "recipient_gone":
         try:
             _raw, dec = peerbind.read_decision_data(
@@ -1078,6 +1136,18 @@ def _control_to(ctx: "Ctx", key_id: Any) -> Optional[str]:
         return None
     runtime = peerbind.runtime_for_key(dc, key_id)
     return runtime.runtime if runtime is not None else None
+
+
+def _statement_id(raw: bytes) -> Optional[str]:
+    """A statement's `id` from its bytes: strict JSON, the id grammar, or
+    None."""
+    from . import peerlane
+    try:
+        doc = peerbind._strict_json(raw)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    ident = doc.get("id") if isinstance(doc, dict) else None
+    return ident if isinstance(ident, str) and peerlane.RECORD_ID_RE.fullmatch(ident) else None
 
 
 def _snapshot_key_id(state_dir: Path, record: Mapping[str, Any]) -> Optional[str]:
@@ -1136,8 +1206,8 @@ def _view(ctx: Ctx, record: Dict[str, Any]) -> Union[Dict[str, Any], Tuple[str, 
 
 
 def _known(ctx: Ctx, record: Mapping[str, Any]):
-    def known(_kind: str, statement: bytes) -> bool:
-        hit = known_fn(ctx.state_dir, hashlib.sha256(statement).hexdigest())
+    def known(kind: str, statement: bytes) -> bool:
+        hit = known_fn(ctx.state_dir, hashlib.sha256(statement).hexdigest(), kind)
         if hit is None:
             return False
         rt, idk = hit
@@ -1196,18 +1266,31 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     # check 12): decided now, NEVER re-checked.
     statement = read_snapshot(ctx.state_dir, record, SNAPSHOT_STATEMENT)
     if statement is not None:
+        # Only the control intake reserves controls (and holds every
+        # statement found there), so the intake names the kind.
+        kind = "control" if record["intake"] == CONTROL_INTAKE else "statement"
         found = discover(ctx.state_dir, record["key"], hashlib.sha256(statement).hexdigest(),
-                         scan=ctx.first_pass)
+                         scan=ctx.first_pass, kind=kind)
         if found is not None:
+            extra = {"kind": "control"} if kind == "control" else {}
             record = write_record(ctx.state_dir, dict(record, state="reserved",
                                                       state_ts=format_utc_ts(now),
-                                                      replay_ref="/".join(found)))
+                                                      replay_ref="/".join(found), **extra))
             return _reserved(ctx, record)
     from . import peerverify
     try:
         fields = peerbind._view(view)[0]
     except peerbind.CandidateMalformed as e:
         return set_hold(ctx.state_dir, record, "candidate_malformed", str(e), now)
+    kinds = _signed_kinds(fields)
+    if record["intake"] == CONTROL_INTAKE:
+        if "control" not in kinds:
+            return _control_plain_mail(ctx, record)
+        return _control_pending(ctx, record, view, fields)
+    if kinds == {"control"}:
+        # A control notice anywhere but the control intake: never placed,
+        # never answered.
+        return _drop_control(ctx, record, CONTROL_OUTSIDE_INTAKE)
     verdict = peerverify.verify(fields, delegation=ctx.delegation, now=now,
                                 known=_known(ctx, record))
     if isinstance(verdict, peerverify.Refused):
@@ -1216,16 +1299,23 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             return _finish(ctx, transition(ctx.state_dir, record, "mail", now, cause=cause))
         if cause == peerverify.CHECK2_DUPLICATE:
             return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE))
-        control = _control("demoted", cause, None) if cause in CONTROL_CODEC_CAUSES else None
+        control = None
+        if cause in CONTROL_CODEC_CAUSES and verdict.statement is not None:
+            # The demotion names its statement: the signature-verified bytes
+            # are snapshotted BEFORE the disposition is written, and the
+            # control's `about` and destination are read from them. A
+            # statement whose id cannot be read gets no control at all.
+            add_snapshot(ctx.state_dir, record, SNAPSHOT_STATEMENT, verdict.statement)
+            about = _statement_id(verdict.statement)
+            if about is not None:
+                control = _control("demoted", cause, about,
+                                   to=_control_to(ctx, verdict.key_id))
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=cause,
                                        control=control))
     about = verdict.payload.get("id") if hasattr(verdict.payload, "get") else None
     to = _control_to(ctx, verdict.key_id)
     if verdict.kind != "statement":
-        out = ctx.hooks.control_receive(view, verdict)
-        if isinstance(out, Hold):
-            return set_hold(ctx.state_dir, record, out.reason, out.detail, now)
-        raise TypeError("control candidates are not decided in this build")
+        raise TypeError("a control verdict outside the control intake")
     add_snapshot(ctx.state_dir, record, SNAPSHOT_STATEMENT, verdict.statement)
 
     def check8(payload, key_id):
@@ -1253,6 +1343,166 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     return _reserved(ctx, record)
 
 
+# ---------------------------------------------------------------------------
+# Control notices IN (the `.control/` intake)
+# ---------------------------------------------------------------------------
+
+def _signed_kinds(fields: Iterable[Tuple[str, Any]]) -> set:
+    """Which signed fields a candidate carries, by header name."""
+    from . import peerlane
+    names = {str(n).lower() for n, _v in fields}
+    return ({"statement"} if peerlane.STATEMENT_FIELD.lower() in names else set()) | (
+        {"control"} if peerlane.CONTROL_FIELD.lower() in names else set())
+
+
+def _control_plain_mail(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
+    """A `.control/` entry with no `AMAP-Peer-Control` field (plain mail, or
+    a peer statement): HELD, never dropped, never answered, never placed,
+    until `ingress_quarantine_days` after it was taken; then `mail`, and its
+    tombstone is committed only then. Until then it blocks the intake's
+    frontier."""
+    first = parse_utc_ts(record["first_seen_ts"])
+    days = getattr(ctx.cfg, "ingress_quarantine_days", None) or 14
+    if first is not None and ctx.now < first + timedelta(days=days):
+        return set_hold(ctx.state_dir, record, CONTROL_PLAIN_MAIL, None, ctx.now)
+    return _finish(ctx, transition(ctx.state_dir, record, "mail", ctx.now,
+                                   cause=CONTROL_PLAIN_MAIL))
+
+
+def _drop_control(ctx: Ctx, record: Dict[str, Any], cause: str) -> Dict[str, Any]:
+    """A control notice that fails a rule: dropped and logged; never placed,
+    never handed to mail admission, never answered (no control of its own)."""
+    logger.warning("control notice %s (%s) dropped: %s", record["key"], record["intake"], cause)
+    return _finish(ctx, transition(ctx.state_dir, record, "dropped", ctx.now, cause=cause))
+
+
+def _control_pending(ctx: Ctx, record: Dict[str, Any], view: Any, fields: Any
+                     ) -> Dict[str, Any]:
+    """Checks 1-5 with the control field and schema (a candidate carrying
+    both fields fails check 1), the receive hook's checks, then check 4: the
+    control reservation. Every failure is a drop."""
+    from . import peerverify
+    now = ctx.now
+    verdict = peerverify.verify(fields, delegation=ctx.delegation, now=now,
+                                known=_known(ctx, record))
+    if isinstance(verdict, peerverify.Refused):
+        cause = DUPLICATE if verdict.cause == peerverify.CHECK2_DUPLICATE else verdict.cause
+        return _drop_control(ctx, record, cause)
+    if verdict.kind != "control":
+        raise TypeError("a statement verdict for a control-only candidate")
+    add_snapshot(ctx.state_dir, record, SNAPSHOT_STATEMENT, verdict.statement)
+    out = ctx.hooks.control_receive(view, verdict)
+    if isinstance(out, Hold):
+        return set_hold(ctx.state_dir, record, out.reason, out.detail, now)
+    if isinstance(out, Refuse):
+        return _drop_control(ctx, record, out.cause)
+    if not isinstance(out, ControlAccepted):
+        raise TypeError("the control_receive hook returns ControlAccepted, Refuse or Hold")
+
+    def build(seq: int) -> bytes:
+        return peerbind.control_reservation_record(
+            runtime=out.runtime, payload=verdict.payload, statement=verdict.statement,
+            logical_id=out.logical_id, issued_path=out.issued_path,
+            issued_sha256=out.issued_sha256, record_id=record["key"], reserve_seq=seq,
+            notice_ts=format_utc_ts(now), state_dir=ctx.state_dir)
+    try:
+        _rcp, record = reserve_control(ctx.state_dir, build, record=record)
+    except peerbind.ReservationCollision:
+        return _drop_control(ctx, record, DUPLICATE)
+    return _reserved(ctx, record)
+
+
+def _control_reservation(ctx: Ctx, record: Mapping[str, Any]) -> Dict[str, Any]:
+    """The record's control reservation, re-read through its receipt, and its
+    `issued` record re-checked by path and sha256: a change is
+    `RecoveryCorrupt`, never placed."""
+    rt, idk = record["replay_ref"].split("/")
+    rcp = peerbind.reopen_reservation(ctx.state_dir, rt, idk, record_id=record["key"])
+    res = peerbind.read_control_reservation(rcp, state_dir=ctx.state_dir)
+    try:
+        data = (ctx.state_dir / res["issued_path"]).read_bytes()
+    except OSError:
+        raise peerbind.RecoveryCorrupt("issued", "the issued record is gone") from None
+    if hashlib.sha256(data).hexdigest() != res["issued_sha256"]:
+        raise peerbind.RecoveryCorrupt("issued", "the issued record changed")
+    return res
+
+
+def _marker_bytes(res: Mapping[str, Any]) -> bytes:
+    return hoplink.canonical({k: res[k] for k in ("runtime", "id", "rt", "idk", "notice_id",
+                                                  "notice_ts")})
+
+
+def _control_reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
+    """The control transaction after the reservation: the one-per-message
+    marker, then the failure notice. The marker ABSENT is claimed for this
+    reservation; naming THIS reservation, the notice is (re)placed; naming
+    ANOTHER, there is no notice and the record is dropped
+    (`duplicate_about`)."""
+    from . import peerledger
+    sd, now = ctx.state_dir, ctx.now
+    try:
+        res = _control_reservation(ctx, record)
+    except peerbind.RecoveryCorrupt as e:
+        return set_hold(sd, record, "recovery_corrupt", e.reason, now)
+    mine = _marker_bytes(res)
+    held = peerledger.claim_notified(sd, res["logical_id"], res["about"], mine)
+    if held != mine:
+        return _drop_control(ctx, record, DUPLICATE_ABOUT)
+    record = transition(sd, record, "decided", now, decided_sticky=True)
+    return _control_decided(ctx, record)
+
+
+def _instance_for(cfg: Any, logical_id: str) -> Optional[str]:
+    """The instance currently configured for `logical_id`, or None."""
+    from . import config as config_mod
+    for name in sorted(getattr(cfg, "instances", {})):
+        try:
+            if config_mod.state_key(cfg, name) == logical_id:
+                return name
+        except Exception:  # noqa: BLE001 -- an unresolved name is not this identity
+            continue
+    return None
+
+
+def _control_decided(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
+    """Place the failure notice under the reservation's own notice id and
+    time, into the issuing agent's CURRENT instance (by logical_id), then
+    `done`. Idempotent under the notice id, so recovery places it once. A
+    missing fleet domain, or an agent no longer configured, holds
+    visibly."""
+    from . import deliver, peercontrol, peerledger
+    sd, now = ctx.state_dir, ctx.now
+    try:
+        res = _control_reservation(ctx, record)
+    except peerbind.RecoveryCorrupt as e:
+        return set_hold(sd, record, "recovery_corrupt", e.reason, now)
+    try:
+        held = peerledger.notified_path(sd, res["logical_id"], res["about"]).read_bytes()
+    except OSError:
+        held = None
+    if held != _marker_bytes(res):
+        return set_hold(sd, record, "recovery_corrupt", "notified_marker", now)
+    recipient = _instance_for(ctx.cfg, res["logical_id"])
+    if recipient is None:
+        return set_hold(sd, record, "recipient_gone", None, now)
+    subject, body = peercontrol.failure_notice(about=res["about"], outcome=res["outcome"],
+                                               cause=res["cause"],
+                                               policy_code=res["policy_code"])
+    try:
+        deliver.deliver_router_notice(
+            ctx.cfg, sd, recipient, subject=subject, body_text=body, in_reply_to=res["about"],
+            preset=(res["notice_id"], res["notice_ts"]),
+            audit_fields={"control_about": res["about"], "control_outcome": res["outcome"],
+                          "control_cause": res["cause"]})
+    except deliver.PeerLaneUnavailable:
+        return set_hold(sd, record, "no_fleet_domain", None, now)
+    except deliver.RecipientHeld:
+        retry = record.get("retry") or {"retry": "recipient_held", "since": format_utc_ts(now)}
+        return record if record.get("retry") else write_record(sd, dict(record, retry=retry))
+    return _done(ctx, record, disposed="placed", done_ts=format_utc_ts(now), retry=None)
+
+
 def _snapshot(ctx: Ctx, record: Mapping[str, Any]) -> "peerbind.Snapshot":
     statement = read_snapshot(ctx.state_dir, record, SNAPSHOT_STATEMENT)
     view = read_snapshot(ctx.state_dir, record, SNAPSHOT_VIEW)
@@ -1266,6 +1516,8 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     configuration, from its reservation; checks 1-12 are never re-run."""
     now = ctx.now
     sd = ctx.state_dir
+    if record.get("kind") == "control":
+        return _control_reserved(ctx, record)
     if (record_dir(sd, record["owner"], record["key"]) / peerbind.DECISION_FILE).exists():
         record = transition(sd, record, "decided", now, decided_sticky=True)
         return _decided(ctx, record)
@@ -1325,6 +1577,8 @@ def _decided(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     from . import deliver
     now = ctx.now
     sd = ctx.state_dir
+    if record.get("kind") == "control":
+        return _control_decided(ctx, record)
     rel = record_dir_rel(record["owner"], record["key"])
     try:
         sup = peerbind.reopen_supersede(sd, rel, record_id=record["key"])
@@ -1806,9 +2060,15 @@ def operator_declare_restored(state_dir: Path, now: datetime, *, evidence: str
     return {"admission": clock.admission}
 
 
-def observed_times(state_dir: Path, hop_root: Optional[Path]) -> List[Tuple[datetime, str]]:
+def observed_times(state_dir: Path, hop_root: Optional[Path],
+                   reply_window_s: Optional[int] = None) -> List[Tuple[datetime, str]]:
     """Every receiver time this router can see, each with its source (file
-    and field): the bound B's mechanical lower bound."""
+    and field): the bound B's mechanical lower bound. Among them, every
+    in-flight record's `written_ts` (an agent's or the runtime control
+    tree's: the exact time a signed request was begun), and, with
+    `reply_window_s`, each issued peer-ledger record's issue time derived as
+    `expires_at - reply_window_s` (it understates the issue time if the
+    window has grown since, which only lowers this bound)."""
     state_dir = Path(state_dir)
     seen: List[Tuple[datetime, str]] = []
 
@@ -1837,6 +2097,25 @@ def observed_times(state_dir: Path, hop_root: Optional[Path]) -> List[Tuple[date
                     add(json.loads(line).get("ts"), f"{log} ts")
                 except ValueError:
                     continue
+    from . import inflight as inflight_mod
+    from . import peerlane
+    for pattern in (f"*/{inflight_mod.INFLIGHT_DIR}/*.json",
+                    f"*/*/{inflight_mod.INFLIGHT_DIR}/*.json"):
+        for f in sorted(state_dir.glob(pattern)):
+            try:
+                add(json.loads(f.read_bytes()).get("written_ts"), f"{f} written_ts")
+            except (OSError, ValueError, AttributeError):
+                continue
+    if reply_window_s is not None:
+        for f in sorted(state_dir.glob(f"*/{peerlane.PEER_LEDGER_DIR}/*.json")):
+            try:
+                doc = json.loads(f.read_bytes())
+            except (OSError, ValueError):
+                continue
+            expires = parse_utc_ts(doc.get("expires_at")) if isinstance(doc, dict) else None
+            if expires is not None and doc.get("direction") == "issued":
+                add(format_utc_ts(expires - timedelta(seconds=reply_window_s)),
+                    f"{f} issued (expires_at - window)")
     replay = state_dir / REPLAY_DIR
     for f in sorted(replay.glob("*/*" + DONE_SUFFIX)) if replay.is_dir() else ():
         try:
@@ -1872,7 +2151,10 @@ def operator_bound(cfg: Any, now: datetime, *, at: datetime, evidence: str,
     hop_root = Path(cfg.hop.root) if getattr(cfg, "hop", None) is not None else None
     clock = peerclock.record_bound(cfg.state_dir, now, at=at, evidence=evidence,
                                    not_from_wall_clock=not_from_wall_clock,
-                                   observed=observed_times(cfg.state_dir, hop_root))
+                                   observed=observed_times(
+                                       cfg.state_dir, hop_root,
+                                       reply_window_s=getattr(cfg, "peer_reply_window_seconds",
+                                                              None)))
     rebuild_meta(cfg.state_dir)
     _audit(cfg.state_dir, "peer-bound", now, B=format_utc_ts(at), evidence=evidence,
            not_from_wall_clock=bool(not_from_wall_clock))
@@ -2076,8 +2358,11 @@ def sweep(state_dir: Path, now: datetime, *, enabled: bool,
             if rec.get("replay_ref"):
                 rt, idk = rec["replay_ref"].split("/")
                 res = _replay(state_dir) / rt / (idk + peerbind.RESERVATION_SUFFIX)
-                ts = parse_utc_ts(peerbind.parse_reservation(res.read_bytes(), None)["ts"]) \
-                    if res.is_file() else None
+                doc = peerbind.parse_reservation(res.read_bytes(), None) if res.is_file() else None
+                if (doc is not None and peerbind.reservation_kind(doc) == "control"
+                        and (state_dir / doc["issued_path"]).exists()):
+                    continue    # a control's reservation is kept while its issued record is
+                ts = parse_utc_ts(doc["ts"]) if doc is not None else None
                 if ts is None or not clock.H > ts + horizon:
                     continue
             else:

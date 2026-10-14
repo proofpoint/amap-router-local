@@ -36,7 +36,7 @@ CONSTANTS = {
     "ingress": {"TRANSITIONS", "_STATUS_DETAIL", "_V1_REQUIRED", "_V1_OPTIONAL",
                 "WAITING_REMOVE", "FAILURE_SUBJECT", "_STATUS_SUBJECT"},
     "outcomes": {"_DSN_MEANING"},
-    "peercontrol": {"CAUSES"},
+    "peercontrol": {"CAUSES", "FAILURE_TEXT"},
     "peerjournal": {"TRANSITIONS", "_DONE_DISPOSITION", "_TOMBSTONE_DISPOSITION"},
     "provision": {"LANE_LEAVES"},
     "registry": {"_CONFUSABLES"},

@@ -355,6 +355,64 @@ def _finish_verb_audit(cfg: Any, marker: Mapping[str, Any], **extra: Any) -> Non
     fsync_dir(runtime_dir(cfg))
 
 
+class PlanPending(Exception):
+    """A verb's durable plan cannot be completed yet; it stays pending."""
+
+
+def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any],
+                   now: datetime) -> str:
+    """Carry a runtime-generation verb's durable plan forward, idempotently,
+    and return its result: every step is checked against the state it
+    produces and skipped once done. `PlanPending` when it cannot complete
+    yet (no capability; a planned mint whose conditions do not hold)."""
+    if any(line.get("audit_id") == marker.get("id")
+           for line in _audit_lines(Path(cfg.state_dir))):
+        # Decided (completed or abandoned): never an effect again.
+        raise PlanPending("the plan is already decided; only its marker remains")
+    verb, d = marker["verb"], marker["detail"]
+    if verb == ADOPT_VERB:
+        record_generation(cfg, d["generation"], now=now)   # the record and the pin, rewritten
+        return f"adopted {d['generation']}"
+    if cap is None:
+        raise PlanPending("the plugin declares no runtime capability")
+    if verb == RETIRE_VERB:
+        return _retire_idempotent(cfg, cap, d["generation"], now)
+    if verb == NEW_VERB:
+        retired = _retire_idempotent(cfg, cap, d["retired"], now)
+        try:
+            recorded: Optional[str] = config_mod.runtime_generation(cfg)
+        except config_mod.StateKeyUnresolved:
+            recorded = None
+        if recorded is None:
+            listed = dict(cap.generations())
+            others = [g for g, st in listed.items() if st in ("live", "unreadable")]
+            frozen = _frozen_elsewhere(cfg, None)
+            if others or frozen:
+                raise PlanPending(f"the planned mint is blocked by {others or frozen}")
+        elif recorded != d["minted"]:
+            raise PlanPending(f"another generation {recorded} is recorded")
+        # The planned generation's FULL effect, the record AND its pin, is
+        # replayed even when the record already names it: a pin write that
+        # failed after the record committed is completed here.
+        record_generation(cfg, d["minted"], now=now)
+        return f"{retired}, minted {d['minted']}"
+    raise PlanPending(f"unknown verb {verb!r}")
+
+
+def _run_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any],
+              now: datetime) -> Dict[str, Any]:
+    """Complete a verb's plan now. Once the plan is durable the act is
+    committed: any failure from here on is `Committed` (exit 3), never a
+    refusal, and the next pass or verb completes it."""
+    try:
+        result = _complete_plan(cfg, cap, marker, now)
+    except Exception as e:  # noqa: BLE001 -- the plan is durable: never "refused"
+        raise Committed(f"{marker['verb']}: COMMITTED (its plan is durable); completing it is "
+                        f"pending ({type(e).__name__}: {e}); the next pass or verb completes "
+                        "it") from e
+    return _complete_verb(cfg, marker, result)
+
+
 def _complete_verb(cfg: Any, marker: Mapping[str, Any], result: str,
                    **extra: Any) -> Dict[str, Any]:
     try:
@@ -365,36 +423,117 @@ def _complete_verb(cfg: Any, marker: Mapping[str, Any], result: str,
 
 
 def _repair_verb_audit(cfg: Any, cap: Optional[Capability]) -> int:
-    """A verb's pending marker: its line appended (once) when the act took
-    effect, the marker removed with no line when it did not. A retire's
-    effect is read through the capability: without one the marker waits."""
+    """A verb's pending plan: completed forward (idempotently), then its
+    audit line appended once and the marker removed. A plan that cannot
+    complete yet stays pending, and nothing else is lost."""
     try:
         marker = json.loads(_verb_marker_path(cfg).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return 0
-    verb, detail = marker.get("verb"), marker.get("detail") or {}
+    if _settled_if_audited(cfg, marker):
+        return 0
+    try:
+        result = _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
+    except Exception:  # noqa: BLE001 -- pending; retried by the next pass or verb
+        logger.warning("a runtime-generation plan (%s) is still pending", marker.get("verb"))
+        return 0
+    _finish_verb_audit(cfg, marker, result=result, completed_on_repair=True)
+    return 1
+
+
+ABANDON_PLAN_VERB = "runtime-generation abandon-plan"
+
+
+def _pending_plan(cfg: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(_verb_marker_path(cfg).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+
+
+def _settled_if_audited(cfg: Any, marker: Mapping[str, Any]) -> bool:
+    """A plan whose audit line is already durable (completed, or abandoned)
+    is DECIDED: its marker is only removed (durably) and no effect of it is
+    ever taken again. Every path that reads the marker asks this first."""
+    if not any(line.get("audit_id") == marker.get("id")
+               for line in _audit_lines(Path(cfg.state_dir))):
+        return False
+    try:
+        os.unlink(_verb_marker_path(cfg))
+    except FileNotFoundError:
+        pass
+    fsync_dir(runtime_dir(cfg))
+    return True
+
+
+def _refuse_while_plan_pending(cfg: Any, cap: Optional[Capability]) -> None:
+    """ONE plan at a time: every verb refuses, BEFORE any effect, while an
+    earlier plan is still pending (the caller has already tried to complete
+    it), naming why and its exits, so a committed effect's audit line is
+    never overwritten."""
+    marker = _pending_plan(cfg)
+    if marker is None or _settled_if_audited(cfg, marker):
+        return
+    try:
+        _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
+        why = "its completion has not been recorded yet"
+    except Exception as e:  # noqa: BLE001 -- the reason it is still pending
+        why = f"{type(e).__name__}: {e}"
+    raise ValueError(
+        f"a {marker.get('verb')} plan is pending: {why}. Its exits: it completes on its own "
+        "once its conditions hold (the next pass or verb retries it), or end it with "
+        "`router runtime-generation abandon-plan --evidence TEXT`, which audits what it "
+        "committed")
+
+
+def operator_abandon_plan(cfg: Any, cap: Optional[Capability], *, now: datetime,
+                          evidence: str) -> Dict[str, Any]:
+    """`router runtime-generation abandon-plan --evidence TEXT`: end a plan
+    that cannot complete. Intent first: the PLAN's own audit line (its id,
+    once) is appended, naming what it committed and that it was abandoned,
+    BEFORE the plan is removed. Idempotent: a repeat after a crash finds the
+    line and only removes the plan."""
+    if not evidence:
+        raise ValueError("evidence is required")
+    marker = _pending_plan(cfg)
+    if marker is None:
+        raise ValueError("no runtime-generation plan is pending")
+    if _settled_if_audited(cfg, marker):
+        return {"result": f"the {marker['verb']} plan was already decided; its plan is removed",
+                "audited": True}
+    try:
+        result = _complete_plan(cfg, cap, marker, parse_utc_ts(marker["at"]))
+        _finish_verb_audit(cfg, marker, result=result, completed_on_repair=True)
+        return {"result": f"the {marker['verb']} plan completed: {result}", "audited": True}
+    except Exception as e:  # noqa: BLE001 -- it cannot complete: abandoned, audited
+        why = f"{type(e).__name__}: {e}"
+    try:
+        _finish_verb_audit(cfg, marker, result=f"abandoned incomplete ({why})",
+                           committed=_committed_so_far(cfg, cap, marker),
+                           abandoned_by=ABANDON_PLAN_VERB, evidence=evidence,
+                           abandoned_at=format_utc_ts(now))
+    except Exception as e:  # noqa: BLE001
+        raise AuditPending(f"the {marker['verb']} plan was not abandoned", e) from e
+    return {"result": f"abandoned the {marker['verb']} plan ({why})", "audited": True}
+
+
+def _committed_so_far(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any]) -> str:
+    """What of a plan took effect, read from the state it produces."""
+    verb, d = marker.get("verb"), marker.get("detail") or {}
     try:
         recorded: Optional[str] = config_mod.runtime_generation(cfg)
     except config_mod.StateKeyUnresolved:
         recorded = None
+    listed = dict(cap.generations()) if cap is not None else {}
     if verb == ADOPT_VERB:
-        done = recorded == detail.get("generation")
-    elif verb in (RETIRE_VERB, NEW_VERB):
-        if cap is None:
-            return 0
-        gen = detail.get("generation") if verb == RETIRE_VERB else detail.get("retired")
-        done = dict(cap.generations()).get(gen) == "retired"
-    else:
-        done = False
-    if done:
-        extra = {"result": "repaired after the act"}
-        if verb == NEW_VERB:
-            extra["minted"] = recorded
-        _finish_verb_audit(cfg, marker, **extra)
-        return 1
-    os.unlink(_verb_marker_path(cfg))
-    fsync_dir(runtime_dir(cfg))
-    return 0
+        return "recorded" if recorded == d.get("generation") else "nothing"
+    gen = d.get("generation") if verb == RETIRE_VERB else d.get("retired")
+    parts = []
+    if listed.get(gen) == "retired":
+        parts.append(f"retired {gen}")
+    if verb == NEW_VERB and recorded == d.get("minted"):
+        parts.append(f"minted {recorded}")
+    return ", ".join(parts) or ("unknown (no capability)" if cap is None else "nothing")
 
 
 def _audit_marker(verb: str, now: datetime, **detail: Any) -> Dict[str, Any]:
@@ -566,13 +705,13 @@ def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: dateti
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     if not evidence:
         raise ValueError("evidence is required")
+    _refuse_while_plan_pending(cfg, cap)
     listed = dict(cap.generations())
     live = [g for g, s in listed.items() if s in ("live", "unreadable")]
     if live != [gen] or listed.get(gen) != "live":
         raise ValueError(f"{gen} is not the only live generation: {sorted(listed.items())}")
     marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence)
-    record_generation(cfg, gen, now=now)
-    return _complete_verb(cfg, marker, f"adopted {gen}")
+    return _run_plan(cfg, cap, marker, now)
 
 
 def _check_retirable(cfg: Any, cap: Capability, gen: str) -> None:
@@ -607,16 +746,24 @@ def _check_retirable(cfg: Any, cap: Capability, gen: str) -> None:
         raise ValueError(f"{gen} is not a listed runtime generation: {sorted(listed.items())}")
 
 
-def _retire(cfg: Any, cap: Capability, gen: str, now: datetime) -> str:
+def _retire_idempotent(cfg: Any, cap: Capability, gen: str, now: datetime) -> str:
+    """Retire `gen` through the capability unless the lister already shows
+    it retired, then remove the generation record when it names `gen`. Each
+    step is skipped once done, so a completion repeated after a failure
+    between them finishes the rest."""
+    if dict(cap.generations()).get(gen) != "retired":
+        cap.retire(gen, format_utc_ts(now))
     try:
         recorded = config_mod.runtime_generation(cfg)
     except config_mod.StateKeyUnresolved:
         recorded = None
-    result = cap.retire(gen, format_utc_ts(now))
     if recorded == gen:
-        os.unlink(runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
+        try:
+            os.unlink(runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
+        except FileNotFoundError:
+            pass
         fsync_dir(runtime_dir(cfg))
-    return f"retired {gen}: {result}"
+    return f"retired {gen}"
 
 
 def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datetime,
@@ -628,9 +775,10 @@ def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datet
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     if not evidence:
         raise ValueError("evidence is required")
+    _refuse_while_plan_pending(cfg, cap)
     _check_retirable(cfg, cap, gen)
     marker = _begin_verb_audit(cfg, RETIRE_VERB, now, generation=gen, evidence=evidence)
-    return _complete_verb(cfg, marker, _retire(cfg, cap, gen, now))
+    return _run_plan(cfg, cap, marker, now)
 
 
 def operator_new(cfg: Any, cap: Optional[Capability], *, now: datetime,
@@ -644,21 +792,15 @@ def operator_new(cfg: Any, cap: Optional[Capability], *, now: datetime,
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     if not evidence:
         raise ValueError("evidence is required")
+    _refuse_while_plan_pending(cfg, cap)
     gen = config_mod.runtime_generation(cfg)
     _check_retirable(cfg, cap, gen)
     _check_mint_after_retire(cfg, cap, gen)
-    marker = _begin_verb_audit(cfg, NEW_VERB, now, retired=gen, evidence=evidence)
-    retired = _retire(cfg, cap, gen, now)
-    try:
-        minted = generation(cfg, cap, now=now)
-    except Exception as e:  # noqa: BLE001 -- the retire is committed: never "refused"
-        try:
-            _finish_verb_audit(cfg, marker, result=retired, minted=None)
-        except Exception:  # noqa: BLE001 -- the marker stays; repaired before the next act
-            pass
-        raise Committed(f"{retired}; COMMITTED, but the mint failed ({type(e).__name__}: {e}); "
-                        "the next pass mints") from e
-    return _complete_verb(cfg, marker, f"{retired}, minted {minted}", minted=minted)
+    # The generation to mint is chosen IN the plan, so completing it is
+    # idempotent: a repeat records the same one.
+    marker = _begin_verb_audit(cfg, NEW_VERB, now, retired=gen, minted=secrets.token_hex(16),
+                               evidence=evidence)
+    return _run_plan(cfg, cap, marker, now)
 
 
 def _check_mint_after_retire(cfg: Any, cap: Capability, gen: str) -> None:
@@ -753,13 +895,22 @@ def coalesce_owner(cfg: Any, destination: str, control: Mapping[str, Any], key: 
 # The pass
 # ---------------------------------------------------------------------------
 
+def _misaddressed(control: Mapping[str, Any]) -> bool:
+    """Suppressed `unconfigured_runtime` with no `about` or no `to`: the
+    label an earlier build gave a 5(b) demotion it wrote without either. It
+    was never a finding about the runtime, so the notice is pending again."""
+    return (control.get("suppressed") == SUPPRESS_UNCONFIGURED
+            and (control.get("about") is None or control.get("to") is None))
+
+
 def pending(state_dir: Path) -> List[Dict[str, Any]]:
     """Every journal record with an unsent, unsuppressed control notice, in
-    take order."""
+    take order (a misaddressed suppression counts as pending)."""
     out = []
     for rec in peerjournal.all_records(state_dir):
         c = rec.get("control")
-        if c and not c.get("sent") and not c.get("suppressed") and not c.get("coalesced_with"):
+        if c and not c.get("sent") and not c.get("coalesced_with") and (
+                not c.get("suppressed") or _misaddressed(c)):
             out.append(rec)
     return sorted(out, key=lambda r: r["take_seq"])
 
@@ -784,12 +935,9 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
     if clock.admission != "open":
         # H is untrusted until admission reopens: no token, no mint, no attempt.
         return {"held_admission_closed": len(pending(state_dir))}
-    if delegation is None:
-        # No signing key: nothing can be signed, so nothing is tried.
-        n = len(pending(state_dir))
-        return {DELEGATION_INACTIVE: n} if n else {}
-    # An audited transition whose audit line is not yet appended is repaired
-    # BEFORE anything is attempted or handed over.
+    # A pending audited act (its audit line, or a verb's plan) is completed
+    # BEFORE anything is attempted or handed over, whether or not any notice
+    # is pending.
     cap = capability(cfg, runtime)
     try:
         repaired = repair_audits(cfg, cap)
@@ -798,6 +946,10 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
     except Exception:  # noqa: BLE001 -- retried next pass; nothing is attempted meanwhile
         logger.exception("control notices: an audit repair failed; nothing attempted this pass")
         return dict(counts, audit_repair_failed=1)
+    if delegation is None:
+        # No signing key: nothing can be signed, so nothing is tried.
+        n = len(pending(state_dir))
+        return dict(counts, **({DELEGATION_INACTIVE: n} if n else {}))
     # Frozen attempts first: their generation is reconciled before any fresh
     # notice could need one.
     for record in sorted(pending(state_dir),
@@ -819,6 +971,14 @@ def _one(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, delegat
     control = record["control"]
     if control.get("attempt"):
         return _resume(cfg, cap, record, delegation=delegation, now=now)
+    if control.get("about") is None or control.get("to") is None:
+        filled = _destination_from_snapshot(cfg, delegation, record)
+        if filled is not None:
+            # Re-pended: the statement's id and its key owner's runtime,
+            # read from the snapshot taken with the disposition.
+            record = _update(sd, record, about=filled[0], to=filled[1], held=None,
+                             suppressed=None)
+            control = record["control"]
     if control.get("about") is None or control.get("to") is None:
         if control.get("held") != HELD_NO_DESTINATION:
             _update(sd, record, held=HELD_NO_DESTINATION)
@@ -848,6 +1008,21 @@ def _one(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, delegat
         return "deferred"
     record = _update(sd, record, attempt={"id": _mint_id(), "at": format_utc_ts(now)})
     return _resume(cfg, cap, record, delegation=delegation, now=now, gen=gen)
+
+
+def _destination_from_snapshot(cfg: Any, delegation: Any, record: Mapping[str, Any]
+                               ) -> Optional[Tuple[str, str]]:
+    """(about, to) from the record's statement snapshot and the configured
+    runtime that owns its key, or None when either cannot be read."""
+    sd = Path(cfg.state_dir)
+    raw = peerjournal.read_snapshot(sd, record, peerjournal.SNAPSHOT_STATEMENT)
+    about = peerjournal._statement_id(raw) if raw is not None else None
+    key_id = peerjournal._snapshot_key_id(sd, record)
+    dc = getattr(delegation, "config", None) or getattr(cfg, "delegation", None)
+    owner = peerbind.runtime_for_key(dc, key_id) if (dc is not None and key_id) else None
+    if about is None or owner is None:
+        return None
+    return about, owner.runtime
 
 
 def _mint_id() -> str:
@@ -996,7 +1171,10 @@ def pin(cfg: Any, attempt: Mapping[str, Any]) -> Dict[str, Any]:
 def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """Status `peer_store.controls`: pending, sent (settled with an outcome
     in `SENT_OUTCOMES`), failed (any other settled outcome, by outcome),
-    suppressed by reason, held by reason, deferred, stuck (by reason, each with its age),
+    suppressed by reason, held by reason, deferred, stuck (by reason; each
+    record's `since` is when it was first marked stuck, and its `age_s` is
+    measured from the attempt's signing time, `attempt.ts`, falling back to
+    the intent time `attempt.at` when nothing was signed),
     and the runtime tree: `unavailable` without the capability; otherwise
     the recorded generation and, read through the read-only lister, every
     listed generation with its state, so a lost record shows what an
@@ -1016,7 +1194,7 @@ def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dic
             else:
                 key = outcome if isinstance(outcome, str) else "unknown"
                 doc["failed"][key] = doc["failed"].get(key, 0) + 1
-        elif c.get("suppressed"):
+        elif c.get("suppressed") and not _misaddressed(c):
             doc["suppressed"][c["suppressed"]] = doc["suppressed"].get(c["suppressed"], 0) + 1
         elif c.get("coalesced_with"):
             doc["suppressed"][SUPPRESS_COALESCED] = doc["suppressed"].get(SUPPRESS_COALESCED, 0) + 1
@@ -1053,3 +1231,76 @@ def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dic
         tree["lister_error"] = f"{type(e).__name__}: {e}"
     doc["runtime_tree"] = tree
     return doc
+
+
+# ---------------------------------------------------------------------------
+# Control notices IN: the issuing agent's failure notice
+# ---------------------------------------------------------------------------
+
+#: What the receiving runtime's report means, in this router's own words,
+#: keyed by the control schema's (outcome, cause). Nothing from the control
+#: notice is rendered but its vocabulary values and the message id.
+FAILURE_TEXT: Mapping[Tuple[str, str], str] = {
+    ("refused", "unresolved_reply"): "refused it: it answered a message the receiving runtime "
+                                     "could not match to a task it had delivered",
+    ("refused", "no_edge"): "refused it: you may not task that recipient there",
+    ("refused", "policy"): "refused it: refused by the receiving runtime's policy ({code})",
+    ("dropped", "duplicate"): "dropped it as a duplicate. The receiving runtime already holds a "
+                              "record of this message, and that record may have been placed: "
+                              "this report is NOT proof that the task failed",
+    ("dropped", "misrouted"): "dropped it: the recipient is not hosted there",
+    ("demoted", "statement_value"): "did not accept it as a signed task: a signed value was "
+                                    "invalid",
+    ("demoted", "key_domain"): "did not accept it as a signed task: the signing key does not "
+                               "cover the sender's domain",
+    ("demoted", "ts_window"): "did not accept it as a signed task: it arrived outside the "
+                              "receiver's time window",
+    ("demoted", "exposure_signer"): "did not accept it as a signed task: the exposure "
+                                    "assertion was not signed by its asserter",
+    ("demoted", "body_charset"): "did not accept it as a signed task: the body's charset did "
+                                 "not decode",
+    ("demoted", "body_digest"): "did not accept it as a signed task: the body did not match "
+                                "its signed digest",
+    ("demoted", "attachment_count"): "did not accept it as a signed task: the attachments did "
+                                     "not match their signed count",
+    ("demoted", "attachment_digest"): "did not accept it as a signed task: an attachment did "
+                                      "not match its signed digest",
+    ("demoted", "message_id"): "did not accept it as a signed task: its Message-ID did not "
+                               "match the signed id",
+}
+
+
+def escaped_token(value: Any) -> str:
+    """A token from a control notice, rendered and never interpreted: ASCII
+    letters, digits, `_`, `.` and `-` kept, every other character as
+    `\\xNN`/`\\uNNNN`, at most 64 characters before escaping."""
+    text = value if isinstance(value, str) else repr(value)
+    out = []
+    for ch in text[:64]:
+        if ch.isascii() and (ch.isalnum() or ch in "_.-"):
+            out.append(ch)
+        elif ord(ch) < 0x100:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(f"\\u{ord(ch):04x}")
+    return "".join(out)
+
+
+def failure_notice(*, about: str, outcome: str, cause: str,
+                   policy_code: Optional[str]) -> Tuple[str, str]:
+    """(subject, body) of the issuing agent's failure notice, entirely
+    runtime-authored."""
+    text = FAILURE_TEXT.get((outcome, cause))
+    if text is None:
+        text = (f"reported it as {escaped_token(outcome)} "
+                f"({escaped_token(cause)}), which this router has no description for")
+    if (outcome, cause) == ("refused", "policy"):
+        # The code is deployment-defined: shown escaped, never interpreted.
+        text = text.format(code=escaped_token(policy_code) if policy_code is not None
+                           else "no code")
+    subject = f"Delivery report for peer message {about}"
+    body = (f"The receiving runtime {text}.\n\n"
+            f"Message: {about}\n"
+            "This report was written by your router from the receiving runtime's signed "
+            "control notice; no text from that notice is included.\n")
+    return subject, body

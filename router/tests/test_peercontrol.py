@@ -15,6 +15,7 @@ import dataclasses
 import json
 import os
 import pathlib
+from pathlib import Path
 import types
 import unittest
 from datetime import timedelta
@@ -543,6 +544,201 @@ class AttemptTests(_Control):
         self.cli("retire", gen="9" * 32)
         self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1, "owed, and repaired")
 
+    def marker(self):
+        p = peercontrol._verb_marker_path(self.cfg)
+        return json.loads(p.read_text()) if p.is_file() else None
+
+    def pin_path(self):
+        from router import hoplink
+        return hoplink.transport_dir(self.cfg, config_mod.RUNTIME_NS) / hoplink.PIN_FILE
+
+    def fail_once(self, target, name, when):
+        """`target.name` raising OSError the first time `when(*args)` holds."""
+        real = getattr(target, name)
+
+        def wrapper(*a, **k):
+            if not wrapper.done and when(*a, **k):
+                wrapper.done = True
+                raise OSError(f"injected: {name}")
+            return real(*a, **k)
+        wrapper.done = False
+        return mock.patch.object(target, name, wrapper)
+
+    def test_adopt_whose_pin_write_fails_after_the_record_is_committed_and_completed(self):
+        a = "a" * 32
+        self.tree.gens[a] = "live"
+        from router import hoplink
+        with self.fail_once(peercontrol, "atomic_write",
+                            lambda path, *_a, **_k: Path(path).name == hoplink.PIN_FILE):
+            code, err = self.cli("adopt", gen=a)
+        self.assertEqual(code, 3, err)
+        self.assertIn("COMMITTED", err)
+        self.assertNotIn("refused", err)
+        self.assertEqual(self.recorded(), a, "the record committed")
+        self.assertFalse(self.pin_path().exists(), "the pin did not")
+        self.assertEqual((self.marker() or {}).get("verb"), peercontrol.ADOPT_VERB)
+        self.cli("retire", gen="9" * 32)          # the next verb completes it first
+        self.assertTrue(self.pin_path().is_file())
+        self.assertIsNone(self.marker())
+        self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1)
+
+    def test_retire_whose_record_removal_fails_after_the_capability_retired_is_completed(self):
+        a = "a" * 32
+        self.tree.gens[a] = "live"
+        peercontrol.record_generation(self.cfg, a, now=NOW)
+        with self.fail_once(peercontrol.os, "unlink",
+                            lambda path, *_a, **_k: Path(path).name
+                            == config_mod.RUNTIME_GENERATION_FILE):
+            code, err = self.cli("retire", gen=a)
+        self.assertEqual(code, 3, err)
+        self.assertIn("COMMITTED", err)
+        self.assertNotIn("refused", err)
+        self.assertEqual(self.tree.gens[a], "retired", "the capability retired it")
+        self.assertEqual(self.recorded(), a, "its record was not yet removed")
+        self.send()                               # a pass completes it, nothing pending
+        self.assertIsNone(self.recorded())
+        self.assertIsNone(self.marker())
+        self.assertEqual(len(self.acts(peercontrol.RETIRE_VERB)), 1)
+
+    def test_new_whose_mint_fails_after_the_retire_completes_its_planned_mint(self):
+        a = "a" * 32
+        self.tree.gens[a] = "live"
+        peercontrol.record_generation(self.cfg, a, now=NOW)
+        with self.fail_once(peercontrol, "record_generation", lambda *_a, **_k: True):
+            code, err = self.cli("new")
+        self.assertEqual(code, 3, err)
+        self.assertIn("COMMITTED", err)
+        self.assertEqual(self.tree.gens[a], "retired")
+        self.assertIsNone(self.recorded(), "nothing minted yet")
+        planned = (self.marker() or {}).get("detail", {}).get("minted")
+        self.assertIsNotNone(planned, "the mint is planned durably")
+        self.assertEqual(peercontrol.pending(self.state_dir), [], "no notice is pending")
+        self.send()                               # completes the plan, queue empty
+        self.assertEqual(self.recorded(), planned, "the planned generation, not another")
+        self.assertIsNone(self.marker())
+        lines = self.acts(peercontrol.NEW_VERB)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(planned, lines[0].get("result", ""))
+
+    def test_new_whose_pin_write_fails_after_the_planned_record_is_completed(self):
+        a = "a" * 32
+        self.tree.gens[a] = "live"
+        peercontrol.record_generation(self.cfg, a, now=NOW)
+        pin_before = self.pin_path()
+        self.assertTrue(pin_before.is_file())
+        from router import hoplink
+        with self.fail_once(peercontrol, "atomic_write",
+                            lambda path, *_a, **_k: Path(path).name == hoplink.PIN_FILE):
+            code, err = self.cli("new")
+        self.assertEqual(code, 3, err)
+        self.assertIn("COMMITTED", err)
+        planned = self.marker()["detail"]["minted"]
+        self.assertEqual(self.recorded(), planned, "the planned record committed")
+        self.assertFalse(self.pin_path().exists(), "its pin did not")
+        self.send()                               # an empty-queue pass completes it
+        self.assertTrue(self.pin_path().is_file(), "the pin is written by the completion")
+        self.assertIsNone(self.marker())
+        self.assertEqual(len(self.acts(peercontrol.NEW_VERB)), 1)
+
+    def test_new_whose_record_removal_fails_mid_rotation_is_completed(self):
+        a = "a" * 32
+        self.tree.gens[a] = "live"
+        peercontrol.record_generation(self.cfg, a, now=NOW)
+        with self.fail_once(peercontrol.os, "unlink",
+                            lambda path, *_a, **_k: Path(path).name
+                            == config_mod.RUNTIME_GENERATION_FILE):
+            code, err = self.cli("new")
+        self.assertEqual(code, 3, err)
+        self.assertNotIn("refused", err)
+        planned = self.marker()["detail"]["minted"]
+        self.cli("retire", gen="9" * 32)
+        self.assertEqual(self.recorded(), planned)
+        self.assertEqual(self.tree.gens[a], "retired")
+        self.assertEqual(len(self.acts(peercontrol.NEW_VERB)), 1)
+
+    def pending_new_plan(self):
+        """`new` with A live: the retire commits, then B goes live before the
+        mint, so the plan cannot complete (Committed, pending)."""
+        a, b = "a" * 32, "b" * 32
+        self.tree.gens[a] = "live"
+        peercontrol.record_generation(self.cfg, a, now=NOW)
+        real = peercontrol._retire_idempotent
+
+        def retire_then_b_live(*args, **kwargs):
+            out = real(*args, **kwargs)
+            self.tree.gens[b] = "live"
+            return out
+        with mock.patch.object(peercontrol, "_retire_idempotent", retire_then_b_live):
+            code, err = self.cli("new")
+        self.assertEqual(code, 3, err)
+        marker = self.marker()
+        self.assertEqual((marker or {}).get("verb"), peercontrol.NEW_VERB)
+        return a, b, marker
+
+    def test_no_verb_overwrites_a_pending_plan(self):
+        a, b, marker = self.pending_new_plan()
+        code, err = self.cli("adopt", gen=b)
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"a {peercontrol.NEW_VERB} plan is pending", err)
+        self.assertIn("abandon-plan", err, "the refusal names the exit")
+        self.assertEqual(self.marker(), marker, "the plan is untouched")
+        self.assertEqual(self.acts(peercontrol.ADOPT_VERB), [])
+        code, err = self.cli("abandon-plan")
+        self.assertEqual(code, 0, err)
+        lines = [l for l in self.audit() if l.get("audit_id") == marker["id"]]
+        self.assertEqual(len(lines), 1, "the NEW plan's line, exactly once")
+        self.assertEqual(lines[0].get("act"), peercontrol.NEW_VERB)
+        self.assertIn(f"retired {a}", lines[0].get("committed", ""))
+        self.assertIsNone(self.marker())
+        code, err = self.cli("adopt", gen=b)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1)
+        self.assertEqual(len([l for l in self.audit() if l.get("audit_id") == marker["id"]]), 1)
+
+    def test_an_abandoned_plan_whose_marker_survived_is_never_resumed(self):
+        """abandon-plan appends the plan's line, then removing the marker
+        fails; once the blocker clears, a pass must take NO effect of the
+        abandoned plan: the line is terminal."""
+        a, b, marker = self.pending_new_plan()
+        with self.fail_once(peercontrol.os, "unlink",
+                            lambda path, *_a, **_k: Path(path).name == peercontrol.VERB_AUDIT_FILE):
+            code, err = self.cli("abandon-plan")
+        self.assertNotEqual(code, 0, err)
+        self.assertEqual(self.marker(), marker, "the marker survived the failed unlink")
+        self.assertEqual(len([l for l in self.audit() if l.get("audit_id") == marker["id"]]), 1)
+        self.tree.gens[b] = "retired"               # the blocker clears
+        self.send()
+        self.assertIsNone(self.recorded(), "the abandoned planned generation was never minted")
+        self.assertIsNone(self.marker(), "the marker is removed")
+        lines = [l for l in self.audit() if l.get("audit_id") == marker["id"]]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].get("abandoned_by"), peercontrol.ABANDON_PLAN_VERB)
+
+    def test_completing_a_decided_plan_takes_no_effect(self):
+        a, b, marker = self.pending_new_plan()
+        with self.fail_once(peercontrol.os, "unlink",
+                            lambda path, *_a, **_k: Path(path).name == peercontrol.VERB_AUDIT_FILE):
+            self.cli("abandon-plan")
+        self.tree.gens[b] = "retired"
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        try:
+            peercontrol._complete_plan(self.cfg, cap, marker, NOW)
+            got = "completed"
+        except peercontrol.PlanPending:
+            got = "refused"
+        self.assertEqual(got, "refused")
+        self.assertIsNone(self.recorded(), "nothing minted")
+
+    def test_every_verb_refuses_while_a_plan_is_pending(self):
+        a, b, marker = self.pending_new_plan()
+        for command, args in (("adopt", {"gen": b}), ("retire", {"gen": b}), ("new", {})):
+            with self.subTest(command=command):
+                code, err = self.cli(command, **args)
+                self.assertEqual(code, 1, err)
+                self.assertIn("plan is pending", err)
+                self.assertEqual(self.marker(), marker)
+                self.assertEqual(self.tree.gens[b], "live", "nothing retired")
+
     def test_a_blocked_store_is_a_clean_refusal(self):
         key = self.held_beside_live_b()
         with mock.patch.object(peercontrol, "operator_abandon_attempt",
@@ -957,15 +1153,21 @@ class GenerationClassifiedTests(_Control):
         self.tree.gens["a" * 32] = "live"
         self.assertEqual(peercontrol.generation(self.cfg, self.cap(), now=NOW), "a" * 32)
 
-    def test_an_attempt_whose_generation_was_retired_is_not_handed_over(self):
+    def not_handed_over_when(self, state):
         key = self.refused()
         with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
             self.send()
         gen = self.record(key)["control"]["attempt"]["gen"]
-        self.tree.gens[gen] = "retired"
+        self.tree.gens[gen] = state
         self.assertEqual(self.send(), {peercontrol.UNAVAILABLE: 1})
         port = self.tree.senders.get(gen)
         self.assertEqual(port.writes if port is not None else [], [], "nothing handed over")
+
+    def test_an_attempt_whose_generation_was_retired_is_not_handed_over(self):
+        self.not_handed_over_when("retired")
+
+    def test_an_attempt_whose_generation_is_unreadable_is_not_handed_over(self):
+        self.not_handed_over_when("unreadable")
 
 
 class DeferralHorizonTests(_Control):
@@ -1011,7 +1213,9 @@ class DestinationUnknownTests(_Control):
         rec = self.record(key)
         peerjournal.write_record(self.state_dir, dict(rec, control=dict(
             rec["control"], about=None, to=None)))
-        self.assertEqual(self.send(), {"held_" + peercontrol.HELD_NO_DESTINATION: 1})
+        # No statement snapshot to read them back from either.
+        with mock.patch.object(peerjournal, "read_snapshot", return_value=None):
+            self.assertEqual(self.send(), {"held_" + peercontrol.HELD_NO_DESTINATION: 1})
         control = self.record(key)["control"]
         self.assertIsNone(control.get("suppressed"), "never suppressed")
         self.assertEqual(control.get("held"), peercontrol.HELD_NO_DESTINATION)
