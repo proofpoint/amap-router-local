@@ -239,6 +239,7 @@ def _sys_renameat2(src_fd: int, src: str, dst_fd: int, dst: str, flags: int) -> 
 
 #: Kinds of tree a binding can be in.
 HOP_ROOT = "hop-root"            # the hop root itself, and `<logical_id>/` dirs
+RUNTIME = "runtime"              # `.runtime/`: the runtime control tree's generations' parent
 GENERATION = "generation"        # a generation tree, published or staging
 INTAKE = "intake"                # a host intake
 PRIVATE = "private"              # one of this writer's private roots
@@ -465,6 +466,8 @@ class FsOps:
             if len(parts) >= 2 and parts[1] not in INTAKES:
                 raise BindingError(f"{DISPOSED_DIR}/ holds only {list(INTAKES)}")
             return DISPOSED, idents[0], parts
+        if parts == (RUNTIME_DIR,):
+            return RUNTIME, idents[0], parts
         if len(parts) == 1:
             return HOP_ROOT, idents[0], parts
         return GENERATION, idents[2], parts[2:]
@@ -479,6 +482,8 @@ class FsOps:
                 return self._register(fd, INTAKE, here, ())
             if parts == (DISPOSED_DIR,):
                 return self._register_disposed(fd, parent.tree, parts)
+            if parts == (RUNTIME_DIR,):
+                return self._register(fd, RUNTIME, parent.tree, parts)
             if len(parts) == 1:
                 return self._register(fd, HOP_ROOT, parent.tree, parts)
             return self._register(fd, GENERATION, here, ())
@@ -487,6 +492,8 @@ class FsOps:
             if len(rel) == 2 and name not in INTAKES:
                 raise BindingError(f"{DISPOSED_DIR}/ holds only {list(INTAKES)}")
             return self._register_disposed(fd, parent.tree, rel)
+        if parent.kind == RUNTIME:
+            return self._register(fd, GENERATION, here, ())
         return self._register(fd, parent.kind, parent.tree, parent.rel + (name,))
 
     def _register_disposed(self, fd: int, tree: Tuple[int, int],
@@ -648,8 +655,10 @@ class FsOps:
         renames: the caller commits the identity marker inside, then
         publishes with `rename_noreplace`."""
         parent = self.binding(parent_fd)
-        if parent.kind != HOP_ROOT or len(parent.rel) != 1 or parent.rel[0] in INTAKES:
-            raise FsOpsError("stage_tree needs a <logical_id>/ directory under the hop root")
+        if parent.kind not in (HOP_ROOT, RUNTIME) or len(parent.rel) != 1 \
+                or parent.rel[0] in INTAKES:
+            raise FsOpsError("stage_tree needs a <logical_id>/ (or .runtime/) directory under "
+                             "the hop root")
         _check_name(staging_name)
         os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
         root = os.open(staging_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,

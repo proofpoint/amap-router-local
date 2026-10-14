@@ -368,6 +368,38 @@ class ReservedIdTests(_Control):
         self.assertEqual(self.begin(m, req_id="r2"), "begun")
 
 
+class RuntimeBindingTests(unittest.TestCase):
+    """fsops binds `.runtime/` as its own kind (never an agent's
+    `<logical_id>/`), and a generation under it as a generation tree."""
+
+    def test_the_runtime_directory_is_its_own_kind(self):
+        import tempfile
+        from router import fsops as fsops_mod
+        with tempfile.TemporaryDirectory() as d:
+            hop = pathlib.Path(d) / "hop"
+            for sub in (".runtime/" + "a" * 32, "agent/" + "b" * 32):
+                (hop / sub).mkdir(parents=True)
+            ops = fsops_mod.FsOps(hop_root=hop)
+            try:
+                root = ops.open_root_nofollow(str(hop))
+                rt = ops.descend_pinned(root, ".runtime")
+                gen = ops.descend_pinned(root, ".runtime/" + "a" * 32)
+                agent = ops.descend_pinned(root, "agent")
+                self.assertEqual(ops.binding(rt).kind, fsops_mod.RUNTIME)
+                self.assertEqual(ops.binding(gen).kind, fsops_mod.GENERATION)
+                self.assertEqual(ops.binding(agent).kind, fsops_mod.HOP_ROOT)
+                # Opened directly, not walked to (a fresh instance: no
+                # earlier binding of the same directory): the same kind.
+                other = fsops_mod.FsOps(hop_root=hop)
+                try:
+                    direct = other.open_root_nofollow(str(hop / ".runtime"))
+                    self.assertEqual(other.binding(direct).kind, fsops_mod.RUNTIME)
+                finally:
+                    other.close()
+            finally:
+                ops.close()
+
+
 class StatementTests(unittest.TestCase):
 
     def doc(self, **over):
