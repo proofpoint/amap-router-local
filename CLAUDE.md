@@ -71,7 +71,13 @@ python3 -m router --config <config.json> peers              # review artifact
 python3 -m router --config <config.json> status
 ```
 
-Full subcommand list: `once run peers matrix status provision reset`.
+Full subcommand list (from `python3 -m router --help`): `once run peers matrix
+console status provision reset`, and the operator verb groups
+`generation {new,adopt,fence-legacy}`, `aliases {reinit}`,
+`peer-store {init,declare-restored}`, `peer-epochs {trust}`, `peer-bound`,
+`peer-decision {drop,restore-key}`, `peer-candidate {quarantine}`,
+`runtime-generation {adopt,retire,new,abandon-attempt,abandon-plan}`,
+`quarantine {list,show}`. `matrix` is a hidden alias of `peers`.
 
 There is **no operator gate before the first drain**. The deliberate human act
 is ENROLMENT — putting the instance in this config — which is upstream of the
