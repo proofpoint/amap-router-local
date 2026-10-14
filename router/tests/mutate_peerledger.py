@@ -462,7 +462,7 @@ M = [
  ("L134 a verb audited after its effect without a pending marker", PC,
   '    marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence)\n    record_generation(cfg, gen, now=now)\n',
   '    record_generation(cfg, gen, now=now)\n    marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence)\n',
-  [C + "AttemptTests.test_every_verb_whose_audit_fails_reports_committed_and_is_repaired"]),
+  [C + "AttemptTests.test_a_crash_right_after_a_verbs_effect_is_still_audited"]),
  ("L135 an unlisted generation's settled traffic ignored", PC,
   '                   and not _named_elsewhere(cfg, gen, record["key"]))\n',
   '                   )\n',

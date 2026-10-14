@@ -525,6 +525,24 @@ class AttemptTests(_Control):
                 self.assertEqual(code, 1)
                 self.assertEqual(len(self.acts(verb)), 1, f"{verb} repaired once")
 
+    def test_a_crash_right_after_a_verbs_effect_is_still_audited(self):
+        """Intent first: the marker is durable before the act, so a crash
+        between the act and its audit line still leaves the line owed."""
+        a = "a" * 32
+        self.tree.gens[a] = "live"
+        real = peercontrol.record_generation
+
+        def record_then_crash(*args, **kwargs):
+            real(*args, **kwargs)
+            raise SystemExit("crash right after the effect")
+        with mock.patch.object(peercontrol, "record_generation", record_then_crash):
+            with self.assertRaises(SystemExit):
+                self.cli("adopt", gen=a)
+        self.assertEqual(self.recorded(), a, "the act took effect")
+        self.assertEqual(self.acts(peercontrol.ADOPT_VERB), [])
+        self.cli("retire", gen="9" * 32)
+        self.assertEqual(len(self.acts(peercontrol.ADOPT_VERB)), 1, "owed, and repaired")
+
     def test_a_blocked_store_is_a_clean_refusal(self):
         key = self.held_beside_live_b()
         with mock.patch.object(peercontrol, "operator_abandon_attempt",
@@ -978,7 +996,10 @@ class RetireListedOnlyTests(_Control):
         self.tree.gens[live] = "live"
         peercontrol.record_generation(self.cfg, live, now=NOW)
         cap = peercontrol.capability(self.cfg, self.runtime)
-        with mock.patch.object(peercontrol, "fsync_dir") as fsync:
+        # The audit's own bookkeeping (which fsyncs the same directory) is
+        # stubbed, so only the retire's fsync can satisfy this.
+        with mock.patch.object(peercontrol, "fsync_dir") as fsync, \
+                mock.patch.object(peercontrol, "_finish_verb_audit"):
             peercontrol.operator_retire(self.cfg, cap, live, now=NOW, evidence="x")
         self.assertIn(mock.call(peercontrol.runtime_dir(self.cfg)), fsync.call_args_list)
 
