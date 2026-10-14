@@ -345,6 +345,54 @@ def _record_bytes(record: Mapping[str, Any]) -> bytes:
     return json.dumps(record, sort_keys=True).encode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+# The not-done index (`peer-open/`): which records recovery must read
+# ---------------------------------------------------------------------------
+
+#: Beside an owner's journal directory: one file per OPEN record, named by
+#: its key, holding its `take_seq` in ASCII decimal. ADVISORY: it says which
+#: records to read, never what they say, and it is outside the content sum;
+#: damage to it is detected and repaired (`recover`), never trusted.
+OPEN_DIR = "peer-open"
+
+
+def open_dir(state_dir: Path, owner: str) -> Path:
+    return Path(state_dir) / owner / OPEN_DIR
+
+
+def is_open(record: Mapping[str, Any]) -> bool:
+    """What recovery must evaluate every pass: a record that is not `done`,
+    or a `done` tree record whose entry's removal never succeeded."""
+    return record.get("state") != "done" or (record.get("intake") not in HOST_INTAKES
+                                             and not record.get("removed"))
+
+
+def _mark_open(state_dir: Path, owner: str, key: str, seq: int) -> None:
+    """The marker, durably: written whole (a stage, then a rename), the file
+    and its directory fsynced. A lost create could hide an open record until
+    the next full walk, so it is durable before the record exists."""
+    d = open_dir(state_dir, owner)
+    if not d.is_dir():
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fsync_dir(d.parent)
+    atomic_write(d / key, str(seq).encode("ascii"), durable_root=Path(state_dir))
+    fsync_dir(d)
+
+
+def _unmark_open(state_dir: Path, owner: str, key: str, *, durable: bool = False) -> None:
+    """The marker removed. No directory fsync is needed for safety on the
+    close path: a marker that comes back names a closed record, which the
+    next pass finds closed and unlinks again. A ROLLED-BACK take's marker is
+    removed durably (`durable`), since its key may be taken again."""
+    d = open_dir(state_dir, owner)
+    try:
+        os.unlink(d / key)
+    except FileNotFoundError:
+        return
+    if durable:
+        fsync_dir(d)
+
+
 def take(state_dir: Path, owner: str, *, intake: str, gen: str, entry_id: str, raw: bytes,
          now: datetime) -> Tuple[str, int]:
     """Take one intake candidate: allocate its seq (durable), create its
@@ -379,6 +427,10 @@ def take(state_dir: Path, owner: str, *, intake: str, gen: str, entry_id: str, r
     _write_meta(state_dir, meta)
     created = False
     try:
+        # The marker FIRST, durably, after the intent and before the record:
+        # a record never exists without its marker (`recover`). `take` is the
+        # ONLY creator of a journal record.
+        _mark_open(state_dir, owner, key, seq)
         rdir.mkdir(mode=0o700)
         created = True
         fsync_dir(rdir.parent)
@@ -392,6 +444,7 @@ def take(state_dir: Path, owner: str, *, intake: str, gen: str, entry_id: str, r
             if created:
                 shutil.rmtree(rdir)
                 fsync_dir(rdir.parent)
+            _unmark_open(state_dir, owner, key, durable=True)
             _mark_vacant(state_dir, seq)
             meta["pending_op"] = None
             _write_meta(state_dir, meta)
@@ -674,6 +727,34 @@ def _check_meta_shape(meta: Mapping[str, Any]) -> None:
             raise bad(f"an entry of pending_op {name}'s delta")
 
 
+class _Unsound(ValueError):
+    """A journal record directory whose record cannot be trusted: `why` is
+    `no_record` (no regular record.json), `unreadable` (with `cause`, the
+    error's type name) or `not_a_record`."""
+
+    def __init__(self, why: str, cause: str = ""):
+        super().__init__(why)
+        self.why, self.cause = why, cause
+
+
+def _strict_record(d: Path) -> Dict[str, Any]:
+    """The record in key directory `d`, read STRICTLY, or `_Unsound`: a
+    regular file (never a symlink), JSON, an object whose key is the
+    directory's name and whose `control` is null or an object. The one
+    per-record check, shared by the strict reader and recovery's index."""
+    path = d / RECORD
+    if path.is_symlink() or not path.is_file():
+        raise _Unsound("no_record")
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise _Unsound("unreadable", type(e).__name__) from None
+    if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec
+            and (rec["control"] is None or isinstance(rec["control"], dict))):
+        raise _Unsound("not_a_record")
+    return rec
+
+
 def _strict_walk(state_dir: Path) -> List[Dict[str, Any]]:
     """Every record under every owner's journal directory ON DISK, whether
     or not the bookkeeping lists the owner; `JournalBlind` naming the first
@@ -697,21 +778,19 @@ def _strict_walk(state_dir: Path) -> List[Dict[str, Any]]:
         for d in entries:
             if not (d.is_dir() and _KEY_RE.fullmatch(d.name)):
                 continue
-            path = d / RECORD
-            if path.is_symlink() or not path.is_file():
-                raise JournalBlind(f"a journal record directory has no regular record "
-                                   f"({child.name}/{d.name}; a restart's reconcile clears a "
-                                   "crash's leftover), so this check cannot pass")
             try:
-                rec = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
-                                   f"{type(e).__name__}), so this check cannot pass") from None
-            if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec
-                    and (rec["control"] is None or isinstance(rec["control"], dict))):
+                rec = _strict_record(d)
+            except _Unsound as u:
+                if u.why == "no_record":
+                    raise JournalBlind(f"a journal record directory has no regular record "
+                                       f"({child.name}/{d.name}; a restart's reconcile clears "
+                                       "a crash's leftover), so this check cannot pass") from None
+                if u.why == "unreadable":
+                    raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
+                                       f"{u.cause}), so this check cannot pass") from None
                 raise JournalBlind(f"a journal record is not a record ({child.name}/{d.name}: "
                                    "its key or its control is not what the router writes), so "
-                                   "this check cannot pass")
+                                   "this check cannot pass") from None
             out.append(rec)
     return out
 
@@ -738,6 +817,11 @@ def write_record(state_dir: Path, record: Dict[str, Any]) -> Dict[str, Any]:
     _apply(meta, delta)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
+    if not is_open(new_record):
+        # Closed, and durably so: only now does its marker go (never before
+        # the record write, or a crash would lose an open record from the
+        # index).
+        _unmark_open(state_dir, owner, key)
     return new_record
 
 
@@ -818,6 +902,12 @@ def reconcile(state_dir: Path) -> List[str]:
                                     "names it")
                     continue
                 shutil.rmtree(d)
+                _unmark_open(state_dir, owner, d.name, durable=True)
+    # A take rolled back before its record existed (a crash between its
+    # marker and its record directory): the ONE owner of that orphan marker.
+    if op is not None and op["op"] == "take" and \
+            not (record_dir(state_dir, op["owner"], op["key"]) / RECORD).exists():
+        _unmark_open(state_dir, op["owner"], op["key"], durable=True)
     if op is not None and op["op"] == "epoch_prune":
         # An epoch prune is completed, never half-undone.
         from . import peerepochs
@@ -3378,6 +3468,232 @@ def operator_quarantine_candidate(cfg: Any, now: datetime, *, key: str,
 
 
 
+#: The full-walk backstop's period: a damage the index validation cannot see
+#: (an open record with no marker) is evaluated on the first full walk at or
+#: after this long since the last COMPLETE one, while polling continues.
+FULL_WALK_S = 3600
+#: The scheduler's clock: MONOTONIC, so a wall-clock step back never
+#: postpones the backstop. Protocol timestamps stay on the pass's own clock.
+#: It is the package's one monotonic source, `hoplink._clock` (the single
+#: `time.monotonic` site the one-clock rule allows), read at call time so a
+#: test that injects either one is honoured.
+
+
+def _monotonic() -> float:
+    from . import hoplink
+    return hoplink._clock()
+#: Per canonical state_dir: when the last complete full walk ended (on the
+#: monotonic clock), and whether the next pass must walk fully (a start, or a
+#: failed walk). Process state: a restart is a start.
+_RECOVERY: Dict[str, Dict[str, Any]] = {}
+
+
+class _IndexDamage(Exception):
+    """The index cannot be trusted this pass: walk fully, before any effect."""
+
+
+def _recovery_worklist(state_dir: Path, meta: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Every OPEN record, in `take_seq` order: from the not-done index when
+    it is sound, else from a full walk that also rebuilds it.
+
+    The indexed pass is TWO phases. Phase 1 reads and validates every marker
+    and its record, with no effect; any unsound pair (a marker that is not a
+    key-named regular file holding a decimal take_seq; its record absent,
+    unreadable or not a record; key, owner or take_seq disagreeing), an index
+    listing that fails, or a missing index beside a non-empty journal root,
+    makes it a full walk before anything is evaluated. Phase 2 unlinks the
+    markers of records found CLOSED (their owner here: the close path's
+    unlink may not have happened) and returns the open ones. The full walk
+    runs at start, after a failed walk, after index damage, and on the
+    monotonic backstop; the schedule advances only when the walk and its
+    rebuild COMPLETE."""
+    key = os.path.realpath(str(state_dir))
+    st = _RECOVERY.setdefault(key, {"last_full": None, "required": True})
+    now = _monotonic()
+    due = (st["required"] or st["last_full"] is None
+           or now - st["last_full"] >= FULL_WALK_S)
+    if not due:
+        try:
+            open_recs, stale = _indexed(state_dir, meta)
+        except _IndexDamage as e:
+            logger.warning("peer recovery: the not-done index is damaged (%s); walking fully", e)
+        else:
+            for owner, k in stale:
+                try:
+                    _unmark_open(state_dir, owner, k)
+                except OSError as e:
+                    # Advisory cleanup only: a closed record's marker that
+                    # stays is read, found closed and unlinked again next
+                    # pass. It never stops the validated open records.
+                    logger.warning("peer recovery: %s/%s/%s cannot be removed (%s)", owner,
+                                   OPEN_DIR, k, e)
+            return sorted(open_recs, key=lambda r: r["take_seq"])
+    st["required"] = True                   # cleared only by a COMPLETE walk
+    open_recs, complete = _full_walk(state_dir, meta)
+    if complete:
+        st["required"] = False
+        st["last_full"] = now
+    return sorted(open_recs, key=lambda r: r["take_seq"])
+
+
+#: A marker's content is a take_seq in ASCII decimal; more bytes than this
+#: is damage, read without converting (no unbounded read, and no int() of a
+#: value past the interpreter's digit limit).
+_MARKER_MAX = 20
+
+
+def _read_marker(path: Path) -> int:
+    if path.is_symlink() or not path.is_file():
+        raise _IndexDamage(f"{path.name}: not a regular file")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(_MARKER_MAX + 1)
+    except OSError as e:
+        raise _IndexDamage(f"{path.name}: unreadable ({type(e).__name__})") from None
+    if len(raw) > _MARKER_MAX or not raw.isdigit():
+        raise _IndexDamage(f"{path.name}: not a decimal take_seq")
+    return int(raw)                         # at most _MARKER_MAX ASCII digits
+
+
+def _indexed(state_dir: Path, meta: Mapping[str, Any]
+             ) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+    """Phase 1 of an indexed pass: validate EVERY marker and its record, with
+    no effect. (open records, stale markers of closed records), or
+    `_IndexDamage`."""
+    open_recs: List[Dict[str, Any]] = []
+    stale: List[Tuple[str, str]] = []
+    for owner in sorted(meta["roots"]):
+        d = open_dir(state_dir, owner)
+        root = journal_root(state_dir, owner)
+        if not d.is_dir():
+            try:
+                has_records = root.is_dir() and any(
+                    _KEY_RE.fullmatch(e.name) for e in root.iterdir())
+            except OSError as e:
+                raise _IndexDamage(f"{owner}: the journal root cannot be listed ({e})") from None
+            if has_records:
+                raise _IndexDamage(f"{owner}: no {OPEN_DIR}/ beside a non-empty journal")
+            continue
+        try:
+            names = sorted(e.name for e in d.iterdir())
+        except OSError as e:
+            raise _IndexDamage(f"{owner}: {OPEN_DIR}/ cannot be listed ({e})") from None
+        for name in names:
+            if not _KEY_RE.fullmatch(name):
+                raise _IndexDamage(f"{owner}/{name}: not a key-named marker")
+            seq = _read_marker(d / name)
+            try:
+                rec = _strict_record(record_dir(state_dir, owner, name))
+            except _Unsound as u:
+                raise _IndexDamage(f"{owner}/{name}: the record is unsound "
+                                   f"({u.why})") from None
+            if not (_indexable(rec, owner) and rec["take_seq"] == seq):
+                raise _IndexDamage(f"{owner}/{name}: the marker and its record disagree")
+            if is_open(rec):
+                open_recs.append(rec)
+            else:
+                stale.append((owner, name))
+    return open_recs, stale
+
+
+def _indexable(rec: Mapping[str, Any], owner: str) -> bool:
+    """What the index needs of a strictly read record beyond its shape: it
+    is the owner's, and its take_seq is an integer (the marker's content)."""
+    return rec.get("owner") == owner and type(rec.get("take_seq")) is int
+
+
+def _full_walk(state_dir: Path, meta: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
+    """Every record of every owner, read strictly; the open ones returned,
+    and the index REBUILT from what was read: a marker added (or rewritten)
+    for every open record, and removed for every key with no record.
+
+    A discovery that cannot be COMPLETED establishes nothing: an owner whose
+    journal root cannot be listed, whose root is missing while the
+    bookkeeping counts live records in it, or which holds a key directory
+    without a sound record (no regular record, unreadable, not a record)
+    is UNRESOLVED. Its markers are all kept, nothing of its index is
+    removed, and the walk is not complete, so the next pass walks fully
+    again and the schedule does not advance. The open records that WERE
+    read are still returned: each is genuinely open. A key directory whose
+    take is in progress (`pending_op` take) is the take's own and is
+    neither damage nor removed."""
+    open_recs: List[Dict[str, Any]] = []
+    seen_open: Dict[str, set] = {}
+    unresolved: set = set()
+    complete = True
+    op = meta.get("pending_op") or {}
+    in_take = (op.get("owner"), op.get("key")) if op.get("op") == "take" else None
+    for owner in sorted(meta["roots"]):
+        root = journal_root(state_dir, owner)
+        seen_open[owner] = set()
+        if not root.is_dir():
+            if (meta["roots"][owner] or {}).get("live"):
+                logger.warning("peer recovery: %s's journal root is missing while %s live "
+                               "record(s) are counted; its index is kept", owner,
+                               meta["roots"][owner]["live"])
+                unresolved.add(owner)
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError as e:
+            logger.warning("peer recovery: %s's journal root cannot be listed (%s); its index "
+                           "is kept", owner, type(e).__name__)
+            unresolved.add(owner)
+            continue
+        for d in entries:
+            if not (d.is_dir() and _KEY_RE.fullmatch(d.name)):
+                continue
+            try:
+                rec = _strict_record(d)
+                if not _indexable(rec, owner):
+                    raise _Unsound("not_indexable")
+            except _Unsound as u:
+                if (owner, d.name) == in_take:
+                    continue
+                logger.warning("peer recovery: %s/%s: the record is unsound (%s); %s's index "
+                               "is kept", owner, d.name, u.why, owner)
+                unresolved.add(owner)
+                continue
+            if is_open(rec):
+                open_recs.append(rec)
+                seen_open[owner].add(d.name)
+    # The rebuild, only after every record was read.
+    for owner, keys in seen_open.items():
+        od = open_dir(state_dir, owner)
+        try:
+            present = set(e.name for e in od.iterdir()) if od.is_dir() else set()
+            for rec in (r for r in open_recs if r["owner"] == owner):
+                k = rec["key"]
+                if k not in present or _marker_seq(od / k) != rec["take_seq"]:
+                    _mark_open(state_dir, owner, k, rec["take_seq"])
+        except OSError as e:
+            logger.warning("peer recovery: %s's index cannot be rebuilt (%s)", owner, e)
+            complete = False
+            continue
+        if owner in unresolved:
+            complete = False
+            continue
+        for k in present - keys:
+            if (owner, k) == in_take:
+                continue
+            try:
+                _unmark_open(state_dir, owner, k)
+            except OSError as e:
+                # Not a marker we can remove (a directory, a permission): the
+                # index stays untrusted, so the next pass walks fully again.
+                logger.warning("peer recovery: %s/%s/%s cannot be removed (%s)", owner,
+                               OPEN_DIR, k, e)
+                complete = False
+    return open_recs, complete
+
+
+def _marker_seq(path: Path) -> Optional[int]:
+    try:
+        return _read_marker(path)
+    except _IndexDamage:
+        return None
+
+
 def recover(cfg: Any, runtime: Any, *, delegation: Any,
             clock: "peerclock.Clock", now: datetime, first_pass: bool = False,
             skip: Iterable[str] = (), profile_factory: Any = None) -> Dict[str, int]:
@@ -3385,7 +3701,8 @@ def recover(cfg: Any, runtime: Any, *, delegation: Any,
     entry's removal never succeeded), BY ITS RECORDED STATE, whether or not
     its entry is listed again: in `take_seq` order, each with the effects of
     its own intake, each isolated. `skip` is what this pass already
-    evaluated."""
+    evaluated. WHICH records are open is found through the not-done index
+    (`_recovery_worklist`), or by a full walk; never which ones differ."""
     from . import hoplink as hoplink_mod
     from . import ingress
     state_dir = Path(cfg.state_dir)
@@ -3395,19 +3712,9 @@ def recover(cfg: Any, runtime: Any, *, delegation: Any,
         counts[what] = counts.get(what, 0) + 1
 
     skip = set(skip)
-    pending: List[Dict[str, Any]] = []
     meta = read_meta(state_dir)
-    for owner in sorted(meta["roots"]):
-        root = journal_root(state_dir, owner)
-        for d in root.iterdir() if root.is_dir() else ():
-            if not (d.is_dir() and _KEY_RE.fullmatch(d.name) and (d / RECORD).is_file()):
-                continue
-            if d.name in skip:
-                continue
-            rec = json.loads((d / RECORD).read_text(encoding="utf-8"))
-            if rec["state"] != "done" or (rec["intake"] not in HOST_INTAKES
-                                          and not rec.get("removed")):
-                pending.append(rec)
+    pending = _recovery_worklist(state_dir, meta)
+    pending = [r for r in pending if r["key"] not in skip]
     view_of = _viewer(delegation)
     hop_root = Path(cfg.hop.root) if getattr(cfg, "hop", None) is not None else None
     hooks = _pass_hooks(cfg, delegation=delegation, state_dir=state_dir, now=now, clock=clock,

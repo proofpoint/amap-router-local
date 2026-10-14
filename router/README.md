@@ -1906,7 +1906,35 @@ narrowing takes effect at once, a wider P raises the floor, and every F
 joins the history. After the listing passes, RECOVERY walks every record
 that is not `done`, by its recorded state and in `take_seq` order, whether
 or not its entry is listed again. Each entry and each recovered record is
-isolated: one that fails is held or counted and the rest proceed. A
+isolated: one that fails is held or counted and the rest proceed.
+
+**Recovery is bounded by a not-done index.** Beside each owner's journal,
+`<owner>/peer-open/` holds one file per OPEN record (not `done`, or `done`
+but its tree entry never removed), named by its key and holding its
+`take_seq`. `take` writes it durably after its intent and before the
+record (take is the only creator of a record), and a record's marker goes
+only after the record is durably closed. A pass reads the index, not the
+journal: it validates EVERY marker and its record first (the key, the
+owner and the take_seq must agree; a closed record's marker is simply
+unlinked), and any damage it can see (a bad marker, a marker naming an
+absent or unreadable record, an unlistable index, no index beside records)
+makes that pass a FULL walk before anything is evaluated. A full walk,
+which also rebuilds the index, runs at start, after a failed walk, and on a
+monotonic hourly backstop (`FULL_WALK_S`), which catches what validation
+cannot see: an open record with no marker is evaluated within the first
+full walk at or after the hour, while polling continues. Both the index
+and the full walk read each record with the strict reader's own check (a
+regular file, a record, its key and its control what the router writes).
+A walk that cannot resolve every entry establishes nothing: an owner whose
+journal root cannot be listed, is missing while its bookkeeping counts
+live records, or holds a key directory without a sound record keeps every
+marker, the next pass walks fully again, and the schedule does not
+advance. The records it could read are still recovered. Such damage is
+logged and costs a full walk per pass until it is repaired; it is never
+read as "nothing open". The index is advisory and outside the store's
+content sum; it lives under each owner's directory, so it reserves no
+instance name, and `reset` keeps it with the journal. Intake-listing truncation is not a trigger: recovery covers
+records already taken. A
 candidate first observed in a generation that is not current is
 `late_inbound`: mailed, quarantined to that generation with that cause, and
 never placed. A tree candidate's quarantine item

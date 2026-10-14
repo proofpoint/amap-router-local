@@ -273,7 +273,7 @@ M = [
   '    EPOCH_COUNTS[key] = EPOCH_COUNTS.get(key, 0) + 1\n', '    return\n',
   [E + "SinceStartCountTests.test_counted_when_written_and_forgotten_by_a_new_process"]),
  ("PP52 the counts outlive the process", HL,
-  '"_POLLED", "EPOCH_COUNTS"),', '"_POLLED"),',
+  '"_POLLED", "EPOCH_COUNTS", "_RECOVERY"),', '"_POLLED", "_RECOVERY"),',
   [E + "SinceStartCountTests.test_counted_when_written_and_forgotten_by_a_new_process"]),
  ("PP53 an epoch hold counted on every retry", PJ,
   '    if held and (held["reason"], held["detail"]) == (reason, detail):\n        return record\n',
