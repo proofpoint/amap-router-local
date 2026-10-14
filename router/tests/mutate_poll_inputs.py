@@ -67,6 +67,17 @@ M = [
   "            sent = peercontrol.send_pending(cfg, transport, delegation=peerlane.current(cfg),\n"
   "                                            now=clock.now())\n",
   [T + "StructureTests.test_run_once_reaches_send_pending_only_through_the_wrapper"]),
+ ("P11 the report drifts after poll_inputs (Codex)", SVC,
+  "    cfg, report, gen_keys = poll_inputs(cfg, report=report, gen_keys=gen_keys)\n",
+  "    cfg, report, gen_keys = poll_inputs(cfg, report=report, gen_keys=gen_keys)\n"
+  "    import dataclasses as _dc\n    report = _dc.replace(report, state=\"off\") if _dc.is_dataclass(report) else report\n",
+  [T + "PollInputsTests.test_run_once_consumes_exactly_the_poll_inputs_it_got"]),
+ ("P12 the wrapper calls the pass twice (Codex)", SVC,
+  "    return peercontrol.send_pending(cfg, transport, delegation=delegation, now=now)\n",
+  "    peercontrol.send_pending(cfg, transport, delegation=delegation, now=now)\n"
+  "    return peercontrol.send_pending(cfg, transport, delegation=delegation, now=now)\n",
+  [T + "SendControlPendingTests.test_the_wrapper_passes_its_arguments_and_returns_the_result_unchanged",
+   T + "SendControlPendingTests.test_its_result_and_record_effects_are_the_direct_calls"]),
 ]
 
 

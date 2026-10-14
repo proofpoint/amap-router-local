@@ -66,6 +66,30 @@ class PollInputsTests(_Aliases):
         self.assertIs(again.report, first.report)
         self.assertEqual(again.gen_keys, first.gen_keys)
 
+    def test_run_once_consumes_exactly_the_poll_inputs_it_got(self):
+        """Every downstream consumer gets the very objects poll_inputs
+        returned: the drain its cfg, the inbound pump its cfg AND its report
+        (object identity, so no re-derived or altered value can pass)."""
+        from router import hoplink, ingress
+        got, drained, pumped = [], [], []
+        real = service.poll_inputs
+
+        def capture(*a, **k):
+            got.append(real(*a, **k))
+            return got[-1]
+        with mock.patch.object(service, "poll_inputs", capture), \
+                mock.patch.object(outbound, "drain_instance",
+                                  lambda cfg, name, **kw: drained.append(cfg) or {}), \
+                mock.patch.object(hoplink, "is_runtime", return_value=True), \
+                mock.patch.object(ingress, "pump_all",
+                                  lambda cfg, transport, report: pumped.append((cfg, report)) or {}):
+            service.run_once(self.cfg, None)
+        self.assertEqual(len(got), 1, "poll_inputs called once")
+        self.assertTrue(drained and pumped, "both consumers ran")
+        self.assertTrue(all(c is got[0].cfg for c in drained), "the drain's cfg")
+        self.assertIs(pumped[0][0], got[0].cfg, "the pump's cfg")
+        self.assertIs(pumped[0][1], got[0].report, "the pump's report")
+
     def test_run_once_drains_on_exactly_poll_inputs_configuration(self):
         seen = []
         real = outbound.drain_instance
@@ -96,19 +120,32 @@ class SendControlPendingTests(_Aliases):
         with mock.patch.object(peercontrol, "send_pending", return_value=result) as sp:
             got = service.send_control_pending(self.cfg, transport, delegation=delegation, now=now)
         self.assertIs(got, result)
-        self.assertEqual(sp.call_args, mock.call(self.cfg, transport, delegation=delegation,
-                                                 now=now))
+        sp.assert_called_once_with(self.cfg, transport, delegation=delegation, now=now)
 
-    def test_its_effects_are_the_direct_calls(self):
+    def run_twin(self, call):
+        """One fresh fixture with one pending control notice, the pass run
+        through `call`, every random mint pinned: (result, the record's
+        control member as canonical bytes)."""
+        import json
+        from router import peercontrol
         from router.tests import test_peercontrol as tpc
         case = tpc.AttemptTests("test_the_request_shape")
         case.setUp()
         self.addCleanup(case.doCleanups)
         key = case.refused()
-        got = service.send_control_pending(case.cfg, case.runtime, delegation=case.signing,
-                                           now=tpc.NOW)
-        self.assertEqual(sum(v for k, v in got.items() if k.startswith("attempt_")), 1, got)
-        self.assertIn("attempt", case.record(key)["control"], "the record took the attempt")
+        with mock.patch.object(peercontrol, "_mint_id", return_value="qTwin0123456789abcdefgh"), \
+                mock.patch.object(peercontrol.secrets, "token_hex", return_value="c" * 32):
+            result = call(case.cfg, case.runtime, delegation=case.signing, now=tpc.NOW)
+        control = case.record(key)["control"]
+        return result, json.dumps(control, sort_keys=True).encode("utf-8")
+
+    def test_its_result_and_record_effects_are_the_direct_calls(self):
+        from router import peercontrol
+        direct = self.run_twin(peercontrol.send_pending)
+        wrapped = self.run_twin(service.send_control_pending)
+        self.assertEqual(wrapped[0], direct[0], "the same result")
+        self.assertEqual(wrapped[1], direct[1], "the same record bytes")
+        self.assertIn(b'"attempt"', direct[1], "the pass did take the attempt")
 
 
 class StructureTests(_Aliases):
