@@ -155,6 +155,23 @@ class AcceptedControlTests(_ControlIn):
         self.assertEqual([p.name for p in self.inbox_notices()],
                          [f"notice-{doc['notice_id']}.json"])
 
+    def test_a_control_reservation_is_never_resumed_as_a_statement(self):
+        self.issued()
+        self.entry(self.control_raw())
+        self.poll()
+        rec = self.rec()
+        rt, idk = rec["replay_ref"].split("/")
+        rcp = peerbind.reopen_reservation(self.state_dir, rt, idk, record_id=rec["key"])
+        snap = peerbind.Snapshot(
+            peerjournal.read_snapshot(self.state_dir, rec, peerjournal.SNAPSHOT_STATEMENT),
+            json.loads(peerjournal.read_snapshot(self.state_dir, rec, peerjournal.SNAPSHOT_VIEW)))
+        try:
+            peerbind.resume_reserved(rcp, snap, state_dir=self.state_dir)
+            got = "resumed"
+        except Exception as e:  # noqa: BLE001
+            got = (type(e).__name__, getattr(e, "reason", None))
+        self.assertEqual(got, ("RecoveryCorrupt", "kind"))
+
     def test_a_reply_to_the_failure_notice_has_no_binding(self):
         from router import binding
         self.issued()
@@ -206,7 +223,11 @@ class DroppedControlTests(_ControlIn):
     def test_a_control_in_an_agents_candidates_is_dropped(self):
         self.issued()
         key = self.take(self.control_raw())
-        rec = self.evaluate(key)
+        try:
+            self.evaluate(key)
+        except Exception:  # noqa: BLE001 -- a wrong outcome must FAIL below, not error
+            pass
+        rec = peerjournal.read_record(self.state_dir, tpe.OWNER, key)
         self.assertEqual((rec["state"], rec["disposed"], rec["cause"]),
                          ("done", "dropped", peerjournal.CONTROL_OUTSIDE_INTAKE))
         self.assertIsNone(rec["control"])
