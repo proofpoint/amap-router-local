@@ -739,11 +739,15 @@ class RecordSchemaTests(_Send):
         self.drain(dataclasses.replace(cfg, reload_failed=True))
         return cfg, inflight.read_record(cfg, "alice", "00000001")
 
-    def test_a_control_pin_has_no_producer(self):
+    def test_a_control_pin_is_damage_outside_the_runtime_namespace(self):
         _cfg, record = self.staged()
         record["peer"]["kind"] = "control"
-        with self.assertRaisesRegex(inflight.RecordDamaged, "no production producer"):
+        # The kind check runs before the statement's own kind is compared,
+        # so the namespace rule is what refuses it.
+        with self.assertRaisesRegex(inflight.RecordDamaged, "kind|namespace"):
             inflight.check_record(record)
+        with self.assertRaisesRegex(inflight.RecordDamaged, "wrong namespace"):
+            inflight.check_record(self.staged()[1], runtime=True)
 
     def test_a_pin_naming_another_recipient_is_damage(self):
         _cfg, record = self.staged()

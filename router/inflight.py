@@ -573,7 +573,11 @@ _PEER_KEYS = frozenset({"kind", "id", "message_id", "key_id", "statement", "sign
                         "statement_header", "in_reply_to", "references"})
 #: The signed kinds a PRODUCTION path begins. Control notices have no
 #: producer yet, so a record pinning one is damaged, never handed over.
-PRODUCED_SIGNED_KINDS = ("peer",)
+PRODUCED_SIGNED_KINDS = ("peer", "control")
+#: The router's own runtime control namespace (`config.RUNTIME_NS`): the only
+#: one whose records may pin a `control` statement. An agent's namespace
+#: pinning one is damaged.
+RUNTIME_ONLY_KINDS = ("control",)
 #: A bound reply's pin (`begin`'s `bound_reply`): the ledger record's notice
 #: id, the binding members as that record carried them at begin, and the
 #: `bound` object every hand-over carries.
@@ -583,8 +587,10 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
-def check_record(doc: Any) -> Dict[str, Any]:
-    """`doc` if it is a record in the closed schema, else `RecordDamaged`."""
+def check_record(doc: Any, *, runtime: bool = False) -> Dict[str, Any]:
+    """`doc` if it is a record in the closed schema, else `RecordDamaged`.
+    `runtime`: the record lives in the router's runtime control namespace,
+    the only one where a `control` pin is not damaged."""
     if not isinstance(doc, dict):
         raise RecordDamaged("not an object")
     extra = sorted(set(doc) - set(_RECORD_KEYS))
@@ -617,6 +623,8 @@ def check_record(doc: Any) -> Dict[str, Any]:
         _check_record_bound_reply(doc)
     if "peer" in doc:
         _check_record_peer(doc)
+        if (doc["peer"]["kind"] in RUNTIME_ONLY_KINDS) != runtime:
+            raise RecordDamaged(f"peer.kind {doc['peer']['kind']!r} in the wrong namespace")
     return doc
 
 
@@ -705,7 +713,7 @@ def read_record(cfg: RouterConfig, name: str, req_id: str) -> Optional[Dict[str,
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise RecordDamaged("not JSON") from e
-    return check_record(doc)
+    return check_record(doc, runtime=name == config_mod.RUNTIME_NS)
 
 
 def list_records(cfg: RouterConfig, name: str) -> List[str]:
@@ -738,8 +746,32 @@ def allocate_transport_req_id(cfg: RouterConfig, name: str) -> str:
     return f"{n:08d}"
 
 
-def begin(
-    cfg: RouterConfig, name: str, req_id: str,
+def reserve_transport_id(cfg: RouterConfig, name: str) -> str:
+    """The next transport id, allocated as its own step: the counter's
+    successor is durable before this returns (`allocate_transport_req_id`),
+    so a caller can record the id durably BEFORE it begins a record under
+    it (`begin_reserved`)."""
+    return allocate_transport_req_id(cfg, name)
+
+
+def _next_transport_id(cfg: RouterConfig, name: str) -> int:
+    try:
+        text = counter_path(cfg, name).read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return 1
+    if not _COUNTER_RE.fullmatch(text):
+        raise CounterCorrupt(f"{counter_path(cfg, name)}: not a positive decimal")
+    return int(text)
+
+
+def begin(cfg: RouterConfig, name: str, req_id: str, **kw: Any) -> Dict[str, Any]:
+    """`begin_reserved` under a transport id allocated now: put `req_id` in
+    flight. See `begin_reserved` for the arguments."""
+    return begin_reserved(cfg, name, req_id, reserve_transport_id(cfg, name), **kw)
+
+
+def begin_reserved(
+    cfg: RouterConfig, name: str, req_id: str, n: str,
     *, digest: Optional[str], request_doc: Dict[str, Any], recipients: List[str],
     policy_digest: Optional[str] = None, route: Optional[str] = None,
     from_address: Optional[str] = None, attachments: Optional[List[Any]] = None,
@@ -747,10 +779,11 @@ def begin(
     peer: Optional[Dict[str, Any]] = None,
     before_record: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
-    """Put `req_id` in flight: allocate its transport id, then write the
-    record. Returns the record. A crash between the two burns the id; the
-    agent's request is still unsettled and unrecorded, so the next poll
-    processes it afresh and allocates a new one. `policy_digest` and `route`
+    """Put `req_id` in flight under the reserved transport id `n`: write the
+    record. Returns the record. Under `begin`, a crash between the
+    allocation and the record burns the id; the agent's request is still
+    unsettled and unrecorded, so the next poll processes it afresh and
+    allocates a new one. `policy_digest` and `route`
     are the sender's policy digest and the request's class when it was
     classified (`router/classify.py`), recorded BEFORE anything is handed
     over. `attachments` (ingest's verified attachments) are snapshotted
@@ -758,8 +791,19 @@ def begin(
     is a bound reply's pin, written once, here: every hand-over's `bound`
     comes from it and from nothing read later. `peer` is a signed kind's
     pin, likewise. `before_record` runs after the snapshot and before the
-    record is written (the peer ledger's `issued` record, durable first)."""
-    n = allocate_transport_req_id(cfg, name)
+    record is written (the peer ledger's `issued` record, durable first).
+
+    `n` is a transport id already reserved (`reserve_transport_id`): one
+    at or above the counter was never allocated and is refused, and so is a
+    record already in flight for `req_id` under a different id, so a
+    re-drive after a crash can only ever resume the same request."""
+    if not (isinstance(n, str) and re.fullmatch(r"[0-9]{8,18}", n)):
+        raise ValueError(f"{n!r} is not a transport id")
+    if int(n) >= _next_transport_id(cfg, name):
+        raise ValueError(f"transport id {n} was never allocated in {name!r}")
+    existing = read_record(cfg, name, req_id)
+    if existing is not None and existing["transport_req_id"] != n:
+        raise ValueError(f"{req_id!r} is already in flight under {existing['transport_req_id']}")
     snapshot = write_snapshot(cfg, name, req_id, attachments) if attachments else None
     record: Dict[str, Any] = {
         "digest": digest,
@@ -782,7 +826,7 @@ def begin(
         record["bound_reply"] = bound_reply
     if peer is not None:
         record["peer"] = peer
-    check_record(record)
+    check_record(record, runtime=name == config_mod.RUNTIME_NS)
     if before_record is not None:
         _effect("ledger", before_record)
     _write_record(cfg, name, req_id, record, "record")

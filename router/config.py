@@ -212,6 +212,13 @@ RESERVED_STATE_NAMES = frozenset({"registry", "status.json", "aliases"})
 PEER_STATE_NAMES = frozenset({"peer-decision.key", "peer-replay", "peer-vacant",
                               "peer-clock.json"})
 RESERVED_STATE_NAMES = RESERVED_STATE_NAMES | PEER_STATE_NAMES
+#: The router's own runtime control namespace (`router/peercontrol.py`):
+#: `state_dir/_runtime/`, with its one generation's transport state under
+#: `_runtime/<generation>/` exactly as an agent's. Never an instance name
+#: (names begin with a letter or digit), and never touched by a reset.
+RUNTIME_NS = "_runtime"
+RUNTIME_GENERATION_FILE = "generation.json"
+RESERVED_STATE_NAMES = RESERVED_STATE_NAMES | frozenset({RUNTIME_NS})
 
 #: Connector ids for `outbound/ext/<id>/outcomes/` — the directories
 #: `outcomes._consume_dir` scans, in this order. The spec ("The Volume
@@ -866,6 +873,8 @@ def gen_key(cfg: "RouterConfig", name: str) -> str:
     registry: its current generation as THIS POLL's pre-pass resolved it,
     and nothing else; an instance without one raises `StateKeyUnresolved`
     (it is held), never falling back to the logical_id or the name."""
+    if name == RUNTIME_NS:
+        return f"{RUNTIME_NS}/{runtime_generation(cfg)}"
     key = cfg.gen_keys.get(name)
     if key is not None:
         return key
@@ -874,6 +883,22 @@ def gen_key(cfg: "RouterConfig", name: str) -> str:
             f"{name!r} has no current generation this poll (held); no generation "
             "state is read or written for it")
     return name
+
+
+def runtime_generation(cfg: "RouterConfig") -> str:
+    """The runtime control namespace's one generation, as recorded at
+    `state_dir/_runtime/generation.json` (`peercontrol` mints and records
+    it); `StateKeyUnresolved` when none is recorded or it cannot be read."""
+    path = Path(cfg.state_dir) / RUNTIME_NS / RUNTIME_GENERATION_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise StateKeyUnresolved("the runtime control namespace has no recorded generation") from None
+    gen = doc.get("generation") if isinstance(doc, dict) else None
+    if not (isinstance(gen, str) and len(gen) == 32
+            and all(c in "0123456789abcdef" for c in gen)):
+        raise StateKeyUnresolved("the runtime control namespace's generation is not 32 hex")
+    return gen
 
 
 def gen_state_dir(cfg: "RouterConfig", name: str) -> Path:

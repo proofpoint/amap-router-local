@@ -1039,11 +1039,35 @@ class Ctx:
 
 
 def _control(outcome: str, cause: str, about: Optional[str],
-             policy_code: Optional[str] = None) -> Dict[str, Any]:
-    c = {"outcome": outcome, "cause": cause, "about": about, "sent": False}
+             policy_code: Optional[str] = None, *, to: Optional[str] = None) -> Dict[str, Any]:
+    """A pending control notice, written in the same journal write as its
+    disposition. `to` is the destination: the configured runtime address of
+    the statement key's owner at this write, or None when no configured
+    runtime owns the key. The send re-checks it and never redirects."""
+    c = {"outcome": outcome, "cause": cause, "about": about, "sent": False, "to": to}
     if policy_code is not None:
         c["policy_code"] = policy_code
     return c
+
+
+def _control_to(ctx: "Ctx", key_id: Any) -> Optional[str]:
+    """The configured runtime address of `key_id`'s owner, or None."""
+    dc = getattr(ctx.delegation, "config", None) or getattr(ctx.cfg, "delegation", None)
+    if dc is None or not isinstance(key_id, str):
+        return None
+    runtime = peerbind.runtime_for_key(dc, key_id)
+    return runtime.runtime if runtime is not None else None
+
+
+def _snapshot_key_id(state_dir: Path, record: Mapping[str, Any]) -> Optional[str]:
+    """The statement's key_id, from the snapshot."""
+    raw = read_snapshot(state_dir, record, SNAPSHOT_STATEMENT)
+    try:
+        doc = json.loads(raw) if raw is not None else None
+    except ValueError:
+        return None
+    key_id = doc.get("key_id") if isinstance(doc, dict) else None
+    return key_id if isinstance(key_id, str) else None
 
 
 def _codec_reason(ctx: Ctx, exc: BaseException) -> Optional[str]:
@@ -1175,6 +1199,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=cause,
                                        control=control))
     about = verdict.payload.get("id") if hasattr(verdict.payload, "get") else None
+    to = _control_to(ctx, verdict.key_id)
     if verdict.kind != "statement":
         out = ctx.hooks.control_receive(view, verdict)
         if isinstance(out, Hold):
@@ -1198,12 +1223,12 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
         return set_hold(ctx.state_dir, record, h.hold.reason, h.hold.detail, now)
     if isinstance(checked, peerbind.Demoted):
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=checked.cause,
-                                       control=_control("demoted", checked.cause, about)))
+                                       control=_control("demoted", checked.cause, about, to=to)))
     try:
         _rcp, record = reserve(ctx.state_dir, checked, record=record)
     except peerbind.ReservationCollision:
         return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE,
-                                       control=_control("dropped", DUPLICATE, about)))
+                                       control=_control("dropped", DUPLICATE, about, to=to)))
     return _reserved(ctx, record)
 
 
@@ -1235,7 +1260,8 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     auth = peerbind.authorise_checked(checked, cfg=ctx.cfg)
     if isinstance(auth, peerbind.NotHosted):
         return _finish(ctx, transition(sd, record, "dropped", now, cause=MISROUTED,
-                                       control=_control("dropped", MISROUTED, about)))
+                                       control=_control("dropped", MISROUTED, about,
+                                                        to=_control_to(ctx, checked.key_id))))
     if isinstance(auth, peerbind.Undecided):
         return set_hold(sd, record, "undecided", auth.reason, now)
     try:
@@ -1255,7 +1281,8 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             return _finish(ctx, transition(sd, record, "refused", now, cause=out.cause,
                                            policy_code=out.policy_code,
                                            control=_control("refused", out.cause, about,
-                                                            out.policy_code)))
+                                                            out.policy_code,
+                                                            to=_control_to(ctx, checked.key_id))))
         if name == "reply" and not isinstance(out, Resolved):
             raise TypeError("the reply hook returns Resolved, Refuse or Hold")
         if name != "reply" and out is not None:
@@ -1407,7 +1434,9 @@ def _refuse_superseded(ctx: Ctx, record: Dict[str, Any], sup: Mapping[str, Any]
         about = _about(ctx.state_dir, record)
         record = transition(ctx.state_dir, record, "refused", ctx.now, cause="policy",
                             policy_code=sup["policy_code"],
-                            control=_control("refused", "policy", about, sup["policy_code"]))
+                            control=_control("refused", "policy", about, sup["policy_code"],
+                                             to=_control_to(ctx, _snapshot_key_id(ctx.state_dir,
+                                                                                  record))))
     return _finish(ctx, record)
 
 
@@ -1481,7 +1510,9 @@ def drop(ctx: Ctx, record: Dict[str, Any], *, by: str) -> Dict[str, Any]:
         return _finish(ctx, transition(sd, record, "refused", ctx.now, cause="policy",
                                        policy_code=DECISION_UNRECOVERABLE,
                                        control=_control("refused", "policy", _about(sd, record),
-                                                        DECISION_UNRECOVERABLE)))
+                                                        DECISION_UNRECOVERABLE,
+                                                        to=_control_to(ctx, _snapshot_key_id(
+                                                            sd, record)))))
     if record["state"] not in ("decided", "reserved") or not has_decision:
         raise DropRefused(f"{record['key']}: {record['state']} with no unrecoverable decision")
     try:
