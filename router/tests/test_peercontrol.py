@@ -1202,6 +1202,90 @@ class StrictJournalGuardTests(_Control):
         (self.record_dir(key) / peerjournal.RECORD).write_text("{}")
         self.assert_refused("retire", gen, "is not a record", gen=gen)
 
+    def bookkeeping(self, **changes):
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"].update(changes)
+        path.write_text(json.dumps(doc))
+
+    def test_a_malformed_root_entry_refuses_never_a_bare_error(self):
+        key, gen = self.frozen_in_live_a()
+        roots = json.loads((self.state_dir / peerclock.CLOCK_FILE).read_text())["store"]["roots"]
+        self.bookkeeping(roots={owner: {} for owner in roots})
+        self.assert_refused("retire", gen, "not the shape this router writes", gen=gen)
+
+    def test_a_malformed_pending_op_refuses_never_a_bare_error(self):
+        key, gen = self.frozen_in_live_a()
+        self.bookkeeping(pending_op="garbage")
+        self.assert_refused("retire", gen, "not the shape this router writes", gen=gen)
+
+    def test_each_wrong_bookkeeping_shape_refuses_before_any_conversion(self):
+        """Falsy wrong types and incomplete objects included: a conversion or
+        a truthiness fallback would read each as "no operation" or "no
+        roots", and let the act through."""
+        key, gen = self.frozen_in_live_a()
+        path = self.state_dir / peerclock.CLOCK_FILE
+        good = path.read_text()
+        store = json.loads(good)["store"]
+        owner = sorted(store["roots"])[0]
+        entry = store["roots"][owner]
+        rows = {
+            "roots []": dict(roots=[]),
+            "roots null": dict(roots=None),
+            "a root entry's live a string": dict(roots={owner: dict(entry, live="1")}),
+            "a root entry missing a member": dict(roots={owner: {k: v for k, v in entry.items()
+                                                                if k != "high_seq"}}),
+            "pending_op []": dict(pending_op=[]),
+            "pending_op {}": dict(pending_op={}),
+            "pending_op false": dict(pending_op=False),
+            "pending_op 0": dict(pending_op=0),
+            "pending_op empty string": dict(pending_op=""),
+            "pending_op without its name": dict(pending_op={"delta": []}),
+            "pending_op of an unknown kind": dict(pending_op={"op": "nope", "owner": None}),
+            "pending_op's delta not a list": dict(pending_op={"op": "take", "owner": owner,
+                                                              "delta": {}}),
+            "pending_op's delta entry incomplete": dict(pending_op={"op": "take", "owner": owner,
+                                                                    "delta": [{"store": "root"}]}),
+            # Codex's probes: an unhashable name, and named operations
+            # missing what their writers always write.
+            "an unhashable op name": dict(pending_op={"op": [], "owner": owner}),
+            "take without key, seq and delta": dict(pending_op={"op": "take", "owner": owner}),
+            "record without key, rev and its delta": dict(pending_op={"op": "record",
+                                                                      "owner": owner,
+                                                                      "delta": []}),
+            "an extra member": dict(pending_op={"op": "register_root", "owner": owner,
+                                                "x": 1}),
+            "a null owner where the writer names one": dict(pending_op={"op": "register_root",
+                                                                        "owner": None}),
+            # The owner is right for take, so only the store check refuses it.
+            "take's delta for another store": dict(pending_op={
+                "op": "take", "owner": owner, "key": "a" * 64, "seq": 1,
+                "delta": [{"store": "replay", "owner": owner, "sum": "0", "rev": 0,
+                           "live": 1}]}),
+            "take's delta for another owner": dict(pending_op={
+                "op": "take", "owner": owner, "key": "a" * 64, "seq": 1,
+                "delta": [{"store": "root", "owner": "someone-else", "sum": "0", "rev": 0,
+                           "live": 1}]}),
+            "take with a seq of zero": dict(pending_op={
+                "op": "take", "owner": owner, "key": "a" * 64, "seq": 0,
+                "delta": [{"store": "root", "owner": owner, "sum": "0", "rev": 0, "live": 1}]}),
+            "prune with one delta, not two": dict(pending_op={
+                "op": "prune", "owner": owner, "key": "a" * 64, "replay_ref": None,
+                "delta": [{"store": "root", "owner": owner, "sum": "0", "rev": 0, "live": -1}]}),
+        }
+        for label, changes in rows.items():
+            with self.subTest(row=label):
+                path.write_text(good)
+                self.bookkeeping(**changes)
+                self.assert_refused("retire", gen, "not the shape this router writes", gen=gen)
+        path.write_text(good)
+
+    def test_a_null_pending_op_and_exact_shapes_still_read(self):
+        key, gen = self.frozen_in_live_a()
+        self.assertIsNone(json.loads((self.state_dir / peerclock.CLOCK_FILE).read_text())
+                          ["store"]["pending_op"])
+        self.assertIn(key, [r["key"] for r in peercontrol._guard_records(self.cfg)])
+
     def test_the_bookkeeping_matching_the_disk_passes(self):
         """The companion: an intact journal is compared and accepted, so the
         refusals above are the comparison's, not a guard that always fails.

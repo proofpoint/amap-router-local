@@ -57,7 +57,7 @@ import shutil
 import stat
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import logging
 
@@ -473,6 +473,8 @@ def all_records(state_dir: Path) -> List[Dict[str, Any]]:
         meta = read_meta(state_dir)
     except (OSError, ValueError, StoreAbsent, peerclock.ClockUntrusted):
         return []
+    if type(meta.get("roots")) is not dict:
+        return []                       # not readable as written; strict_records says why
     out = []
     for owner in sorted(meta["roots"]):
         root = journal_root(state_dir, owner)
@@ -483,6 +485,234 @@ def all_records(state_dir: Path) -> List[Dict[str, Any]]:
                 out.append(json.loads((d / RECORD).read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 continue
+    return out
+
+
+class JournalBlind(ValueError):
+    """The journal cannot be read reliably, so a reader that must not take
+    "nothing there" on trust (a runtime-generation guard, the resend
+    workflow's "answered", the trust verb's reseed) cannot answer. A
+    `ValueError`, so an operator verb is refused before any effect."""
+
+
+#: The refusal while the clock is untrusted: the journal is verified by it.
+JOURNAL_BLIND = ("the peer clock is untrusted, so the journal's records cannot be seen and "
+                 "this check cannot pass; recover the clock first")
+#: The same, when the clock is trusted but holds no store bookkeeping while a
+#: journal is on disk (a clock rebuilt by a bound, before its bookkeeping).
+JOURNAL_UNKEPT = ("the peer clock holds no store bookkeeping beside a journal on disk, so the "
+                  "journal's records cannot be seen and this check cannot pass; rebuild the "
+                  "bookkeeping first (`router peer-bound` records the bound and rebuilds it)")
+
+
+def journal_present(state_dir: Path) -> bool:
+    """Whether any owner's journal directory exists on disk
+    (`state_dir/<owner>/<JOURNAL_DIR>`, `_find`'s layout). A state
+    directory that cannot be listed is `JournalBlind`: unlistable is not
+    "no journal"."""
+    try:
+        children = list(Path(state_dir).iterdir())
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise JournalBlind(f"the state directory cannot be listed ({type(e).__name__}), so "
+                           "this check cannot pass") from None
+    return any((c / JOURNAL_DIR).exists() for c in children)
+
+
+def strict_records(state_dir: Path) -> List[Dict[str, Any]]:
+    """Every journal record, for a reader that must not take an empty answer
+    on trust. `all_records` answers `[]` while the clock is untrusted or the
+    bookkeeping unreadable or absent, and skips an unreadable record, a
+    record directory without its record, or an owner the bookkeeping does
+    not list; any of those would read as "nothing there".
+
+    `[]` only when nothing was ever journaled: no journal directory on disk,
+    and the clock either absent or holding no store. Otherwise every record
+    under every owner's journal directory ON DISK, each a record, after the
+    disk is compared with the bookkeeping (`_scan_root`, `reconcile`'s own
+    comparison, read only); or `JournalBlind`, naming why."""
+    state_dir = Path(state_dir)
+    journaled = journal_present(state_dir)
+    try:
+        meta = read_meta(state_dir)
+    except StoreAbsent:
+        if not journaled:
+            return []
+        raise JournalBlind(JOURNAL_UNKEPT) from None
+    except peerclock.ClockUntrusted as e:
+        if not journaled and not peerclock.path(state_dir).exists():
+            return []
+        raise JournalBlind(f"{JOURNAL_BLIND} ({e})") from None
+    except (OSError, ValueError) as e:
+        raise JournalBlind(f"{JOURNAL_BLIND} (the bookkeeping is unreadable: "
+                           f"{type(e).__name__}: {e})") from None
+    records = _strict_walk(state_dir)
+    _check_bookkeeping(state_dir, meta)
+    return records
+
+
+def _check_bookkeeping(state_dir: Path, meta: Mapping[str, Any]) -> None:
+    """Every journal root the bookkeeping lists is on disk and holds exactly
+    what the bookkeeping says: a record deleted whole, or a root gone,
+    leaves nothing on disk for the walk to see. An operation still pending
+    on a root may have run or not. The bookkeeping's shape is validated
+    first (`_check_meta_shape`), so nothing below converts or guesses."""
+    _check_meta_shape(meta)
+    roots = meta["roots"]
+    op = meta["pending_op"]
+    deltas = [x for x in (op.get("delta", []) if op is not None else []) if x["store"] == "root"]
+    for owner, entry in sorted(roots.items()):
+        want = (entry["live"], entry["content_sum"], entry["rev_total"])
+        if not journal_root(state_dir, owner).is_dir():
+            raise JournalBlind(f"the journal root {owner} the bookkeeping lists is missing, "
+                               "so this check cannot pass")
+        try:
+            live, _high, total, revs, _seqs = _scan_root(state_dir, owner)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise JournalBlind(f"the journal root {owner} cannot be read "
+                               f"({type(e).__name__}), so this check cannot pass") from None
+        d = next((x for x in deltas if x["owner"] == owner), None)
+        if not ((live, str(total), revs) == want or _rolled(entry, d, live, total, revs)):
+            raise JournalBlind(f"the journal root {owner} does not match its bookkeeping (a "
+                               "record lost or changed outside the router), so this check "
+                               "cannot pass")
+
+
+_ROOT_MEMBERS = frozenset({"token", "live", "high_seq", "content_sum", "rev_total"})
+_DELTA_MEMBERS = frozenset({"store", "owner", "sum", "rev", "live"})
+_DIGITS = re.compile(r"[0-9]+\Z")
+
+
+def _is_count(v: Any) -> bool:
+    return type(v) is int and v >= 0
+
+
+def _is_str(v: Any) -> bool:
+    return isinstance(v, str) and bool(v)
+
+
+def _is_key(v: Any) -> bool:
+    return isinstance(v, str) and bool(_KEY_RE.fullmatch(v))
+
+
+def _is_seq(v: Any) -> bool:
+    return type(v) is int and v >= 1
+
+
+#: Every `pending_op` this package writes, EXACTLY (each writer's literal):
+#: its members beyond `op` and `owner`, each member's check, the owner's
+#: form (`str`: the op's own owner; None: always null), and the stores its
+#: `delta` list holds, in order (None: the op has no delta).
+PENDING_OP_FORMS: Dict[str, Tuple[Dict[str, Callable[[Any], bool]], str, Optional[Tuple[str, ...]]]] = {
+    "register_root": ({}, "str", None),
+    "take": ({"key": _is_key, "seq": _is_seq}, "str", ("root",)),
+    "snapshot": ({"key": _is_key, "name": _is_str}, "str", ("root",)),
+    "record": ({"key": _is_key, "rev": _is_seq}, "str", ("root",)),
+    "reserve": ({"rt": _is_str, "idk": _is_str, "seq": _is_seq}, "none", ("replay",)),
+    "done": ({"rt": _is_str, "idk": _is_str}, "none", ("replay",)),
+    "prune": ({"key": _is_key, "replay_ref": lambda v: v is None or _is_str(v)}, "str",
+              ("root", "replay")),
+    "epoch": ({"target": _is_str}, "none", ("epochs",)),
+    "epoch_prune": ({"target": _is_str}, "none", ("epochs",)),
+    "epoch_recount": ({"targets": lambda v: type(v) is list and all(_is_str(t) for t in v)},
+                      "none", None),
+}
+#: The operation names, for readers that need only the set.
+PENDING_OPS = frozenset(PENDING_OP_FORMS)
+
+
+def _check_meta_shape(meta: Mapping[str, Any]) -> None:
+    """The bookkeeping `_check_bookkeeping` relies on, validated EXACTLY,
+    before any conversion or truthiness fallback: `roots` a mapping of owner
+    to the closed root entry `_root_entry` writes, and `pending_op` null or
+    EXACTLY one of the forms its writers emit (`PENDING_OP_FORMS`): the
+    name's type first, then every member, then the delta's stores in order.
+    Anything else is `JournalBlind`."""
+    def bad(what: str) -> JournalBlind:
+        return JournalBlind(f"the store bookkeeping is not the shape this router writes ({what}), "
+                            "so this check cannot pass")
+    roots = meta.get("roots")
+    if type(roots) is not dict:
+        raise bad("roots is not a mapping")
+    for owner, entry in roots.items():
+        if not (isinstance(owner, str) and type(entry) is dict and set(entry) == _ROOT_MEMBERS
+                and isinstance(entry["token"], str) and _is_count(entry["live"])
+                and _is_count(entry["high_seq"]) and _is_count(entry["rev_total"])
+                and isinstance(entry["content_sum"], str)
+                and _DIGITS.fullmatch(entry["content_sum"])):
+            raise bad(f"the root entry for {owner!r}")
+    op = meta.get("pending_op")
+    if op is None:
+        return
+    if type(op) is not dict:
+        raise bad("pending_op is neither null nor an operation")
+    name = op.get("op")
+    if not isinstance(name, str) or name not in PENDING_OP_FORMS:
+        raise bad("pending_op names no operation this router writes")
+    members, owner_form, stores = PENDING_OP_FORMS[name]
+    want = {"op", "owner"} | set(members) | ({"delta"} if stores is not None else set())
+    if set(op) != want:
+        raise bad(f"pending_op {name} has members {sorted(op)}, not {sorted(want)}")
+    owner = op["owner"]
+    if not (owner is None if owner_form == "none" else _is_str(owner)):
+        raise bad(f"pending_op {name}'s owner")
+    for member, check in members.items():
+        if not check(op[member]):
+            raise bad(f"pending_op {name}'s {member}")
+    if stores is None:
+        return
+    delta = op["delta"]
+    if type(delta) is not list or len(delta) != len(stores):
+        raise bad(f"pending_op {name}'s delta is not {len(stores)} entr"
+                  f"{'y' if len(stores) == 1 else 'ies'}")
+    for d, store in zip(delta, stores):
+        if not (type(d) is dict and set(d) == _DELTA_MEMBERS and d["store"] == store
+                and d["owner"] == (owner if store == "root" else None)
+                and isinstance(d["sum"], str) and _DIGITS.fullmatch(d["sum"])
+                and type(d["rev"]) is int and type(d["live"]) is int):
+            raise bad(f"an entry of pending_op {name}'s delta")
+
+
+def _strict_walk(state_dir: Path) -> List[Dict[str, Any]]:
+    """Every record under every owner's journal directory ON DISK, whether
+    or not the bookkeeping lists the owner; `JournalBlind` naming the first
+    that cannot be read or is not a record, or a record directory without
+    its record, where `all_records` would skip it."""
+    out = []
+    try:
+        children = sorted(state_dir.iterdir())
+    except OSError as e:
+        raise JournalBlind(f"the state directory cannot be listed ({type(e).__name__}), so "
+                           "this check cannot pass") from None
+    for child in children:
+        root = child / JOURNAL_DIR
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError as e:
+            raise JournalBlind(f"a journal directory cannot be listed ({child.name}: "
+                               f"{type(e).__name__}), so this check cannot pass") from None
+        for d in entries:
+            if not (d.is_dir() and _KEY_RE.fullmatch(d.name)):
+                continue
+            path = d / RECORD
+            if path.is_symlink() or not path.is_file():
+                raise JournalBlind(f"a journal record directory has no regular record "
+                                   f"({child.name}/{d.name}; a restart's reconcile clears a "
+                                   "crash's leftover), so this check cannot pass")
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
+                                   f"{type(e).__name__}), so this check cannot pass") from None
+            if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec
+                    and (rec["control"] is None or isinstance(rec["control"], dict))):
+                raise JournalBlind(f"a journal record is not a record ({child.name}/{d.name}: "
+                                   "its key or its control is not what the router writes), so "
+                                   "this check cannot pass")
+            out.append(rec)
     return out
 
 

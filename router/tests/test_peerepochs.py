@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from router import config as config_mod
@@ -440,6 +440,93 @@ class TrustVerbTests(_Epochs):
         self.assertTrue(out["cleared"], out)
         self.assertEqual(self.accepted(), ts(-3 * DAY))
         self.assertFalse(self.meta()["epochs_untrusted"])
+
+    def assert_not_reseeded(self, needle):
+        peerepochs.set_untrusted(self.state_dir, "test")
+        try:
+            out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+            out = {"cleared": f"raised {type(e).__name__}: {e}", "problems": []}
+        self.assertIs(out["cleared"], False, out)
+        self.assertTrue(any("cannot be read reliably" in p and needle in p
+                            for p in out["problems"]), out["problems"])
+        self.assertIsNone(self.accepted(), "nothing reseeded from a partial view")
+        self.assertTrue(self.meta()["epochs_untrusted"], "the flag stays")
+
+    def test_an_unreadable_record_reseeds_nothing_and_keeps_the_flag(self):
+        rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        (peerjournal.record_dir(self.state_dir, rec["owner"], rec["key"])
+         / peerjournal.RECORD).write_text("{")
+        self.assertEqual(peerjournal.all_records(self.state_dir), [], "a plain read skips it")
+        self.assert_not_reseeded("cannot be read")
+
+    def test_a_record_directory_without_its_record_reseeds_nothing(self):
+        rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        (peerjournal.record_dir(self.state_dir, rec["owner"], rec["key"])
+         / peerjournal.RECORD).unlink()
+        self.assert_not_reseeded("has no regular record")
+
+    def test_a_record_that_is_not_a_record_reseeds_nothing(self):
+        rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        (peerjournal.record_dir(self.state_dir, rec["owner"], rec["key"])
+         / peerjournal.RECORD).write_text("[]")
+        self.assert_not_reseeded("is not a record")
+
+    def test_a_malformed_roots_reseeds_nothing_and_keeps_the_flag(self):
+        self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"]["roots"] = []
+        path.write_text(json.dumps(doc))
+        self.assert_not_reseeded("not the shape this router writes")
+
+    def test_every_pending_op_the_real_writers_emit_passes_the_shape_check(self):
+        """Positive witnesses from the WRITERS themselves: every pending_op
+        written during a real take, evaluation (reservation, done marker,
+        epoch), trust verb and retention prune is captured as written, and
+        each passes `_check_meta_shape`. A form the check refuses would be a
+        refusal of a live router's own state."""
+        import copy
+        from unittest import mock
+        seen = []
+        real = peerjournal._write_meta
+
+        def capture(state_dir, meta):
+            if meta.get("pending_op") is not None:
+                seen.append(copy.deepcopy(meta))
+            return real(state_dir, meta)
+        with mock.patch.object(peerjournal, "_write_meta", capture):
+            rec = self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+            peerepochs.set_untrusted(self.state_dir, "test")
+            peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+            # A newer sender_since for the same sender prunes the older epoch.
+            self.decide(payload(sender_since=ts(-2 * DAY)))
+            # The retention sweep past the record's horizon prunes it.
+            rt, idk = rec["replay_ref"].split("/")
+            stamp = json.loads((self.state_dir / peerjournal.REPLAY_DIR / rt
+                                / f"{idk}.json").read_text())["ts"]
+            horizon = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc) + timedelta(seconds=3600 + 300 + 1)
+            peerjournal.advance_frontier(self.state_dir)
+            peerclock.advance(self.state_dir, horizon)
+            peerjournal.sweep(self.state_dir, horizon, enabled=True)
+        ops = sorted({m["pending_op"]["op"] for m in seen})
+        for m in seen:
+            with self.subTest(op=m["pending_op"]["op"]):
+                try:
+                    peerjournal._check_meta_shape(m)
+                    refused = None
+                except peerjournal.JournalBlind as e:
+                    refused = str(e)
+                self.assertIsNone(refused, "a real writer's own form refused")
+        self.assertEqual(set(ops), set(peerjournal.PENDING_OP_FORMS),
+                         "every form the check knows was emitted by a real writer here")
+
+    def test_a_never_journaled_store_still_clears(self):
+        self.assertFalse(peerjournal.journal_present(self.state_dir))
+        peerepochs.set_untrusted(self.state_dir, "test")
+        out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        self.assertTrue(out["cleared"], out)
 
     def test_an_inconsistent_record_is_never_reseeded(self):
         key = self.take(self.raw(sender_since=ts(-DAY * 9), id="qIncons0123456789abcde"))

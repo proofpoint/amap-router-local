@@ -877,7 +877,7 @@ class SignedResultAnswersTests(_Retransmit):
         k, pid = self.unknown()
         from router import peerjournal
         rec = {"key": "r" * 22, "disposed": "placed"}
-        with mock.patch.object(peerjournal, "all_records", return_value=[rec]), \
+        with mock.patch.object(peerjournal, "strict_records", return_value=[rec]), \
                 mock.patch.object(peerjournal, "read_snapshot",
                                   return_value=json.dumps({"in_reply_to": pid}).encode()):
             try:
@@ -887,6 +887,230 @@ class SignedResultAnswersTests(_Retransmit):
                 self.assertIn("signed Result", e.detail)
             else:
                 self.fail("retransmitted an answered task")
+
+
+class StrictJournalAnsweredTests(_Retransmit):
+    """`answered` reads the receive journal strictly: a received signed
+    Result that cannot be SEEN is never "not answered". Under each condition
+    that would hide it, the retransmit is refused `journal_unreadable` and
+    nothing is claimed or handed; a router that never journaled anything
+    retransmits as before. The Result here is a REAL journal record: a
+    placed statement whose snapshot replies to the task."""
+
+    OWNER = LIDS["alpha"]
+
+    def received(self, pid, entry="e1", statement=None):
+        from router import peerjournal
+        key, _ = peerjournal.take(self.state_dir, self.OWNER, intake="candidates", gen="0" * 32,
+                                  entry_id=entry, raw=b"{}", now=NOW)
+        rec = peerjournal.read_record(self.state_dir, self.OWNER, key)
+        peerjournal.add_snapshot(self.state_dir, rec, peerjournal.SNAPSHOT_STATEMENT,
+                                 statement if statement is not None
+                                 else json.dumps({"in_reply_to": pid}).encode())
+        rec = peerjournal.read_record(self.state_dir, self.OWNER, key)
+        peerjournal.write_record(self.state_dir, dict(rec, disposed="placed"))
+        return key
+
+    def record_path(self, key):
+        from router import peerjournal
+        return peerjournal.record_dir(self.state_dir, self.OWNER, key) / peerjournal.RECORD
+
+    def refused(self, k, pid, code):
+        try:
+            self.retransmit(k, pid)
+        except peerresend.Refused as e:
+            got = e.code
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+            got = f"raised {type(e).__name__}: {e}"
+        else:
+            got = "retransmitted"
+        self.assertEqual(got, code)
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        self.assertFalse((d / peerresend.CLAIM).exists(), "nothing claimed")
+
+    def test_a_received_result_answers_it_under_a_trusted_journal(self):
+        k, pid = self.unknown()
+        self.received(pid)
+        self.refused(k, pid, "answered")
+
+    def test_a_store_less_trusted_clock_beside_the_journal_refuses(self):
+        from router import peerclock
+        k, pid = self.unknown()
+        self.received(pid)
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"] = None
+        path.write_text(json.dumps(doc))
+        peerclock.read(self.state_dir)              # the clock itself is trusted
+        self.refused(k, pid, "journal_unreadable")
+
+    def test_a_falsy_wrong_pending_op_refuses(self):
+        from router import peerclock
+        k, pid = self.unknown()
+        self.received(pid)
+        path = self.state_dir / peerclock.CLOCK_FILE
+        doc = json.loads(path.read_text())
+        doc["store"]["pending_op"] = []
+        path.write_text(json.dumps(doc))
+        self.refused(k, pid, "journal_unreadable")
+
+    def test_an_unreadable_record_refuses(self):
+        k, pid = self.unknown()
+        key = self.received(pid)
+        self.record_path(key).write_text("{")
+        self.refused(k, pid, "journal_unreadable")
+
+    def test_a_non_object_record_refuses(self):
+        k, pid = self.unknown()
+        key = self.received(pid)
+        self.record_path(key).write_text("[]")
+        self.refused(k, pid, "journal_unreadable")
+
+    def test_an_unlistable_journal_directory_refuses(self):
+        from pathlib import Path
+        from router import peerjournal
+        k, pid = self.unknown()
+        self.received(pid)
+        root = peerjournal.journal_root(self.state_dir, self.OWNER)
+        real = Path.iterdir
+
+        def iterdir(p):
+            if Path(p) == root:
+                raise PermissionError(13, "denied")
+            return real(p)
+        with mock.patch.object(Path, "iterdir", iterdir):
+            self.refused(k, pid, "journal_unreadable")
+
+    def test_a_placed_statement_whose_snapshot_is_not_a_statement_refuses(self):
+        # Written through the journal, so the bookkeeping agrees: only the
+        # snapshot check can see that whether it answers cannot be told.
+        from router import peerjournal
+        k, pid = self.unknown()
+        key = self.received(pid, statement=b"[]")
+        self.assertEqual(peerjournal.read_record(self.state_dir, self.OWNER, key)["disposed"],
+                         "placed")
+        peerjournal.strict_records(self.state_dir)      # the journal itself reads
+        self.refused(k, pid, "journal_unreadable")
+
+    def test_a_placed_statement_without_its_snapshot_refuses(self):
+        from router import peerjournal
+        k, pid = self.unknown()
+        key = self.received(pid)
+        (peerjournal.record_dir(self.state_dir, self.OWNER, key) / peerjournal.SNAPSHOT_DIR
+         / peerjournal.SNAPSHOT_STATEMENT).unlink()
+        self.refused(k, pid, "journal_unreadable")
+
+    def test_show_never_says_not_answered_when_it_cannot_tell(self):
+        k, pid = self.unknown()
+        key = self.received(pid)
+        self.record_path(key).write_text("{")
+        try:
+            got = str(peerresend.show(k, pid, now=self.now())["answered"])
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+            got = f"raised {type(e).__name__}"
+        self.assertTrue(got.startswith("unknown (journal unreadable"), got)
+
+    def test_a_claim_is_held_never_handed_while_the_journal_is_unreadable(self):
+        k, pid = self.unknown()
+        other = self.received("someone-else")       # placed, but answers another task
+        self.retransmit(k, pid)                     # claimed while the journal reads
+        good = self.record_path(other).read_bytes()
+        self.record_path(other).write_text("{")
+        port = self.plugin.ports[-1]
+        before = dict(port.pending)
+        k, _ = self.drain()
+        self.assertEqual(port.pending, before, "nothing handed while the journal cannot be read")
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        self.assertTrue((d / peerresend.CLAIM).exists(), "held, never cancelled")
+        self.assertEqual(peerresend.retransmits(d), [], "no settlement")
+        self.record_path(other).write_bytes(good)
+        k, _ = self.drain()
+        self.assertEqual(len(port.pending), len(before) + 1, "handed once the journal reads")
+
+    def test_a_claim_never_begun_is_held_while_the_journal_is_unreadable(self):
+        k, pid = self.unknown()
+        other = self.received("someone-else")
+        with mock.patch.object(peerresend, "begin_record", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.retransmit(k, pid)
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        n = json.loads((d / peerresend.CLAIM).read_text())["n"]
+        good = self.record_path(other).read_bytes()
+        self.record_path(other).write_text("{")
+        k, _ = self.drain()
+        self.assertIsNone(inflight.read_record(k, "alpha", peerresend.rtx_name(n)), "never begun")
+        self.assertEqual(peerresend.retransmits(d), [], "never cancelled")
+        self.assertTrue((d / peerresend.CLAIM).exists(), "the claim holds")
+        self.record_path(other).write_bytes(good)
+        k, _ = self.drain()
+        self.assertIsNotNone(inflight.read_record(k, "alpha", peerresend.rtx_name(n))
+                             or peerresend.retransmits(d), "begun once the journal reads")
+
+    def test_a_journal_blind_only_at_the_gate_holds_never_cancels(self):
+        # The drain's pre-check reads the journal once and passes; the gate's
+        # own read (answered) is blind: a router state, so the record HOLDS.
+        k, pid = self.unknown()
+        other = self.received("someone-else")
+        n = self.retransmit(k, pid)["n"]
+        self.record_path(other).write_text("{")
+        port = self.plugin.ports[-1]
+        before = dict(port.pending)
+        import logging
+        records = []
+        handler = logging.Handler(level=logging.DEBUG)
+        handler.emit = records.append
+        loggers = [logging.getLogger("amap_router_local.outbound"),
+                   logging.getLogger("amap_router_local.inflight")]
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            with mock.patch.object(peerresend, "journal_blind", return_value=None):
+                k, _ = self.drain()
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+        # A clean hold: nothing isolated as an error, and the hold itself said.
+        self.assertEqual([r.getMessage() for r in records if r.levelno >= logging.ERROR], [])
+        self.assertTrue(any("held, not published" in r.getMessage() for r in records),
+                        [r.getMessage() for r in records])
+        self.assertEqual(port.pending, before, "nothing handed")
+        d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
+        self.assertEqual(peerresend.retransmits(d), [], "never cancelled: no settlement")
+        self.assertIsNotNone(inflight.read_record(k, "alpha", peerresend.rtx_name(n)),
+                             "the record stays")
+
+    def test_each_router_state_at_the_gate_is_a_hold_not_a_verdict(self):
+        from router import outbound
+        k, pid = self.unknown()
+        n = self.retransmit(k, pid)["n"]
+        record = inflight.read_record(k, "alpha", peerresend.rtx_name(n))
+        other = self.received("someone-else", entry="e2")
+        for name, patches in (
+                ("clock_untrusted", [mock.patch.object(peerresend, "clock_trusted",
+                                                       return_value=False)]),
+                ("journal_unreadable", [])):
+            with self.subTest(code=name):
+                good = self.record_path(other).read_bytes()
+                if name == "journal_unreadable":
+                    self.record_path(other).write_text("{")
+                try:
+                    for p in patches:
+                        p.start()
+                    rc = outbound._recheck_retransmit(k, "alpha", peerresend.rtx_name(n),
+                                                      record, None, None)
+                finally:
+                    for p in patches:
+                        p.stop()
+                    self.record_path(other).write_bytes(good)
+                self.assertEqual((rc.hold, rc.verdict), (True, None), rc)
+                self.assertIn(name, rc.why)
+
+    def test_a_router_that_never_journaled_retransmits_as_before(self):
+        from router import peerjournal
+        k, pid = self.unknown()
+        self.assertFalse(peerjournal.journal_present(self.state_dir), "no journal on disk")
+        out = self.retransmit(k, pid)
+        self.assertIn("n", out)
 
 
 class FrontierTests(_Retransmit):

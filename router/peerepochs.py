@@ -338,11 +338,14 @@ def _reseed_claims(state_dir: Path) -> Dict[Tuple[str, str], str]:
     """Per pair, the maximum `sender_since` of every DECIDED record that
     passed the consistency step: placed, or refused (policy) quarantined
     or exposure_missing. Never an inconsistent one, an age-missing one, an
-    edge refusal or a demotion."""
+    edge refusal or a demotion. The journal is read strictly
+    (`peerjournal.strict_records`): one that cannot be read reliably is
+    `peerjournal.JournalBlind`, never a reseed from what happened to be
+    visible."""
     from . import peerbind
     from . import peerjournal as pj
     out: Dict[Tuple[str, str], str] = {}
-    for rec in pj.all_records(Path(state_dir)):
+    for rec in pj.strict_records(Path(state_dir)):
         if rec.get("kind") == "control":
             continue
         passed = rec.get("disposed") == "placed" or (
@@ -429,7 +432,13 @@ def operator_trust(state_dir: Path, now: datetime, *, evidence: str) -> Dict[str
         except OSError as e:
             problems.append(f"cannot remove an invalid file: {e}")
     if not problems:
-        for (runtime, from_canon), claim in sorted(_reseed_claims(state_dir).items()):
+        try:
+            claims = _reseed_claims(state_dir)
+        except pj.JournalBlind as e:
+            # Nothing reseeded from a partial view; the flag stays.
+            problems.append(f"the journal cannot be read reliably, so no epoch was reseeded: {e}")
+            claims = {}
+        for (runtime, from_canon), claim in sorted(claims.items()):
             old = accepted(state_dir, runtime, from_canon)
             if old is None or claim > old:
                 write_epoch(state_dir, runtime, from_canon, claim)
