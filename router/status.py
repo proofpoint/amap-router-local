@@ -202,6 +202,11 @@ class StatusTracker:
         hop transport. Replaced every poll: it is state."""
         self.hop = doc
 
+    def record_peer_store(self, doc: Optional[Dict[str, Any]]) -> None:
+        """This poll's `peer_store` section (`peerjournal.status_doc`), or
+        None without `delegation`. Replaced every poll: it is state."""
+        self.peer_store = doc
+
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that
         errored — the set the loader accepted is known even when draining it
@@ -283,6 +288,12 @@ class StatusTracker:
         # Never in the drained summary line.
         if getattr(self, "hop", None) is not None:
             doc["hop"] = self.hop
+        # Present only with `delegation`: peer admission and why, H, the
+        # floor, the operator's bound B, the clock_behind_h warning, the
+        # settled-through frontier, and every held candidate and transient
+        # retry with its age (router/peerjournal.py).
+        if getattr(self, "peer_store", None) is not None:
+            doc["peer_store"] = self.peer_store
         # Omitted, never defaulted, when this tracker cannot answer. A
         # consumer distinguishes "a router older than this field" from a
         # wrong value only if the absence is real.

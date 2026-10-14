@@ -27,7 +27,9 @@ imported, over every part it binds. Only this module computes one, every
 consumer re-checks it first, and it cannot be pickled, so no `Authorised`
 outlives its process. `authorise` issues a FRESH one; `confirm` re-checks it
 against the current configuration; `decision_record` turns a confirmed one
-into the decision's bytes, MAC'd under a durable key in `state_dir`;
+into the decision's bytes, MAC'd under a durable key in `state_dir` (the
+key signs decision, reservation and supersession records, each under its
+own label);
 `commit_decision` writes those bytes into the candidate's record directory
 (linked into place, never replacing, every step fsynced, then read back) and
 only then returns a `PersistedDecision` receipt; `resume` takes ONLY a
@@ -585,7 +587,8 @@ def confirm(auth: Authorised, *, cfg: Any) -> Authorised:
         raise AuthorisationMismatch("stale", "runtime")
     return _issue(statement=auth.statement, key_id=auth.key_id, runtime=auth.runtime,
                   body_text=auth.body_text, attachments=auth.attachments, hosted=auth.hosted,
-                  origin=ORIGIN_FRESH, confirmed=True, record_id=None, notice_id=None, ts=None)
+                  origin=ORIGIN_FRESH, confirmed=True, record_id=auth.record_id,
+                  notice_id=auth.notice_id, ts=auth.ts)
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +759,12 @@ def decision_record(auth: Authorised, *, record_id: str, preset: Tuple[str, str]
         raise ValueError("preset notice_id: 32 lower-case hex")
     if not (isinstance(ts, str) and _TS_RE.fullmatch(ts)):
         raise ValueError("preset ts: YYYY-MM-DDTHH:MM:SSZ")
+    # A reserved value (`authorise_checked`) carries its reservation's
+    # identity; the preset and the record id must be exactly that.
+    if auth.notice_id is not None and (notice_id, ts) != (auth.notice_id, auth.ts):
+        raise ValueError("the preset is not the reservation's notice_id and ts")
+    if auth.record_id is not None and record_id != auth.record_id:
+        raise ValueError("record_id is not the reservation's candidate")
     members = {"v": 1, "state": "decided", "disposition": "place", "record_id": record_id,
                "statement_sha256": auth.statement_sha256, "key_id": auth.key_id,
                "runtime": auth.runtime, "hosted_instance": auth.hosted,
@@ -896,6 +905,514 @@ def resume(receipt: PersistedDecision, snapshot: Snapshot, *, state_dir: Path) -
                   body_text=text, attachments=tuple(leaves), hosted=rec["hosted_instance"],
                   origin=ORIGIN_DECIDED, confirmed=True, record_id=rec["record_id"],
                   notice_id=rec["notice_id"], ts=rec["ts"])
+
+
+# ---------------------------------------------------------------------------
+# The reserved path: checks 6-11 once, the reservation, then hosting
+# ---------------------------------------------------------------------------
+#
+#   bind_for_reservation -> reservation_record -> commit_reservation
+#       -> resume_reserved -> authorise_checked -> confirm -> decision_record
+#
+# A `Checked` carries a statement across check 12. Its `origin` is
+# ORIGIN_PRE from `bind_for_reservation`, which only `reservation_record`
+# accepts, or ORIGIN_RESERVED from `resume_reserved`, which only
+# `authorise_checked` accepts. The fresh path re-reads the reservation it
+# just committed exactly as recovery does, so the two are one path, and a
+# change of time or of check 8 after an id is reserved can never produce a
+# pre-reservation outcome. The reserved `notice_id` is minted by
+# `reservation_record` and read back from the reservation; no function
+# takes one from its caller.
+
+ORIGIN_PRE = "pre"
+ORIGIN_RESERVED = "reserved"
+REPLAY_DIR = "peer-replay"
+RESERVATION_SUFFIX = ".json"
+_LABEL_CHECKED = b"amap-rl/checked/1\x00"
+_LABEL_PERSISTED_RESERVATION = b"amap-rl/persisted-reservation/1\x00"
+_LABEL_RESERVATION = b"amap-rl/peer-reservation/1\x00"
+_RESERVATION_MEMBERS = ("v", "state", "rt", "idk", "runtime", "id", "ts", "statement_sha256",
+                        "body_sha256", "attachment_sha256s", "key_id", "notice_id",
+                        "candidate_ref", "reserve_seq")
+_RT_RE = re.compile(r"[0-9a-f]{32}\Z")
+_IDK_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class ReservationCollision(Exception):
+    """A reservation for this (runtime, id) already exists for ANOTHER
+    candidate: check 12's duplicate. The prior file is untouched."""
+
+    def __init__(self, candidate_ref: str):
+        super().__init__(candidate_ref)
+        self.candidate_ref = candidate_ref
+
+
+def replay_keys(runtime: str, ident: str) -> Tuple[str, str]:
+    """(rt, idk) for a (configured runtime, statement id)."""
+    return (_sha(runtime.encode("utf-8"))[:32], _sha(ident.encode("utf-8")))
+
+
+def _checked_seal(statement: bytes, key_id: str, runtime: str, body_text: str,
+                  attachments: Tuple[bytes, ...], origin: str, record_id: Optional[str],
+                  notice_id: Optional[str], ts: Optional[str], key: bytes) -> bytes:
+    members = dict(statement_sha256=_sha(statement), key_id=key_id, runtime=runtime,
+                   body_sha256=_sha(body_text.encode("utf-8")),
+                   attachment_sha256s=[_sha(a) for a in attachments], origin=origin,
+                   record_id=record_id, notice_id=notice_id, ts=ts)
+    return hmac.new(key, _LABEL_CHECKED + hoplink.canonical(members), hashlib.sha256).digest()
+
+
+@dataclass(frozen=True)
+class Checked:
+    """A statement through checks 6-11 (ORIGIN_PRE), or re-read from its
+    durable reservation (ORIGIN_RESERVED). Built only by this module."""
+    statement: bytes
+    key_id: str
+    runtime: str
+    body_text: str
+    attachments: Tuple[bytes, ...]
+    origin: str
+    record_id: Optional[str]
+    notice_id: Optional[str]
+    ts: Optional[str]
+    seal: bytes = field(repr=False)
+    payload: Any = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self):
+        _require_checked(self)
+        object.__setattr__(self, "payload", _freeze(_strict_json(self.statement)))
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("a Checked is not persisted")
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def _require_checked(chk: Any, origin: Optional[str] = None) -> None:
+    if not isinstance(chk, Checked) or not isinstance(getattr(chk, "seal", None), bytes):
+        raise TypeError("not a live Checked")
+    want = _checked_seal(chk.statement, chk.key_id, chk.runtime, chk.body_text, chk.attachments,
+                         chk.origin, chk.record_id, chk.notice_id, chk.ts, _SEAL_KEY)
+    if not hmac.compare_digest(want, chk.seal):
+        raise TypeError("not a live Checked")
+    if origin is not None and chk.origin != origin:
+        raise TypeError(f"a {chk.origin!r} Checked where {origin!r} is required")
+
+
+def _issue_checked(**parts: Any) -> Checked:
+    return Checked(seal=_checked_seal(key=_SEAL_KEY, **parts), **parts)
+
+
+def bind_for_reservation(verified: Any, candidate: Any, *, delegation: Any,
+                         check7: Callable[[Mapping[str, Any], str], Optional[str]],
+                         check8: Callable[[Mapping[str, Any], str], Optional[str]]
+                         ) -> Union[Checked, Demoted]:
+    """Checks 6-11, exactly `bind`; a pre-reservation `Checked` when they
+    pass. A hold raised by a supplied check propagates."""
+    bound = bind(verified, candidate, delegation=delegation, check7=check7, check8=check8)
+    if isinstance(bound, Demoted):
+        return bound
+    runtime = runtime_for_key(delegation.config, verified.key_id)
+    return _issue_checked(statement=verified.statement, key_id=verified.key_id,
+                          runtime=runtime.runtime, body_text=bound.body_text,
+                          attachments=bound.attachments, origin=ORIGIN_PRE, record_id=None,
+                          notice_id=None, ts=None)
+
+
+def _reservation_mac(members: Mapping[str, Any], key: bytes) -> str:
+    return hmac.new(key, _LABEL_RESERVATION + hoplink.canonical(dict(members)),
+                    hashlib.sha256).hexdigest()
+
+
+def reservation_record(checked: Checked, *, record_id: str, reserve_seq: int,
+                       state_dir: Path) -> bytes:
+    """The reservation's bytes for a pre-reservation `checked`: a freshly
+    minted `notice_id`, MAC'd under the decision key with the reservation's
+    own label. Not an authority until `commit_reservation`."""
+    _require_checked(checked, ORIGIN_PRE)
+    if not (isinstance(record_id, str) and record_id):
+        raise ValueError("record_id: a non-empty string")
+    if not (type(reserve_seq) is int and reserve_seq > 0):
+        raise ValueError("reserve_seq: a positive integer")
+    p = checked.payload
+    rt, idk = replay_keys(checked.runtime, p["id"])
+    members = {"v": 1, "state": "reserved", "rt": rt, "idk": idk, "runtime": checked.runtime,
+               "id": p["id"], "ts": p["ts"], "statement_sha256": _sha(checked.statement),
+               "body_sha256": _sha(checked.body_text.encode("utf-8")),
+               "attachment_sha256s": [_sha(a) for a in checked.attachments],
+               "key_id": checked.key_id, "notice_id": secrets.token_hex(16),
+               "candidate_ref": record_id, "reserve_seq": reserve_seq}
+    return hoplink.canonical(dict(members, mac=_reservation_mac(members,
+                                                               _decision_key(state_dir))))
+
+
+def parse_reservation(raw: bytes, key: Optional[bytes]) -> Dict[str, Any]:
+    """A reservation's members, its MAC verified FIRST; `RecoveryCorrupt`.
+    With `key` None (the decision key is lost) the record is read as DATA
+    ONLY: strict JSON, the closed member set and the field grammars, never
+    as an authority."""
+    try:
+        doc = _strict_json(raw)
+    except (UnicodeDecodeError, ValueError):
+        raise RecoveryCorrupt("mac", "not a reservation") from None
+    if not isinstance(doc, dict) or set(doc) != set(_RESERVATION_MEMBERS) | {"mac"}:
+        raise RecoveryCorrupt("mac", "not a closed reservation")
+    members = {k: doc[k] for k in _RESERVATION_MEMBERS}
+    if key is not None:
+        try:
+            want = _reservation_mac(members, key)
+        except hoplink.CanonicalRefused:
+            raise RecoveryCorrupt("mac", "not canonical") from None
+        if not (isinstance(doc["mac"], str) and hmac.compare_digest(want, doc["mac"])):
+            raise RecoveryCorrupt("mac")
+    if members["v"] != 1 or members["state"] != "reserved":
+        raise RecoveryCorrupt("state")
+    if not (isinstance(members["notice_id"], str) and _NOTICE_ID_RE.fullmatch(members["notice_id"])
+            and isinstance(members["rt"], str) and _RT_RE.fullmatch(members["rt"])
+            and isinstance(members["idk"], str) and _IDK_RE.fullmatch(members["idk"])
+            and isinstance(members["candidate_ref"], str)):
+        raise RecoveryCorrupt("grammar")
+    return members
+
+
+def _replay_dir_fd(state_dir: Path, rt: str, *, create: bool) -> int:
+    """`state_dir/peer-replay/<rt>`, descended without following a link;
+    created (durably) when `create`."""
+    if not (isinstance(rt, str) and _RT_RE.fullmatch(rt)):
+        raise ValueError("rt: 32 lower-case hex")
+    fd = _open_dir(Path(state_dir))
+    try:
+        for part in (REPLAY_DIR, rt):
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                os.fsync(fd)
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _persisted_reservation_seal(rt: str, idk: str, dev: int, ino: int, sha256: str,
+                                record_id: str, notice_id: str, key: bytes) -> bytes:
+    members = {"rt": rt, "idk": idk, "dev": dev, "ino": ino, "sha256": sha256,
+               "record_id": record_id, "notice_id": notice_id}
+    return hmac.new(key, _LABEL_PERSISTED_RESERVATION + hoplink.canonical(members),
+                    hashlib.sha256).digest()
+
+
+@dataclass(frozen=True)
+class PersistedReservation:
+    """The receipt for a reservation durable on disk and read back. Issued
+    only by `commit_reservation` and `reopen_reservation`."""
+    rt: str
+    idk: str
+    dev: int
+    ino: int
+    sha256: str
+    record_id: str
+    notice_id: str
+    seal: bytes = field(repr=False)
+
+    def __post_init__(self):
+        _require_reservation_receipt(self)
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("a PersistedReservation is not persisted")
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def _require_reservation_receipt(rcp: Any) -> None:
+    if (not isinstance(rcp, PersistedReservation)
+            or not isinstance(getattr(rcp, "seal", None), bytes)):
+        raise TypeError("not a live PersistedReservation")
+    want = _persisted_reservation_seal(rcp.rt, rcp.idk, rcp.dev, rcp.ino, rcp.sha256,
+                                       rcp.record_id, rcp.notice_id, _SEAL_KEY)
+    if not hmac.compare_digest(want, rcp.seal):
+        raise TypeError("not a live PersistedReservation")
+
+
+def _issue_reservation_receipt(rt: str, idk: str, dev: int, ino: int, sha256: str,
+                               record_id: str, notice_id: str) -> PersistedReservation:
+    seal = _persisted_reservation_seal(rt, idk, dev, ino, sha256, record_id, notice_id, _SEAL_KEY)
+    return PersistedReservation(rt, idk, dev, ino, sha256, record_id, notice_id, seal)
+
+
+def _reservation_name(idk: str) -> str:
+    if not (isinstance(idk, str) and _IDK_RE.fullmatch(idk)):
+        raise ValueError("idk: 64 lower-case hex")
+    return idk + RESERVATION_SUFFIX
+
+
+def _receipt_from(dirfd: int, name: str, key: bytes, rt: str, idk: str,
+                  record_id: str) -> PersistedReservation:
+    data, fd, dev, ino = _read_checked(dirfd, name)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(dirfd)
+    rec = parse_reservation(data, key)
+    if (rec["rt"], rec["idk"]) != (rt, idk):
+        raise RecoveryCorrupt("placement", "the reservation is not at its own (rt, idk)")
+    if rec["candidate_ref"] != record_id:
+        raise ReservationCollision(rec["candidate_ref"])
+    return _issue_reservation_receipt(rt, idk, dev, ino, _sha(data), record_id, rec["notice_id"])
+
+
+def commit_reservation(state_dir: Path, rt: str, idk: str, rec: bytes, *,
+                       record_id: str) -> PersistedReservation:
+    """Link the reservation at `peer-replay/<rt>/<idk>.json` (never
+    replacing, every step durable), read it back, and only then return its
+    receipt. An existing reservation for this candidate (a retried step) is
+    ours and its receipt is returned; one for another candidate raises
+    `ReservationCollision`, the file untouched."""
+    key = _decision_key(state_dir)
+    mine = parse_reservation(rec, key)
+    if (mine["rt"], mine["idk"], mine["candidate_ref"]) != (rt, idk, record_id):
+        raise ValueError("the reservation does not name this (rt, idk) and candidate")
+    name = _reservation_name(idk)
+    dirfd = _replay_dir_fd(Path(state_dir), rt, create=True)
+    try:
+        try:
+            _link_once(dirfd, name, rec, stage_prefix=f".{name}.stage-")
+        except LinkConflict:
+            pass                        # an existing reservation: ours, or a collision
+        return _receipt_from(dirfd, name, key, rt, idk, record_id)
+    finally:
+        os.close(dirfd)
+
+
+def reopen_reservation(state_dir: Path, rt: str, idk: str, *,
+                       record_id: str) -> PersistedReservation:
+    """The receipt for a reservation already on disk: the stage cleaned, the
+    file read with every check and made durable, its MAC verified FIRST.
+    `FileNotFoundError` when there is none; `ReservationCollision` when it
+    belongs to another candidate."""
+    key = _decision_key(state_dir)
+    name = _reservation_name(idk)
+    dirfd = _replay_dir_fd(Path(state_dir), rt, create=False)
+    try:
+        _clean_stage(dirfd, f".{name}.stage-")
+        return _receipt_from(dirfd, name, key, rt, idk, record_id)
+    finally:
+        os.close(dirfd)
+
+
+def resume_reserved(receipt: PersistedReservation, snapshot: Snapshot, *,
+                    state_dir: Path) -> Checked:
+    """A RESERVED `Checked` from a durable reservation: the file re-read
+    through the receipt (inode and digest), its MAC first, then the
+    snapshot's bindings. Re-runs no check; the runtime is the reservation's
+    own, never the current configuration's."""
+    _require_reservation_receipt(receipt)
+    key = _decision_key(state_dir)
+    name = _reservation_name(receipt.idk)
+    dirfd = _replay_dir_fd(Path(state_dir), receipt.rt, create=False)
+    try:
+        try:
+            data, fd, dev, ino = _read_checked(dirfd, name)
+        except FileNotFoundError:
+            raise RecoveryCorrupt("replaced", "the reservation is gone") from None
+        os.close(fd)
+    finally:
+        os.close(dirfd)
+    if (dev, ino) != (receipt.dev, receipt.ino) or _sha(data) != receipt.sha256:
+        raise RecoveryCorrupt("replaced")
+    rec = parse_reservation(data, key)
+    if rec["candidate_ref"] != receipt.record_id or rec["notice_id"] != receipt.notice_id:
+        raise RecoveryCorrupt("candidate_ref")
+    if not isinstance(snapshot, Snapshot) or not isinstance(snapshot.statement, bytes):
+        raise RecoveryCorrupt("snapshot", "incomplete")
+    if rec["statement_sha256"] != _sha(snapshot.statement):
+        raise RecoveryCorrupt("snapshot", "statement")
+    try:
+        payload = _strict_json(snapshot.statement)
+        _fields, octets, label, leaves = _view(snapshot.candidate)
+    except (UnicodeDecodeError, ValueError):
+        raise RecoveryCorrupt("snapshot", "unreadable") from None
+    if (not isinstance(payload, dict) or payload.get("key_id") != rec["key_id"]
+            or payload.get("id") != rec["id"] or payload.get("ts") != rec["ts"]):
+        raise RecoveryCorrupt("snapshot", "statement_members")
+    text = _body_text(octets, label)
+    if text is None or rec["body_sha256"] != _sha(text.encode("utf-8")):
+        raise RecoveryCorrupt("snapshot", "body")
+    if list(rec["attachment_sha256s"]) != [_sha(a) for a in leaves]:
+        raise RecoveryCorrupt("snapshot", "attachments")
+    return _issue_checked(statement=snapshot.statement, key_id=rec["key_id"],
+                          runtime=rec["runtime"], body_text=text, attachments=tuple(leaves),
+                          origin=ORIGIN_RESERVED, record_id=rec["candidate_ref"],
+                          notice_id=rec["notice_id"], ts=rec["ts"])
+
+
+def authorise_checked(checked: Checked, *, cfg: Any) -> Union[Authorised, NotHosted, Undecided]:
+    """Hosting ONLY, for a RESERVED `checked`; a fresh `Authorised` carrying
+    the reservation's candidate, `notice_id` and `ts`. `confirm` (which
+    re-checks the key's runtime against the reservation's) and
+    `decision_record` follow as for any fresh value."""
+    _require_checked(checked, ORIGIN_RESERVED)
+    host = hosting(cfg, checked.payload.get("to"))
+    if not isinstance(host, Hosted):
+        return host
+    return _issue(statement=checked.statement, key_id=checked.key_id, runtime=checked.runtime,
+                  body_text=checked.body_text, attachments=checked.attachments,
+                  hosted=host.instance, origin=ORIGIN_FRESH, confirmed=False,
+                  record_id=checked.record_id, notice_id=checked.notice_id, ts=checked.ts)
+
+
+# ---------------------------------------------------------------------------
+# Supersession: the only path from a decision to a refusal
+# ---------------------------------------------------------------------------
+#
+# A decided record is refused only by the generation fence (router) or the
+# operator's key-loss drop, and only through `supersede.json`: a closed,
+# MAC'd record naming the exact bytes of the decision it supersedes. A
+# supersession MAC'd under the CURRENT key is valid even when the decision
+# itself can no longer be verified (the key-loss case).
+
+SUPERSEDE_FILE = "supersede.json"
+SUPERSEDE_STAGE_PREFIX = ".supersede.json.stage-"
+SUPERSEDE_CODES = frozenset({"generation_retired", "decision_unrecoverable"})
+_LABEL_SUPERSEDE = b"amap-rl/peer-supersede/1\x00"
+_SUPERSEDE_MEMBERS = ("v", "type", "record_id", "decision_sha256", "outcome", "cause",
+                      "policy_code", "superseded_at", "by")
+
+
+def _supersede_mac(members: Mapping[str, Any], key: bytes) -> str:
+    return hmac.new(key, _LABEL_SUPERSEDE + hoplink.canonical(dict(members)),
+                    hashlib.sha256).hexdigest()
+
+
+def read_decision_data(state_dir: Path, record_dir: str) -> Tuple[bytes, Dict[str, Any]]:
+    """The decision's bytes and members read as DATA ONLY (no MAC): strict
+    JSON, the closed member set, and the notice id and recipient grammars.
+    Never an authority; used to find what a supersession names."""
+    dirfd = _record_dir_fd(Path(state_dir), record_dir)
+    try:
+        data, fd, _dev, _ino = _read_checked(dirfd, DECISION_FILE)
+        os.close(fd)
+    finally:
+        os.close(dirfd)
+    try:
+        doc = _strict_json(data)
+    except (UnicodeDecodeError, ValueError):
+        raise RecoveryCorrupt("grammar", "not a record") from None
+    if not isinstance(doc, dict) or set(doc) != set(_RECORD_MEMBERS) | {"mac"}:
+        raise RecoveryCorrupt("grammar", "not a closed record")
+    if not (isinstance(doc["notice_id"], str) and _NOTICE_ID_RE.fullmatch(doc["notice_id"])
+            and isinstance(doc["hosted_instance"], str)
+            and config_mod._NAME_RE.fullmatch(doc["hosted_instance"])):
+        raise RecoveryCorrupt("grammar")
+    return data, doc
+
+
+def supersede_record(state_dir: Path, *, record_id: str, decision: bytes, policy_code: str,
+                     by: str, at: str) -> bytes:
+    """The supersession's bytes, MAC'd under the current decision key with
+    the supersession label."""
+    if policy_code not in SUPERSEDE_CODES:
+        raise ValueError(f"{policy_code!r} is not a supersession code")
+    if not (isinstance(at, str) and _TS_RE.fullmatch(at)):
+        raise ValueError("at: YYYY-MM-DDTHH:MM:SSZ")
+    if not (isinstance(by, str) and by):
+        raise ValueError("by: who superseded")
+    members = {"v": 1, "type": "supersede", "record_id": record_id,
+               "decision_sha256": _sha(decision), "outcome": "refused", "cause": "policy",
+               "policy_code": policy_code, "superseded_at": at, "by": by}
+    return hoplink.canonical(dict(members, mac=_supersede_mac(members,
+                                                             _decision_key(state_dir))))
+
+
+def parse_supersede(raw: bytes, key: bytes, *, record_id: str,
+                    decision_sha256: Optional[str]) -> Dict[str, Any]:
+    """A supersession's members, its MAC FIRST, then the record it names and
+    (when the decision is present) the decision's exact bytes;
+    `RecoveryCorrupt("supersede_invalid", ...)` otherwise."""
+    try:
+        doc = _strict_json(raw)
+    except (UnicodeDecodeError, ValueError):
+        raise RecoveryCorrupt("supersede_invalid", "not JSON") from None
+    if not isinstance(doc, dict) or set(doc) != set(_SUPERSEDE_MEMBERS) | {"mac"}:
+        raise RecoveryCorrupt("supersede_invalid", "not a closed supersession")
+    members = {k: doc[k] for k in _SUPERSEDE_MEMBERS}
+    try:
+        want = _supersede_mac(members, key)
+    except hoplink.CanonicalRefused:
+        raise RecoveryCorrupt("supersede_invalid", "not canonical") from None
+    if not (isinstance(doc["mac"], str) and hmac.compare_digest(want, doc["mac"])):
+        raise RecoveryCorrupt("supersede_invalid", "mac")
+    if members["record_id"] != record_id:
+        raise RecoveryCorrupt("supersede_invalid", "record_id")
+    if decision_sha256 is not None and members["decision_sha256"] != decision_sha256:
+        raise RecoveryCorrupt("supersede_invalid", "decision_sha256")
+    if (members["v"], members["type"], members["outcome"], members["cause"]) != (
+            1, "supersede", "refused", "policy") or members["policy_code"] not in SUPERSEDE_CODES:
+        raise RecoveryCorrupt("supersede_invalid", "members")
+    return members
+
+
+def commit_supersede(state_dir: Path, record_dir: str, rec: bytes, *, record_id: str,
+                     decision_sha256: str) -> Dict[str, Any]:
+    """Link the supersession once (never replacing, durable), read it back
+    and verify it. An identical one already there is accepted."""
+    key = _decision_key(state_dir)
+    parse_supersede(rec, key, record_id=record_id, decision_sha256=decision_sha256)
+    dirfd = _record_dir_fd(Path(state_dir), record_dir)
+    try:
+        _link_once(dirfd, SUPERSEDE_FILE, rec, stage_prefix=SUPERSEDE_STAGE_PREFIX)
+        data, fd, _dev, _ino = _read_checked(dirfd, SUPERSEDE_FILE)
+        os.close(fd)
+    finally:
+        os.close(dirfd)
+    if data != rec:
+        raise RecoveryCorrupt("readback")
+    return parse_supersede(data, key, record_id=record_id, decision_sha256=decision_sha256)
+
+
+def reopen_supersede(state_dir: Path, record_dir: str, *, record_id: str
+                     ) -> Optional[Dict[str, Any]]:
+    """The supersession on disk, verified, or None when there is none. The
+    decision's bytes are compared when the decision is present; a
+    supersession is valid under the current key whether or not the decision
+    still verifies."""
+    key = _decision_key(state_dir)
+    dirfd = _record_dir_fd(Path(state_dir), record_dir)
+    try:
+        _clean_stage(dirfd, SUPERSEDE_STAGE_PREFIX)
+        try:
+            data, fd, _dev, _ino = _read_checked(dirfd, SUPERSEDE_FILE)
+        except FileNotFoundError:
+            return None
+        os.close(fd)
+        try:
+            dec, dfd, _d, _i = _read_checked(dirfd, DECISION_FILE)
+            os.close(dfd)
+            decision_sha = _sha(dec)
+        except FileNotFoundError:
+            decision_sha = None
+    finally:
+        os.close(dirfd)
+    return parse_supersede(data, key, record_id=record_id, decision_sha256=decision_sha)
 
 
 # ---------------------------------------------------------------------------

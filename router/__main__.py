@@ -34,6 +34,24 @@
                                  rebuild an unverified alias tombstone store (the router must be
                                  stopped). It PERMANENTLY retires every configured alias:
                                  tombstoned addresses can never be re-enabled.
+  peer-store init --never-admitted [--acknowledge-surviving EVIDENCE]
+                                 a fresh signed-peer store, admission open, no floor: refused over
+                                 any peer artefact, and over surviving placement evidence unless
+                                 acknowledged (router/peerjournal.py). The router must be stopped.
+  peer-store declare-restored --evidence TEXT
+                                 after ANY restore of state_dir: admission closes until peer-bound
+  peer-bound --at TS --evidence TEXT [--b-not-from-wall-clock]
+                                 record an operator bound B after a lost clock: refused below any
+                                 receiver time the router can see; floor = B + Fmax + 1 s, then
+                                 admission opens. The evidence is recorded, NOT verified.
+  peer-decision drop KEY --evidence TEXT
+                                 key loss only: a decision or reservation that no longer verifies
+                                 is refused with decision_unrecoverable, or done if already placed
+  peer-decision restore-key --from FILE
+                                 put the ORIGINAL decision key back (refused unless it is)
+  peer-candidate quarantine KEY --evidence TEXT
+                                 the exit from a candidate held on a view that can never be read:
+                                 mail, quarantined (or tombstoned), done
   quarantine list [NAME] [--control-dir DIR]
   quarantine show NAME SOURCE GEN ID [--control-dir DIR]
                                  read-only inspection of the ingress quarantine
@@ -186,6 +204,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ri.add_argument("--dry-run", action="store_true",
                       help="list what would be tombstoned; take no lock and write nothing")
 
+    p_ps = sub.add_parser("peer-store", help="operator verbs on the signed-peer store")
+    ps_sub = p_ps.add_subparsers(dest="peer_store_command", required=True)
+    p_psi = ps_sub.add_parser("init", help="a fresh store, admission open, no floor")
+    p_psi.add_argument("--never-admitted", action="store_true", required=True,
+                       help="attest that this router has never admitted a signed peer candidate")
+    p_psi.add_argument("--acknowledge-surviving", metavar="EVIDENCE", default=None,
+                       help="proceed over surviving placement evidence, recording why")
+    p_psr = ps_sub.add_parser("declare-restored", help="state_dir was restored: close admission")
+    p_psr.add_argument("--evidence", required=True)
+    p_pb = sub.add_parser("peer-bound", help="record an operator bound B after a lost clock")
+    p_pb.add_argument("--at", required=True, help="B, as YYYY-MM-DDTHH:MM:SSZ (no default)")
+    p_pb.add_argument("--evidence", required=True,
+                      help="where B comes from (recorded verbatim, not verified)")
+    p_pb.add_argument("--b-not-from-wall-clock", action="store_true",
+                      help="B is within 60 s of now and was NOT derived from the clock")
+    p_pd = sub.add_parser("peer-decision", help="operator exits for an unrecoverable decision")
+    pd_sub = p_pd.add_subparsers(dest="peer_decision_command", required=True)
+    p_pdd = pd_sub.add_parser("drop", help="refuse a decision whose key is lost")
+    p_pdd.add_argument("key", help="the candidate record's 64-hex key")
+    p_pdd.add_argument("--evidence", required=True,
+                       help="why the key is lost for good (recorded in the audit)")
+    p_pdr = pd_sub.add_parser("restore-key", help="put the original decision key back")
+    p_pdr.add_argument("--from", dest="source", type=Path, required=True)
+
+    p_pc = sub.add_parser("peer-candidate", help="operator exits for a held signed candidate")
+    pc_sub = p_pc.add_subparsers(dest="peer_candidate_command", required=True)
+    p_pcq = pc_sub.add_parser("quarantine", help="mail a candidate whose view can never be read")
+    p_pcq.add_argument("key", help="the candidate record's 64-hex key")
+    p_pcq.add_argument("--evidence", required=True)
+
     p_q = sub.add_parser("quarantine", help="read-only inspection of the ingress quarantine")
     q_sub = p_q.add_subparsers(dest="quarantine_command", required=True)
     p_ql = q_sub.add_parser("list", help="one line per item: NAME SOURCE GEN ID and its state")
@@ -202,6 +250,51 @@ def _build_parser() -> argparse.ArgumentParser:
                             "option is refused")
 
     return parser
+
+
+def _peer_operator(cfg, args) -> int:
+    """The signed-peer store's operator verbs, under the drain lock
+    (fail-fast: the router must be stopped)."""
+    from datetime import datetime, timezone
+    from . import peerclock, peerjournal
+    from .util import parse_utc_ts
+    verb = " ".join(v for v in (args.command, getattr(args, "peer_store_command", None),
+                                getattr(args, "peer_decision_command", None),
+                                getattr(args, "peer_candidate_command", None)) if v)
+    try:
+        lk = acquire_lock(cfg.state_dir)
+    except LockHeldError as e:
+        print(f"router: refusing to run '{verb}': {e}", file=sys.stderr)
+        return 1
+    now = datetime.now(timezone.utc)
+    try:
+        if verb == "peer-store init":
+            out = peerjournal.operator_init(cfg, now,
+                                            acknowledge_surviving=args.acknowledge_surviving)
+        elif verb == "peer-store declare-restored":
+            out = peerjournal.operator_declare_restored(cfg.state_dir, now,
+                                                        evidence=args.evidence)
+        elif verb == "peer-bound":
+            at = parse_utc_ts(args.at)
+            if at is None:
+                raise peerclock.BoundRefused("--at must be YYYY-MM-DDTHH:MM:SSZ")
+            out = peerjournal.operator_bound(cfg, now, at=at, evidence=args.evidence,
+                                             not_from_wall_clock=args.b_not_from_wall_clock)
+        elif verb == "peer-candidate quarantine":
+            out = peerjournal.operator_quarantine_candidate(cfg, now, key=args.key,
+                                                            evidence=args.evidence)
+        elif verb == "peer-decision drop":
+            out = peerjournal.operator_drop(cfg, now, key=args.key, evidence=args.evidence)
+        else:
+            out = peerjournal.operator_restore_key(cfg, now, source=args.source)
+    except (peerjournal.StoreRefused, peerjournal.DropRefused, peerclock.BoundRefused,
+            peerclock.ClockUntrusted, peerjournal.StoreBlocked, OSError) as e:
+        print(f"router: {verb}: refused: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lk.release()
+    print(json.dumps(out, sort_keys=True))
+    return 0
 
 
 def _quarantine(cfg, args) -> int:
@@ -625,6 +718,9 @@ def main(argv=None) -> int:
 
     if args.command == "quarantine":
         return _quarantine(cfg, args)
+
+    if args.command in ("peer-store", "peer-bound", "peer-decision", "peer-candidate"):
+        return _peer_operator(cfg, args)
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover — argparse prevents this
     return 2

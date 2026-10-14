@@ -1,4 +1,4 @@
-"""A stand-in for the transport plugin's peer seam (PLUGIN_API (3, 3)), for
+"""A stand-in for the transport plugin's peer seam (PLUGIN_API (3, 4)), for
 tests: the same factories, the same Protocol, the same reason vocabularies,
 and SYNTHETIC crypto. Not Ed25519: a "signature" is SHA-512 over the seed and
 the message, and a public key is SHA-256 of the seed, with a registry from
@@ -28,6 +28,8 @@ KEY_CONFIG_REASONS = frozenset({
     "duplicate_key_id", "inverted_validity", "key_malformed", "key_not_canonical",
     "key_small_order",
 })
+#: `candidate_view`'s vocabulary (3, 4), a set of its own.
+CANDIDATE_REASONS = frozenset({"candidate_json", "candidate_schema", "over_cap"})
 
 
 class CodecError(ValueError):
@@ -245,6 +247,25 @@ def verify_candidate(fields, key_table, verifier, now, known):
     return verify_checked(kind, k, statement, signature, key_table, verifier, now)
 
 
+def candidate_view(raw):
+    """The stand-in's candidate form IS a verifier view as JSON, plus an
+    optional `"withheld": true` for a candidate withheld at write time.
+    Raises CodecError with a CANDIDATE_REASONS reason, and nothing else."""
+    if not isinstance(raw, (bytes, bytearray)):
+        raise CodecError("parse", "candidate_json", "not_bytes")
+    try:
+        doc = json.loads(bytes(raw).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise CodecError("parse", "candidate_json", "not_json") from None
+    if not isinstance(doc, dict):
+        raise CodecError("schema", "candidate_schema")
+    if doc.get("withheld") is True:
+        raise CodecError("codec", "over_cap")
+    if set(doc) != {"fields", "body", "attachments"}:
+        raise CodecError("schema", "candidate_schema")
+    return doc
+
+
 class PeerCodec:
     __slots__ = ()
     check1 = staticmethod(check1)
@@ -255,8 +276,10 @@ class PeerCodec:
     decode_statement = staticmethod(decode_statement)
     decode_control = staticmethod(decode_control)
     encode_control = staticmethod(encode_control)
+    candidate_view = staticmethod(candidate_view)
     REASONS = REASONS
     KEY_CONFIG_REASONS = KEY_CONFIG_REASONS
+    CANDIDATE_REASONS = CANDIDATE_REASONS
 
 
 def namespace(*, api=(3, 3), sign_fails=None, verify_fails=None, calls=None) -> Dict[str, Any]:

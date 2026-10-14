@@ -122,6 +122,18 @@ PLUGIN_API of at least `DELEGATION_MINOR`, with the plugin's own
 `OPTIONAL_FACTORIES` declaring both new names at that minor or later; any
 shortfall is `delegation_capability_missing`. Without `delegation` nothing
 here is consulted, so an older compatible plugin still loads.
+
+API 3.4: THE CANDIDATE VIEW, one additive minor with no port change. The
+peer codec gains an OPTIONAL method, `candidate_view(raw)` (the verifier's
+candidate form from a candidate's bytes: a view, or the plugin's
+`CodecError` with a reason in `CANDIDATE_REASONS` and nothing else), and an
+OPTIONAL attribute, `CANDIDATE_REASONS` (`CODEC_OPTIONAL_METHODS`,
+`CODEC_OPTIONAL_ATTRIBUTES`). The same gate as an optional factory: below
+the minor the names are ignored; at or above it, absent is OFF (signed
+candidates are held, `candidate_view_unavailable`); a method present but
+not callable, or `CANDIDATE_REASONS` present but not exactly
+`CANDIDATE_REASONS_3_4`, refuses delegation: exactly that set, at every
+minor, until this runtime handles more.
 """
 
 from __future__ import annotations
@@ -153,7 +165,7 @@ _logger = logging.getLogger("amap_router_local.transport")
 #: `UnsafeRead` attribute, so a `(1, x)` plugin is refused here and a
 #: `(2, x)` plugin by a `(1, x)` runtime, before any factory is called.
 #: `(3, 0)` is amendment E8 (module docstring, API 3.0).
-PLUGIN_API: Tuple[int, int] = (3, 3)
+PLUGIN_API: Tuple[int, int] = (3, 4)
 
 #: The lowest minor this runtime LOADS. Optional factories never raise it: a
 #: plugin with the same major and a minor of at least this loads, and the
@@ -176,6 +188,13 @@ OPTIONAL_FACTORIES: Mapping[str, Tuple[Tuple[int, int], Optional[str]]] = {
 DELEGATION_MINOR: Tuple[int, int] = (3, 3)
 DELEGATION_FACTORIES: Tuple[str, ...] = (
     "make_signer", "make_verifier", "make_peer_codec", "make_peer_errors")
+#: Optional methods and attributes of the peer codec, by name, with the minor
+#: introducing each (module docstring, API 3.4).
+CODEC_OPTIONAL_METHODS: Mapping[str, Tuple[int, int]] = {"candidate_view": (3, 4)}
+CODEC_OPTIONAL_ATTRIBUTES: Mapping[str, Tuple[int, int]] = {"CANDIDATE_REASONS": (3, 4)}
+#: `candidate_view`'s vocabulary at (3, 4), exactly: a strict-decode refusal,
+#: a schema refusal, and a candidate withheld at write time.
+CANDIDATE_REASONS_3_4 = frozenset({"candidate_json", "candidate_schema", "over_cap"})
 #: `make_peer_errors()`'s keys, exactly.
 PEER_ERROR_NAMES: Tuple[str, ...] = ("CodecError", "KeyConfigError", "BackendError", "ConfigError")
 

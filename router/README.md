@@ -1564,7 +1564,8 @@ JSON object this router builds, signs with its own Ed25519 key through the
 plugin, and hands over as envelope kind `"peer"`. Off unless `delegation` is
 configured; then item 5e is on.
 
-**Config** (`delegation`; every member required except `attachment_basis`):
+**Config** (`delegation`; every member required except `attachment_basis`,
+`inbound`, `windows` and `retention`):
 
 ```
 "delegation": {
@@ -1574,7 +1575,10 @@ configured; then item 5e is on.
                 "keys": [{"key_id": "...", "public_key": "<64 hex>",
                           "not_before": "...Z", "not_after": "...Z"}]}],
   "crypto": {"crypto_backend": "pyca" | "openssl", "openssl_path": "/abs/openssl"},
-  "attachment_basis": "closed_fleet"
+  "attachment_basis": "closed_fleet",
+  "inbound": false,
+  "windows": {"p": 3600, "f": 300},
+  "retention": {"sweep": false}
 }
 ```
 
@@ -1585,6 +1589,15 @@ configured; then item 5e is on.
   belongs to exactly one runtime (`domain_shared` otherwise).
 - `attachment_basis`, optional: absent, or `"closed_fleet"`, the deployment's
   basis for asserting `clean` on a signed peer task's attachments (below).
+- `inbound`, optional: absent or `false`. `true` (taking signed candidates
+  at all) is refused at load in this build: "inbound peer intake is not
+  available in this build". It is lifted only with the policy, edge and
+  reply decisions it needs.
+- `windows`, optional: the receiver's window, `p` (past) and `f` (future
+  skew) in seconds, within the profile's bounds (`p` in [300, 86400], `f`
+  at most 900). Default `{"p": 3600, "f": 300}`.
+- `retention`, optional: `{"sweep": false}` by default. `true` is refused
+  while the store has no settled-through frontier (no `peer-store init`).
 - `signing_key.path` is in normal form and lexically outside `state_dir`,
   `hop.root`, the registry, the intake directory and every agent-reachable
   root, each compared as configured AND as resolved, by path components.
@@ -1656,8 +1669,9 @@ production path begins one, and an in-flight record pinning one is damaged.
 
 **Verifying** (`router/peerverify.py`, public): check 1, then the caller's
 check 2 (`known`, required), then checks 3-5, each refusal the codec's cause
-token; a local backend fault propagates. The candidate journal and replay
-index that answer check 2 are a later unit's.
+token; a local backend fault propagates. Check 2 is answered by the replay
+index (`peerjournal.known`, below), excluding the candidate's own
+reservation.
 
 **Binding checks and placement** (`router/peerbind.py`, public;
 `deliver.deliver_signed_peer`). After verification, `peerbind.bind` runs the
@@ -1683,7 +1697,9 @@ value; `confirm` re-checks it against the current configuration;
 `decision_record` turns a confirmed one into the decision's bytes, MAC'd
 under `state_dir/peer-decision.key` (32 bytes, 0600, created once at
 activation and made durable before use; never rotated; a reset leaves it,
-and the candidate journal, alone); `commit_decision` links those bytes into
+and the candidate journal, alone; it signs three record types, decisions,
+reservations and supersessions, each under its own label, so no one
+verifies as another); `commit_decision` links those bytes into
 `<state_dir>/<logical_id>/peer-candidates/<key>/decision.json` without ever
 replacing a file, makes every step durable, reads them back, and only then
 returns a receipt; `resume` takes only a receipt, re-reads the file through
@@ -1728,9 +1744,209 @@ removes an entry only on a valid tombstone. `peerlane.tombstone_bytes` gives
 the exact form (a closed object: `v` 1, `intake`, `id` as 32 lower-case hex,
 `candidate_sha256` as 64 lower-case hex, `disposition`, and `disposed_at` as
 `YYYY-MM-DDTHH:MM:SSZ`), and `fsops` binds `.disposed/<intake>/` as this
-router's own kind, rooted at the hop root, with a private `.stage/`. Nothing
-writes a tombstone yet: the candidate journal does, in a later unit, which
-will also create and check `.stage/` at startup.
+router's own kind, rooted at the hop root, with a private `.stage/`. The
+candidate journal writes them (below), and creates and checks each
+`.stage/` at startup.
+
+## The candidate journal (`router/peerjournal.py`, `router/peerclock.py`)
+
+Every signed candidate this router takes gets one durable record BEFORE any
+check, and every step after it is durable before the next. Both modules are
+internal. Inbound intake is off in this build (`delegation.inbound` is
+refused at load), so in production no candidate is taken, and with it on
+the production decision hooks hold every candidate they would decide
+(`hook_absent`); the journal, its clock and the operator verbs below are in
+place for when the policy, edge and reply decisions exist.
+
+**The candidate view** (plugin API 3.4). A candidate's bytes become the
+verifier's view only through the plugin's `candidate_view`; this router
+never parses a candidate itself. A plugin below 3.4, or one without the view
+or without its vocabulary (`CANDIDATE_REASONS`), leaves the view OFF:
+candidates are held (`candidate_view_unavailable`), never guessed at. A
+vocabulary that is not exactly the three 3.4 reasons refuses delegation.
+
+**The inbound poll** (`peerjournal.poll`, after the ingress pass, under the
+same lock, with `delegation.inbound` only): H is advanced first; then each
+identity's each generation's `candidates/` is listed through the reader
+port (one page per poll, with a cursor so held candidates never starve the
+rest) and each entry is taken once (its bytes read once, into the snapshot)
+and evaluated; then each host intake; then the frontier and, when
+configured, the sweep. Without a trustworthy clock, or before
+`peer-store init`, nothing is taken. The configured window
+(`delegation.windows`) is applied first, at startup and at every poll: a
+narrowing takes effect at once, a wider P raises the floor, and every F
+joins the history. After the listing passes, RECOVERY walks every record
+that is not `done`, by its recorded state and in `take_seq` order, whether
+or not its entry is listed again. Each entry and each recovered record is
+isolated: one that fails is held or counted and the rest proceed. A
+candidate first observed in a generation that is not current is
+`late_inbound`: mailed, quarantined to that generation with that cause, and
+never placed. A tree candidate's quarantine item
+(for `demoted` and `mail`) goes into its generation's ingress quarantine
+with cause `cold_fleet_mail` and the profile's cause as evidence; its entry
+is removed through the plugin's remover only after `done`, and a removal
+that does not succeed is retried by the next poll, which finds the entry
+again with its record `done`.
+
+**Host intakes** (`.unresolved/`, `.control/`, owned by `_host`). An entry
+is taken only once its `candidate.json` is committed (at two links it is a
+commit in progress). It is disposed of by a TOMBSTONE, never removed by
+this router: the tombstone's bytes are frozen in the same record write that
+records the disposition (`placed` for a decision, re-frozen as `refused` by
+a supersession); then the effect; then the tombstone is committed with
+`commit_durable` from exactly those bytes, mode 0640; then the record is
+`done`. The downstream runtime removes the entry on a valid tombstone. The
+record is kept while its tombstone exists, and a tombstone is removed only
+once a complete listing, taken after it was committed, no longer shows the
+entry. Without `.disposed/<intake>/` (the deploy creates it) nothing is
+taken from that intake.
+
+**Layout**, all under `state_dir`:
+
+```
+<logical_id>|_host/peer-candidates/<key>/
+    snapshot/candidate.json | view.json | statement   written once
+    record.json                                       the record (rev n)
+    decision.json                                     a decided placement
+    supersede.json                                    a refusal superseding it
+peer-replay/<rt>/<idk>.json                           a reservation (MAC'd, immutable)
+peer-replay/<rt>/<idk>.done                           its settlement marker
+peer-replay/digests/<sha256(statement)>               check 2's index
+peer-replay/operator.audit.jsonl                      every operator act
+peer-vacant/<seq>                                     a take seq with no record
+peer-clock.json                                       the clock AND the bookkeeping
+```
+
+`<key>` is sha256 over the delivery (intake, generation, owner, entry id):
+one record per delivery, never per message. `rt` is the first 32 hex of
+sha256(runtime), `idk` sha256(id). An instance cannot be named after any of
+the top-level entries above (`config.RESERVED_STATE_NAMES`): a reset of it
+would clear them.
+
+**The lifecycle** is forward-only: `pending` -> `reserved` -> `decided` ->
+`done`, or `pending` -> `demoted` | `dropped` | `mail` -> `done`, or
+`reserved` -> `dropped` | `refused` -> `done`; `decided` -> `refused` only
+through a supersession (below). A HOLD is metadata on a record, never a
+state: it names why the record cannot move now (`candidate_view_unavailable`,
+`admission_closed`, `hook_absent`, `undecided`, `key_runtime_changed`: each
+clears on its own; `candidate_view_refused` and `candidate_malformed` only by
+`peer-candidate quarantine`; `recovery_corrupt` only by an operator act
+(`restore-key` releases every `recovery_corrupt/mac` hold; `drop` exits key
+loss); `recipient_gone` is re-tried once the decision's recipient is
+configured again, and never attempted while it is not; `unpublishable`, a
+statement id or `in_reply_to` the notice-id grammar cannot carry (a leading
+`-`), is re-tried at every start and never dropped). A recipient held by its generation is not a hold: the
+decided record stays `decided` with a retry note, and the next poll
+retries. A terminal disposition and its pending control notice are one
+write.
+
+**Order of evaluation** (the peer-origin profile's checks, in order): the
+candidate view (`over_cap` is terminal mail; `candidate_json` and
+`candidate_schema` hold); no statement field is mail; checks 1-5 through
+the verifier, with check 2 against the replay index (an exact replay is
+dropped as `duplicate` with no notice and no replay mutation); checks 6-11
+with this router's window as check 7 and the check-8 hook; then check 12,
+the reservation. A reservation is linked once, MAC'd, and read back before
+it is used; another candidate's reservation for the same (runtime, id) is
+the collision: `dropped(duplicate)` with a control notice, the prior
+untouched. From the reservation on, a record is decided only from its
+reservation and snapshot: checks 1-12 are never run again, whatever time it
+is, so a reserved record held past P + F is still decided, never demoted.
+Hosting, then the reply, edge and policy hooks (each may hold or refuse),
+then the decision, then placement.
+
+**Supersession.** A decided record becomes `refused` only through
+`supersede.json`, a closed record MAC'd under the decision key that names
+the exact bytes of the decision it supersedes, and only for the generation
+fence (`generation_retired`) or the operator's drop
+(`decision_unrecoverable`). A valid supersession always wins over the
+decision; an invalid one holds (`recovery_corrupt`). Before either writes
+one, the recorded recipient's notice is looked for under the reservation's
+notice id: if it is there the message was placed, and the record is
+`done(placed)` with no supersession and no control notice. RESIDUAL: that
+check sees only what is in the peer tree now. A notice placed and since
+removed reads as never placed; a durable post-placement fact would close
+it, and none exists yet.
+
+**Windows, H, the floor and admission** (`peerclock`). A statement's `ts` is
+accepted when `max(H - P, floor) <= ts <= now + F`, both bounds inclusive.
+H is the latest receiver time ever observed, only ever raised. A wall clock
+stepped back below H keeps the window defined: a statement outside it is
+demoted, as the profile's clock-rollback case requires, and status shows a
+`clock_behind_h` warning. ADMISSION is closed when no trustworthy bound
+exists (never initialised, a lost or untrusted clock, a declared restore):
+check 7 then holds every candidate (`admission_closed`), nothing is reserved
+or demoted, and only `peer-store init` or `peer-bound` reopens it.
+
+**Startup** (`peerjournal.startup`, from `run`, once, under the drain lock):
+settle an unfinished store operation, remove record directories without a
+record, mark the top take seq vacant if nothing carries it, and compare
+every store with its bookkeeping (live count, high-water seq, an
+order-independent content sum and a revision total); then repair missing
+digest entries and missing settlement markers. If
+the live stores hold MORE than the bookkeeping records, the clock file is
+older than the stores and its H proves nothing: admission closes. If they
+hold LESS (a record, a marker, a root gone or rolled back), the floor rises
+to `max(now, H) + Fmax + 1 s`, where Fmax is the largest F ever in force
+(900 when that history is lost), and once that floor is persisted the
+bookkeeping is rebased to the live stores, so a loss is accounted for once.
+An operation caught in flight is accepted only as not applied or as fully
+applied to its own target, and anything else is reported. This detects
+corruption and rollback; it
+is not a defence against a writer of `state_dir`. A rollback of the WHOLE
+`state_dir` is undetectable, which is why a restore is declared.
+
+**Retention.** Off unless `delegation.retention.sweep`. Only a `done` record
+at or below the settled-through frontier (the highest take seq up to which
+every record is settled) is pruned: with its reservation, marker and digest
+entry (the digest first) once H > ts + P + F; without a reservation, 30
+days after it settled, so a re-presented intake entry is still recognised.
+Never while its control notice is unsent, never (for `candidates/`) before
+its entry's removal succeeded, and never (for a host intake) while its
+tombstone exists.
+
+**Operator runbook.** Each verb takes the drain lock (stop the router
+first), prints one JSON line, and appends to the operator audit:
+
+- `router peer-store init --never-admitted [--acknowledge-surviving EVIDENCE]`:
+  before the first start with inbound intake. Refused over any peer
+  artefact, and over placement evidence that survived a wipe (a disposal
+  tombstone, or a signed peer notice in any peer tree) unless acknowledged.
+- `router peer-store declare-restored --evidence TEXT`: after ANY restore of
+  `state_dir`. Admission closes.
+- `router peer-bound --at B --evidence TEXT [--b-not-from-wall-clock]`: after
+  a lost clock or a declared restore. `--at` has no default. B below any
+  receiver time this router can see (record times, audit lines, settlement
+  markers, tombstones, H) is refused, naming the source; "now" is never
+  evidence; a B within 60 s of the wall clock needs the flag. Then floor =
+  max(floor, B + Fmax + 1 s), H = max(H, B, now), the bookkeeping is rebuilt
+  from the live stores (the settled-through frontier never lowered), and
+  admission opens. A B in the future needs the same flag. THE EVIDENCE IS AN OPERATOR
+  ATTESTATION: it is recorded verbatim and nothing verifies it.
+- `router peer-decision restore-key --from FILE`: puts the original decision
+  key back; refused unless no decision verifies under the current key and
+  at least one verifies under the offered one.
+- `router peer-candidate quarantine KEY --evidence TEXT`: the exit from a
+  candidate held on a view that can never be read (`candidate_view_refused`,
+  `candidate_malformed`): `mail` with cause `candidate_view_refused`, then
+  its quarantine item (or, for a host intake, its tombstone, by the next
+  poll), then `done`, which settles it for the frontier.
+- `router peer-decision drop KEY --evidence TEXT`: the exit from key loss
+  and nothing else. A decision, or a reservation without one, that no
+  longer verifies becomes `refused(policy, decision_unrecoverable)` with a
+  control notice pending; a decision whose notice is present becomes
+  `done(placed)`. Refused for anything that still verifies, a reserved
+  record held on `key_runtime_changed` included (that hold clears when the
+  runtime's configuration is restored).
+
+`router reset` never touches any of this: it clears instance state, and
+these stores are not an instance's.
+
+**Status** (`peer_store`, with `delegation` only): admission and why, H, the
+floor, the warnings, the bound B (its evidence cut to 80 characters), the
+take seq and the settled-through frontier, every held record and transient
+retry with its key, reason and age, whether inbound intake is on, and the
+last poll's counts.
 
 ## The ingress journal (`router/ingress.py`)
 

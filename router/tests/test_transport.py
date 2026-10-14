@@ -121,7 +121,7 @@ class LoaderTests(_PluginDir):
         MAJOR change: a plugin written for (2, x), or the (1, x) of E5's
         time, would call ports that differ from the ones it was written
         against, so it is refused before any factory runs."""
-        self.assertEqual(transport.PLUGIN_API, (3, 3))
+        self.assertEqual(transport.PLUGIN_API, (3, 4))
         for old in (b"(2, 0)", b"(2, 9)", b"(1, 9)"):
             with self.subTest(api=old):
                 marker, factory = self._calls_marker()
