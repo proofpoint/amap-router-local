@@ -1155,6 +1155,67 @@ class UnkeptJournalGuardTests(_Control):
         self.assertIn("cannot be listed", str(got))
 
 
+class StrictJournalGuardTests(_Control):
+    """The guards judge the journal ON DISK against its bookkeeping: what a
+    plain read would skip, or never see because it is gone, refuses."""
+
+    cli = AttemptTests.cli
+    frozen_in_live_a = AttemptTests.frozen_in_live_a
+    acts = AttemptTests.acts
+    audit = AttemptTests.audit
+    recorded = AttemptTests.recorded
+
+    def assert_refused(self, command, live, needle, **args):
+        code, err = self.cli(command, **args)
+        self.assertEqual(code, 1, err)
+        self.assertIn("refused", err)
+        self.assertIn(needle, err)
+        self.assertEqual(self.tree.gens[live], "live", "nothing retired")
+        self.assertEqual(self.recorded(), live, "generation.json intact")
+        self.assertEqual(self.acts(peercontrol.NEW_VERB) + self.acts(peercontrol.RETIRE_VERB), [])
+
+    def record_dir(self, key):
+        return peerjournal.record_dir(self.state_dir, tpe.OWNER, key)
+
+    def test_a_record_directory_without_its_record_refuses(self):
+        # The exact probe: only the frozen attempt's record.json deleted,
+        # the bookkeeping still counting it.
+        key, gen = self.frozen_in_live_a()
+        (self.record_dir(key) / peerjournal.RECORD).unlink()
+        self.assertNotIn(key, [r["key"] for r in peerjournal.all_records(self.state_dir)])
+        self.assert_refused("new", gen, "has no regular record")
+
+    def test_a_record_deleted_whole_refuses_against_the_bookkeeping(self):
+        import shutil
+        key, gen = self.frozen_in_live_a()
+        shutil.rmtree(self.record_dir(key))
+        self.assert_refused("new", gen, "does not match its bookkeeping")
+
+    def test_a_missing_journal_root_refuses(self):
+        import shutil
+        key, gen = self.frozen_in_live_a()
+        shutil.rmtree(peerjournal.journal_root(self.state_dir, tpe.OWNER))
+        self.assert_refused("retire", gen, "the bookkeeping lists is missing", gen=gen)
+
+    def test_a_record_that_is_not_a_record_refuses(self):
+        key, gen = self.frozen_in_live_a()
+        (self.record_dir(key) / peerjournal.RECORD).write_text("{}")
+        self.assert_refused("retire", gen, "is not a record", gen=gen)
+
+    def test_the_bookkeeping_matching_the_disk_passes(self):
+        """The companion: an intact journal is compared and accepted, so the
+        refusals above are the comparison's, not a guard that always fails.
+        (A journal record made without a drain pass: the drain's own mint
+        reads the guard too.)"""
+        key = self.refused()
+        try:
+            got = [r["key"] for r in peercontrol._guard_records(self.cfg)]
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
+            got = e
+        self.assertEqual(got, [r["key"] for r in peerjournal.all_records(self.state_dir)])
+        self.assertIn(key, got)
+
+
 class CorruptClockGuardTests(UntrustedClockGuardTests):
     """The same, with the clock file present and not a clock record."""
 

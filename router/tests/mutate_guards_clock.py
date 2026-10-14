@@ -23,6 +23,7 @@ T = "router.tests.test_peercontrol."
 U, C, N, B, K = (T + "UntrustedClockGuardTests.", T + "CorruptClockGuardTests.",
                  T + "NoPeerStoreGuardTests.", T + "UnreadableBookkeepingGuardTests.",
                  T + "UnkeptJournalGuardTests.")
+S = T + "StrictJournalGuardTests."
 PC = "router/peercontrol.py"
 
 M = [
@@ -78,8 +79,8 @@ M = [
   '        if False:\n            return []\n        raise JournalBlind(JOURNAL_UNKEPT) from None\n',
   [N + "test_new_runs_with_a_clock_holding_no_store_and_no_journal"]),
  ("G12 the guard walks the bookkeeping's records, not the disk's", PC,
-  '    return _strict_records(sd)\n',
-  '    return peerjournal.all_records(sd)\n',
+  '    records = _strict_records(sd)\n',
+  '    records = peerjournal.all_records(sd)\n',
   [K + "test_an_unreadable_record_refuses_where_all_records_skips_it",
    K + "test_a_frozen_attempt_under_an_unlisted_owner_still_refuses"]),
  ("G13 an unreadable record is skipped", PC,
@@ -90,6 +91,26 @@ M = [
   '    except FileNotFoundError:\n        return False\n    except OSError as e:\n',
   '    except FileNotFoundError:\n        return False\n    except KeyError as e:\n',
   [K + "test_an_unlistable_state_dir_is_journal_blind_never_a_bare_os_error"]),
+ ("G15 a record directory without its record is skipped", PC,
+  '                raise JournalBlind(f"a journal record directory has no regular record "\n',
+  '                continue\n                raise JournalBlind(f"a journal record directory has no regular record "\n',
+  [S + "test_a_record_directory_without_its_record_refuses"]),
+ ("G16 the disk is not compared with the bookkeeping", PC,
+  '    _check_bookkeeping(sd, meta)\n', '',
+  [S + "test_a_record_deleted_whole_refuses_against_the_bookkeeping",
+   S + "test_a_missing_journal_root_refuses"]),
+ ("G17 a missing journal root is skipped", PC,
+  '        if not peerjournal.journal_root(state_dir, owner).is_dir():\n            raise JournalBlind(',
+  '        if not peerjournal.journal_root(state_dir, owner).is_dir():\n            continue\n            raise JournalBlind(',
+  [S + "test_a_missing_journal_root_refuses"]),
+ ("G18 any object counts as a record", PC,
+  '            if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec\n',
+  '            if not (isinstance(rec, dict)\n',
+  [S + "test_a_record_that_is_not_a_record_refuses"]),
+ ("G19 an intact journal is refused against its bookkeeping", PC,
+  '        if not (exact or peerjournal._rolled(entry, d, live, total, revs)):\n',
+  '        if True:\n',
+  [S + "test_the_bookkeeping_matching_the_disk_passes"]),
 ]
 
 

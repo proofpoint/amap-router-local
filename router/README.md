@@ -2491,8 +2491,10 @@ verifies but its store bookkeeping is unreadable, or ABSENT while a journal
 is on disk: a clock rebuilt by a bound before its bookkeeping (`router
 peer-bound` does both) is trusted, and these guards still refuse until the
 bookkeeping is rebuilt. The guards read every record on disk, under every
-owner, and refuse on one they cannot read, where a plain journal read
-would skip it. Only a router that never journaled anything (no journal
+owner, and refuse on one they cannot read or that is not a record, on a
+record directory without its record, and on a journal root that is missing
+or does not match its bookkeeping (the comparison startup's reconcile
+makes, read only), where a plain journal read would skip each of them. Only a router that never journaled anything (no journal
 directory, and the clock absent or holding no store) is not blocked.
 
 ### Runtime tree repair

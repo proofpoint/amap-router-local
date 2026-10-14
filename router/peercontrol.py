@@ -410,7 +410,7 @@ def _guard_records(cfg: Any) -> List[Dict[str, Any]]:
     sd = Path(cfg.state_dir)
     journaled = _journal_dirs(sd)
     try:
-        peerjournal.read_meta(sd)
+        meta = peerjournal.read_meta(sd)
     except peerjournal.StoreAbsent:
         if not journaled:
             return []
@@ -422,7 +422,34 @@ def _guard_records(cfg: Any) -> List[Dict[str, Any]]:
     except (OSError, ValueError) as e:
         raise JournalBlind(f"{JOURNAL_BLIND} (the bookkeeping is unreadable: "
                            f"{type(e).__name__}: {e})") from None
-    return _strict_records(sd)
+    records = _strict_records(sd)
+    _check_bookkeeping(sd, meta)
+    return records
+
+
+def _check_bookkeeping(state_dir: Path, meta: Mapping[str, Any]) -> None:
+    """Every journal root the bookkeeping lists is on disk and holds exactly
+    what the bookkeeping says (`peerjournal._scan_root`, the comparison
+    `reconcile` makes, read only): a record deleted whole, or a root gone,
+    leaves nothing on disk for the walk to see. An operation still pending
+    on a root may have run or not; anything else is `JournalBlind`."""
+    op = meta.get("pending_op") or {}
+    for owner, entry in sorted(meta["roots"].items()):
+        if not peerjournal.journal_root(state_dir, owner).is_dir():
+            raise JournalBlind(f"the journal root {owner} the bookkeeping lists is missing, so "
+                               "this check cannot pass")
+        try:
+            live, _high, total, revs, _seqs = peerjournal._scan_root(state_dir, owner)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise JournalBlind(f"the journal root {owner} cannot be read ({type(e).__name__}), "
+                               "so this check cannot pass") from None
+        d = next((x for x in op.get("delta") or () if x.get("store") == "root"
+                  and x.get("owner") == owner), None)
+        exact = (live, str(total), revs) == (entry["live"], entry["content_sum"], entry["rev_total"])
+        if not (exact or peerjournal._rolled(entry, d, live, total, revs)):
+            raise JournalBlind(f"the journal root {owner} does not match its bookkeeping (a "
+                               "record lost or changed outside the router), so this check "
+                               "cannot pass")
 
 
 def _strict_records(state_dir: Path) -> List[Dict[str, Any]]:
@@ -446,17 +473,25 @@ def _strict_records(state_dir: Path) -> List[Dict[str, Any]]:
             raise JournalBlind(f"a journal directory cannot be listed ({child.name}: "
                                f"{type(e).__name__}), so this check cannot pass") from None
         for d in entries:
-            if not (d.is_dir() and peerjournal._KEY_RE.fullmatch(d.name)
-                    and (d / peerjournal.RECORD).is_file()):
+            if not (d.is_dir() and peerjournal._KEY_RE.fullmatch(d.name)):
                 continue
+            path = d / peerjournal.RECORD
+            if path.is_symlink() or not path.is_file():
+                # A record directory without its record: a crash mid-take
+                # (reconcile removes it at startup) or a record lost. Either
+                # way this check cannot see what it held.
+                raise JournalBlind(f"a journal record directory has no regular record "
+                                   f"({child.name}/{d.name}), so this check cannot pass")
             try:
-                rec = json.loads((d / peerjournal.RECORD).read_text(encoding="utf-8"))
+                rec = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as e:
                 raise JournalBlind(f"a journal record cannot be read ({child.name}/{d.name}: "
                                    f"{type(e).__name__}), so this check cannot pass") from None
-            if not isinstance(rec, dict):
-                raise JournalBlind(f"a journal record is not an object ({child.name}/{d.name}), "
-                                   "so this check cannot pass")
+            if not (isinstance(rec, dict) and rec.get("key") == d.name and "control" in rec
+                    and (rec["control"] is None or isinstance(rec["control"], dict))):
+                raise JournalBlind(f"a journal record is not a record ({child.name}/{d.name}: "
+                                   "its key or its control is not what the router writes), so "
+                                   "this check cannot pass")
             out.append(rec)
     return out
 
