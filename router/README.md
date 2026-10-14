@@ -2211,8 +2211,10 @@ agent under a registry.
 
 Every wall-clock read in the package is `clock.now()`, an aware UTC datetime;
 `util.utc_ts()` formats it. `router/tests/test_one_clock.py` holds every other
-module to that: direct, aliased, re-exported, reflective and import-time reads
-all fail it. Exactly one other time source is allowed: `hoplink._clock`
+module to that: direct, aliased, re-exported (resolved through this package's
+own imports), reflective, `sys.modules`, star-imported and import-time reads
+all fail it, within the limits its docstring states (a read hidden behind an
+allowed helper, or a cache decorator over one). Exactly one other time source is allowed: `hoplink._clock`
 (`time.monotonic`), whose consumers are status ages and retry log levels,
 never a decision. A time passed in as data (a statement's `ts`, a record's
 `recorded_ts`, an operator's bound) and a file time (`st_mtime`, stamped by the

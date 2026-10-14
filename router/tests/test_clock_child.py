@@ -11,8 +11,9 @@ a further process.
 
 Every timestamp those operations newly wrote must be one the Stepper emitted
 (an operator's B is data, and so is H after a bound raises it to B), the
-values must not go backwards from one operation to the next, and at least two
-must be distinct, which a cached read would collapse. A companion run with no
+values must not go backwards from one operation to the next, nor from one
+write to the next inside an operation (an fsync-ordered trace), and at least
+two must be distinct, which a cached read would collapse. A companion run with no
 source writes none in the Stepper's year. And the lifecycle: `clock.reset()`
 takes the source away, while `hoplink.reset_process_state()`, a modelled
 restart, keeps it.
@@ -109,6 +110,30 @@ class InstalledSourceTests(unittest.TestCase):
                         self.assertGreaterEqual(min(vals), high, "an earlier time written later")
                     high = max(high, max(vals))
         self.assertGreaterEqual(len(distinct), 2, "one value everywhere: a cached read")
+
+    def test_writes_within_an_operation_never_go_backwards(self):
+        """In fsync order, inside each operation, no write's earliest added
+        time is earlier than the earliest of the write before it: a value
+        read early and written after a later one would show here, where the
+        operation-level check above cannot see it."""
+        data = self.data()
+        events = 0
+        for r in self.ops():
+            # Only the times this operation is known to have written to its
+            # JSON documents (and that were judged above); a temp or snapshot
+            # file can also carry data, such as a fixture's own date.
+            written = {v[2] for v in r["values"]} - data
+            prev = None
+            for added in r["trace"]:
+                vals = [v for v in added if v in written]
+                if not vals:
+                    continue
+                events += 1
+                if prev is not None:
+                    with self.subTest(flow=r["flow"], op=r["label"]):
+                        self.assertGreaterEqual(min(vals), prev, "a write stamped an earlier time")
+                prev = min(vals)
+        self.assertGreater(events, 10, "the write trace saw almost nothing: not tracing")
 
     def test_the_exposure_follows_the_file_time_set_from_the_installed_clock(self):
         [rec] = [r for r in self.doc["records"] if "exposure" in r]

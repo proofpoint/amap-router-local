@@ -100,13 +100,14 @@ M = [
   "        peerjournal.apply_window(cfg.state_dir, clock.now(), cfg.delegation)",
   [ONE]),
  ("C17 the scan glob matches nothing", "router/tests/test_one_clock.py",
-  'ROUTER.rglob("*.py")',
-  'ROUTER.rglob("*.pyx")',
+  '    return sorted(p for p in ROUTER.rglob("*.py")',
+  '    return sorted(p for p in ROUTER.rglob("*.pyx")',
   [SCAN]),
  ("C18 now() ignores the installed source", "router/clock.py",
   "    if _INSTALLED:\n",
   "    if False:\n",
-  [UNIT + "ReadTests.test_an_installed_source_is_what_every_read_returns"]),
+  [UNIT + "ReadTests.test_an_installed_source_is_what_every_read_returns",
+   W2 + "test_every_written_time_is_one_the_source_emitted"]),
  ("C19 a naive source accepted", "router/clock.py",
   "        if not isinstance(t, datetime) or t.utcoffset() is None:\n",
   "        if not isinstance(t, datetime):\n",
@@ -119,6 +120,45 @@ M = [
   "    if _STRICT:\n",
   "    if False:\n",
   [UNIT + "StrictTests.test_strict_raises_when_the_source_is_lost_other_than_by_reset"]),
+ ("C22 R2 a router re-export referenced, not called", "router/generations.py",
+  "from . import clock\n",
+  "from . import clock\nfrom . import util as _u\n_g = _u.datetime.now\n",
+  [ONE]),
+ ("C23 R3 sys.modules['time']", "router/firstsight.py",
+  "def marker_path(state_dir: Path, name: str, *, state_key: Optional[str] = None) -> Path:",
+  "def _m():\n    import sys\n    return sys.modules['time'].time\n\n\n"
+  "def marker_path(state_dir: Path, name: str, *, state_key: Optional[str] = None) -> Path:",
+  [ONE]),
+ ("C24 R3 from time import *", "router/roster.py",
+  "def roster_dir(cfg: RouterConfig) -> Optional[Path]:",
+  "from time import *  # noqa: E402,F401,F403\n\n\ndef roster_dir(cfg: RouterConfig) -> Optional[Path]:",
+  [ONE]),
+ ("C25 R3 operator.attrgetter over a re-export", "router/outcomes.py",
+  "def outcomes_rel(connector_id: str) -> Path:",
+  "def _a():\n    import operator\n    from . import util\n"
+  "    return operator.attrgetter('now')(util.datetime)\n\n\n"
+  "def outcomes_rel(connector_id: str) -> Path:",
+  [ONE]),
+ ("C26 isolation: getattr(clock, 'install')", "router/service.py",
+  "peerjournal.apply_window(cfg.state_dir, clock.now(), cfg.delegation)",
+  "getattr(clock, 'install')(clock.fixed(clock.now()))\n"
+  "        peerjournal.apply_window(cfg.state_dir, clock.now(), cfg.delegation)",
+  [ONE]),
+ ("C27 the reset rule accepts a reset anywhere", "router/tests/test_one_clock.py",
+  "and _raw_qual(n, aliases) == f\"{CLOCK_OWN}.reset\" and always_runs(n)]",
+  "and _raw_qual(n, aliases) == f\"{CLOCK_OWN}.reset\"]",
+  ["router.tests.test_one_clock.TestsResetWhatTheyInstallTests."
+   "test_the_rule_finds_each_bad_form_and_passes_each_good_one"]),
+ ("C28 re-exports not resolved", "router/tests/test_one_clock.py",
+  "    return _resolve(_raw_qual(node, aliases))",
+  "    return _raw_qual(node, aliases)",
+  ["router.tests.test_one_clock.ControlTests.test_each_banned_form_is_found"]),
+ ("C29 a write inside one operation goes backwards", "router/util.py",
+  "    return format_utc_ts(clock.now())\n",
+  "    _H.append(clock.now())\n"
+  "    return format_utc_ts(_H[-3] if len(_H) % 2 == 0 and len(_H) > 2 else _H[-1])\n\n\n"
+  "_H = []\n",
+  [W2 + "test_writes_within_an_operation_never_go_backwards"]),
 ]
 
 

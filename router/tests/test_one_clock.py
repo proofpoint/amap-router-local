@@ -18,7 +18,10 @@
   the local time now; a datetime's own `strftime` is not.
 - R3, reflective and dynamic access: `getattr`/`setattr`/`hasattr`/`delattr`/
   `vars` on a clock base or naming a banned member, `__dict__` of a clock
-  base, and any `importlib.import_module` or `__import__` call.
+  base, `operator.attrgetter`/`methodcaller` naming a banned member, any
+  `importlib.import_module` or `__import__` call, any `sys.modules` reference
+  (allowed, exactly, as `hoplink`'s two `sys.modules.get(f"{__package__}…")`
+  lookups of its own package), and `from <clock base or this package> import *`.
 - R4, re-export imports and rebinding: `from .<module> import datetime|date|
   time` from this package, and a clock base (the `time`, `datetime`,
   `email.utils` or `uuid` module, or the `datetime`/`date` class) assigned,
@@ -29,15 +32,29 @@
   would run before a test installs its source and stay real for the process.
   This reuses the test modules' import-time scanner.
 
+A name reached through this package is resolved to what it is bound to
+there: `util.datetime.now` is `datetime.datetime.now`, however many modules it
+is re-exported through, so R2, R3 and R4 see the stdlib name.
+
 Allowed, exactly: the one `time.monotonic` reference in `hoplink` (its
-`_clock`, whose consumers are status ages and log levels). What is not a
+`_clock`, whose consumers are status ages and log levels), and `hoplink`'s two
+package-local `sys.modules.get` lookups. What is not a
 clock read at all: a time passed in as data and a file time (`st_mtime`).
 
 Also: no router module but `clock.py` references `clock.install`,
-`clock.reset`, `_INSTALLED` or `_STRICT`; and a test that installs a clock
-also resets it, in the same class or function.
+`clock.reset`, `_INSTALLED` or `_STRICT`, directly or reflectively
+(`getattr`/`vars`/`__dict__` of the clock module, `operator.attrgetter`); and a test that installs a clock
+also resets it: `clock.reset`, resolved through its imports, in `tearDown`
+or `tearDownClass`, as an `addCleanup` argument, or in a `finally` body (or
+it installs through `ClockMixin.install_clock`, which registers the reset).
 
-A tripwire, not a certificate: it sees names in source. The controls prove
+A tripwire, not a certificate: it sees names in source. What it cannot see:
+a read made through a helper that is itself allowed (an import-time call of a
+function whose body calls `clock.now()`), a value cached by a decorator such
+as `functools.lru_cache` over a function that reads the clock, and a name
+built at run time (`getattr(m, name)` with a computed `name` on a non-clock
+base). The child-process witness's successive-values check covers the
+caching shape on the paths it drives. The controls prove
 each form is found and each allowed form is not, and the scan's file count
 proves it is looking at the package."""
 from __future__ import annotations
@@ -69,8 +86,12 @@ BANNED_MEMBERS = frozenset({
 CLOCK_BASES = frozenset({"time", "datetime", "datetime.datetime", "datetime.date",
                          "email.utils", "uuid"})
 
-#: (module, qualified name): the exact number of references allowed.
-ALLOWED = {("hoplink", "time.monotonic"): 1}
+#: (module, qualified name or form): the exact number of references allowed.
+ALLOWED = {("hoplink", "time.monotonic"): 1,
+           ("hoplink", "sys.modules.get(__package__)"): 2}
+
+#: Modules whose `from X import *` would bring a clock read in unseen.
+STAR_BASES = frozenset({"time", "datetime", "email", "email.utils", "uuid"})
 
 CLOCK_OWN = "router.clock"
 ISOLATED = frozenset({"install", "reset", "_INSTALLED", "_STRICT"})
@@ -97,13 +118,53 @@ def _aliases(tree: ast.AST, package: str = "router") -> dict:
     return out
 
 
-def _qual(node: ast.AST, aliases: dict):
+def _raw_qual(node: ast.AST, aliases: dict):
     if isinstance(node, ast.Name):
         return aliases.get(node.id)
     if isinstance(node, ast.Attribute):
-        base = _qual(node.value, aliases)
+        base = _raw_qual(node.value, aliases)
         return f"{base}.{node.attr}" if base else None
     return None
+
+
+_EXPORTS: dict = {}
+
+
+def exports() -> dict:
+    """`router.<module>` -> that module's alias map, for every module of the
+    package (clock.py and __init__.py included): how a re-export resolves."""
+    if not _EXPORTS:
+        for path in sorted(ROUTER.rglob("*.py")):
+            rel = path.relative_to(ROUTER)
+            if "tests" in rel.parts:
+                continue
+            parts = rel.with_suffix("").parts
+            name = ".".join(("router",) + (parts[:-1] if parts[-1] == "__init__" else parts))
+            _EXPORTS[name] = _aliases(ast.parse(path.read_text(encoding="utf-8")))
+    return _EXPORTS
+
+
+def _resolve(q):
+    """Rewrite `router.<module>.<name>…` through `<module>`'s imports until
+    the name is no longer one of this package's re-exports."""
+    table = exports()
+    for _ in range(16):
+        if not q or not q.startswith("router."):
+            return q
+        parts = q.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            mod = ".".join(parts[:i])
+            bound = table.get(mod, {}).get(parts[i])
+            if bound is not None and bound != q:
+                q = ".".join([bound] + parts[i + 1:])
+                break
+        else:
+            return q
+    return q
+
+
+def _qual(node: ast.AST, aliases: dict):
+    return _resolve(_raw_qual(node, aliases))
 
 
 def _call_name(func: ast.AST):
@@ -128,6 +189,7 @@ def scan(source: str, module: str, package: str = "router"):
     bases = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     # A tuple or list inside a subscript is a type (`Tuple[datetime, str]`).
     typed = {id(n.slice) for n in ast.walk(tree) if isinstance(n, ast.Subscript)}
+    parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = _call_name(node.func)
@@ -146,9 +208,21 @@ def scan(source: str, module: str, package: str = "router"):
                          and node.args[1].value in BANNED_NAMES | {"time", "strftime"})
                 if target in CLOCK_BASES or named:
                     hit(node, "R3")
+                if target == CLOCK_OWN:
+                    hit(node, "isolation")     # reflective access to the clock module
+            if q in ("operator.attrgetter", "operator.methodcaller") and any(
+                    isinstance(a, ast.Constant) and isinstance(a.value, str)
+                    and set(a.value.split(".")) & (BANNED_NAMES | {"time", "strftime"})
+                    for a in node.args):
+                hit(node, "R3")
+            if q in ("operator.attrgetter", "operator.methodcaller") and any(
+                    isinstance(a, ast.Constant) and isinstance(a.value, str)
+                    and set(a.value.split(".")) & ISOLATED for a in node.args):
+                hit(node, "isolation")
             if not (isinstance(node.func, ast.Name) and node.func.id in ("isinstance", "issubclass")):
                 for a in list(node.args) + [k.value for k in node.keywords]:
-                    if isinstance(a, ast.Name) and _qual(a, aliases) in CLOCK_BASES:
+                    if isinstance(a, (ast.Name, ast.Attribute)) and id(a) not in bases \
+                            and _qual(a, aliases) in CLOCK_BASES:
                         hit(a, "R4")
         if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load) \
                 and id(node) not in bases:
@@ -158,6 +232,13 @@ def scan(source: str, module: str, package: str = "router"):
         if isinstance(node, ast.Attribute) and node.attr == "__dict__" \
                 and _qual(node.value, aliases) in CLOCK_BASES:
             hit(node, "R3")
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__" \
+                and _qual(node.value, aliases) == CLOCK_OWN:
+            hit(node, "isolation")
+        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load) \
+                and _qual(node, aliases) == "sys.modules":
+            hit(node, "R3:" + ("sys.modules.get(__package__)" if _package_get(node, parents)
+                               else "sys.modules"))
         if isinstance(node, ast.ImportFrom):
             pkg = node.level or (node.module or "").split(".")[0] == package
             if pkg and any(a.name in ("datetime", "date", "time") for a in node.names):
@@ -166,6 +247,8 @@ def scan(source: str, module: str, package: str = "router"):
                        else node.module if not node.level else package)
             if src_mod == CLOCK_OWN and any(a.name in ISOLATED for a in node.names):
                 hit(node, "isolation")
+            if any(a.name == "*" for a in node.names) and (pkg or node.module in STAR_BASES):
+                hit(node, "R3")
         values = []
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return)) \
                 and node.value is not None:
@@ -175,7 +258,7 @@ def scan(source: str, module: str, package: str = "router"):
         if isinstance(node, ast.Dict):
             values.extend(v for v in node.values if v is not None)
         for v in values:
-            if isinstance(v, ast.Name) and _qual(v, aliases) in CLOCK_BASES:
+            if isinstance(v, (ast.Name, ast.Attribute)) and _qual(v, aliases) in CLOCK_BASES:
                 hit(v, "R4")
         if isinstance(node, (ast.Name, ast.Attribute)):
             q = _qual(node, aliases)
@@ -184,6 +267,21 @@ def scan(source: str, module: str, package: str = "router"):
     for line, text in import_time_clocks(source, module):
         found.append((line, "R5", text))
     return found
+
+
+def _package_get(node, parents) -> bool:
+    """`sys.modules.get(f"{__package__}…")`: a lookup of this package's own
+    module, never of a clock module."""
+    attr = parents.get(id(node))
+    call = parents.get(id(attr)) if isinstance(attr, ast.Attribute) else None
+    if not (isinstance(attr, ast.Attribute) and attr.attr == "get" and isinstance(call, ast.Call)
+            and call.func is attr and call.args):
+        return False
+    arg = call.args[0]
+    return (isinstance(arg, ast.JoinedStr) and arg.values
+            and isinstance(arg.values[0], ast.FormattedValue)
+            and isinstance(arg.values[0].value, ast.Name)
+            and arg.values[0].value.id == "__package__")
 
 
 def production_modules():
@@ -197,7 +295,7 @@ def violations():
     for path in production_modules():
         module = ".".join(path.relative_to(ROUTER).with_suffix("").parts)
         for line, rule, text in scan(path.read_text(encoding="utf-8"), module):
-            key = (module, rule[3:]) if rule.startswith("R2:") else None
+            key = (module, rule.split(":", 1)[1]) if ":" in rule else None
             if key in ALLOWED:
                 used[key] += 1
                 if used[key] <= ALLOWED[key]:
@@ -271,6 +369,28 @@ class ControlTests(unittest.TestCase):
         "class body utc_ts": "from .util import utc_ts\nclass C:\n    T = utc_ts()\n",
         "isolation": "from . import clock\ndef f():\n    clock.install(lambda: None)\n",
         "isolation from-import": "from .clock import reset\n",
+        "re-export, referenced": "from . import util\ng = util.datetime.now\n",
+        "re-exported module": "from . import service\ng = service.time.time\n",
+        "re-export rebound": "from . import util\ndef f():\n    d = util.datetime\n    return d\n",
+        "vars of a re-export": ("from . import util\ndef f():\n"
+                                "    return vars(util.datetime)['now']()\n"),
+        "__dict__ of a re-export": ("from . import util\ndef f():\n"
+                                    "    return util.datetime.__dict__['now']()\n"),
+        "attrgetter": ("import operator\nfrom . import util\ndef f():\n"
+                       "    return operator.attrgetter('now')(util.datetime)()\n"),
+        "methodcaller": ("import operator\nfrom . import util\ndef f():\n"
+                         "    return operator.methodcaller('now')(util.datetime)\n"),
+        "sys.modules['time']": "import sys\ndef f():\n    g = sys.modules['time'].time\n    return g()\n",
+        "sys.modules['datetime']": "import sys\ndef f():\n    return sys.modules['datetime'].datetime\n",
+        "from sys import modules": "from sys import modules\ndef f():\n    return modules['time']\n",
+        "sys.modules.get, not the package": "import sys\ndef f():\n    return sys.modules.get('time')\n",
+        "star import": "from time import *\ndef f():\n    g = monotonic\n    return g()\n",
+        "star import of this package": "from .util import *\n",
+        "getattr on clock": "from . import clock\ndef f():\n    return getattr(clock, 'install')\n",
+        "vars of clock": "from . import clock\ndef f():\n    return vars(clock)['reset']\n",
+        "__dict__ of clock": "from . import clock\ndef f():\n    return clock.__dict__['_INSTALLED']\n",
+        "attrgetter on clock": ("import operator\nfrom . import clock\ndef f():\n"
+                                "    return operator.attrgetter('install')(clock)\n"),
     }
 
     NOT_FOUND = {
@@ -300,32 +420,93 @@ class ControlTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(scan(src, "synthetic"), [], label)
 
+    def test_a_package_local_sys_modules_lookup_is_the_allowed_form_only(self):
+        src = 'import sys\ndef f(m):\n    return sys.modules.get(f"{__package__}.{m}")\n'
+        self.assertEqual([r for _l, r, _t in scan(src, "synthetic")],
+                         ["R3:sys.modules.get(__package__)"])
+        src = "import sys\ndef f():\n    return sys.modules.get('time')\n"
+        self.assertEqual([r for _l, r, _t in scan(src, "synthetic")], ["R3:sys.modules"])
+
     def test_a_module_level_monotonic_reference_is_allowed_only_once_in_hoplink(self):
         src = "import time\n_clock = time.monotonic\n"
         self.assertEqual(_rules(src), ["R2"])     # found; only ALLOWED forgives it
 
 
-class TestsResetWhatTheyInstallTests(unittest.TestCase):
-    """A test that installs a clock resets it: the source survives
-    `reset_process_state`, so nothing else would."""
+def unreset_installs(source: str):
+    """`(line, name)` for each top-level class or function of a test module
+    that calls `router.clock.install` (resolved through its imports) without
+    resetting it where a reset always runs: `clock.reset` in `tearDown` or
+    `tearDownClass`, as an `addCleanup` argument, or in a `finally` body."""
+    tree = ast.parse(source)
+    aliases = _aliases(tree, "router.tests")
+    parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
 
-    def test_every_install_has_a_reset_beside_it(self):
+    def always_runs(node):
+        child, n = node, parents.get(id(node))
+        while n is not None:
+            if isinstance(n, ast.Call) and _call_name(n.func) == "addCleanup" \
+                    and child in n.args:
+                return True
+            if isinstance(n, ast.Try) and child in n.finalbody:
+                return True
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and n.name in ("tearDown", "tearDownClass"):
+                return True
+            child, n = n, parents.get(id(n))
+        return False
+
+    bad = []
+    for top in tree.body:
+        if not isinstance(top, (ast.ClassDef, ast.FunctionDef)):
+            continue
+        installs = [n for n in ast.walk(top) if isinstance(n, ast.Call)
+                    and _raw_qual(n.func, aliases) == f"{CLOCK_OWN}.install"]
+        resets = [n for n in ast.walk(top) if isinstance(n, (ast.Name, ast.Attribute))
+                  and _raw_qual(n, aliases) == f"{CLOCK_OWN}.reset" and always_runs(n)]
+        if installs and not resets:
+            bad.append((top.lineno, top.name))
+    return bad
+
+
+class TestsResetWhatTheyInstallTests(unittest.TestCase):
+    """A test that installs a clock resets it where a reset always runs: the
+    source survives `reset_process_state`, so nothing else would."""
+
+    def test_every_install_has_a_reset_that_always_runs(self):
         bad = []
-        tests = ROUTER / "tests"
-        for path in sorted(tests.glob("test_*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for top in tree.body:
-                if not isinstance(top, (ast.ClassDef, ast.FunctionDef)):
-                    continue
-                attrs = {n.attr for n in ast.walk(top) if isinstance(n, ast.Attribute)}
-                calls = {_call_name(n.func) for n in ast.walk(top) if isinstance(n, ast.Call)}
-                if "install" in attrs and "clock" in {
-                        n.value.id for n in ast.walk(top)
-                        if isinstance(n, ast.Attribute) and n.attr == "install"
-                        and isinstance(n.value, ast.Name)} and "reset" not in attrs \
-                        and "install_clock" not in calls:
-                    bad.append(f"{path.name}:{top.lineno}: {top.name}")
+        for path in sorted((ROUTER / "tests").glob("test_*.py")):
+            bad += [f"{path.name}:{line}: {name}"
+                    for line, name in unreset_installs(path.read_text(encoding="utf-8"))]
         self.assertEqual(bad, [], "a clock installed with no reset:\n" + "\n".join(bad))
+
+    BAD = {
+        "reset in a helper only": ("from router import clock\nclass T:\n"
+                                   "    def test(self):\n        clock.install(f)\n"
+                                   "    def helper(self):\n        clock.reset()\n"),
+        "from-import, no reset": ("from router.clock import install\nclass T:\n"
+                                  "    def test(self):\n        install(f)\n"),
+        "another object's reset": ("from router import clock\nclass T:\n"
+                                   "    def test(self):\n        clock.install(f)\n"
+                                   "    def tearDown(self):\n        other.reset()\n"),
+    }
+    GOOD = {
+        "aliased, tearDown": ("from router import clock as c\nclass T:\n"
+                              "    def test(self):\n        c.install(f)\n"
+                              "    def tearDown(self):\n        c.reset()\n"),
+        "addCleanup": ("from router import clock\nclass T:\n    def test(self):\n"
+                       "        clock.install(f)\n        self.addCleanup(clock.reset)\n"),
+        "finally": ("from router.clock import install, reset\ndef f():\n    try:\n"
+                    "        install(g)\n    finally:\n        reset()\n"),
+        "mixin": ("class T:\n    def test(self):\n        self.install_clock(f)\n"),
+    }
+
+    def test_the_rule_finds_each_bad_form_and_passes_each_good_one(self):
+        for label, src in self.BAD.items():
+            with self.subTest(bad=label):
+                self.assertTrue(unreset_installs(src), label)
+        for label, src in self.GOOD.items():
+            with self.subTest(good=label):
+                self.assertEqual(unreset_installs(src), [], label)
 
 
 if __name__ == "__main__":

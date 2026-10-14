@@ -11,6 +11,14 @@ carry a time passed in as DATA, or one derived from the clock by arithmetic
 (`DERIVED`), are not clock reads and are skipped. The parent judges the
 records; the flows only drive and observe.
 
+Write ORDER is observed too: `install_write_trace()` wraps `os.fsync`, which
+every durable write in the package calls on the file it has just written
+(before a rename into place, or after an append). At each fsync of a regular
+file under the flow's tree the file is read back through `/proc/self/fd`, and
+the timestamps that write ADDED (not in that path's previous content) are
+appended to `TRACE` in call order. Each operation records its slice, so the
+parent can check that no write stamps a time earlier than the write before it.
+
 The flows:
 - `mail_once`: an outbound mail request through `router once` (the CLI's
   `main`, in this interpreter), then a service poll that writes
@@ -49,6 +57,49 @@ DERIVED = frozenset({"window_start", "expires_at", "floor", "B", "at", "deferred
 
 OUT = os.environ.get("CLOCK_W2_OUT")
 RECORDS: list = []
+#: (path, added timestamps) per fsync of a regular file, in call order.
+TRACE: list = []
+_SEEN_BY_PATH: dict = {}
+_ROOTS: list = []
+
+
+def _values_in(text: str, suffix: str) -> set:
+    out: set = set()
+    docs = text.splitlines() if suffix == ".jsonl" else [text]
+    for line in docs:
+        try:
+            _walk(json.loads(line), (), out, "")
+        except ValueError:
+            continue
+    return {v for _r, _k, v in out}
+
+
+def install_write_trace() -> None:
+    import stat as stat_mod
+    real = os.fsync
+
+    def fsync(fd):
+        real(fd)
+        try:
+            st = os.fstat(fd)
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            return
+        if not stat_mod.S_ISREG(st.st_mode) or not any(path.startswith(r) for r in _ROOTS):
+            return
+        try:
+            with open(f"/proc/self/fd/{fd}", "rb") as f:
+                text = f.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return
+        suffix = ".jsonl" if ".jsonl" in path else ".json"
+        now = _values_in(text, suffix)
+        added = sorted(now - _SEEN_BY_PATH.get(path, set()))
+        _SEEN_BY_PATH[path] = now
+        if added:
+            TRACE.append([path, added])
+
+    os.fsync = fsync
 
 
 def _walk(value, path, out, rel):
@@ -88,14 +139,17 @@ class _Observe:
 
     def begin(self, flow, root):
         self.flow, self.root, self.seen, self.n = flow, Path(root), snapshot(root), 0
+        _ROOTS[:] = [os.path.realpath(root)]
 
     def op(self, label, fn):
+        start = len(TRACE)
         out = fn()
+        trace = [added for _p, added in TRACE[start:]]
         now = snapshot(self.root)
         new = sorted(now - self.seen)
         self.seen = now
         RECORDS.append({"flow": self.flow, "op": self.n, "label": label,
-                        "values": [list(v) for v in new]})
+                        "values": [list(v) for v in new], "trace": trace})
         self.n += 1
         return out
 
@@ -179,6 +233,7 @@ class PeerVerbs(_Observe, _PeerBase):
 
 def main() -> int:
     import unittest
+    install_write_trace()
     suite = unittest.defaultTestLoader.loadTestsFromNames(
         [f"{__name__}.{c}" for c in ("MailOnce", "PeerSend", "Ingress", "PeerVerbs")])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
