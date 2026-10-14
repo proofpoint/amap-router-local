@@ -3,6 +3,7 @@ real drain under a registry and a hop, with a delegation activated."""
 from __future__ import annotations
 
 import dataclasses
+import unittest
 import json
 import os
 from unittest import mock
@@ -968,3 +969,19 @@ class CompleteAloneTests(_Retransmit):
         d = peerresend.copy_dir(self.state_dir, LIDS["alpha"], pid)
         self.assertEqual([(d / peerresend.ATTACHMENTS / str(i)).read_bytes() for i in range(2)],
                          blobs)
+
+
+class PendingRowsTests(unittest.TestCase):
+    """The real-downstream rows wait, PENDING by name, never skipped: each is
+    named in the README's resend section until it runs."""
+
+    PENDING = ("realre_check2_duplicate_silent", "realre_first_arrival_placed")
+
+    def test_each_pending_row_is_named(self):
+        from pathlib import Path
+        text = (Path(peerresend.__file__).parent / "README.md").read_text(encoding="utf-8")
+        section = text[text.index("### Resending a signed peer task"):]
+        section = section[:section.index("\n## ")]
+        self.assertIn("PENDING, by name", section)
+        for row in self.PENDING:
+            self.assertIn(f"`{row}`", section, row)
