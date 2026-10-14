@@ -233,6 +233,14 @@ class BuilderTests(_Hooks):
         self.assertEqual(outcome(hk.check8(payload(), KEY_ID)), ("hold", "hook_absent", "check8"))
         self.assertEqual(outcome(hk.policy(payload(), "bob")), ("hold", "hook_absent", "policy"))
 
+    def test_control_candidates_still_hold_hook_absent_under_every_profile(self):
+        """control_receive is unchanged from the base: a control candidate
+        holds `hook_absent` under production and conformance alike, so the
+        receive path is not half-built in this part."""
+        for hk in (self.production(), self.conformance(pairs=[(PLANNER, BOB)])):
+            self.assertEqual(outcome(hk.control_receive(None, None)),
+                             ("hold", "hook_absent", "control_receive"))
+
     def test_production_hooks_is_decide_hooks_of_the_production_profile(self):
         self.issued("issued-1")
         ctx = self.ctx()

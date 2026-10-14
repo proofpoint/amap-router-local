@@ -258,6 +258,10 @@ M = [
   "            if parts == (RUNTIME_DIR,):\n                return self._register(fd, RUNTIME, parent.tree, parts)\n",
   "",
   [C + "RuntimeBindingTests.test_the_runtime_directory_is_its_own_kind"]),
+ ("L53 control candidates no longer held", POL,
+  '        return peerjournal.Hold("hook_absent", "control_receive")\n',
+  '        return None\n',
+  [T + "BuilderTests.test_control_candidates_still_hold_hook_absent_under_every_profile"]),
  ("L28 a router module builds a conformance profile", SVC,
   "def poll_once(",
   "def _conf(h):\n    from . import peerpolicy\n    return peerpolicy.conformance_profile(h, None, [])\n\n\n"
