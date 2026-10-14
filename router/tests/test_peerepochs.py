@@ -16,6 +16,7 @@ import dataclasses
 import json
 import os
 from datetime import timedelta
+from unittest import mock
 
 from router import config as config_mod
 from router import peerclock, peerepochs, peerjournal, peerpolicy
@@ -302,6 +303,35 @@ class StoreTests(_Epochs):
         self.assertTrue(any("beside a v1 record" in p for p in rep["problems"]), rep["problems"])
         self.assertTrue(self.meta()["epochs_untrusted"])
 
+    def behind_crash_then_restart(self, patch):
+        """The BEHIND migration with one crash injected by `patch`, then a
+        restart: (the restart's report, the PERSISTED admission)."""
+        self.decide(payload(sender_since=ts(-2 * DAY)))
+        self.assertEqual(peerclock.read(self.state_dir).admission, "open", "open before")
+        self.to_v1()
+        with patch, self.assertRaises(SystemExit):
+            peerjournal.startup(self.state_dir, NOW)
+        rep = peerjournal.startup(self.state_dir, NOW)
+        return rep, peerclock.read(self.state_dir).admission
+
+    def test_a_crash_at_the_behind_close_leaves_admission_closed_on_restart(self):
+        rep, persisted = self.behind_crash_then_restart(
+            mock.patch.object(peerclock, "close", side_effect=SystemExit("crash")))
+        self.assertEqual((rep["admission"], persisted), ("closed", "closed"))
+        self.assertTrue(self.meta()["epochs_untrusted"])
+
+    def test_a_crash_at_the_behind_v2_write_leaves_admission_closed_on_restart(self):
+        real = peerclock.write_doc
+
+        def write_doc(state_dir, doc, *a, **k):
+            if doc.get("store", {}).get("v") == 2:
+                raise SystemExit("crash")
+            return real(state_dir, doc, *a, **k)
+        rep, persisted = self.behind_crash_then_restart(
+            mock.patch.object(peerclock, "write_doc", write_doc))
+        self.assertEqual((rep["admission"], persisted), ("closed", "closed"))
+        self.assertEqual((self.meta()["v"], self.meta()["epochs_untrusted"]), (2, True))
+
     def test_deleting_the_only_file_is_loss_and_sets_the_flag(self):
         self.decide(payload(sender_since=ts(-2 * DAY)))
         (path,) = list(peerepochs.root(self.state_dir).rglob("*.json"))
@@ -432,6 +462,211 @@ class TrustVerbTests(_Epochs):
                          ("hold", "epoch_store_unavailable"))
         peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
         self.assertEqual(self.decide(payload(sender_since=ts(-2 * DAY))), "exposure_missing")
+
+
+class RepairTests(_Epochs):
+    """The trust verb repairs what the fail-closed flag holds on: a counted
+    file corrupted, an unexpected root entry, each across its crash seam,
+    ending with the flag clear and the next start clean."""
+
+    def trust(self):
+        try:
+            return peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL
+            return {"cleared": ("raised", type(e).__name__), "problems": [str(e)]}
+
+    def corrupt_counted(self):
+        self.decide(payload(sender_since=ts(-2 * DAY)))
+        (path,) = list(peerepochs.root(self.state_dir).rglob("*.json"))
+        path.write_text("{not json")
+        self.assertEqual(self.decide(payload(sender_since=ts(-2 * DAY))),
+                         ("hold", "epoch_store_unavailable"))
+        self.assertTrue(self.meta()["epochs_untrusted"], "the fault set the flag")
+        return path
+
+    def assert_repaired(self, out):
+        self.assertIs(out["cleared"], True, out)
+        self.assertFalse(self.meta()["epochs_untrusted"])
+        rep = peerjournal.startup(self.state_dir, NOW)
+        self.assertEqual(rep["problems"], [], "the next start is clean")
+        self.assertFalse(self.meta()["epochs_untrusted"], "and stays clear")
+
+    def test_a_corrupted_counted_file_is_repaired(self):
+        path = self.corrupt_counted()
+        out = self.trust()
+        self.assertFalse(path.exists(), "the invalid file is removed")
+        self.assert_repaired(out)
+
+    def test_a_corrupted_counted_file_is_repaired_after_a_restart(self):
+        self.corrupt_counted()
+        self.assertTrue(peerjournal.startup(self.state_dir, NOW)["problems"], "a finding")
+        self.assert_repaired(self.trust())
+
+    def test_a_crash_inside_the_recount_is_completed_at_reconcile(self):
+        path = self.corrupt_counted()
+        with mock.patch.object(peerepochs, "complete_prune",
+                               side_effect=SystemExit("crash")):
+            with self.assertRaises(SystemExit):
+                peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        self.assertTrue(path.exists(), "crashed before the removal")
+        self.assertTrue(self.meta()["epochs_untrusted"], "the flag survives the crash")
+        rep = peerjournal.startup(self.state_dir, NOW)
+        self.assertEqual(rep["problems"], [], "the recount is completed, not a loss")
+        self.assertFalse(path.exists(), "reconcile removed the target")
+        self.assert_repaired(self.trust())
+
+    def test_every_unexpected_root_entry_is_removed_or_keeps_the_flag(self):
+        r = peerepochs.root(self.state_dir)
+        for name, make, cleared in (
+                (".rogue", lambda p: p.write_text("x"), True),
+                ("rogue", lambda p: p.write_text("x"), True),
+                (".rogue-dir", lambda p: p.mkdir(), False),
+                (".rogue-link", lambda p: p.symlink_to(self.state_dir), False)):
+            with self.subTest(name=name):
+                peerepochs.set_untrusted(self.state_dir, "test")
+                make(r / name)
+                self.assertTrue(any("epoch store" in p for p in
+                                    peerjournal.reconcile(self.state_dir)),
+                                "a finding at reconcile")
+                out = self.trust()
+                self.assertIs(out["cleared"], cleared, out)
+                self.assertEqual(self.meta()["epochs_untrusted"], not cleared)
+                if cleared:
+                    self.assertFalse(os.path.lexists(r / name), "removed")
+                else:
+                    self.assertTrue(any(name in p for p in out["problems"]), out)
+                    (r / name).unlink() if (r / name).is_symlink() else (r / name).rmdir()
+                    self.assertIs(self.trust()["cleared"], True, "clears once it is gone")
+
+    def test_a_v1_store_beside_any_other_root_entry_is_behind(self):
+        import shutil
+        for name, make in ((".rogue-dir", lambda p: p.mkdir()),
+                           (".rogue", lambda p: p.write_text("x")),
+                           ("a" * 32, lambda p: p.mkdir()),
+                           (".rogue-link", lambda p: p.symlink_to(self.state_dir))):
+            with self.subTest(name=name):
+                r = peerepochs.root(self.state_dir)
+                shutil.rmtree(r, ignore_errors=True)
+                r.mkdir()
+                (r / peerjournal.WITNESS).write_text("t" * 64)
+                peerclock.write(self.state_dir, dataclasses.replace(
+                    peerclock.read(self.state_dir), admission="open"),
+                    previous=peerclock.read(self.state_dir))
+                StoreTests.to_v1(self)
+                make(r / name)
+                rep = peerjournal.startup(self.state_dir, NOW)
+                self.assertEqual((rep["admission"], rep["why"]),
+                                 ("closed", "clock_behind_stores"))
+                self.assertEqual(peerclock.read(self.state_dir).admission, "closed")
+                self.assertTrue(self.meta()["epochs_untrusted"])
+
+    def test_a_migrated_epoch_token_survives_a_journal_loss(self):
+        import shutil
+        shutil.rmtree(peerepochs.root(self.state_dir))
+        StoreTests.to_v1(self)
+        peerjournal.startup(self.state_dir, NOW)
+        meta = self.meta()
+        self.assertNotEqual(meta["epochs"]["token"], meta["replay"]["token"],
+                            "the migration gave the epoch store its own token")
+        key = self.take(self.raw())
+        self.evaluate(key, hk=tpe.hooks(policy=lambda _p, _h, _r: None))
+        shutil.rmtree(peerjournal.record_dir(self.state_dir, tpe.OWNER, key))
+        self.assertTrue(peerjournal.startup(self.state_dir, NOW)["problems"], "the journal loss")
+        self.assertEqual(self.meta()["epochs"]["token"], meta["epochs"]["token"])
+        self.assertEqual(peerjournal.startup(self.state_dir, NOW)["problems"], [],
+                         "no false epoch loss at the second start")
+        self.assertFalse(self.meta()["epochs_untrusted"])
+
+
+class TrustCrashTests(_Epochs):
+    """The trust verb's crash seams: each crash leaves the flag set, and a
+    re-run completes and clears it, idempotently."""
+
+    place_with_since = TrustVerbTests.place_with_since
+
+    def two_pairs(self):
+        self.place_with_since(ts(-3 * DAY), "qPlaced0123456789abcde")
+        key = self.take(self.raw(sender_since=ts(-4 * DAY), id="qOther00123456789abcde",
+                                 **{"from": f"other@{T1}"}))
+        self.evaluate(key, hk=tpe.hooks(policy=lambda _p, _h, _r: None))
+        import shutil
+        shutil.rmtree(peerepochs.root(self.state_dir))
+        peerepochs.root(self.state_dir).mkdir()
+        (peerepochs.root(self.state_dir) / peerjournal.WITNESS).write_text(
+            self.meta()["epochs"]["token"])
+        meta = self.meta()
+        meta["epochs"] = dict(meta["epochs"], live=0, content_sum="0")
+        meta["epochs_untrusted"] = True
+        peerjournal._write_meta(self.state_dir, meta)
+
+    def rerun_clears(self):
+        out = peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        self.assertIs(out["cleared"], True, out)
+        self.assertEqual((self.accepted(), self.accepted(f"other@{T1}")),
+                         (ts(-3 * DAY), ts(-4 * DAY)), "both pairs reseeded")
+        self.assertEqual(peerjournal.startup(self.state_dir, NOW)["problems"], [])
+        again = peerepochs.operator_trust(self.state_dir, NOW, evidence="again")
+        self.assertIs(again["cleared"], True, "idempotent")
+
+    def test_a_crash_mid_reseed_then_a_rerun_completes(self):
+        self.two_pairs()
+        real, calls = peerepochs._link, []
+
+        def link(path, data):
+            calls.append(path)
+            real(path, data)
+            if len(calls) == 2:
+                raise SystemExit("crash after the second file, before its counts")
+        with mock.patch.object(peerepochs, "_link", link), self.assertRaises(SystemExit):
+            peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        self.assertTrue(self.meta()["epochs_untrusted"], "the flag survives the crash")
+        self.assertEqual(peerjournal.startup(self.state_dir, NOW)["problems"], [],
+                         "the reseed write is completed at reconcile")
+        self.rerun_clears()
+
+    def test_a_crash_before_the_final_clear_leaves_the_flag_set(self):
+        self.two_pairs()
+        real = peerjournal._write_meta
+
+        def write_meta(state_dir, meta):
+            if not meta["epochs_untrusted"]:
+                raise SystemExit("crash at the clear")
+            return real(state_dir, meta)
+        with mock.patch.object(peerjournal, "_write_meta", write_meta), \
+                self.assertRaises(SystemExit):
+            peerepochs.operator_trust(self.state_dir, NOW, evidence="checked")
+        self.assertTrue(self.meta()["epochs_untrusted"], "never cleared before its write")
+        self.rerun_clears()
+
+
+class SinceStartCountTests(_Epochs):
+    """Status counts SINCE START: counted when written, through the real
+    transition and hold paths; a new process starts again at zero while the
+    records are still there."""
+
+    def counts(self):
+        doc = peerjournal.status_doc(self.state_dir, NOW)["epochs"]
+        return (doc["refusals"]["quarantined"], doc["exposure_signer_demotions"],
+                doc["epoch_store_unavailable_holds"])
+
+    def test_counted_when_written_and_forgotten_by_a_new_process(self):
+        from router import hoplink
+        hoplink.reset_process_state()
+        self.addCleanup(hoplink.reset_process_state)
+        quarantine = tpe.hooks(policy=lambda _p, _h, _r: peerjournal.Refuse("policy",
+                                                                            "quarantined"))
+        self.evaluate(self.take(self.raw(id="qQuarant0123456789abcd")), hk=quarantine)
+        self.evaluate(self.take(self.raw(id="qDemoted0123456789abcd")),
+                      hk=tpe.hooks(check8=lambda _p, _k: "exposure_signer"))
+        held = self.take(self.raw(id="qHeld0000123456789abcd"))
+        hold = tpe.hooks(policy=lambda _p, _h, _r: peerjournal.Hold("epoch_store_unavailable"))
+        self.evaluate(held, hk=hold)
+        self.evaluate(held, hk=hold)                       # the same hold: counted once
+        self.assertEqual(self.counts(), (1, 1, 1))
+        hoplink.reset_process_state()
+        self.assertEqual(self.counts(), (0, 0, 0), "since start, not over retained records")
+        self.assertEqual(peerjournal.status_doc(self.state_dir, NOW)["epochs"]["counted"],
+                         "since_start")
 
 
 class ConfigRefusalTests(tpe._Eval):

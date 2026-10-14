@@ -1939,14 +1939,54 @@ first), prints one JSON line, and appends to the operator audit:
   record held on `key_runtime_changed` included (that hold clears when the
   runtime's configuration is restored).
 
+- `router peer-epochs trust --evidence TEXT`: the exit from an untrusted
+  epoch store (below). Regular files of the router's own that do not
+  validate are removed, in the same bookkept transaction that recounts the
+  store from the files that remain; the store is reseeded from decided
+  records that passed the consistency step; two-file pairs are completed;
+  the store is recounted and must equal its bookkeeping; only then is the
+  flag cleared, in its own write. Anything else in the epoch root (a
+  directory, a link, another owner's file) keeps the flag, and the verb
+  names it and exits non-zero. A crash anywhere leaves the flag set; run
+  the verb again.
+
 `router reset` never touches any of this: it clears instance state, and
 these stores are not an instance's.
+
+**Sender age and the epoch store.** The production profile requires
+`sender_exposure` and `sender_since` on every signed task, and refuses a
+sender younger than 24 hours by the router's own clock (`quarantined`).
+Each (sending runtime, `from`) pair's accepted `sender_since` is kept in
+`state_dir/peer-epochs/`, one immutable file per pair, counted in the
+store bookkeeping like the journal and the replay index.
+
+- **A lost or rolled-back epoch store HOLDS (PROVISIONAL, pending an
+  operator-policy decision).** Any loss or behind finding for the epoch
+  store, any epoch file that does not read back as written, and any
+  `declare-restored`, set a durable `epochs_untrusted` flag. While it is
+  set, every statement that reaches the consistency step is held
+  `epoch_store_unavailable` (its record stays reserved and is decided after
+  the trust verb); refusals before that step, and profiles without an age
+  policy, are unaffected. The alternative under consideration accepts the
+  residual instead: a lost or rolled-back pair would accept an earlier
+  `sender_since` once, with a named startup finding.
+- **`exposure_missing` may advance the epoch.** The consistency step runs
+  before the exposure requirement, so a statement refused for a missing
+  exposure still records a later `sender_since`. That only lengthens the
+  sender's own wait.
+- **An over-late `sender_since` sticks.** One statement carrying a
+  `sender_since` later than the sender's real enrolment makes every later
+  statement from that pair refuse as `sender_since_inconsistent` until the
+  sender re-enrols with a later value.
 
 **Status** (`peer_store`, with `delegation` only): admission and why, H, the
 floor, the warnings, the bound B (its evidence cut to 80 characters), the
 take seq and the settled-through frontier, every held record and transient
 retry with its key, reason and age, whether inbound intake is on, and the
-last poll's counts.
+last poll's counts. Its `epochs` section: the tracked pairs, pairs caught
+mid-prune, `untrusted`, and, counted since this process started, the
+policy refusals by code, the `exposure_signer` demotions and the
+`epoch_store_unavailable` holds.
 
 ## The ingress journal (`router/ingress.py`)
 

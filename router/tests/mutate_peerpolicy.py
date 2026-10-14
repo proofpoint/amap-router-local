@@ -24,6 +24,7 @@ E = "router.tests.test_peerepochs."
 L = "router.tests.test_peerledger."
 POL, EP, PJ, CF = ("router/peerpolicy.py", "router/peerepochs.py", "router/peerjournal.py",
                    "router/config.py")
+HL = "router/hoplink.py"
 
 M = [
  ("PP1 a delegation naming an overlay loads", CF,
@@ -155,8 +156,8 @@ M = [
   '    if False:\n        meta["epochs_untrusted"] = True\n    elif midprune:\n',
   [E + "StoreTests.test_deleting_the_only_file_is_loss_and_sets_the_flag"]),
  ("PP31 migration over existing epoch files", PJ,
-  '    if files:\n        token = leftover or store["replay"]["token"]\n',
-  '    if False:\n        token = leftover or store["replay"]["token"]\n',
+  '    if beside:\n        peerclock.close(',
+  '    if False:\n        peerclock.close(',
   [E + "StoreTests.test_a_v1_store_beside_epoch_files_is_behind_and_flagged"]),
  ("PP32 a v1 store read as complete", PJ,
   '    if isinstance(store, dict) and store.get("v") == 1 and set(store) == set(_V1_MEMBERS):\n'
@@ -199,6 +200,89 @@ M = [
   '    eroot.mkdir(mode=0o700)\n    atomic_write(eroot / WITNESS, clock.store_token.encode("ascii"), durable_root=state_dir)\n',
   '',
   [E + "StoreTests.test_init_writes_store_v2_with_the_epoch_root"]),
+ ("PP42 the BEHIND migration writes v2 before it closes admission", PJ,
+  '    if beside:\n'
+  '        peerclock.close(state_dir, peerclock.read(state_dir),\n'
+  '                        "a store.v 1 record beside epoch files")\n'
+  '        doc = peerclock.read_doc(state_dir)\n'
+  '        store = dict(doc["store"])\n'
+  '        token = leftover or store["replay"]["token"]\n'
+  '        live, total, _p, _m = (0, 0, 0, 0)\n'
+  '        try:\n'
+  '            live, total, _p, _m = peerepochs.scan(state_dir)\n'
+  '        except peerepochs.EpochFault:\n'
+  '            pass\n'
+  '        store.update(v=STORE_V, epochs=dict(_epochs_entry(token), live=live,\n'
+  '                                            content_sum=str(total)),\n'
+  '                     epochs_untrusted=True)\n'
+  '        doc["store"] = store\n'
+  '        peerclock.write_doc(state_dir, doc)\n'
+  '        return "behind"\n',
+  '    if beside:\n'
+  '        token = leftover or store["replay"]["token"]\n'
+  '        live, total, _p, _m = (0, 0, 0, 0)\n'
+  '        try:\n'
+  '            live, total, _p, _m = peerepochs.scan(state_dir)\n'
+  '        except peerepochs.EpochFault:\n'
+  '            pass\n'
+  '        store.update(v=STORE_V, epochs=dict(_epochs_entry(token), live=live,\n'
+  '                                            content_sum=str(total)),\n'
+  '                     epochs_untrusted=True)\n'
+  '        doc["store"] = store\n'
+  '        peerclock.write_doc(state_dir, doc)\n'
+  '        peerclock.close(state_dir, peerclock.read(state_dir),\n'
+  '                        "a store.v 1 record beside epoch files")\n'
+  '        return "behind"\n',
+  [E + "StoreTests.test_a_crash_at_the_behind_close_leaves_admission_closed_on_restart"]),
+ ("PP43 the trust recount keeps the old counts", EP,
+  '    meta["epochs"] = dict(meta["epochs"], live=live, content_sum=str(total))\n', '',
+  [E + "RepairTests.test_a_corrupted_counted_file_is_repaired"]),
+ ("PP44 the trust recount counts the files it removes", EP,
+  '    live, total, _pairs, _mid = scan(state_dir, skip=frozenset(targets))\n',
+  '    live, total, _pairs, _mid = scan(state_dir)\n',
+  [E + "RepairTests.test_a_corrupted_counted_file_is_repaired"]),
+ ("PP45 reconcile leaves a pending recount's targets", PJ,
+  '        for target in op["targets"]:\n            peerepochs.complete_prune(Path(target))\n',
+  '        pass\n',
+  [E + "RepairTests.test_a_crash_inside_the_recount_is_completed_at_reconcile"]),
+ ("PP46 scan skips dot-named root entries", EP,
+  '        if is_witness(rtdir) or rtdir in skip:\n',
+  '        if rtdir.name.startswith(".") or rtdir in skip:\n',
+  [E + "RepairTests.test_every_unexpected_root_entry_is_removed_or_keeps_the_flag"]),
+ ("PP47 the trust verb skips dot-named root entries", EP,
+  '        if is_witness(rtdir):\n            continue\n        if not _real_dir(rtdir, _HEX32):\n'
+  '            bad.append(rtdir)\n',
+  '        if rtdir.name.startswith("."):\n            continue\n        if not _real_dir(rtdir, _HEX32):\n'
+  '            bad.append(rtdir)\n',
+  [E + "RepairTests.test_every_unexpected_root_entry_is_removed_or_keeps_the_flag"]),
+ ("PP48 migration checks only for epoch files", PJ,
+  '        beside = eroot.is_dir() and any(not peerepochs.is_witness(e) for e in eroot.iterdir())\n',
+  '        beside = eroot.is_dir() and any(p.is_file() and p.name != WITNESS\n'
+  '                                        for p in eroot.rglob("*"))\n',
+  [E + "RepairTests.test_a_v1_store_beside_any_other_root_entry_is_behind"]),
+ ("PP49 the loss rebase renames the epoch token", PJ,
+  '        meta["epochs"])), epoch_token=meta["epochs"]["token"]))',
+  '        meta["epochs"]))))',
+  [E + "RepairTests.test_a_migrated_epoch_token_survives_a_journal_loss"]),
+ ("PP50 the trust verb clears the flag before the reseed", EP,
+  '    if not problems:\n        for (runtime, from_canon), claim in sorted(',
+  '    if not problems:\n        _m = pj.read_meta(state_dir)\n        _m["epochs_untrusted"] = False\n'
+  '        pj._write_meta(state_dir, _m)\n        for (runtime, from_canon), claim in sorted(',
+  [E + "TrustCrashTests.test_a_crash_mid_reseed_then_a_rerun_completes"]),
+ ("PP51 a disposition is not counted", PJ,
+  '    EPOCH_COUNTS[key] = EPOCH_COUNTS.get(key, 0) + 1\n', '    return\n',
+  [E + "SinceStartCountTests.test_counted_when_written_and_forgotten_by_a_new_process"]),
+ ("PP52 the counts outlive the process", HL,
+  '"_POLLED", "EPOCH_COUNTS"),', '"_POLLED"),',
+  [E + "SinceStartCountTests.test_counted_when_written_and_forgotten_by_a_new_process"]),
+ ("PP53 an epoch hold counted on every retry", PJ,
+  '    if held and (held["reason"], held["detail"]) == (reason, detail):\n        return record\n',
+  '    if held and (held["reason"], held["detail"]) == (reason, detail):\n'
+  '        if reason == "epoch_store_unavailable":\n'
+  '            EPOCH_COUNTS["held:epoch_store_unavailable"] = \\\n'
+  '                EPOCH_COUNTS.get("held:epoch_store_unavailable", 0) + 1\n'
+  '        return record\n',
+  [E + "SinceStartCountTests.test_counted_when_written_and_forgotten_by_a_new_process"]),
 ]
 
 

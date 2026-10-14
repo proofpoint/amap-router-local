@@ -137,21 +137,36 @@ def accepted(state_dir: Path, runtime: str, from_canon: str) -> Optional[str]:
     return files[-1].name[:-len(SUFFIX)] if files else None
 
 
-def scan(state_dir: Path) -> Tuple[int, int, int, int]:
+def is_witness(entry: Path) -> bool:
+    """The ONE root entry that is not a runtime directory: the bookkeeping
+    witness, by exact name, a regular file. Any other root entry, a dot
+    name included, is an unexpected object."""
+    from .peerjournal import WITNESS
+    return entry.name == WITNESS and not entry.is_symlink() and entry.is_file()
+
+
+def _real_dir(entry: Path, pattern: "re.Pattern[str]") -> bool:
+    return not entry.is_symlink() and entry.is_dir() and bool(pattern.fullmatch(entry.name))
+
+
+def scan(state_dir: Path, *, skip: frozenset = frozenset()) -> Tuple[int, int, int, int]:
     """(live files, content_sum, pairs, pairs mid-prune) recomputed from
-    disk. Raises `EpochFault` on any file that does not validate."""
+    disk, leaving out the files in `skip`. Raises `EpochFault` on any other
+    entry that does not validate."""
     from .peerjournal import _MOD, contribution
     live = total = pairs = midprune = 0
     r = root(state_dir)
     for rtdir in sorted(r.iterdir()) if r.is_dir() else ():
-        if rtdir.name.startswith("."):
+        if is_witness(rtdir) or rtdir in skip:
             continue
-        if not (rtdir.is_dir() and _HEX32.fullmatch(rtdir.name)):
+        if not _real_dir(rtdir, _HEX32):
             raise EpochFault(f"unexpected entry {rtdir}")
         for fdir in sorted(rtdir.iterdir()):
-            if not (fdir.is_dir() and _HEX64.fullmatch(fdir.name)):
+            if fdir in skip:
+                continue
+            if not _real_dir(fdir, _HEX64):
                 raise EpochFault(f"unexpected entry {fdir}")
-            files = sorted(fdir.iterdir())
+            files = [f for f in sorted(fdir.iterdir()) if f not in skip]
             if files:
                 pairs += 1
             if len(files) > 1:
@@ -243,7 +258,7 @@ def complete_pairs(state_dir: Path) -> int:
     n = 0
     r = root(state_dir)
     for rtdir in sorted(r.iterdir()) if r.is_dir() else ():
-        if rtdir.name.startswith("."):
+        if is_witness(rtdir):
             continue
         for fdir in sorted(rtdir.iterdir()):
             files = sorted(fdir.iterdir())
@@ -353,13 +368,13 @@ def _invalid_entries(state_dir: Path) -> List[Path]:
     bad = []
     r = root(state_dir)
     for rtdir in sorted(r.iterdir()) if r.is_dir() else ():
-        if rtdir.name.startswith("."):
+        if is_witness(rtdir):
             continue
-        if not (rtdir.is_dir() and not rtdir.is_symlink() and _HEX32.fullmatch(rtdir.name)):
+        if not _real_dir(rtdir, _HEX32):
             bad.append(rtdir)
             continue
         for fdir in sorted(rtdir.iterdir()):
-            if not (fdir.is_dir() and not fdir.is_symlink() and _HEX64.fullmatch(fdir.name)):
+            if not _real_dir(fdir, _HEX64):
                 bad.append(fdir)
                 continue
             for f in sorted(fdir.iterdir()):
@@ -381,16 +396,21 @@ def operator_trust(state_dir: Path, now: datetime, *, evidence: str) -> Dict[str
         raise ValueError("evidence is required")
     before = _pairs_report(state_dir)
     problems: List[str] = []
-    # Invalid objects: removed through the bookkept prune when they are
-    # regular files; anything else is unsafe and keeps the flag.
+    # Invalid objects: regular files of ours are removed, in the recount's
+    # own transaction; anything else is unsafe and keeps the flag.
+    targets = []
     for bad in _invalid_entries(state_dir):
-        if bad.is_file() and not bad.is_symlink() and os.stat(bad).st_uid == os.getuid():
-            try:
-                _remove_uncounted(state_dir, bad)
-            except OSError as e:
-                problems.append(f"cannot remove {bad}: {e}")
+        if not bad.is_symlink() and bad.is_file() and os.stat(bad).st_uid == os.getuid():
+            targets.append(bad)
         else:
             problems.append(f"unsafe object {bad}")
+    if not problems:
+        try:
+            _recount_removing(state_dir, targets)
+        except EpochFault as e:
+            problems.append(e.reason)
+        except OSError as e:
+            problems.append(f"cannot remove an invalid file: {e}")
     if not problems:
         for (runtime, from_canon), claim in sorted(_reseed_claims(state_dir).items()):
             old = accepted(state_dir, runtime, from_canon)
@@ -422,19 +442,25 @@ def operator_trust(state_dir: Path, now: datetime, *, evidence: str) -> Dict[str
             "after": _pairs_report(state_dir)}
 
 
-def _remove_uncounted(state_dir: Path, path: Path) -> None:
-    """Remove an invalid file, through the bookkept prune when the
-    bookkeeping counts it, plainly when it never did."""
+def _recount_removing(state_dir: Path, targets: List[Path]) -> None:
+    """The trust verb's recount, ONE bookkept transaction: the intent names
+    the invalid files and, in the same write, carries the epoch counts of
+    the store WITHOUT them, recomputed from the verified remaining files
+    (`scan` raises if any other entry is invalid); then the files go; then
+    the intent is cleared. An invalid file's bytes are never taken for the
+    bytes the bookkeeping once counted. A crash after the intent is
+    completed at reconcile (the targets removed, the counts already theirs);
+    the flag stays set throughout, and a re-run repeats it idempotently."""
     from . import peerjournal as pj
     meta = pj.read_meta(state_dir)
     pj._require_clear(meta)
-    data = path.read_bytes()
-    delta = pj._delta("epochs", None, -_contribution(path, data), 0, -1)
-    meta["pending_op"] = {"op": "epoch_prune", "owner": None, "target": str(path),
-                          "delta": [delta]}
+    live, total, _pairs, _mid = scan(state_dir, skip=frozenset(targets))
+    meta["epochs"] = dict(meta["epochs"], live=live, content_sum=str(total))
+    meta["pending_op"] = {"op": "epoch_recount", "owner": None,
+                          "targets": [str(t) for t in targets]}
     pj._write_meta(state_dir, meta)
-    complete_prune(path)
-    pj._apply(meta, delta)
+    for t in targets:
+        complete_prune(t)
     meta["pending_op"] = None
     pj._write_meta(state_dir, meta)
 
@@ -443,7 +469,7 @@ def _pairs_report(state_dir: Path) -> List[Dict[str, Any]]:
     out = []
     r = root(state_dir)
     for rtdir in sorted(r.iterdir()) if r.is_dir() else ():
-        if rtdir.name.startswith(".") or not rtdir.is_dir():
+        if is_witness(rtdir) or not _real_dir(rtdir, _HEX32):
             continue
         for fdir in sorted(rtdir.iterdir()) if rtdir.is_dir() else ():
             if not fdir.is_dir():
