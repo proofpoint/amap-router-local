@@ -23,8 +23,12 @@ from router.tests import helpers
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "registry"
 ALPHA_LID = "72a96bbced1aa04414517b96ebbb6179"  # snapshot.json's active entry
 #: The host registry's skeleton vectors, at this source commit (fixtures/registry/SOURCE.md).
-SKELETON_SOURCE_SHA = "3f28c782b41df5b701e259c535732e859553ddef"
-SKELETON_SHA256 = "7d4088dc1686aa8daa9a65a4a820ec118bf214ebd51ed112880a81a2955a6d1c"
+SKELETON_SOURCE_SHA = "4993eec9ab765343ab5832ea24bd4dad0d67baf9"
+SKELETON_SHA256 = "bb46836da795b4c35c190bb98b144c50b099eb7630337d509ebb57e6875a8a3f"
+#: Every member but `description`, canonical JSON, sha256, computed from the
+#: copy taken at the previous source commit: the source's description fix
+#: changed no vector.
+SKELETON_VECTORS_SHA256 = "ad4442a8380f90e0b5ef84332201ca87044e7bf9d4ee3786740fd34bd6cfbac6"
 SNAPSHOT_SHA256 = "98e5fd3f521e89a4d1ab74574e33a1a2cdb030652ba9c56402f6f16ef7a8e81d"
 
 
@@ -38,6 +42,17 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(_sha(FIXTURES / "skeleton_vectors.json"), SKELETON_SHA256)
         self.assertEqual(_sha(FIXTURES / "snapshot.json"), SNAPSHOT_SHA256)
         self.assertIn(SKELETON_SOURCE_SHA, (FIXTURES / "SOURCE.md").read_text())
+
+    def test_the_skeleton_vectors_are_unchanged_by_the_description_fix(self):
+        """Every member but `description`, in canonical form, hashes to the
+        previous copy's: only the description line changed upstream."""
+        doc = json.loads((FIXTURES / "skeleton_vectors.json").read_text())
+        rest = {k: v for k, v in doc.items() if k != "description"}
+        self.assertEqual(hashlib.sha256(json.dumps(
+            rest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest(), SKELETON_VECTORS_SHA256)
+        self.assertEqual(sorted(doc), ["collide", "description", "distinct", "fold", "not_reserved",
+                                       "reserved", "reserved_local_parts", "skeletons"])
 
 
 class SkeletonTests(unittest.TestCase):
