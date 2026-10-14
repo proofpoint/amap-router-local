@@ -705,6 +705,29 @@ def _inflight_dir(cfg: Any, gen: str) -> Path:
     return Path(cfg.state_dir) / config_mod.RUNTIME_NS / gen / inflight.INFLIGHT_DIR
 
 
+def finish_settled(cfg: Any) -> int:
+    """The cleanup a settlement owes, completed: an attempt whose journal
+    record is SENT (settled: delivered, refused, or rejected because its
+    generation was retired) whose in-flight record or handed marker is still
+    in its generation's directory (a crash between the settlement and the
+    cleanup; `pending` never selects a sent record again) has them removed,
+    as `inflight.advance` does for a settled record. Needs no capability:
+    nothing is read from or written to the runtime tree. Returns how many."""
+    from . import inflight
+    n = 0
+    for rec in peerjournal.all_records(Path(cfg.state_dir)):
+        c = rec.get("control") or {}
+        attempt = c.get("attempt") or {}
+        if not (c.get("sent") and attempt.get("gen") and attempt.get("id")):
+            continue
+        d = _inflight_dir(cfg, attempt["gen"])
+        path, handed = d / f"{attempt['id']}.json", d / f"{attempt['id']}{inflight.HANDED_SUFFIX}"
+        if os.path.lexists(path) or os.path.lexists(handed):
+            inflight._cleanup(path, handed)
+            n += 1
+    return n
+
+
 def _inflight_entries(cfg: Any, gen: str) -> List[str]:
     """Every in-flight record and handed marker name in generation `gen`."""
     from . import inflight
@@ -1084,6 +1107,9 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
     except Exception:  # noqa: BLE001 -- retried next pass; nothing is attempted meanwhile
         logger.exception("control notices: an audit repair failed; nothing attempted this pass")
         return dict(counts, audit_repair_failed=1)
+    cleaned = finish_settled(cfg)
+    if cleaned:
+        counts["settled_cleaned"] = cleaned
     if delegation is None:
         # No signing key: nothing can be signed, so nothing is tried.
         n = len(pending(state_dir))
