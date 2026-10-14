@@ -44,8 +44,9 @@
                                  record an operator bound B after a lost clock: refused below any
                                  receiver time the router can see; floor = B + Fmax + 1 s, then
                                  admission opens. The evidence is recorded, NOT verified.
-  peer-decision drop KEY         an unrecoverable decision (its key lost): refused with
-                                 decision_unrecoverable, or done if already placed
+  peer-decision drop KEY --evidence TEXT
+                                 key loss only: a decision or reservation that no longer verifies
+                                 is refused with decision_unrecoverable, or done if already placed
   peer-decision restore-key --from FILE
                                  put the ORIGINAL decision key back (refused unless it is)
   peer-candidate quarantine KEY --evidence TEXT
@@ -222,6 +223,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pd_sub = p_pd.add_subparsers(dest="peer_decision_command", required=True)
     p_pdd = pd_sub.add_parser("drop", help="refuse a decision whose key is lost")
     p_pdd.add_argument("key", help="the candidate record's 64-hex key")
+    p_pdd.add_argument("--evidence", required=True,
+                       help="why the key is lost for good (recorded in the audit)")
     p_pdr = pd_sub.add_parser("restore-key", help="put the original decision key back")
     p_pdr.add_argument("--from", dest="source", type=Path, required=True)
 
@@ -281,7 +284,7 @@ def _peer_operator(cfg, args) -> int:
             out = peerjournal.operator_quarantine_candidate(cfg, now, key=args.key,
                                                             evidence=args.evidence)
         elif verb == "peer-decision drop":
-            out = peerjournal.operator_drop(cfg, now, key=args.key)
+            out = peerjournal.operator_drop(cfg, now, key=args.key, evidence=args.evidence)
         else:
             out = peerjournal.operator_restore_key(cfg, now, source=args.source)
     except (peerjournal.StoreRefused, peerjournal.DropRefused, peerclock.BoundRefused,

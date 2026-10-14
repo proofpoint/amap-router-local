@@ -136,8 +136,27 @@ def _parse(raw: bytes) -> Clock:
     token = doc["store_token"]
     if not (isinstance(token, str) and re.fullmatch(r"[0-9a-f]{64}", token)):
         raise ClockUntrusted("store_token is not 64 lower hex")
+    _check_bound(doc["bound_b"])
     return Clock(H=H, floor=floor, admission=doc["admission"], p=p, f=f,
                  f_history=tuple(hist), store_token=token, bound_b=doc["bound_b"])
+
+
+_BOUND_MEMBERS = frozenset({"B", "evidence", "recorded_at", "by", "not_from_wall_clock"})
+
+
+def _check_bound(b: Any) -> None:
+    """`bound_b` is null or exactly the closed record `record_bound` writes;
+    anything else makes the whole clock untrusted."""
+    if b is None:
+        return
+    if not (isinstance(b, dict) and set(b) == _BOUND_MEMBERS):
+        raise ClockUntrusted("bound_b is neither null nor the closed bound record")
+    if parse_utc_ts(b["B"]) is None or parse_utc_ts(b["recorded_at"]) is None:
+        raise ClockUntrusted("bound_b's B or recorded_at is not a UTC timestamp")
+    if not (isinstance(b["evidence"], str) and b["evidence"].strip()
+            and isinstance(b["by"], str) and b["by"]
+            and type(b["not_from_wall_clock"]) is bool):
+        raise ClockUntrusted("bound_b's evidence, by or not_from_wall_clock is malformed")
 
 
 def read(state_dir: Path) -> Clock:
@@ -286,6 +305,9 @@ def record_bound(state_dir: Path, now: datetime, *, at: datetime, evidence: str,
     if abs((now - at).total_seconds()) <= NEAR_WALL_CLOCK_S and not not_from_wall_clock:
         raise BoundRefused("B is within 60 s of wall time: pass --b-not-from-wall-clock if B "
                            "was not derived from the clock")
+    if (at - now).total_seconds() > NEAR_WALL_CLOCK_S and not not_from_wall_clock:
+        raise BoundRefused("B is in the future: H would jump to it and demote valid traffic "
+                           "until wall time catches up; pass --b-not-from-wall-clock to insist")
     try:
         clock = read(state_dir)
         previous: Optional[Clock] = clock

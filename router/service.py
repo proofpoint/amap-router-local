@@ -486,6 +486,7 @@ def peer_startup(cfg: RouterConfig, transport: Any = None) -> Optional[Dict[str,
         return None
     from . import peerjournal
     try:
+        peerjournal.apply_window(cfg.state_dir, datetime.now(timezone.utc), cfg.delegation)
         rep = peerjournal.startup(cfg.state_dir, datetime.now(timezone.utc))
     except Exception as e:  # noqa: BLE001 -- isolated, recorded
         logger.exception("peer store startup check failed")

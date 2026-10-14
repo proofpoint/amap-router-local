@@ -132,8 +132,8 @@ OPTIONAL attribute, `CANDIDATE_REASONS` (`CODEC_OPTIONAL_METHODS`,
 the minor the names are ignored; at or above it, absent is OFF (signed
 candidates are held, `candidate_view_unavailable`); a method present but
 not callable, or `CANDIDATE_REASONS` present but not exactly
-`CANDIDATE_REASONS_3_4`, refuses delegation. A later minor may extend the
-set only with members this runtime handles.
+`CANDIDATE_REASONS_3_4`, refuses delegation: exactly that set, at every
+minor, until this runtime handles more.
 """
 
 from __future__ import annotations

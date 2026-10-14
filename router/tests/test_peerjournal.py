@@ -251,6 +251,18 @@ class CompletenessTests(_Store):
         self.assertIn("behind: journal root lid-b is not recorded",
                       peerjournal.reconcile(self.state_dir))
 
+    def test_a_missing_record_a_reservation_names_is_never_removed(self):
+        """A record directory without record.json is crash residue only when
+        no reservation names it; otherwise it is loss, kept for the operator."""
+        rdir = self.path(self.k1).parent
+        with mock.patch.object(peerjournal, "_reservations",
+                               return_value=[("r" * 32, "i" * 64, {"candidate_ref": self.k1})]):
+            self.path(self.k1).unlink()
+            problems = peerjournal.reconcile(self.state_dir)
+        self.assertTrue(rdir.is_dir(), "kept")
+        self.assertIn(f"loss: record {OWNER}/{self.k1} is missing but a reservation names it",
+                      problems)
+
     def test_a_missing_seq_below_the_top_is_loss(self):
         self.take("e3")
         shutil.rmtree(self.path(self.k2).parent)
@@ -366,13 +378,33 @@ class ReplayCompletenessTests(_Replay):
                       peerjournal.reconcile(self.state_dir))
 
     def test_a_crash_before_the_bookkeeping_rolls_forward(self):
-        meta = peerjournal.read_meta(self.state_dir)
-        meta["replay"].update(live=0, content_sum="0", high_reserve_seq=0)
-        meta["pending_op"] = {"op": "reserve", "owner": None, "rt": self.rcp.rt,
-                              "idk": self.rcp.idk, "seq": 1}
-        peerjournal._write_meta(self.state_dir, meta)
+        """mark_done wrote its marker and crashed before its counts: the
+        pending op's own change accounts for exactly that file."""
+        key, chk, _ = self.candidate("e2", id="qB2c3D4e5F6g7H8i9J0kLmx", subject="two")
+        rcp, _ = self.reserve(key, chk)
+        with mock.patch.object(peerjournal, "_apply", side_effect=SystemExit("crash")):
+            with self.assertRaises(SystemExit):
+                peerjournal.mark_done(self.state_dir, rcp.rt, rcp.idk, disposition="placed",
+                                      now=NOW)
+        self.assertIsNotNone(peerjournal.read_meta(self.state_dir)["pending_op"])
         self.assertEqual(peerjournal.reconcile(self.state_dir), [])
         self.assertEqual(peerjournal.reconcile(self.state_dir), [])
+
+    def test_a_pending_op_never_hides_another_records_rollback(self):
+        """An op left pending on one record, and a sibling in the same root
+        rolled back in place: the op's change explains only its own target."""
+        key2, _chk, _ = self.candidate("e2")
+        path = peerjournal.record_dir(self.state_dir, OWNER, key2) / "record.json"
+        old = path.read_bytes()
+        peerjournal.set_hold(self.state_dir, self.record(key2), "hook_absent", "x", NOW)
+        path.write_bytes(old)
+        k1 = peerjournal.record_key(intake="candidates", gen="g1", owner=OWNER, entry_id="e1")
+        rec1 = self.record(k1)
+        with mock.patch.object(peerjournal, "_apply", side_effect=SystemExit("crash")):
+            with self.assertRaises(SystemExit):
+                peerjournal.write_record(self.state_dir, dict(rec1, state="pending"))
+        problems = peerjournal.reconcile(self.state_dir)
+        self.assertTrue(any("content does not match" in p for p in problems), problems)
 
 
 class InboundConfigTests(helpers.RouterTestCase):
@@ -528,6 +560,23 @@ class StartupTests(_Replay):
         peerjournal.rebuild_meta(self.state_dir)
         rep = peerjournal.startup(self.state_dir, NOW + timedelta(hours=1))
         self.assertEqual((rep["admission"], rep["why"], rep["problems"]), ("open", None, []))
+
+
+class ObservedTimesTests(_Replay):
+
+    def test_every_source_is_seen_with_its_name(self):
+        key, chk, _ = self.candidate("e1")
+        rcp, _ = self.reserve(key, chk)
+        peerjournal.mark_done(self.state_dir, rcp.rt, rcp.idk, disposition="placed", now=NOW)
+        peerjournal._audit(self.state_dir, "test", NOW)
+        sources = {src.rsplit(" ", 1)[-1] for _t, src in
+                   peerjournal.observed_times(self.state_dir, None)}
+        for field in ("H", "first_seen_ts", "state_ts", "done_ts", "ts"):
+            self.assertIn(field, sources)
+        names = " ".join(src for _t, src in peerjournal.observed_times(self.state_dir, None))
+        for where in ("record.json first_seen_ts", ".done done_ts", ".json ts",
+                      "operator.audit.jsonl ts"):
+            self.assertIn(where, names)
 
 
 class StatusTests(_Replay):

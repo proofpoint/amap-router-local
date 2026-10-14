@@ -157,6 +157,18 @@ def _root_entry(token: str) -> Dict[str, Any]:
     return {"token": token, "live": 0, "high_seq": 0, "content_sum": "0", "rev_total": 0}
 
 
+def _delta(store: str, owner: Optional[str], dsum: int, drev: int, dlive: int) -> Dict[str, Any]:
+    """One store's exact change by an operation, recorded in `pending_op`
+    BEFORE it acts: reconcile accepts that store as recorded (not applied)
+    or recorded plus this (applied), and nothing else."""
+    return {"store": store, "owner": owner, "sum": str(dsum % _MOD), "rev": drev, "live": dlive}
+
+
+def _apply(meta: Dict[str, Any], d: Mapping[str, Any]) -> None:
+    entry = meta["replay"] if d["store"] == "replay" else meta["roots"][d["owner"]]
+    _add(entry, int(d["sum"]), d["rev"], d["live"])
+
+
 def _add(entry: Dict[str, Any], delta_sum: int, delta_rev: int, delta_live: int) -> None:
     entry["content_sum"] = str((int(entry["content_sum"]) + delta_sum) % _MOD)
     entry["rev_total"] += delta_rev
@@ -271,8 +283,19 @@ def take(state_dir: Path, owner: str, *, intake: str, gen: str, entry_id: str, r
     if rdir.exists():
         raise StoreBlocked(f"record directory {key} has no record; reconcile at startup")
     seq = meta["take_seq"] + 1
+    record = {"schema": "amap-router-local.peer-candidate/1", "key": key, "owner": owner,
+              "intake": intake, "gen": gen, "entry_id": entry_id, "take_seq": seq,
+              "rev": 1, "first_seen_ts": format_utc_ts(now), "state_ts": format_utc_ts(now),
+              "state": "pending", "hold": None, "decided_sticky": False, "cause": None,
+              "policy_code": None, "control": None, "replay_ref": None, "retry": None,
+              "tombstone": None, "removed": False, "disposed": None, "done_ts": None}
+    data = _record_bytes(record)
+    snap_bytes = bytes(raw)
+    delta = _delta("root", owner,
+                   contribution(f"{key}/{SNAPSHOT_DIR}/{SNAPSHOT_CANDIDATE}", 0, snap_bytes)
+                   + contribution(f"{key}/{RECORD}", 1, data), 1, 2)
     meta["take_seq"] = seq
-    meta["pending_op"] = {"op": "take", "owner": owner, "key": key, "seq": seq}
+    meta["pending_op"] = {"op": "take", "owner": owner, "key": key, "seq": seq, "delta": [delta]}
     _write_meta(state_dir, meta)
     created = False
     try:
@@ -282,14 +305,7 @@ def take(state_dir: Path, owner: str, *, intake: str, gen: str, entry_id: str, r
         snap = rdir / SNAPSHOT_DIR
         snap.mkdir(mode=0o700)
         fsync_dir(rdir)
-        _write_once(snap, SNAPSHOT_CANDIDATE, bytes(raw))
-        record = {"schema": "amap-router-local.peer-candidate/1", "key": key, "owner": owner,
-                  "intake": intake, "gen": gen, "entry_id": entry_id, "take_seq": seq,
-                  "rev": 1, "first_seen_ts": format_utc_ts(now), "state_ts": format_utc_ts(now),
-                  "state": "pending", "hold": None, "decided_sticky": False, "cause": None,
-                  "policy_code": None, "control": None, "replay_ref": None, "retry": None,
-                  "tombstone": None, "disposed": None, "done_ts": None}
-        data = _record_bytes(record)
+        _write_once(snap, SNAPSHOT_CANDIDATE, snap_bytes)
         _write_once(rdir, RECORD, data)
     except Exception:
         try:
@@ -302,10 +318,8 @@ def take(state_dir: Path, owner: str, *, intake: str, gen: str, entry_id: str, r
         except Exception:
             raise StoreBlocked(f"take of seq {seq} failed and its cleanup failed too") from None
         raise
+    _apply(meta, delta)
     entry = meta["roots"][owner]
-    snap_bytes = bytes(raw)
-    _add(entry, contribution(f"{key}/{SNAPSHOT_DIR}/{SNAPSHOT_CANDIDATE}", 0, snap_bytes)
-         + contribution(f"{key}/{RECORD}", 1, data), 1, 2)
     entry["high_seq"] = max(entry["high_seq"], seq)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
@@ -349,10 +363,12 @@ def add_snapshot(state_dir: Path, record: Mapping[str, Any], name: str, data: by
     meta = read_meta(state_dir)
     if meta["pending_op"] is not None:
         raise StoreBlocked(f"an operation is unreconciled: {meta['pending_op']}")
-    meta["pending_op"] = {"op": "snapshot", "owner": owner, "key": key, "name": name}
+    delta = _delta("root", owner, contribution(f"{key}/{SNAPSHOT_DIR}/{name}", 0, data), 0, 1)
+    meta["pending_op"] = {"op": "snapshot", "owner": owner, "key": key, "name": name,
+                          "delta": [delta]}
     _write_meta(state_dir, meta)
     _write_once(snap, name, data)
-    _add(meta["roots"][owner], contribution(f"{key}/{SNAPSHOT_DIR}/{name}", 0, data), 0, 1)
+    _apply(meta, delta)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
 
@@ -382,12 +398,13 @@ def write_record(state_dir: Path, record: Dict[str, Any]) -> Dict[str, Any]:
     old_rev = json.loads(old)["rev"]
     new_record = dict(record, rev=old_rev + 1)
     new = _record_bytes(new_record)
-    meta["pending_op"] = {"op": "record", "owner": owner, "key": key, "rev": old_rev + 1}
+    delta = _delta("root", owner, contribution(f"{key}/{RECORD}", old_rev + 1, new)
+                   - contribution(f"{key}/{RECORD}", old_rev, old), 1, 0)
+    meta["pending_op"] = {"op": "record", "owner": owner, "key": key, "rev": old_rev + 1,
+                          "delta": [delta]}
     _write_meta(state_dir, meta)
     atomic_write(path, new, durable_root=state_dir)
-    entry = meta["roots"][owner]
-    _add(entry, contribution(f"{key}/{RECORD}", old_rev + 1, new)
-         - contribution(f"{key}/{RECORD}", old_rev, old), 1, 0)
+    _apply(meta, delta)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
     return new_record
@@ -434,6 +451,20 @@ def _scan_root(state_dir: Path, owner: str) -> Tuple[int, int, int, int, List[in
 BEHIND, LOSS = "behind: ", "loss: "
 
 
+def _rolled(entry: Mapping[str, Any], d: Optional[Mapping[str, Any]], live: int, total: int,
+            revs: int) -> bool:
+    """Whether a store with an operation pending on it (`d`, its exact
+    change) is exactly as recorded, or exactly as recorded plus that
+    change: the operation did not run, or ran completely. Without an
+    operation on it, never: it is compared as usual."""
+    if d is None:
+        return False
+    before = (entry["live"], int(entry["content_sum"]) % _MOD, entry["rev_total"])
+    after = (entry["live"] + d["live"], (int(entry["content_sum"]) + int(d["sum"])) % _MOD,
+             entry["rev_total"] + d["rev"])
+    return (live, total % _MOD, revs) in (before, after)
+
+
 def reconcile(state_dir: Path) -> List[str]:
     """Run at startup, under the drain lock, before any drain: settle an
     unreconciled operation, remove record directories without a record,
@@ -451,7 +482,16 @@ def reconcile(state_dir: Path) -> List[str]:
             continue
         for d in sorted(root.iterdir()):
             if d.is_dir() and _KEY_RE.fullmatch(d.name) and not (d / RECORD).exists():
+                if any(doc["candidate_ref"] == d.name for _rt, _idk, doc in _reservations(state_dir)):
+                    problems.append(f"{LOSS}record {owner}/{d.name} is missing but a reservation "
+                                    "names it")
+                    continue
                 shutil.rmtree(d)
+    if op is not None and op["op"] == "prune":
+        # A prune is completed, never half-undone: every target goes.
+        _remove_targets(*_prune_targets(state_dir, {"owner": op["owner"], "key": op["key"],
+                                                    "replay_ref": op.get("replay_ref")}))
+    deltas = list((op or {}).get("delta") or ())
     if op is not None and op["op"] == "register_root":
         owner = op["owner"]
         root = journal_root(state_dir, owner)
@@ -475,7 +515,8 @@ def reconcile(state_dir: Path) -> List[str]:
             problems.append(f"{LOSS}journal root {owner}: witness does not match")
         live, high, total, revs, seqs = _scan_root(state_dir, owner)
         carried |= set(seqs)
-        if op is not None and op.get("owner") == owner:
+        d = next((x for x in deltas if x["store"] == "root" and x["owner"] == owner), None)
+        if _rolled(entry, d, live, total, revs):
             entry.update(live=live, high_seq=max(entry["high_seq"], high),
                          content_sum=str(total), rev_total=revs)
             continue
@@ -495,7 +536,9 @@ def reconcile(state_dir: Path) -> List[str]:
     if rtoken != replay["token"]:
         problems.append(f"{LOSS}replay store: witness does not match")
     rlive, rhigh, rtotal = _scan_replay(state_dir)
-    if op is not None and op["op"] in ("reserve", "done", "prune"):
+    d = next((x for x in deltas if x["store"] == "replay"), None)
+    if d is not None and _rolled(replay, d, rlive, rtotal, replay["rev_total"]) and \
+            rhigh <= max(replay["high_reserve_seq"], meta["reserve_seq"]):
         replay.update(live=rlive, high_reserve_seq=max(replay["high_reserve_seq"], rhigh),
                       content_sum=str(rtotal))
     elif ((rlive, str(rtotal)) != (replay["live"], replay["content_sum"])
@@ -622,10 +665,16 @@ def reserve(state_dir: Path, checked: "peerbind.Checked", *, record: Dict[str, A
                                       state_dir=state_dir)
     doc = json.loads(rec)
     rt, idk = doc["rt"], doc["idk"]
-    meta["reserve_seq"] = seq
-    meta["pending_op"] = {"op": "reserve", "owner": None, "rt": rt, "idk": idk, "seq": seq}
-    _write_meta(state_dir, meta)
     before = _replay_files(state_dir, rt, idk)
+    # A reservation already there (ours, a retried step; or another's, the
+    # collision) is never replaced, so it changes nothing.
+    delta = _delta("replay", None, 0 if before else
+                   contribution(f"{rt}/{idk}{peerbind.RESERVATION_SUFFIX}", 0, rec),
+                   0, 0 if before else 1)
+    meta["reserve_seq"] = seq
+    meta["pending_op"] = {"op": "reserve", "owner": None, "rt": rt, "idk": idk, "seq": seq,
+                          "delta": [delta]}
+    _write_meta(state_dir, meta)
     try:
         receipt = peerbind.commit_reservation(state_dir, rt, idk, rec, record_id=record["key"])
     except peerbind.ReservationCollision:
@@ -634,11 +683,8 @@ def reserve(state_dir: Path, checked: "peerbind.Checked", *, record: Dict[str, A
         raise
     _link_digest(state_dir, doc["statement_sha256"], rt, idk)
     if not before:
-        data = (_replay(state_dir) / rt / (idk + peerbind.RESERVATION_SUFFIX)).read_bytes()
-        _add(meta["replay"], contribution(f"{rt}/{idk}{peerbind.RESERVATION_SUFFIX}", 0, data),
-             0, 1)
-        meta["replay"]["high_reserve_seq"] = max(meta["replay"]["high_reserve_seq"],
-                                                 json.loads(data)["reserve_seq"])
+        _apply(meta, delta)
+        meta["replay"]["high_reserve_seq"] = max(meta["replay"]["high_reserve_seq"], seq)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
     written = write_record(state_dir, dict(record, state="reserved", replay_ref=f"{rt}/{idk}"))
@@ -670,10 +716,11 @@ def mark_done(state_dir: Path, rt: str, idk: str, *, disposition: str, now: date
         return
     data = json.dumps({"done_ts": format_utc_ts(now), "disposition": disposition},
                       sort_keys=True).encode("utf-8")
-    meta["pending_op"] = {"op": "done", "owner": None, "rt": rt, "idk": idk}
+    delta = _delta("replay", None, contribution(f"{rt}/{name}", 0, data), 0, 1)
+    meta["pending_op"] = {"op": "done", "owner": None, "rt": rt, "idk": idk, "delta": [delta]}
     _write_meta(state_dir, meta)
     _write_once(d, name, data)
-    _add(meta["replay"], contribution(f"{rt}/{name}", 0, data), 0, 1)
+    _apply(meta, delta)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
 
@@ -685,8 +732,8 @@ def done_marker(state_dir: Path, rt: str, idk: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def discover(state_dir: Path, record_key: str, statement_sha256: str
-             ) -> Optional[Tuple[str, str]]:
+def discover(state_dir: Path, record_key: str, statement_sha256: str, *,
+             scan: bool = True) -> Optional[Tuple[str, str]]:
     """The reservation a `pending` record already owns, found WITHOUT the
     current configuration: the digest index first, then (the gap between a
     reservation and its digest entry) a scan for one whose `candidate_ref`
@@ -702,6 +749,8 @@ def discover(state_dir: Path, record_key: str, statement_sha256: str
             doc = None
         if doc is not None and doc["candidate_ref"] == record_key:
             return hit
+    if not scan:
+        return None
     for rt, idk, doc in _reservations(state_dir):
         if doc["candidate_ref"] == record_key:
             return rt, idk
@@ -797,6 +846,11 @@ HOLD_REASONS = frozenset({
 #: Holds only an operator act clears: never re-evaluated by a poll.
 OPERATOR_HOLDS = frozenset({"candidate_view_refused", "candidate_malformed",
                             "recovery_corrupt", "recipient_gone", "unpublishable"})
+#: Of those, the ones re-tried without an operator verb: `recipient_gone`
+#: once the decision's recipient is configured again (re-enrolment; checked
+#: from config, so a recipient still gone is never attempted), and
+#: `unpublishable` once per start (a published id's grammar changes only
+#: with the code). Each stays visible in status, with its age, until then.
 #: The codec causes whose demotion carries a control notice (check 5(b));
 #: every binding cause (checks 6-11) carries one too.
 CONTROL_CODEC_CAUSES = frozenset({"statement_value"})
@@ -943,6 +997,19 @@ class ViewUnavailable(Exception):
     """The candidate-view seam is not available (the codec predates it)."""
 
 
+def _retry_due(ctx: "Ctx", record: Mapping[str, Any], hold: Mapping[str, Any]) -> bool:
+    if hold["reason"] == "unpublishable":
+        return ctx.first_pass
+    if hold["reason"] == "recipient_gone":
+        try:
+            _raw, dec = peerbind.read_decision_data(
+                ctx.state_dir, record_dir_rel(record["owner"], record["key"]))
+        except (OSError, peerbind.RecoveryCorrupt):
+            return False
+        return dec["hosted_instance"] in getattr(ctx.cfg, "instances", {})
+    return False
+
+
 class Ctx:
     """One poll's evaluation context. `view(raw)` is the codec's
     `candidate_view` (raising its CodecError, or `ViewUnavailable`);
@@ -951,11 +1018,15 @@ class Ctx:
 
     def __init__(self, *, state_dir: Path, cfg: Any, delegation: Any, hooks: DecideHooks,
                  now: datetime, clock: "peerclock.Clock", view: Any, effects: Any,
-                 retired: Any):
+                 retired: Any, first_pass: bool = False):
         if not isinstance(hooks, DecideHooks):
             raise TypeError("hooks: a DecideHooks")
         self.state_dir, self.cfg, self.delegation, self.hooks = Path(state_dir), cfg, delegation, hooks
         self.now, self.clock, self.view, self.effects, self.retired = now, clock, view, effects, retired
+        #: The first pass of this process: unpublishable holds are re-tried
+        #: and a reservation is discovered by the full scan, not only the
+        #: digest index.
+        self.first_pass = first_pass
 
 
 def _control(outcome: str, cause: str, about: Optional[str],
@@ -1031,9 +1102,21 @@ known_fn = known
 
 def evaluate(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     """Advance one record as far as it can go this poll; returns it as
-    written. Operator-only holds are left alone."""
+    written. Operator-only holds are left alone. A record that cannot be
+    recovered as recorded (`RecoveryCorrupt`, wherever it is raised) is held
+    visibly, never failed with the rest of the pass."""
+    try:
+        return _evaluate(ctx, record)
+    except peerbind.RecoveryCorrupt as e:
+        current = read_record(ctx.state_dir, record["owner"], record["key"])
+        if current["state"] == "done":
+            raise
+        return set_hold(ctx.state_dir, current, "recovery_corrupt", e.reason, ctx.now)
+
+
+def _evaluate(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     hold = record.get("hold")
-    if hold and hold["reason"] in OPERATOR_HOLDS:
+    if hold and hold["reason"] in OPERATOR_HOLDS and not _retry_due(ctx, record, hold):
         return record
     state = record["state"]
     if state == "pending":
@@ -1059,7 +1142,8 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     # check 12): decided now, NEVER re-checked.
     statement = read_snapshot(ctx.state_dir, record, SNAPSHOT_STATEMENT)
     if statement is not None:
-        found = discover(ctx.state_dir, record["key"], hashlib.sha256(statement).hexdigest())
+        found = discover(ctx.state_dir, record["key"], hashlib.sha256(statement).hexdigest(),
+                         scan=ctx.first_pass)
         if found is not None:
             record = write_record(ctx.state_dir, dict(record, state="reserved",
                                                       state_ts=format_utc_ts(now),
@@ -1128,8 +1212,7 @@ def _reserved(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     now = ctx.now
     sd = ctx.state_dir
     if (record_dir(sd, record["owner"], record["key"]) / peerbind.DECISION_FILE).exists():
-        record = write_record(sd, dict(record, state="decided", state_ts=format_utc_ts(now),
-                                       decided_sticky=True, hold=None))
+        record = transition(sd, record, "decided", now, decided_sticky=True)
         return _decided(ctx, record)
     if record.get("decided_sticky"):
         return set_hold(sd, record, "recovery_corrupt", "decision_missing", now)
@@ -1210,7 +1293,7 @@ def _decided(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     except peerbind.RecipientGone:
         return set_hold(sd, record, "recipient_gone", None, now)
     except peerbind.Unpublishable as e:
-        return set_hold(sd, record, "unpublishable", str(e.args[0]) if e.args else None, now)
+        return set_hold(sd, record, "unpublishable", getattr(e, "member", None), now)
     except peerbind.RecoveryCorrupt as e:
         return set_hold(sd, record, "recovery_corrupt", e.reason, now)
     return _done(ctx, record, disposed="placed", done_ts=format_utc_ts(now), retry=None)
@@ -1237,7 +1320,8 @@ def _settle(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
         rt, idk = record["replay_ref"].split("/")
         mark_done(ctx.state_dir, rt, idk, disposition=_DONE_DISPOSITION[record["disposed"]],
                   now=ctx.now)
-    ctx.effects.remove(record)
+    if ctx.effects.remove(record) is True and not record.get("removed"):
+        record = write_record(ctx.state_dir, dict(record, removed=True))
     return record
 
 
@@ -1282,7 +1366,7 @@ def _notice_present(cfg: Any, hosted: str, notice_id: str) -> Optional[bool]:
 def _refuse_superseded(ctx: Ctx, record: Dict[str, Any], sup: Mapping[str, Any]
                        ) -> Dict[str, Any]:
     if record["state"] != "refused":
-        about = None
+        about = _about(ctx.state_dir, record)
         record = transition(ctx.state_dir, record, "refused", ctx.now, cause="policy",
                             policy_code=sup["policy_code"],
                             control=_control("refused", "policy", about, sup["policy_code"]))
@@ -1320,23 +1404,47 @@ def supersede(ctx: Ctx, record: Dict[str, Any], *, policy_code: str, by: str,
     return _refuse_superseded(ctx, record, sup)
 
 
+def _about(state_dir: Path, record: Mapping[str, Any]) -> Optional[str]:
+    """The statement id a control notice is about, from the snapshot."""
+    raw = read_snapshot(state_dir, record, SNAPSHOT_STATEMENT)
+    if raw is None:
+        return None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return None
+    ident = doc.get("id") if isinstance(doc, dict) else None
+    return ident if isinstance(ident, str) else None
+
+
 def drop(ctx: Ctx, record: Dict[str, Any], *, by: str) -> Dict[str, Any]:
-    """`router peer-decision drop <key>`, operator-only, the exit from an
-    unrecoverable decision. A decided record whose
-    decision no longer verifies is superseded with `decision_unrecoverable`
-    (never when its notice is present: that is `done(placed)`); a reserved
-    record held on `key_runtime_changed` is refused with the same code.
-    Anything else is refused and nothing is written."""
+    """`router peer-decision drop <key>`, operator-only, the exit from key
+    loss and nothing else (`decision_unrecoverable`):
+    - a decided record whose decision no longer verifies is superseded
+      (never when its notice is present: that is `done(placed)`);
+    - a reserved record (no decision) whose reservation no longer verifies
+      is refused, control pending; there is no decision to supersede.
+    Anything else, a reserved record held on `key_runtime_changed` whose
+    reservation verifies included, is refused and nothing is written."""
     sd = ctx.state_dir
     rel = record_dir_rel(record["owner"], record["key"])
-    if record["state"] == "reserved" and (record.get("hold") or {}).get("reason") == \
-            "key_runtime_changed":
+    has_decision = (record_dir(sd, record["owner"], record["key"])
+                    / peerbind.DECISION_FILE).exists()
+    if record["state"] == "reserved" and not has_decision:
+        rt, idk = record["replay_ref"].split("/")
+        try:
+            peerbind.reopen_reservation(sd, rt, idk, record_id=record["key"])
+        except peerbind.RecoveryCorrupt as e:
+            if e.reason != "mac":
+                raise DropRefused(f"{record['key']}: the reservation is corrupt ({e.reason}), "
+                                  "not unrecoverable") from None
+        else:
+            raise DropRefused(f"{record['key']}: the reservation verifies; nothing to drop")
         return _finish(ctx, transition(sd, record, "refused", ctx.now, cause="policy",
                                        policy_code=DECISION_UNRECOVERABLE,
-                                       control=_control("refused", "policy", None,
+                                       control=_control("refused", "policy", _about(sd, record),
                                                         DECISION_UNRECOVERABLE)))
-    if record["state"] not in ("decided", "reserved") or not (
-            record_dir(sd, record["owner"], record["key"]) / peerbind.DECISION_FILE).exists():
+    if record["state"] not in ("decided", "reserved") or not has_decision:
         raise DropRefused(f"{record['key']}: {record['state']} with no unrecoverable decision")
     try:
         peerbind.reopen_decision(sd, rel, record_id=record["key"])
@@ -1347,8 +1455,7 @@ def drop(ctx: Ctx, record: Dict[str, Any], *, by: str) -> Dict[str, Any]:
     else:
         raise DropRefused(f"{record['key']}: the decision verifies; nothing to drop")
     if record["state"] == "reserved":
-        record = write_record(sd, dict(record, state="decided", decided_sticky=True,
-                                       state_ts=format_utc_ts(ctx.now)))
+        record = transition(sd, record, "decided", ctx.now, decided_sticky=True)
     return supersede(ctx, record, policy_code=DECISION_UNRECOVERABLE, by=by, key_lost=True)
 
 
@@ -1356,35 +1463,112 @@ def drop(ctx: Ctx, record: Dict[str, Any], *, by: str) -> Dict[str, Any]:
 # Startup
 # ---------------------------------------------------------------------------
 
+def _recount(state_dir: Path, token: str, old: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The bookkeeping recomputed from the live stores. `settled_through`,
+    the take and reserve seqs and every high-water NEVER fall below `old`'s
+    (retention may have pruned what they cover); without `old` the frontier
+    is the contiguous settled prefix of what is on disk."""
+    state_dir = Path(state_dir)
+    meta: Dict[str, Any] = {"v": 1, "take_seq": 0, "reserve_seq": 0, "settled_through": 0,
+                            "roots": {}, "replay": None, "pending_op": None}
+    states: Dict[int, str] = {}
+    for child in sorted(state_dir.iterdir()):
+        if (child / JOURNAL_DIR).is_dir():
+            live, high, total, revs, seqs = _scan_root(state_dir, child.name)
+            prev = (old or {}).get("roots", {}).get(child.name) or {}
+            meta["roots"][child.name] = {"token": token, "live": live,
+                                         "high_seq": max(high, prev.get("high_seq", 0)),
+                                         "content_sum": str(total), "rev_total": revs}
+            meta["take_seq"] = max(meta["take_seq"], high)
+            root = child / JOURNAL_DIR
+            for d in root.iterdir():
+                if (d / RECORD).is_file():
+                    rec = json.loads((d / RECORD).read_text(encoding="utf-8"))
+                    states[rec["take_seq"]] = rec["state"]
+    rlive, rhigh, rtotal = _scan_replay(state_dir)
+    prev_replay = (old or {}).get("replay") or {}
+    meta["replay"] = {"token": token, "live": rlive,
+                      "high_reserve_seq": max(rhigh, prev_replay.get("high_reserve_seq", 0)),
+                      "content_sum": str(rtotal), "rev_total": 0}
+    vacant = _vacant(state_dir)
+    meta["take_seq"] = max([meta["take_seq"], (old or {}).get("take_seq", 0)] + list(vacant))
+    meta["reserve_seq"] = max(rhigh, (old or {}).get("reserve_seq", 0))
+    if old is not None:
+        meta["settled_through"] = old["settled_through"]
+    else:
+        floor_seq = min(states) if states else meta["take_seq"] + 1
+        s = 0
+        while s + 1 <= meta["take_seq"] and (s + 1 < floor_seq or s + 1 in vacant
+                                             or states.get(s + 1) in SETTLED_STATES):
+            s += 1
+        meta["settled_through"] = s
+    return meta
+
+
+def _old_meta(state_dir: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return read_meta(state_dir)
+    except (StoreAbsent, ValueError, peerclock.ClockUntrusted):
+        return None
+
+
 def rebuild_meta(state_dir: Path) -> Dict[str, Any]:
     """Recompute the bookkeeping from the live stores: ONLY after the
     operator recorded a bound B (`peerclock.record_bound`), whose floor is
-    what protects everything the lost bookkeeping could have proved."""
+    what protects everything the lost bookkeeping could have proved. The
+    frontier is never lowered (`_recount`)."""
     state_dir = Path(state_dir)
     clock = peerclock.read(state_dir)
     if clock.bound_b is None:
         raise StoreRefused("the bookkeeping is rebuilt only under a recorded bound B")
     token = clock.store_token
-    meta: Dict[str, Any] = {"v": 1, "take_seq": 0, "reserve_seq": 0, "settled_through": 0,
-                            "roots": {}, "replay": None, "pending_op": None}
     for child in sorted(state_dir.iterdir()):
         if (child / JOURNAL_DIR).is_dir():
-            root = child / JOURNAL_DIR
-            atomic_write(root / WITNESS, token.encode("ascii"), durable_root=state_dir)
-            live, high, total, revs, _ = _scan_root(state_dir, child.name)
-            meta["roots"][child.name] = {"token": token, "live": live, "high_seq": high,
-                                         "content_sum": str(total), "rev_total": revs}
-            meta["take_seq"] = max(meta["take_seq"], high)
+            atomic_write(child / JOURNAL_DIR / WITNESS, token.encode("ascii"),
+                         durable_root=state_dir)
     replay = state_dir / REPLAY_DIR
     replay.mkdir(exist_ok=True, mode=0o700)
     atomic_write(replay / WITNESS, token.encode("ascii"), durable_root=state_dir)
-    rlive, rhigh, rtotal = _scan_replay(state_dir)
-    meta["replay"] = {"token": token, "live": rlive, "high_reserve_seq": rhigh,
-                      "content_sum": str(rtotal), "rev_total": 0}
-    meta["reserve_seq"] = rhigh
-    meta["take_seq"] = max([meta["take_seq"]] + list(_vacant(state_dir)))
+    meta = _recount(state_dir, token, _old_meta(state_dir))
     _write_meta(state_dir, meta)
     return meta
+
+
+def _rebase_after_loss(state_dir: Path, meta: Mapping[str, Any]) -> None:
+    """Once the floor protecting a detected LOSS is persisted: the
+    bookkeeping is rebased to the live stores (a lost root dropped, each
+    seq lost below the top marked vacant), so the loss is accounted for
+    once and the next start is clean. Never after an AHEAD finding: that
+    closes admission, and only a bound B reopens it."""
+    state_dir = Path(state_dir)
+    carried = set()
+    for child in sorted(state_dir.iterdir()):
+        root = child / JOURNAL_DIR
+        for d in root.iterdir() if root.is_dir() else ():
+            if (d / RECORD).is_file():
+                carried.add(json.loads((d / RECORD).read_text(encoding="utf-8"))["take_seq"])
+    vacant = _vacant(state_dir)
+    for seq in range(meta["settled_through"] + 1, meta["take_seq"] + 1):
+        if seq not in carried and seq not in vacant:
+            _mark_vacant(state_dir, seq)
+    token = meta["replay"]["token"]
+    _write_meta(state_dir, _recount(state_dir, token, meta))
+
+
+def apply_window(state_dir: Path, now: datetime, dc: Any) -> Optional["peerclock.Clock"]:
+    """The configured window (`delegation.windows`) made the clock's, under
+    the drain lock, through `peerclock.change_window`: a narrowing takes
+    effect at once, a wider P raises the floor to the bound in force, and
+    every F joins the history. None when there is no trusted clock."""
+    try:
+        clock = peerclock.read(state_dir)
+    except peerclock.ClockUntrusted:
+        return None
+    if dc is None or (clock.p, clock.f) == (dc.window_p, dc.window_f):
+        return clock
+    logger.info("peer clock: window changed from P=%s F=%s to P=%s F=%s",
+                clock.p, clock.f, dc.window_p, dc.window_f)
+    return peerclock.change_window(state_dir, now, p=dc.window_p, f=dc.window_f)
 
 
 def startup(state_dir: Path, now: datetime) -> Dict[str, Any]:
@@ -1412,6 +1596,7 @@ def startup(state_dir: Path, now: datetime) -> Dict[str, Any]:
         why = "clock_behind_stores"
     elif problems:
         clock = peerclock.raise_floor_for_loss(state_dir, now)
+        _rebase_after_loss(state_dir, read_meta(state_dir))
         why = "store_loss"
     repaired = repair_digests(state_dir)
     markers = repair_done_markers(state_dir, now)
@@ -1550,6 +1735,18 @@ def observed_times(state_dir: Path, hop_root: Optional[Path]) -> List[Tuple[date
             add(json.loads(f.read_bytes()).get("done_ts"), f"{f} done_ts")
         except ValueError:
             continue
+    for f in sorted(replay.glob("*/*" + peerbind.RESERVATION_SUFFIX)) if replay.is_dir() else ():
+        try:
+            add(json.loads(f.read_bytes()).get("ts"), f"{f} ts")
+        except ValueError:
+            continue
+    oplog = replay / OPERATOR_AUDIT
+    if oplog.is_file():
+        for line in oplog.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                add(json.loads(line).get("ts"), f"{oplog} ts")
+            except ValueError:
+                continue
     if hop_root is not None:
         for f in sorted((Path(hop_root) / ".disposed").glob("*/*")):
             try:
@@ -1600,8 +1797,10 @@ def _find(state_dir: Path, key: str) -> Dict[str, Any]:
     raise StoreRefused(f"no candidate record {key}")
 
 
-def operator_drop(cfg: Any, now: datetime, *, key: str) -> Dict[str, Any]:
-    """`router peer-decision drop <key>` (`drop`)."""
+def operator_drop(cfg: Any, now: datetime, *, key: str, evidence: str) -> Dict[str, Any]:
+    """`router peer-decision drop <key> --evidence <text>` (`drop`)."""
+    if not (isinstance(evidence, str) and evidence.strip()):
+        raise StoreRefused("evidence is required")
     record = _find(cfg.state_dir, key)
     ctx = Ctx(state_dir=cfg.state_dir, cfg=cfg, delegation=None, hooks=absent_hooks(), now=now,
               clock=peerclock.read(cfg.state_dir), view=None, effects=_NoEffects(),
@@ -1610,11 +1809,12 @@ def operator_drop(cfg: Any, now: datetime, *, key: str) -> Dict[str, Any]:
         out = drop(ctx, record, by=peerclock.operator_by())
     except DisposeDeferred:
         out = read_record(cfg.state_dir, record["owner"], key)
-        _audit(cfg.state_dir, "peer-decision drop", now, key=key, result=out["state"])
+        _audit(cfg.state_dir, "peer-decision drop", now, key=key, evidence=evidence,
+               result=out["state"])
         return {"result": f"{out['state']}: {out.get('policy_code') or out.get('disposed')}, "
                           "tombstone committed by the next poll"}
     placed = out.get("disposed") == "placed"
-    _audit(cfg.state_dir, "peer-decision drop", now, key=key,
+    _audit(cfg.state_dir, "peer-decision drop", now, key=key, evidence=evidence,
            result="already_placed" if placed else "refused")
     if placed:
         rt, idk = out["replay_ref"].split("/")
@@ -1653,8 +1853,19 @@ def operator_restore_key(cfg: Any, now: datetime, *, source: Path) -> Dict[str, 
     if not any(verifies(offered, rid, raw) for rid, raw in decisions):
         raise StoreRefused("no decision verifies under the offered key: it is not the original")
     atomic_write(sd / peerbind.DECISION_KEY_FILE, offered, durable_root=sd, mode=0o600)
-    _audit(sd, "peer-decision restore-key", now, decisions=len(decisions))
-    return {"restored": True, "decisions": len(decisions)}
+    released = 0
+    for child in sorted(sd.iterdir()):
+        root = child / JOURNAL_DIR
+        for d in sorted(root.iterdir()) if root.is_dir() else ():
+            if not (d / RECORD).is_file():
+                continue
+            rec = json.loads((d / RECORD).read_text(encoding="utf-8"))
+            h = rec.get("hold") or {}
+            if (h.get("reason"), h.get("detail")) == ("recovery_corrupt", "mac"):
+                write_record(sd, dict(rec, hold=None))
+                released += 1
+    _audit(sd, "peer-decision restore-key", now, decisions=len(decisions), released=released)
+    return {"restored": True, "decisions": len(decisions), "released": released}
 
 
 # ---------------------------------------------------------------------------
@@ -1666,33 +1877,59 @@ def operator_restore_key(cfg: Any, now: datetime, *, source: Path) -> Dict[str, 
 PRESENTATION_DAYS = 30
 
 
-def _prune(state_dir: Path, meta: Dict[str, Any], record: Mapping[str, Any]) -> None:
-    owner, key = record["owner"], record["key"]
-    rt = idk = None
+def _prune_targets(state_dir: Path, record: Mapping[str, Any]) -> Tuple[List[Path], Path]:
+    """(replay files, digest first; the record directory) a prune removes."""
+    files: List[Path] = []
     if record.get("replay_ref"):
         rt, idk = record["replay_ref"].split("/")
-    meta["pending_op"] = {"op": "prune", "owner": owner, "key": key, "rt": rt, "idk": idk}
-    _write_meta(state_dir, meta)
-    if rt is not None:
         d = _replay(state_dir) / rt
         res = d / (idk + peerbind.RESERVATION_SUFFIX)
-        doc = peerbind.parse_reservation(res.read_bytes(), None)
-        dig = _replay(state_dir) / DIGESTS_DIR / doc["statement_sha256"]
-        for f in (dig, d / (idk + DONE_SUFFIX), res):      # the digest FIRST
-            try:
-                f.unlink()
-            except FileNotFoundError:
-                pass
-        fsync_dir(d)
-        if dig.parent.is_dir():
-            fsync_dir(dig.parent)
-    rdir = record_dir(state_dir, owner, key)
-    shutil.rmtree(rdir)
-    fsync_dir(rdir.parent)
-    live, high, total, revs, _ = _scan_root(state_dir, owner)
-    meta["roots"][owner].update(live=live, content_sum=str(total), rev_total=revs)
-    rlive, _rhigh, rtotal = _scan_replay(state_dir)
-    meta["replay"].update(live=rlive, content_sum=str(rtotal))
+        if res.is_file():
+            doc = peerbind.parse_reservation(res.read_bytes(), None)
+            files.append(_replay(state_dir) / DIGESTS_DIR / doc["statement_sha256"])
+        files += [d / (idk + DONE_SUFFIX), res]
+    return files, record_dir(state_dir, record["owner"], record["key"])
+
+
+def _remove_targets(files: List[Path], rdir: Path) -> None:
+    for f in files:                                     # the digest FIRST
+        try:
+            f.unlink()
+            fsync_dir(f.parent)
+        except FileNotFoundError:
+            pass
+    if rdir.exists():
+        shutil.rmtree(rdir)
+        fsync_dir(rdir.parent)
+
+
+def _prune(state_dir: Path, meta: Dict[str, Any], record: Mapping[str, Any]) -> None:
+    owner, key = record["owner"], record["key"]
+    files, rdir = _prune_targets(state_dir, record)
+    rsum = rlive = 0
+    for f in files:
+        if f.parent.name != DIGESTS_DIR and f.is_file():    # the index is not counted
+            rsum -= contribution(f"{f.parent.name}/{f.name}", 0, f.read_bytes())
+            rlive -= 1
+    jsum = jrev = jlive = 0
+    rec_path = rdir / RECORD
+    if rec_path.is_file():
+        rb = rec_path.read_bytes()
+        rev = json.loads(rb)["rev"]
+        jsum -= contribution(f"{key}/{RECORD}", rev, rb)
+        jrev -= rev
+        jlive -= 1
+    for snap in sorted((rdir / SNAPSHOT_DIR).iterdir()) if (rdir / SNAPSHOT_DIR).is_dir() else ():
+        if snap.name in SNAPSHOT_FILES and snap.is_file():
+            jsum -= contribution(f"{key}/{SNAPSHOT_DIR}/{snap.name}", 0, snap.read_bytes())
+            jlive -= 1
+    deltas = [_delta("root", owner, jsum, jrev, jlive), _delta("replay", None, rsum, 0, rlive)]
+    meta["pending_op"] = {"op": "prune", "owner": owner, "key": key,
+                          "replay_ref": record.get("replay_ref"), "delta": deltas}
+    _write_meta(state_dir, meta)
+    _remove_targets(files, rdir)
+    for d in deltas:
+        _apply(meta, d)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
 
@@ -1724,6 +1961,10 @@ def sweep(state_dir: Path, now: datetime, *, enabled: bool,
             if rec["intake"] in HOST_INTAKES and (hop_root is None or os.path.lexists(
                     Path(hop_root) / ".disposed" / rec["intake"] / rec["entry_id"])):
                 continue        # kept while its tombstone exists (or cannot be checked)
+            if rec["intake"] not in HOST_INTAKES and not rec.get("removed"):
+                continue        # kept until its entry's removal succeeded
+            if rec.get("control") and not rec["control"].get("sent"):
+                continue        # kept while its control notice is pending
             if rec.get("replay_ref"):
                 rt, idk = rec["replay_ref"].split("/")
                 res = _replay(state_dir) / rt / (idk + peerbind.RESERVATION_SUFFIX)
@@ -1747,6 +1988,14 @@ def sweep(state_dir: Path, now: datetime, *, enabled: bool,
 #: PROCESS state: the listing cursor per (state_dir, logical_id, gen), so a
 #: page full of held candidates never starves the entries after it.
 _CURSORS: Dict[Tuple[str, str, str], Optional[str]] = {}
+#: PROCESS state: the state_dirs this process has polled once (the first
+#: pass re-tries `unpublishable` holds and runs the full discovery scan).
+_POLLED: set = set()
+
+
+#: A candidate this router FIRST observes in a generation that is not
+#: current: quarantined to that generation, never placed into a later one.
+LATE_INBOUND = "late_inbound"
 
 
 class TreeEffects:
@@ -1765,9 +2014,13 @@ class TreeEffects:
     def quarantine(self, record: Mapping[str, Any]) -> None:
         from . import ingress, quarantine
         snap = read_snapshot(self.cfg.state_dir, record, SNAPSHOT_CANDIDATE) or b""
+        if self.link is None:
+            raise peerbind.RecoveryCorrupt("quarantine", "no link pin for the generation")
+        late = record["cause"] == LATE_INBOUND
         ingress.write_quarantine_item(
             Path(self.cfg.state_dir), self.logical_id, self.gen, "candidate", self.link,
-            record["entry_id"], quarantine.CAUSE_COLD_FLEET_MAIL,
+            record["entry_id"],
+            quarantine.CAUSE_LATE_INBOUND if late else quarantine.CAUSE_COLD_FLEET_MAIL,
             extra_evidence={"peer_cause": record["cause"],
                             "candidate_sha256": hashlib.sha256(snap).hexdigest()})
 
@@ -1787,8 +2040,9 @@ class TreeEffects:
             return
         if got in ("removed", "absent"):
             self.removed.append(record["entry_id"])
-        else:
-            self.remove_held.append(record["entry_id"])
+            return True
+        self.remove_held.append(record["entry_id"])
+        return None
 
 
 def _viewer(delegation: Any) -> Any:
@@ -1803,10 +2057,63 @@ def _viewer(delegation: Any) -> Any:
     return view_of
 
 
+#: An entry-level anomaly the reader reports by a `.reason` (another owner,
+#: a missing layout): the entry is held, counted under that reason, and the
+#: rest of the page proceeds.
+ENTRY_ANOMALY_REASONS = ("owner", "layout")
+
+
+def _entry_failed(count: Any, where: str, exc: BaseException) -> None:
+    reason = getattr(exc, "reason", None)
+    if type(reason) is str and reason in ENTRY_ANOMALY_REASONS:
+        count(f"held_{reason}")
+        logger.warning("signed candidates: %s held (%s): %s", where, reason, exc)
+    else:
+        count("errored")
+        logger.exception("signed candidates: %s errored; isolated, the page continues", where)
+
+
+def _poll_tree_entry(ctx: "Ctx", effects: "TreeEffects", reader: Any, count: Any, *,
+                     logical_id: str, gen: str, entry_id: str, now: datetime,
+                     read_refused: Tuple[type, ...], current: bool = True,
+                     touched: Optional[set] = None) -> None:
+    state_dir = ctx.state_dir
+    key = record_key(intake="candidates", gen=gen, owner=logical_id, entry_id=entry_id)
+    if touched is not None:
+        touched.add(key)
+    if (record_dir(state_dir, logical_id, key) / RECORD).is_file():
+        record = read_record(state_dir, logical_id, key)
+        if record["state"] == "done":
+            _settle(ctx, record)
+            count("settled_again")
+            return
+    else:
+        try:
+            raw = reader.port.read_entry("candidate", entry_id)
+        except FileNotFoundError:
+            count("gone")
+            return
+        except (OSError,) + tuple(read_refused):
+            count("read_refused")
+            return
+        key, _seq = take(state_dir, logical_id, intake="candidates", gen=gen,
+                         entry_id=entry_id, raw=bytes(raw), now=now)
+        record = read_record(state_dir, logical_id, key)
+        count("taken")
+        if not current:
+            # First observed in a generation that is no longer current.
+            _finish(ctx, transition(state_dir, record, "mail", now, cause=LATE_INBOUND))
+            count(LATE_INBOUND)
+            return
+    out = evaluate(ctx, record)
+    count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
+
+
 def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "peerclock.Clock",
                     now: datetime, logical_id: str, gen: str, link: str, reader: Any,
                     remover: Any, retired: Any, limit: int = 256,
-                    read_refused: Tuple[type, ...] = ()) -> Dict[str, int]:
+                    read_refused: Tuple[type, ...] = (), first_pass: bool = False,
+                    current: bool = True, touched: Optional[set] = None) -> Dict[str, int]:
     """One listing page of a generation's `candidates/`: each entry taken
     once (its bytes read once, into the snapshot) and evaluated; an entry
     whose record is `done` is settled again (its removal retried)."""
@@ -1819,33 +2126,19 @@ def poll_generation(cfg: Any, *, delegation: Any, hooks: DecideHooks, clock: "pe
     effects = TreeEffects(cfg, logical_id, gen, link, remover)
     view_of = _viewer(delegation)
     ctx = Ctx(state_dir=state_dir, cfg=cfg, delegation=delegation, hooks=hooks, now=now,
-              clock=clock, view=view_of, effects=effects, retired=retired)
+              clock=clock, view=view_of, effects=effects, retired=retired, first_pass=first_pass)
     ckey = (str(state_dir), logical_id, gen)
     ids, truncated = reader.port.list_entries("candidate", limit=limit, after=_CURSORS.get(ckey))
     _CURSORS[ckey] = ids[-1] if (truncated and ids) else None
     for entry_id in ids:
-        key = record_key(intake="candidates", gen=gen, owner=logical_id, entry_id=entry_id)
-        if (record_dir(state_dir, logical_id, key) / RECORD).is_file():
-            record = read_record(state_dir, logical_id, key)
-            if record["state"] == "done":
-                _settle(ctx, record)
-                count("settled_again")
-                continue
-        else:
-            try:
-                raw = reader.port.read_entry("candidate", entry_id)
-            except FileNotFoundError:
-                count("gone")
-                continue
-            except (OSError,) + tuple(read_refused):
-                count("read_refused")
-                continue
-            key, _seq = take(state_dir, logical_id, intake="candidates", gen=gen,
-                             entry_id=entry_id, raw=bytes(raw), now=now)
-            record = read_record(state_dir, logical_id, key)
-            count("taken")
-        out = evaluate(ctx, record)
-        count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
+        try:
+            _poll_tree_entry(ctx, effects, reader, count, logical_id=logical_id, gen=gen,
+                             entry_id=entry_id, now=now, read_refused=read_refused,
+                             current=current, touched=touched)
+        except StoreBlocked:
+            raise
+        except Exception as e:  # noqa: BLE001 -- one bad entry never wedges the page
+            _entry_failed(count, f"{logical_id}/{gen} candidate {entry_id!r}", e)
     counts["removed"] = len(effects.removed)
     counts["remove_held"] = len(effects.remove_held)
     return counts
@@ -1866,6 +2159,7 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
     if dc is None or not dc.inbound or cfg.hop is None:
         return out
     try:
+        apply_window(cfg.state_dir, now, dc)
         clock = peerclock.advance(cfg.state_dir, now)
     except peerclock.ClockUntrusted:
         out["held"] = "clock_untrusted"
@@ -1877,6 +2171,8 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
         return out
     fsops = runtime.fsops
     read_refused = tuple(c for c in (getattr(fsops, "UnsafeRead", None),) if c)
+    first = str(cfg.state_dir) not in _POLLED
+    touched: set = set()
     for ident in ingress.identities(cfg, report):
         lid = ident["logical_id"]
         try:
@@ -1905,7 +2201,8 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
                     cfg, delegation=delegation, hooks=hooks, clock=clock, now=now,
                     logical_id=lid, gen=gen, link=link, reader=reader, remover=remover,
                     retired=lambda r: hoplink_mod._is_retired(runtime, cfg, r["owner"], r["gen"]),
-                    read_refused=read_refused)
+                    read_refused=read_refused, first_pass=first,
+                    current=gen == doc["current"], touched=touched)
             except StoreBlocked:
                 logger.error("peer store blocked: an operation is unreconciled; nothing more "
                              "is taken until the next start")
@@ -1917,7 +2214,8 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
     for intake in HOST_INTAKES:
         try:
             out[intake] = poll_host(cfg, fsops, delegation=delegation, hooks=hooks, clock=clock,
-                                    now=now, intake=intake)
+                                    now=now, intake=intake, first_pass=first,
+                                    touched=touched)
         except DisposedUnavailable as e:
             logger.error("signed candidates %s: not taken: %s", intake, e)
             out[intake] = {"held_disposed_unavailable": 1}
@@ -1929,6 +2227,13 @@ def poll(cfg: Any, runtime: Any, report: Any, *, delegation: Any, hooks: DecideH
         except Exception:
             logger.exception("signed candidates %s: isolated, continuing", intake)
             out[intake] = {"errored": 1}
+    try:
+        out["recovered"] = recover(cfg, runtime, delegation=delegation, hooks=hooks, clock=clock,
+                                   now=now, first_pass=first, skip=touched)
+    except StoreBlocked:
+        out["recovered"] = {"store_blocked": 1}
+        return out
+    _POLLED.add(str(cfg.state_dir))
     advance_frontier(cfg.state_dir)
     out["swept"] = sweep(cfg.state_dir, now, enabled=dc.retention_sweep,
                          hop_root=Path(cfg.hop.root))
@@ -2012,27 +2317,32 @@ class HostEffects:
         return None
 
 
-def _host_entries(intake_dir: Path) -> Tuple[List[Tuple[str, Optional[bytes]]], bool]:
-    """([(id, candidate bytes or None while in flight)], complete): every
-    32-hex entry of a host intake, its committed `candidate.json` read with
-    no link followed. An entry without one, or caught at two links, is in
-    flight; anything damaged is skipped (the quarantine listing shows it).
-    `complete` is False when the intake could not be listed."""
+def _host_entries(intake_dir: Path) -> Tuple[List[Tuple[str, Optional[bytes]]], set, bool]:
+    """(entries, names, complete) for a host intake. `entries` is every
+    32-hex entry whose `candidate.json` was read (with no link followed) or
+    is in flight (absent, or caught at two links), as (id, bytes or None).
+    `names` is EVERY 32-hex name the listing showed, read or not: an entry
+    that could not be opened or read is still there. `complete` is False
+    when the intake could not be listed, is missing (more likely a mount or
+    deploy fault than an empty intake), or any entry could not be read: no
+    tombstone is pruned on such a listing."""
     from . import quarantine
     out: List[Tuple[str, Optional[bytes]]] = []
+    names: set = set()
     try:
         c_fd = quarantine._open_dir(str(intake_dir))
-    except FileNotFoundError:
-        return out, True
     except OSError:
-        return out, False
+        return out, names, False
+    complete = True
     try:
         for entry in sorted(os.listdir(c_fd)):
             if entry == quarantine.STAGE_NAME or not re.fullmatch(r"[0-9a-f]{32}", entry):
                 continue
+            names.add(entry)
             try:
                 d_fd = quarantine._open_dir(entry, c_fd)
             except OSError:
+                complete = False
                 continue
             try:
                 raw, _st = quarantine.read_pinned(d_fd, "candidate.json",
@@ -2043,17 +2353,46 @@ def _host_entries(intake_dir: Path) -> Tuple[List[Tuple[str, Optional[bytes]]], 
             except quarantine.Linked as e:
                 if e.nlink == 2:
                     out.append((entry, None))
-            except quarantine.Damaged:
-                continue
+                else:
+                    complete = False
+            except (quarantine.Damaged, OSError):
+                complete = False
             finally:
                 os.close(d_fd)
     finally:
         os.close(c_fd)
-    return out, True
+    return out, names, complete
+
+
+def _poll_host_entry(ctx: "Ctx", effects: "HostEffects", count: Any, *, intake: str,
+                     entry_id: str, raw: Optional[bytes], now: datetime,
+                     touched: Optional[set] = None) -> None:
+    state_dir = ctx.state_dir
+    key = record_key(intake=intake, gen="", owner=HOST_OWNER, entry_id=entry_id)
+    if touched is not None:
+        touched.add(key)
+    if (record_dir(state_dir, HOST_OWNER, key) / RECORD).is_file():
+        record = read_record(state_dir, HOST_OWNER, key)
+        if record["state"] == "done":
+            effects.dispose(record)          # idempotent: exists_same
+            _settle(ctx, record)             # the replay marker, if a crash left it
+            count("disposed_again")
+            return
+    elif raw is None:
+        count("in_flight")
+        return
+    else:
+        key, _seq = take(state_dir, HOST_OWNER, intake=intake, gen="", entry_id=entry_id,
+                         raw=raw, now=now)
+        record = read_record(state_dir, HOST_OWNER, key)
+        count("taken")
+    out = evaluate(ctx, record)
+    count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
 
 
 def poll_host(cfg: Any, fsops: Any, *, delegation: Any, hooks: DecideHooks,
-              clock: "peerclock.Clock", now: datetime, intake: str) -> Dict[str, int]:
+              clock: "peerclock.Clock", now: datetime, intake: str,
+              first_pass: bool = False, touched: Optional[set] = None) -> Dict[str, int]:
     """One pass over a host intake: each committed entry taken once and
     evaluated; a `done` record's tombstone committed again if missing; then,
     after a complete listing, the tombstones of entries no longer listed
@@ -2070,29 +2409,17 @@ def poll_host(cfg: Any, fsops: Any, *, delegation: Any, hooks: DecideHooks,
     effects = HostEffects(fsops, hop_root, intake)
     view_of = _viewer(delegation)
     ctx = Ctx(state_dir=state_dir, cfg=cfg, delegation=delegation, hooks=hooks, now=now,
-              clock=clock, view=view_of, effects=effects, retired=lambda _r: False)
-    entries, complete = _host_entries(hop_root / intake)
-    listed = set()
+              clock=clock, view=view_of, effects=effects, retired=lambda _r: False,
+              first_pass=first_pass)
+    entries, listed, complete = _host_entries(hop_root / intake)
     for entry_id, raw in entries:
-        listed.add(entry_id)
-        key = record_key(intake=intake, gen="", owner=HOST_OWNER, entry_id=entry_id)
-        if (record_dir(state_dir, HOST_OWNER, key) / RECORD).is_file():
-            record = read_record(state_dir, HOST_OWNER, key)
-            if record["state"] == "done":
-                effects.dispose(record)          # idempotent: exists_same
-                _settle(ctx, record)             # the replay marker, if a crash left it
-                count("disposed_again")
-                continue
-        elif raw is None:
-            count("in_flight")
-            continue
-        else:
-            key, _seq = take(state_dir, HOST_OWNER, intake=intake, gen="", entry_id=entry_id,
-                             raw=raw, now=now)
-            record = read_record(state_dir, HOST_OWNER, key)
-            count("taken")
-        out = evaluate(ctx, record)
-        count(f"state_{out['state']}" if not out.get("hold") else f"held_{out['hold']['reason']}")
+        try:
+            _poll_host_entry(ctx, effects, count, intake=intake, entry_id=entry_id, raw=raw,
+                             now=now, touched=touched)
+        except (StoreBlocked, DisposedUnavailable):
+            raise
+        except Exception as e:  # noqa: BLE001 -- one bad entry never wedges the intake
+            _entry_failed(count, f"{intake} {entry_id!r}", e)
     if complete:
         counts["tombstones_pruned"] = prune_tombstones(cfg, fsops, intake, listed)
     counts["tombstones_committed"] = len(effects.committed)
@@ -2159,3 +2486,69 @@ def operator_quarantine_candidate(cfg: Any, now: datetime, *, key: str,
               retired=lambda _r: False)
     _finish(ctx, record)
     return {"result": "mail: candidate_view_refused, quarantined, done"}
+
+
+
+def recover(cfg: Any, runtime: Any, *, delegation: Any, hooks: DecideHooks,
+            clock: "peerclock.Clock", now: datetime, first_pass: bool = False,
+            skip: Iterable[str] = ()) -> Dict[str, int]:
+    """Every record that is not `done` (and every done tree record whose
+    entry's removal never succeeded), BY ITS RECORDED STATE, whether or not
+    its entry is listed again: in `take_seq` order, each with the effects of
+    its own intake, each isolated. `skip` is what this pass already
+    evaluated."""
+    from . import hoplink as hoplink_mod
+    from . import ingress
+    state_dir = Path(cfg.state_dir)
+    counts: Dict[str, int] = {}
+
+    def count(what: str) -> None:
+        counts[what] = counts.get(what, 0) + 1
+
+    skip = set(skip)
+    pending: List[Dict[str, Any]] = []
+    meta = read_meta(state_dir)
+    for owner in sorted(meta["roots"]):
+        root = journal_root(state_dir, owner)
+        for d in root.iterdir() if root.is_dir() else ():
+            if not (d.is_dir() and _KEY_RE.fullmatch(d.name) and (d / RECORD).is_file()):
+                continue
+            if d.name in skip:
+                continue
+            rec = json.loads((d / RECORD).read_text(encoding="utf-8"))
+            if rec["state"] != "done" or (rec["intake"] not in HOST_INTAKES
+                                          and not rec.get("removed")):
+                pending.append(rec)
+    view_of = _viewer(delegation)
+    hop_root = Path(cfg.hop.root) if getattr(cfg, "hop", None) is not None else None
+    for rec in sorted(pending, key=lambda r: r["take_seq"]):
+        try:
+            if rec["intake"] in HOST_INTAKES:
+                effects: Any = HostEffects(runtime.fsops, hop_root, rec["intake"])
+            else:
+                link = ingress.pump_link(cfg, rec["owner"], rec["gen"])
+                if link is None:
+                    count("held_link_unset")
+                    continue
+                try:
+                    remover = hoplink_mod.remover_for(runtime, cfg, rec["owner"], rec["gen"])
+                except Exception:  # noqa: BLE001 -- no remover: removal is retried later
+                    remover = None
+                effects = TreeEffects(cfg, rec["owner"], rec["gen"], link, remover)
+            ctx = Ctx(state_dir=state_dir, cfg=cfg, delegation=delegation, hooks=hooks,
+                      now=now, clock=clock, view=view_of, effects=effects,
+                      retired=lambda r: hoplink_mod._is_retired(runtime, cfg, r["owner"],
+                                                                r["gen"]),
+                      first_pass=first_pass)
+            if rec["state"] == "done":
+                _settle(ctx, rec)
+                count("settled")
+                continue
+            out = evaluate(ctx, rec)
+            count(f"state_{out['state']}" if not out.get("hold")
+                  else f"held_{out['hold']['reason']}")
+        except StoreBlocked:
+            raise
+        except Exception as e:  # noqa: BLE001 -- one record never wedges recovery
+            _entry_failed(count, f"recovery of {rec['key']}", e)
+    return counts

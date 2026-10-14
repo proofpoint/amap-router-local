@@ -1772,7 +1772,16 @@ port (one page per poll, with a cursor so held candidates never starve the
 rest) and each entry is taken once (its bytes read once, into the snapshot)
 and evaluated; then each host intake; then the frontier and, when
 configured, the sweep. Without a trustworthy clock, or before
-`peer-store init`, nothing is taken. A tree candidate's quarantine item
+`peer-store init`, nothing is taken. The configured window
+(`delegation.windows`) is applied first, at startup and at every poll: a
+narrowing takes effect at once, a wider P raises the floor, and every F
+joins the history. After the listing passes, RECOVERY walks every record
+that is not `done`, by its recorded state and in `take_seq` order, whether
+or not its entry is listed again. Each entry and each recovered record is
+isolated: one that fails is held or counted and the rest proceed. A
+candidate first observed in a generation that is not current is
+`late_inbound`: mailed, quarantined to that generation with that cause, and
+never placed. A tree candidate's quarantine item
 (for `demoted` and `mail`) goes into its generation's ingress quarantine
 with cause `cold_fleet_mail` and the profile's cause as evidence; its entry
 is removed through the plugin's remover only after `done`, and a removal
@@ -1820,9 +1829,13 @@ would clear them.
 through a supersession (below). A HOLD is metadata on a record, never a
 state: it names why the record cannot move now (`candidate_view_unavailable`,
 `admission_closed`, `hook_absent`, `undecided`, `key_runtime_changed`: each
-clears on its own; `candidate_view_refused`, `candidate_malformed`,
-`recovery_corrupt`, `recipient_gone`, `unpublishable`: each only by an
-operator act). A recipient held by its generation is not a hold: the
+clears on its own; `candidate_view_refused` and `candidate_malformed` only by
+`peer-candidate quarantine`; `recovery_corrupt` only by an operator act
+(`restore-key` releases every `recovery_corrupt/mac` hold; `drop` exits key
+loss); `recipient_gone` is re-tried once the decision's recipient is
+configured again, and never attempted while it is not; `unpublishable`, a
+statement id or `in_reply_to` the notice-id grammar cannot carry (a leading
+`-`), is re-tried at every start and never dropped). A recipient held by its generation is not a hold: the
 decided record stays `decided` with a retry note, and the next poll
 retries. A terminal disposition and its pending control notice are one
 write.
@@ -1875,7 +1888,11 @@ the live stores hold MORE than the bookkeeping records, the clock file is
 older than the stores and its H proves nothing: admission closes. If they
 hold LESS (a record, a marker, a root gone or rolled back), the floor rises
 to `max(now, H) + Fmax + 1 s`, where Fmax is the largest F ever in force
-(900 when that history is lost). This detects corruption and rollback; it
+(900 when that history is lost), and once that floor is persisted the
+bookkeeping is rebased to the live stores, so a loss is accounted for once.
+An operation caught in flight is accepted only as not applied or as fully
+applied to its own target, and anything else is reported. This detects
+corruption and rollback; it
 is not a defence against a writer of `state_dir`. A rollback of the WHOLE
 `state_dir` is undetectable, which is why a restore is declared.
 
@@ -1884,6 +1901,9 @@ at or below the settled-through frontier (the highest take seq up to which
 every record is settled) is pruned: with its reservation, marker and digest
 entry (the digest first) once H > ts + P + F; without a reservation, 30
 days after it settled, so a re-presented intake entry is still recognised.
+Never while its control notice is unsent, never (for `candidates/`) before
+its entry's removal succeeded, and never (for a host intake) while its
+tombstone exists.
 
 **Operator runbook.** Each verb takes the drain lock (stop the router
 first), prints one JSON line, and appends to the operator audit:
@@ -1900,7 +1920,8 @@ first), prints one JSON line, and appends to the operator audit:
   markers, tombstones, H) is refused, naming the source; "now" is never
   evidence; a B within 60 s of the wall clock needs the flag. Then floor =
   max(floor, B + Fmax + 1 s), H = max(H, B, now), the bookkeeping is rebuilt
-  from the live stores, and admission opens. THE EVIDENCE IS AN OPERATOR
+  from the live stores (the settled-through frontier never lowered), and
+  admission opens. A B in the future needs the same flag. THE EVIDENCE IS AN OPERATOR
   ATTESTATION: it is recorded verbatim and nothing verifies it.
 - `router peer-decision restore-key --from FILE`: puts the original decision
   key back; refused unless no decision verifies under the current key and
@@ -1910,11 +1931,13 @@ first), prints one JSON line, and appends to the operator audit:
   `candidate_malformed`): `mail` with cause `candidate_view_refused`, then
   its quarantine item (or, for a host intake, its tombstone, by the next
   poll), then `done`, which settles it for the frontier.
-- `router peer-decision drop KEY`: the exit from a decision whose key is
-  lost for good: `refused(policy, decision_unrecoverable)` with a control
-  notice pending, or, if its notice is present, `done(placed)`. Also the
-  exit from a reserved record held on `key_runtime_changed`. Refused for a
-  decision that still verifies.
+- `router peer-decision drop KEY --evidence TEXT`: the exit from key loss
+  and nothing else. A decision, or a reservation without one, that no
+  longer verifies becomes `refused(policy, decision_unrecoverable)` with a
+  control notice pending; a decision whose notice is present becomes
+  `done(placed)`. Refused for anything that still verifies, a reserved
+  record held on `key_runtime_changed` included (that hold clears when the
+  runtime's configuration is restored).
 
 `router reset` never touches any of this: it clears instance state, and
 these stores are not an instance's.

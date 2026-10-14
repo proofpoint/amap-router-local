@@ -116,6 +116,22 @@ class StoreLossTests(_Clock):
                                                                "floor": at(15, 0)}),
                             previous=second)
 
+    def test_a_malformed_bound_makes_the_clock_untrusted(self):
+        clock = peerclock.record_bound(self.state_dir, at(17, 0), at=at(16, 0),
+                                       evidence="hub log line 4411", not_from_wall_clock=False,
+                                       observed=())
+        good = json.loads(peerclock.path(self.state_dir).read_text())
+        self.assertEqual(peerclock.read(self.state_dir).bound_b, clock.bound_b)
+        b = good["bound_b"]
+        bad = [1, "x", [], {}, dict(b, extra=1), {k: v for k, v in b.items() if k != "by"},
+               dict(b, B="yesterday"), dict(b, recorded_at=None), dict(b, evidence=" "),
+               dict(b, by=""), dict(b, not_from_wall_clock="no"), dict(b, not_from_wall_clock=0)]
+        for value in bad:
+            with self.subTest(bound_b=value):
+                peerclock.path(self.state_dir).write_text(json.dumps(dict(good, bound_b=value)))
+                with self.assertRaises(peerclock.ClockUntrusted):
+                    peerclock.read(self.state_dir)
+
     def test_an_absent_clock_is_untrusted(self):
         with self.assertRaises(peerclock.ClockUntrusted):
             peerclock.read(self.state_dir)
@@ -152,6 +168,12 @@ class BoundTests(_Clock):
             self.bound(at(17, 0), at(16, 59, 30))
         clock = self.bound(at(17, 0), at(16, 59, 30), flag=True)
         self.assertTrue(clock.bound_b["not_from_wall_clock"])
+
+    def test_a_future_bound_needs_the_flag(self):
+        with self.assertRaises(peerclock.BoundRefused) as cm:
+            self.bound(at(17, 0), at(19, 0))
+        self.assertIn("in the future", str(cm.exception))
+        self.assertEqual(self.bound(at(17, 0), at(19, 0), flag=True).H, at(19, 0))
 
     def test_the_floor_is_by_max_never_refusal(self):
         self.init(at(15, 0))

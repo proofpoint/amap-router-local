@@ -8,6 +8,7 @@ import base64
 import dataclasses
 import hashlib
 import json
+import os
 import shutil
 import types
 import unittest
@@ -50,6 +51,7 @@ def marker(state_dir, rec):
 class Effects:
     def __init__(self):
         self.quarantined, self.removed, self.disposed = [], [], []
+        self.remove_result = True
 
     def quarantine(self, record):
         self.quarantined.append((record["key"], record["state"], record["cause"]))
@@ -59,6 +61,7 @@ class Effects:
 
     def remove(self, record):
         self.removed.append(record["key"])
+        return self.remove_result
 
 
 def hooks(**over):
@@ -414,6 +417,24 @@ class SupersedeTests(_Eval):
         self.assertTrue(self.sup_path(key).is_file())
         self.assertEqual(marker(self.state_dir, rec), "refused")
         self.assertEqual(self.notices(), [])
+        self.assertEqual(rec["control"]["about"], STATEMENT_ID)
+
+    def test_a_recovery_fault_inside_evaluation_is_a_visible_hold(self):
+        """The fence reads the reservation with its MAC; a reservation that
+        fails it is held, never a failed pass."""
+        key = self.decided()
+        rec = peerjournal.read_record(self.state_dir, OWNER, key)
+        rt, idk = rec["replay_ref"].split("/")
+        res = self.state_dir / "peer-replay" / rt / f"{idk}.json"
+        doc = json.loads(res.read_bytes())
+        res.unlink()
+        res.write_bytes(json.dumps(dict(doc, mac="0" * 64), sort_keys=True).encode())
+        res.chmod(0o600)
+        try:
+            rec = self.evaluate(key, retired=lambda _r: True)
+        except peerbind.RecoveryCorrupt as e:
+            self.fail(f"a recovery fault escaped the evaluation: {e}")
+        self.assertEqual((rec["state"], hold(rec)), ("decided", ("recovery_corrupt", "mac")))
 
     def test_a_placed_message_is_never_superseded(self):
         key = self.placed_then_crash_before_done()
@@ -449,15 +470,77 @@ class SupersedeTests(_Eval):
         self.assertFalse(self.sup_path(key).exists())
         self.assertEqual(peerjournal.read_record(self.state_dir, OWNER, key)["state"], "decided")
 
-    def test_the_drop_exits_a_runtime_changed_hold(self):
+    def test_the_drop_refuses_a_runtime_changed_hold(self):
+        """Not key loss: the hold stays explicit, and nothing is written."""
         key = self.take(self.raw())
         self.evaluate(key, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
         rt = self.dc.runtimes[0]
         cfg = dataclasses.replace(self.cfg, delegation=dataclasses.replace(
             self.dc, runtimes=(dataclasses.replace(rt, runtime=f"amap.router@{rt.domains[1]}"),)))
         rec = self.evaluate(key, cfg=cfg)
-        rec = peerjournal.drop(self.ctx(cfg=cfg), rec, by="uid=0(root)")
-        self.assertEqual((rec["disposed"], rec["policy_code"]), ("refused", "decision_unrecoverable"))
+        self.assertEqual(hold(rec), ("key_runtime_changed", None))
+        with self.assertRaises(peerjournal.DropRefused):
+            peerjournal.drop(self.ctx(cfg=cfg), rec, by="uid=0(root)")
+        self.assertEqual(peerjournal.read_record(self.state_dir, OWNER, key), rec)
+
+    def test_a_reserved_record_under_key_loss_is_dropped(self):
+        key = self.take(self.raw())
+        rec = self.evaluate(key, hk=hooks(reply=lambda _p: peerjournal.Hold("hook_absent", "reply")))
+        self.assertEqual(rec["state"], "reserved")
+        self.lose_the_key()
+        rec = self.evaluate(key)
+        self.assertEqual(hold(rec), ("recovery_corrupt", "mac"))
+        try:
+            rec = peerjournal.drop(self.ctx(), rec, by="uid=0(root)")
+        except peerjournal.DropRefused as e:
+            self.fail(f"a reserved record under key loss must be droppable: {e}")
+        self.assertEqual((rec["disposed"], rec["policy_code"], control(rec)),
+                         ("refused", "decision_unrecoverable", "refused"))
+        self.assertEqual(rec["control"]["about"], STATEMENT_ID)
+        self.assertEqual(marker(self.state_dir, rec), "refused")
+        self.assertFalse(self.sup_path(key).exists(), "no decision, so no supersession")
+
+    def test_restore_key_after_a_poll_saw_the_loss_resumes_the_record(self):
+        key = self.decided()
+        original = (self.state_dir / peerbind.DECISION_KEY_FILE).read_bytes()
+        self.lose_the_key()
+        self.assertEqual(hold(self.evaluate(key)), ("recovery_corrupt", "mac"))
+        good = self.tmp / "orig.key"
+        good.write_bytes(original)
+        out = peerjournal.operator_restore_key(self.cfg, NOW, source=good)
+        self.assertEqual(out["released"], 1)
+        self.assertEqual(self.evaluate(key)["disposed"], "placed")
+
+    def test_recipient_gone_is_retried_once_the_recipient_is_configured(self):
+        key = self.take(self.raw())
+        with mock.patch.object(deliver, "deliver_signed_peer",
+                               side_effect=peerbind.RecipientGone("bob")):
+            rec = self.evaluate(key)
+        self.assertEqual(hold(rec), ("recipient_gone", None))
+        gone = dataclasses.replace(self.cfg, instances={})
+        with mock.patch.object(deliver, "deliver_signed_peer",
+                               side_effect=AssertionError("never attempted while gone")):
+            rec = self.evaluate(key, cfg=gone)
+        self.assertEqual(hold(rec), ("recipient_gone", None), "stays visible")
+        self.assertEqual(self.evaluate(key)["disposed"], "placed")
+
+    def test_unpublishable_is_retried_at_start_only(self):
+        key = self.take(self.raw())
+        with mock.patch.object(deliver, "deliver_signed_peer",
+                               side_effect=peerbind.Unpublishable("id", "grammar")):
+            rec = self.evaluate(key)
+        self.assertEqual(hold(rec), ("unpublishable", "id"))
+        with mock.patch.object(deliver, "deliver_signed_peer",
+                               side_effect=AssertionError("re-tried mid-process")):
+            self.assertEqual(hold(self.evaluate(key)), ("unpublishable", "id"))
+        rec = peerjournal.evaluate(self.ctx_first(), peerjournal.read_record(self.state_dir,
+                                                                             OWNER, key))
+        self.assertEqual(rec["disposed"], "placed", "the next start re-tried it")
+
+    def ctx_first(self):
+        ctx = self.ctx()
+        ctx.first_pass = True
+        return ctx
 
     def test_a_crash_after_the_supersession_never_resurrects_decided(self):
         key = self.decided()
@@ -553,9 +636,11 @@ class OperatorCliTests(_Eval):
         self.assertEqual((code, out), (0, {"admission": "closed"}))
         code, _, err = self.cli("peer-bound", "--at", "2026-10-13T11:00:00Z", "--evidence", "log")
         self.assertEqual(code, 1)
-        self.assertIn("record.json", err, "the refusal names the observed source")
-        code, out, err = self.cli("peer-bound", "--at", "2026-10-13T12:30:00Z", "--evidence",
-                                  "hub log line 4411")
+        self.assertIn("operator.audit.jsonl ts", err, "the refusal names the largest source")
+        # The operator audit's own lines are receiver times too: B is above them.
+        b = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        code, out, err = self.cli("peer-bound", "--at", b, "--evidence", "hub log line 4411",
+                                  "--b-not-from-wall-clock")
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(out["admission"], "open")
         self.assertEqual(peerjournal.startup(self.state_dir, datetime.now(timezone.utc))["why"],
@@ -569,7 +654,7 @@ class OperatorCliTests(_Eval):
         # Placement's audit lines carry the real wall clock: B is above them.
         b = datetime.now(timezone.utc) + timedelta(minutes=5)
         code, out, err = self.cli("peer-bound", "--at", b.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                  "--evidence", "hub log line 4411")
+                                  "--evidence", "hub log line 4411", "--b-not-from-wall-clock")
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(out["admission"], "open")
         rep = peerjournal.startup(self.state_dir, b + timedelta(hours=2))
@@ -577,13 +662,22 @@ class OperatorCliTests(_Eval):
 
     def test_drop_through_the_cli(self):
         key = self.decided()
-        code, _, err = self.cli("peer-decision", "drop", key)
+        code, _, err = self.cli("peer-decision", "drop", key, "--evidence", "x")
         self.assertEqual(code, 1)
         self.assertIn("the decision verifies", err)
         SupersedeTests.lose_the_key(self)
-        code, out, _ = self.cli("peer-decision", "drop", key)
+        code, out, _ = self.cli("peer-decision", "drop", key, "--evidence", "disk 3 died")
         self.assertEqual((code, out), (0, {"result": "refused: decision_unrecoverable, "
                                                      "control pending"}))
+        audit = (self.state_dir / "peer-replay" / "operator.audit.jsonl").read_text()
+        self.assertIn('"evidence": "disk 3 died"', audit)
+
+    def test_drop_needs_evidence(self):
+        with self.assertRaises(SystemExit):
+            self.cli("peer-decision", "drop", "a" * 64)
+        code, _, err = self.cli("peer-decision", "drop", "a" * 64, "--evidence", " ")
+        self.assertEqual(code, 1)
+        self.assertIn("evidence is required", err)
 
     def test_restore_key_needs_the_original(self):
         key = self.decided()
@@ -601,7 +695,7 @@ class OperatorCliTests(_Eval):
         good = self.tmp / "orig.key"
         good.write_bytes(original)
         code, out, _ = self.cli("peer-decision", "restore-key", "--from", str(good))
-        self.assertEqual((code, out), (0, {"restored": True, "decisions": 1}))
+        self.assertEqual((code, out), (0, {"restored": True, "decisions": 1, "released": 0}))
         self.assertEqual(self.evaluate(key)["disposed"], "placed")
 
     def test_the_verbs_refuse_while_the_router_runs(self):
@@ -671,6 +765,26 @@ class RetentionTests(_Eval):
         later = NOW + timedelta(days=30, seconds=1)
         self.assertEqual(peerjournal.sweep(self.state_dir, later, enabled=True), {"pruned": 1})
         self.assertEqual(peerjournal.reconcile(self.state_dir), [])
+
+    def test_a_record_whose_entry_was_not_removed_is_kept(self):
+        self.effects.remove_result = None              # the remover did not succeed
+        rec = self.placed()
+        self.assertFalse(peerjournal.read_record(self.state_dir, OWNER, rec["key"])["removed"])
+        peerjournal.advance_frontier(self.state_dir)
+        peerclock.advance(self.state_dir, self.past(rec))
+        self.assertEqual(peerjournal.sweep(self.state_dir, self.past(rec), enabled=True),
+                         {"pruned": 0})
+
+    def test_a_record_with_a_pending_control_is_kept(self):
+        rec = self.evaluate(self.take(self.raw(ts="2026-10-13T09:00:00Z")))
+        self.assertEqual((control(rec), rec["control"]["sent"]), ("demoted", False))
+        peerjournal.advance_frontier(self.state_dir)
+        later = NOW + timedelta(days=31)
+        self.assertEqual(peerjournal.sweep(self.state_dir, later, enabled=True), {"pruned": 0})
+        rec = peerjournal.read_record(self.state_dir, OWNER, rec["key"])
+        peerjournal.write_record(self.state_dir, dict(rec, control=dict(rec["control"],
+                                                                        sent=True)))
+        self.assertEqual(peerjournal.sweep(self.state_dir, later, enabled=True), {"pruned": 1})
 
     def test_the_frontier_never_decreases(self):
         self.placed()
@@ -767,6 +881,57 @@ class PollTests(_Polling):
         port = FakePort({"c1": self.raw()})
         got = self.poll(port, remover=FakeRemover(port, result="pending"))
         self.assertEqual((got["removed"], got["remove_held"]), (0, 1))
+
+    def test_one_anomalous_entry_never_wedges_the_page(self):
+        class Anomaly(Exception):
+            reason = "owner"
+
+        class Port(FakePort):
+            def read_entry(self, kind, entry_id):
+                if entry_id == "c2":
+                    raise Anomaly("another owner")
+                return super().read_entry(kind, entry_id)
+
+        port = Port({"c1": self.raw(), "c2": self.raw(),
+                     "c3": self.raw(id="qB2c3D4e5F6g7H8i9J0kLmx", subject="three")})
+        try:
+            got = self.poll(port)
+        except Exception as e:  # noqa: BLE001 -- an escape is the defect under test
+            self.fail(f"one entry's anomaly escaped the page: {type(e).__name__}: {e}")
+        self.assertEqual((got.get("held_owner"), got.get("state_done")), (1, 2))
+        self.assertEqual(sorted(port.entries), ["c2"])
+        self.assertEqual(self.poll(port).get("held_owner"), 1, "held on every poll")
+
+    def test_a_candidate_first_seen_in_a_superseded_generation_is_late_inbound(self):
+        port = FakePort({"c1": self.raw()})
+        got = peerjournal.poll_generation(
+            self.cfg, delegation=self.lane, hooks=hooks(),
+            clock=peerclock.advance(self.state_dir, NOW), now=NOW, logical_id=OWNER, gen=GEN,
+            link="hub", reader=types.SimpleNamespace(port=port), remover=FakeRemover(port),
+            retired=lambda _r: False, current=False)
+        rec = peerjournal.read_record(self.state_dir, OWNER, self.key("c1"))
+        self.assertEqual((got.get("late_inbound"), rec["disposed"], rec["cause"]),
+                         (1, "mail", "late_inbound"))
+        self.assertEqual((self.notices(), self.replay_files()), ([], []), "never placed")
+        from router import generations, quarantine
+        qdir = generations.gen_dir(self.state_dir, OWNER, GEN) / quarantine.DIR_NAME
+        self.assertEqual([json.loads(p.read_text())["causes"] for p in qdir.glob("*.json")],
+                         [["late_inbound"]])
+
+    def test_a_tree_record_whose_entry_vanished_is_recovered(self):
+        port = FakePort({"c1": self.raw()})
+        with mock.patch.object(deliver, "deliver_signed_peer",
+                               side_effect=deliver.RecipientHeld("bob", "held")):
+            self.poll(port)
+        port.entries.clear()
+        self.assertEqual(self.poll(port), {"removed": 0, "remove_held": 0})
+        with mock.patch("router.ingress.pump_link", return_value="hub"):
+            got = peerjournal.recover(self.cfg, types.SimpleNamespace(), delegation=self.lane,
+                                      hooks=hooks(), clock=peerclock.read(self.state_dir),
+                                      now=NOW)
+        rec = peerjournal.read_record(self.state_dir, OWNER, self.key("c1"))
+        self.assertEqual((got.get("state_done"), rec["disposed"]), (1, "placed"))
+        self.assertEqual(len(self.notices()), 1)
 
     def test_a_demoted_candidate_is_quarantined_with_its_cause(self):
         port = FakePort({"c1": self.raw(ts="2026-10-13T09:00:00Z")})
@@ -865,6 +1030,28 @@ class HostIntakeTests(_Eval):
         self.assertTrue((d / "candidate.json").is_file(), "the downstream runtime removes it")
         self.assertEqual(len(self.notices()), 1)
 
+    def test_a_crash_after_the_decision_freezes_the_tombstone_on_recovery(self):
+        """The mirror of decision.json (reserved -> decided) records the
+        disposition too, so its tombstone is frozen: placed, then disposed."""
+        self.entry(self.raw())
+        real = peerjournal.transition
+
+        def crash(state_dir, record, to, now, **f):
+            if to == "decided" and record["state"] == "reserved" and not crash.done:
+                crash.done = True
+                raise SystemExit("crash after commit_decision")
+            return real(state_dir, record, to, now, **f)
+        crash.done = False
+        with mock.patch.object(peerjournal, "transition", crash):
+            with self.assertRaises(SystemExit):
+                self.poll()
+        self.assertEqual(self.rec()["state"], "reserved")
+        self.poll()
+        rec = self.rec()
+        self.assertEqual((rec["state"], rec["disposed"], hold(rec)), ("done", "placed", None))
+        self.assertEqual(json.loads(self.tomb().read_bytes())["disposition"], "placed")
+        self.assertEqual(len(self.notices()), 1)
+
     def test_the_tombstone_precedes_done(self):
         self.entry(self.raw())
         real = peerjournal.transition
@@ -923,6 +1110,126 @@ class HostIntakeTests(_Eval):
         self.assertIsNone(marker(self.state_dir, self.rec()))
         self.assertEqual(self.poll().get("disposed_again"), 1)
         self.assertEqual(marker(self.state_dir, self.rec()), "placed")
+
+    def placed_and_tombstoned(self):
+        d = self.entry(self.raw())
+        self.poll()
+        self.assertTrue(self.tomb().is_file())
+        return d
+
+    def test_an_entry_at_three_links_keeps_its_tombstone(self):
+        d = self.placed_and_tombstoned()
+        os.link(d / "candidate.json", self.tmp / "link-a")
+        os.link(d / "candidate.json", self.tmp / "link-b")
+        got = self.poll()
+        self.assertEqual(got.get("tombstones_pruned", 0), 0)
+        self.assertTrue(self.tomb().is_file(), "the entry is still there")
+
+    def test_an_unreadable_entry_keeps_its_tombstone(self):
+        d = self.placed_and_tombstoned()
+        os.chmod(d, 0)
+        try:
+            got = self.poll()
+        finally:
+            os.chmod(d, 0o700)
+        self.assertEqual(got.get("tombstones_pruned", 0), 0)
+        self.assertTrue(self.tomb().is_file(), "the entry is still there")
+
+    def test_a_candidate_replaced_by_a_directory_keeps_its_tombstone(self):
+        d = self.placed_and_tombstoned()
+        (d / "candidate.json").unlink()
+        (d / "candidate.json").mkdir()
+        got = self.poll()
+        self.assertEqual(got.get("tombstones_pruned", 0), 0)
+        self.assertTrue(self.tomb().is_file(), "the entry is still there")
+
+    def test_a_missing_intake_directory_prunes_nothing(self):
+        d = self.placed_and_tombstoned()
+        shutil.rmtree(d)
+        (self.hop / ".unresolved").rmdir()
+        got = self.poll()
+        self.assertEqual(got.get("tombstones_pruned", 0), 0)
+        self.assertTrue(self.tomb().is_file())
+
+    def test_one_failing_entry_never_wedges_the_intake(self):
+        other = "f" * 32
+        self.entry(self.raw(), ident=other)
+        self.entry(self.raw(id="qB2c3D4e5F6g7H8i9J0kLmx", subject="two"))
+        real = peerjournal.evaluate
+
+        def boom(ctx, record):
+            if record["entry_id"] == HID:
+                raise RuntimeError("unexpected")
+            return real(ctx, record)
+
+        with mock.patch.object(peerjournal, "evaluate", boom):
+            try:
+                got = self.poll()
+            except RuntimeError as e:
+                self.fail(f"one entry's failure escaped the intake: {e}")
+        self.assertEqual((got.get("errored"), got.get("state_done")), (1, 1))
+        self.assertEqual(self.rec(ident=other)["state"], "done")
+
+    def test_the_operator_quarantine_of_a_host_candidate_is_tombstoned_as_mail(self):
+        self.entry(self.raw())
+
+        def refusing(raw):
+            raise si.CodecError("parse", "candidate_schema")
+        self.poll_with_view(refusing)
+        key = self.rec()["key"]
+        self.assertEqual(hold(self.rec()), ("candidate_view_refused", "candidate_schema"))
+        code, out, err = OperatorCliTests.cli(self, "peer-candidate", "quarantine", key,
+                                              "--evidence", "ticket 8")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("tombstone committed by the next poll", out["result"])
+        self.assertFalse(self.tomb().exists())
+        self.poll()
+        self.assertEqual((self.rec()["state"], self.rec()["disposed"]), ("done", "mail"))
+        self.assertEqual(json.loads(self.tomb().read_bytes())["disposition"], "mail")
+
+    def poll_with_view(self, view):
+        lane, self.lane = self.lane, dataclasses.replace(self.lane, candidate_view=view)
+        try:
+            return self.poll()
+        finally:
+            self.lane = lane
+
+    def test_startup_reports_a_wrong_stage(self):
+        from router import service
+        self.addCleanup(service.PEER_STARTUP.clear)
+        stage = self.hop / ".disposed" / ".control" / ".stage"
+        stage.mkdir(mode=0o700)
+        os.chmod(stage, 0o755)
+        cfg = dataclasses.replace(self.cfg, delegation=dataclasses.replace(self.dc, inbound=True))
+        runtime = types.SimpleNamespace(plugin=None, fsops=self.ops, hop=None)
+        rep = service.peer_startup(cfg, runtime)
+        self.assertEqual([p.split(":")[0] for p in rep["problems"]], ["disposed"])
+        self.assertIn(".control", rep["problems"][0])
+
+    def test_a_record_whose_entry_is_gone_is_recovered(self):
+        """Crash after the tombstone, before done; the downstream runtime
+        removes the entry on that valid tombstone. Recovery finishes it from
+        the journal, and the frontier passes it."""
+        d = self.entry(self.raw())
+        real = peerjournal.transition
+
+        def crash(state_dir, record, to, now, **f):
+            if to == "done":
+                raise SystemExit("crash")
+            return real(state_dir, record, to, now, **f)
+
+        with mock.patch.object(peerjournal, "transition", crash):
+            with self.assertRaises(SystemExit):
+                self.poll()
+        shutil.rmtree(d)
+        self.assertEqual(self.poll().get("taken"), None, "nothing listed")
+        self.assertEqual(self.rec()["state"], "decided")
+        got = peerjournal.recover(self.cfg, types.SimpleNamespace(fsops=self.ops),
+                                  delegation=self.lane, hooks=hooks(),
+                                  clock=peerclock.read(self.state_dir), now=NOW)
+        self.assertEqual(got.get("state_done"), 1)
+        self.assertEqual(self.rec()["state"], "done")
+        self.assertEqual(peerjournal.advance_frontier(self.state_dir), 1)
 
     def test_an_entry_in_flight_is_not_taken(self):
         (self.hop / ".unresolved" / HID).mkdir()
@@ -1017,6 +1324,84 @@ class CandidateQuarantineVerbTests(_Polling):
         code, _out, err = self.cli("peer-candidate", "quarantine", "a" * 64, "--evidence", " ")
         self.assertEqual(code, 1)
         self.assertIn("evidence is required", err)
+
+
+class StoreRecoveryTests(_Eval):
+    """A detected loss is accounted for once; a bound B never lowers the
+    frontier."""
+
+    def test_a_lost_marker_raises_the_floor_once(self):
+        rec = self.evaluate(self.take(self.raw()))
+        rt, idk = rec["replay_ref"].split("/")
+        (self.state_dir / "peer-replay" / rt / (idk + ".done")).unlink()
+        r1 = peerjournal.startup(self.state_dir, NOW + timedelta(hours=1))
+        f1 = peerclock.read(self.state_dir).floor
+        self.assertEqual(r1["why"], "store_loss")
+        r2 = peerjournal.startup(self.state_dir, NOW + timedelta(hours=5))
+        self.assertEqual((r2["why"], r2["problems"]), (None, []))
+        self.assertEqual(peerclock.read(self.state_dir).floor, f1, "the floor does not ratchet")
+
+    def test_a_lost_record_is_accounted_for_once(self):
+        self.evaluate(self.take(self.raw()))
+        k2 = self.take(self.raw(id="qB2c3D4e5F6g7H8i9J0kLmx", subject="two"))
+        shutil.rmtree(peerjournal.record_dir(self.state_dir, OWNER, k2))
+        self.take(self.raw(id="rC3d4E5f6G7h8I9j0KlMn0x", subject="three"))
+        self.assertEqual(peerjournal.startup(self.state_dir, NOW)["why"], "store_loss")
+        self.assertEqual(peerjournal.startup(self.state_dir, NOW)["problems"], [])
+
+    def test_peer_bound_keeps_the_frontier(self):
+        """A record pruned by retention, then a bound B: the frontier stays,
+        the next start finds no loss, and the frontier still advances."""
+        rec = self.evaluate(self.take(self.raw()))
+        self.assertEqual(peerjournal.advance_frontier(self.state_dir), 1)
+        peerjournal._prune(self.state_dir, peerjournal.read_meta(self.state_dir), rec)
+        b = datetime.now(timezone.utc) + timedelta(minutes=5)
+        peerclock.record_bound(self.state_dir, b, at=b, evidence="hub log line 4411",
+                               not_from_wall_clock=True, observed=())
+        peerjournal.rebuild_meta(self.state_dir)
+        self.assertEqual(peerjournal.read_meta(self.state_dir)["settled_through"], 1)
+        self.assertEqual(peerjournal.startup(self.state_dir, b)["problems"], [])
+        k2 = self.take(self.raw(id="qB2c3D4e5F6g7H8i9J0kLmx", subject="two"))
+        peerjournal.write_record(self.state_dir, dict(
+            peerjournal.read_record(self.state_dir, OWNER, k2), state="done"))
+        self.assertEqual(peerjournal.advance_frontier(self.state_dir), 2)
+
+class WindowWiringTests(_Eval):
+    """`delegation.windows` edited after init is applied, never ignored."""
+
+    def dc_with(self, p, f):
+        return dataclasses.replace(self.dc, window_p=p, window_f=f)
+
+    def test_a_narrowed_window_takes_effect(self):
+        clock = peerjournal.apply_window(self.state_dir, NOW, self.dc_with(600, 300))
+        self.assertEqual((clock.p, peerclock.read(self.state_dir).p), (600, 600))
+        rec = self.evaluate(self.take(self.raw(ts="2026-10-13T11:45:00Z")))
+        self.assertEqual((rec["disposed"], rec["cause"]), ("demoted", "ts_window"))
+
+    def test_a_widened_p_raises_the_floor(self):
+        peerclock.advance(self.state_dir, NOW)
+        clock = peerjournal.apply_window(self.state_dir, NOW, self.dc_with(7200, 300))
+        self.assertEqual((clock.p, clock.floor), (7200, NOW - timedelta(seconds=3600)))
+
+    def test_every_f_joins_the_history(self):
+        peerjournal.apply_window(self.state_dir, NOW, self.dc_with(3600, 900))
+        clock = peerjournal.apply_window(self.state_dir, NOW, self.dc_with(3600, 120))
+        self.assertEqual((clock.f, clock.fmax), (120, 900))
+
+    def test_the_poll_applies_it(self):
+        cfg = dataclasses.replace(self.cfg, delegation=dataclasses.replace(
+            self.dc_with(600, 300), inbound=True), hop=types.SimpleNamespace())
+        with mock.patch.object(peerjournal, "read_meta",
+                               side_effect=peerjournal.StoreAbsent("stop here")):
+            peerjournal.poll(cfg, None, None, delegation=self.lane, hooks=hooks(), now=NOW)
+        self.assertEqual(peerclock.read(self.state_dir).p, 600)
+
+    def test_startup_applies_it(self):
+        from router import service
+        self.addCleanup(service.PEER_STARTUP.clear)
+        cfg = dataclasses.replace(self.cfg, delegation=self.dc_with(900, 300))
+        service.peer_startup(cfg)
+        self.assertEqual(peerclock.read(self.state_dir).p, 900)
 
 
 if __name__ == "__main__":
