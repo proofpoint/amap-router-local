@@ -1358,6 +1358,20 @@ def _advance(
     try:
         _effect("transport", writer.write_request, n, data)
     except Exception as e:  # noqa: BLE001 -- the closed table decides
+        # A settling reason FIRST, before the latched and retried rows: the
+        # plugin raised it with no part of the request in the tree, so it is
+        # a definite non-delivery, settled once and cleaned up (a crash
+        # between the two repeats the refusal and settles again, idempotently).
+        settles = hoplink.settle_for_write(e)
+        if settles is not None:
+            outcome, reason = settles
+            logger.error("instance %r req %r: NOT handed over, settled %s/%s: %s",
+                         name, req_id, outcome, reason, e)
+            _effect("settle", settle, {"outcome": outcome, "reason_code": reason,
+                                       "detail": f"{DETAIL_PREFIX}{e}"[:_DETAIL_CAP],
+                                       "recipients": []}, record.get("digest"))
+            _effect("unlink", _cleanup, path, handed)
+            return SETTLED
         latched = hoplink.latch_for_write(e)
         if latched is not None:
             hoplink.set_write_hold(cfg, name, latched, str(e), n)

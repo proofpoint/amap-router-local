@@ -207,6 +207,7 @@ RUNTIME_CAPABILITY: Mapping[str, str] = {
     "retired": "retired",
     "retired_at": "retired_at",
     "identity": "identity",
+    "admit": "admit",
 }
 
 
@@ -517,6 +518,7 @@ TRANSPORT_REASONS = (
     "exists_different", "reconcile", "sidecars", "sidecars_orphaned", "heal_state",
     "protocol_violation", "marker_unreadable",
     "settings_invalid", "closed",
+    "generation_retired",
 )
 
 

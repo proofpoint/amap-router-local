@@ -89,7 +89,8 @@ class ShapeTests(unittest.TestCase):
             "layout", "owner", "version",
             "exists_different", "reconcile", "sidecars", "sidecars_orphaned", "heal_state",
             "protocol_violation", "marker_unreadable",
-            "settings_invalid", "closed"))
+            "settings_invalid", "closed",
+            "generation_retired"))
 
     def test_the_reason_tuples_are_pairwise_disjoint(self):
         """The classifier's order no longer depends on it, but a later

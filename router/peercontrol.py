@@ -211,20 +211,37 @@ def statement_doc(*, key_id: str, control_id: str, from_address: str, to: str, t
 # ---------------------------------------------------------------------------
 
 class Capability:
-    """The plugin's runtime capability, when it declares one."""
+    """The plugin's runtime capability, when it declares one. Every call into
+    it goes through `_call`: an anomaly the plugin raises (a `.reason` from
+    the closed vocabulary: a misowned tree, a stray entry, an unreadable
+    identity, `exists_different`) becomes `Unavailable(runtime_tree_unavailable)`
+    naming it, on every path, never an escaping exception."""
 
     def __init__(self, plugin: Any, fsops: Any, cfg: Any):
         self.plugin, self.fsops, self.cfg = plugin, fsops, cfg
 
+    def _call(self, what: str, fn: Any, *args: Any) -> Any:
+        try:
+            return fn(*args)
+        except Unavailable:
+            raise
+        except Exception as e:  # noqa: BLE001 -- classified exactly
+            reason = anomaly_reason(e)
+            if reason is None:
+                raise
+            raise Unavailable(UNAVAILABLE, f"{what}: {reason}: {e}") from None
+
     def lister(self) -> Any:
         from . import transport as transport_mod
         settings = {"hop_root": str(self.cfg.hop.root), "peer_uid": self.cfg.hop.peer_uid}
-        return transport_mod.runtime_factory(self.plugin, "lister")(settings, self.fsops)
+        return self._call("the runtime lister",
+                          transport_mod.runtime_factory(self.plugin, "lister"),
+                          settings, self.fsops)
 
     def generations(self) -> List[Tuple[str, str]]:
         from . import transport as transport_mod
         names = transport_mod.RUNTIME_CAPABILITY
-        out = getattr(self.lister(), names["generations"])()
+        out = self._call("the runtime lister", getattr(self.lister(), names["generations"]))
         listed = []
         for gen, state in out:
             if state not in ("live", "retired", "unreadable"):
@@ -232,16 +249,63 @@ class Capability:
             listed.append((gen, state))
         return listed
 
-    def sender(self, generation: str) -> Any:
+    def sender(self, generation: str, *, port: bool = False) -> Any:
+        """The runtime sender for `generation`, its settings EXACTLY the
+        plugin's closed list: `version_write` from that generation's runtime
+        pin (as an agent sender takes it from its pin) and `caps` from
+        `cfg.hop.caps`. A sender used as the transport port (`port=True`)
+        REQUIRES the pin; one only read or retired falls back to the
+        configured `version_write`, which it never uses to send."""
         from . import transport as transport_mod
+        pin = runtime_pin(self.cfg, generation)
+        version = pin.get("version_write") if isinstance(pin, dict) else None
+        if type(version) is not int:
+            if port:
+                raise Unavailable(UNAVAILABLE, f"generation {generation} has no pinned "
+                                               "version_write")
+            version = self.cfg.hop.version_write
         settings = {"hop_root": str(self.cfg.hop.root), "generation": generation,
-                    "peer_uid": self.cfg.hop.peer_uid, "address": runtime_address(self.cfg)}
-        return transport_mod.runtime_factory(self.plugin, "factory")(settings, self.fsops)
+                    "peer_uid": self.cfg.hop.peer_uid, "address": runtime_address(self.cfg),
+                    "version_write": version, "caps": dict(self.cfg.hop.caps)}
+        return self._call(f"the runtime sender for {generation}",
+                          transport_mod.runtime_factory(self.plugin, "factory"),
+                          settings, self.fsops)
 
     def retire(self, generation: str, retired_at: str) -> Any:
         from . import transport as transport_mod
         names = transport_mod.RUNTIME_CAPABILITY
-        return getattr(self.sender(generation), names["retire"])(retired_at)
+        return self._call(f"retire {generation}",
+                          getattr(self.sender(generation), names["retire"]), retired_at)
+
+    def identity(self, generation: str) -> Optional[Dict[str, Any]]:
+        from . import transport as transport_mod
+        names = transport_mod.RUNTIME_CAPABILITY
+        return self._call(f"the identity of {generation}",
+                          getattr(self.sender(generation), names["identity"]))
+
+    def admit(self, port: Any, generation: str, admitted_at: str) -> str:
+        from . import transport as transport_mod
+        names = transport_mod.RUNTIME_CAPABILITY
+        return self._call(f"admit {generation}", getattr(port, names["admit"]), admitted_at)
+
+
+def anomaly_reason(exc: BaseException) -> Optional[str]:
+    """The closed-vocabulary `.reason` of a plugin anomaly, or None."""
+    from . import hoplink
+    from . import transport as transport_mod
+    kind, detail = transport_mod.classify(exc, runtime=tuple(hoplink._RUNTIME_CLASSES))
+    return detail if kind == "reason" else None
+
+
+def runtime_pin(cfg: Any, generation: str) -> Optional[Dict[str, Any]]:
+    """`generation`'s runtime binding pin (`record_generation`), or None."""
+    from . import hoplink
+    path = runtime_dir(cfg) / generation / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def capability(cfg: Any, runtime: Any) -> Optional[Capability]:
@@ -294,7 +358,7 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
         raise Unavailable(UNAVAILABLE, f"a frozen attempt names another generation ({frozen[0]}):"
                                        " it is restored, adopted or abandoned first")
     gen = secrets.token_hex(16)
-    record_generation(cfg, gen, now=now)
+    record_generation(cfg, gen, admitted_at=format_utc_ts(now))
     return gen
 
 
@@ -371,7 +435,15 @@ def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any
         raise PlanPending("the plan is already decided; only its marker remains")
     verb, d = marker["verb"], marker["detail"]
     if verb == ADOPT_VERB:
-        record_generation(cfg, d["generation"], now=now)   # the record and the pin, rewritten
+        # The record and the pin, rewritten with the tree's OWN admitted_at,
+        # carried in the plan (read once, at the verb), so every replay writes
+        # the same bytes; a plan from before it was carried reads it again.
+        at = d.get("admitted_at")
+        if not isinstance(at, str):
+            if cap is None:
+                raise PlanPending("the plugin declares no runtime capability")
+            at = _admitted_at_for_restore(cfg, cap, d["generation"], "live", now)
+        record_generation(cfg, d["generation"], admitted_at=at)
         return f"adopted {d['generation']}"
     if cap is None:
         raise PlanPending("the plugin declares no runtime capability")
@@ -394,7 +466,7 @@ def _complete_plan(cfg: Any, cap: Optional[Capability], marker: Mapping[str, Any
         # The planned generation's FULL effect, the record AND its pin, is
         # replayed even when the record already names it: a pin write that
         # failed after the record committed is completed here.
-        record_generation(cfg, d["minted"], now=now)
+        record_generation(cfg, d["minted"], admitted_at=marker["at"])   # the plan's time
         return f"{retired}, minted {d['minted']}"
     raise PlanPending(f"unknown verb {verb!r}")
 
@@ -669,17 +741,52 @@ def operator_abandon_attempt(cfg: Any, cap: Optional[Capability], key: str, *,
     return {"result": result, "audited": True}
 
 
-def record_generation(cfg: Any, gen: str, *, now: datetime) -> None:
+def record_generation(cfg: Any, gen: str, *, admitted_at: str) -> None:
+    """Record `gen` as the runtime generation, with its pin, both carrying
+    `admitted_at` AS GIVEN, never a clock read here: the value the plugin's
+    `admit` is called with, which must be stable on every path (the
+    caller's source: a fresh mint's own time, the tree's identity for an
+    adopt or a listed-live restore, the restore's own time once for an
+    unlisted one, the plan's time for `new`). The record's `minted_ts` and
+    the pin's `admitted_at` are that same value."""
     from . import hoplink
     d = runtime_dir(cfg)
     d.mkdir(parents=True, exist_ok=True)
     atomic_write(d / config_mod.RUNTIME_GENERATION_FILE,
-                 json.dumps({"generation": gen, "minted_ts": format_utc_ts(now)},
+                 json.dumps({"generation": gen, "minted_ts": admitted_at},
                             sort_keys=True).encode("utf-8"), durable_root=cfg.state_dir)
-    pin = hoplink.transport_dir(cfg, config_mod.RUNTIME_NS) / hoplink.PIN_FILE
+    pin = d / gen / hoplink.TRANSPORT_DIR / hoplink.PIN_FILE
     pin.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(pin, hoplink.canonical(hoplink.pin_doc(cfg.hop, format_utc_ts(now))),
+    atomic_write(pin, hoplink.canonical(hoplink.pin_doc(cfg.hop, admitted_at)),
                  durable_root=cfg.state_dir)
+
+
+def recorded_admitted_at(cfg: Any) -> Optional[Tuple[str, str]]:
+    """(generation, minted_ts) of the runtime generation record, or None."""
+    try:
+        doc = json.loads((runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(doc, dict) and isinstance(doc.get("generation"), str)
+            and isinstance(doc.get("minted_ts"), str)):
+        return None
+    return doc["generation"], doc["minted_ts"]
+
+
+def _admitted_at_for_restore(cfg: Any, cap: "Capability", gen: str, listed: Optional[str],
+                             now: datetime) -> str:
+    """The value a restored generation is recorded with: the tree's identity
+    for a LISTED generation; for an unlisted one (never admitted) a pin that
+    survived, else the restore's own time, written once and reused."""
+    if listed is not None:
+        ident = cap.identity(gen)
+        at = ident.get("admitted_at") if isinstance(ident, dict) else None
+        if not isinstance(at, str):
+            raise Unavailable(UNAVAILABLE, f"generation {gen} has no readable admitted_at")
+        return at
+    pin = runtime_pin(cfg, gen) or {}
+    return pin["admitted_at"] if isinstance(pin.get("admitted_at"), str) else format_utc_ts(now)
 
 
 def unsettled_attempts(cfg: Any) -> List[str]:
@@ -710,7 +817,9 @@ def operator_adopt(cfg: Any, cap: Optional[Capability], gen: str, *, now: dateti
     live = [g for g, s in listed.items() if s in ("live", "unreadable")]
     if live != [gen] or listed.get(gen) != "live":
         raise ValueError(f"{gen} is not the only live generation: {sorted(listed.items())}")
-    marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence)
+    admitted_at = _admitted_at_for_restore(cfg, cap, gen, "live", now)
+    marker = _begin_verb_audit(cfg, ADOPT_VERB, now, generation=gen, evidence=evidence,
+                               admitted_at=admitted_at)
     return _run_plan(cfg, cap, marker, now)
 
 
@@ -1079,17 +1188,35 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
             cfg, ns, rid, attempt["n"], digest=None,
             request_doc=request_doc(cfg, record, attempt), recipients=[record["control"]["to"]],
             from_address=runtime_address(cfg), peer=pin(cfg, attempt))
-    port = cap.sender(attempt["gen"])
+    port = cap.sender(attempt["gen"], port=True)
+    # ADMIT before the first call of ANY port method in the generation, on
+    # every resume (idempotent; a steady state writes nothing), with the
+    # generation's own stable admitted_at.
+    _admit(cfg, cap, port, attempt["gen"])
 
     def settle(verdict: Dict[str, Any], _digest: Optional[str]) -> str:
-        _update(sd, record, sent=True, stuck=None,
-                settled={"outcome": verdict.get("outcome"), "at": format_utc_ts(clock_mod.now())})
+        settled = {"outcome": verdict.get("outcome"), "at": format_utc_ts(clock_mod.now())}
+        if verdict.get("reason_code") is not None:
+            settled["reason_code"] = verdict["reason_code"]
+        _update(sd, record, sent=True, stuck=None, settled=settled)
         return verdict.get("outcome") or ""
 
     if not inflight._was_handed(inflight.handed_path(cfg, ns, rid), attempt["n"]):
         _require_writable(cap, attempt["gen"])
-    state = inflight.advance(cfg, ns, rid, existing, port, settle=settle,
-                             already_settled=bool(record["control"].get("settled")))
+    try:
+        state = inflight.advance(cfg, ns, rid, existing, port, settle=settle,
+                                 already_settled=bool(record["control"].get("settled")))
+    except Unavailable:
+        raise
+    except Exception as e:  # noqa: BLE001 -- classified exactly
+        # A port anomaly outside the write row (the write row settles,
+        # latches or retries inside `advance`): the tree cannot be used this
+        # pass, named; a RuntimeRetired here, before any hand-over, HOLDS.
+        reason = anomaly_reason(e)
+        if reason is None:
+            raise
+        raise Unavailable(UNAVAILABLE, f"the runtime port for {attempt['gen']}: {reason}: "
+                                       f"{e}") from None
     if state not in (inflight.SETTLED, inflight.CLEANED):
         current = peerjournal.read_record(sd, record["owner"], record["key"])
         signed = parse_utc_ts(attempt.get("ts"))
@@ -1134,12 +1261,29 @@ def _attempt_generation(cfg: Any, cap: Capability, gen: str, *, now: datetime,
     unlisted_ok = (listed.get(gen) is None and not _inflight_entries(cfg, gen)
                    and not _named_elsewhere(cfg, gen, record["key"]))
     if (listed.get(gen) == "live" or unlisted_ok) and not others:
+        admitted_at = _admitted_at_for_restore(cfg, cap, gen, listed.get(gen), now)
         record = _begin_audit(cfg, record, RESTORE_VERB, now, key=record["key"], generation=gen,
-                              listed=listed.get(gen) or "not listed")
-        record_generation(cfg, gen, now=now)
+                              listed=listed.get(gen) or "not listed", admitted_at=admitted_at)
+        record_generation(cfg, gen, admitted_at=admitted_at)
         _finish_audit(cfg, record)
         return None
     return HELD_GENERATION_UNRECORDED
+
+
+def _admit(cfg: Any, cap: Capability, port: Any, gen: str) -> str:
+    """`admit(admitted_at)` on `gen`'s port, with the value its pin carries,
+    which must equal the generation record's `minted_ts` when the record
+    names `gen`: a disagreement HOLDS, visibly, and is never re-admitted
+    with another time."""
+    pin = runtime_pin(cfg, gen) or {}
+    at = pin.get("admitted_at")
+    if not isinstance(at, str):
+        raise Unavailable(UNAVAILABLE, f"generation {gen} has no pinned admitted_at")
+    rec = recorded_admitted_at(cfg)
+    if rec is not None and rec[0] == gen and rec[1] != at:
+        raise Unavailable(UNAVAILABLE, f"generation {gen}: the record's minted_ts {rec[1]} is "
+                                       f"not its pin's admitted_at {at}")
+    return cap.admit(port, gen, at)
 
 
 def _require_writable(cap: Capability, gen: str) -> None:

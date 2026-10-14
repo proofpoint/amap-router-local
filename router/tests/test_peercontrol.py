@@ -31,6 +31,7 @@ from router.tests.helpers import ClockMixin
 from router.tests.test_peerbind import FD, KEY_ID, STATEMENT_ID, T1
 
 NOW = tpe.NOW
+AT = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
 DEST = f"amap.router@{T1}"
 ROUTER = pathlib.Path(router.__file__).parent
 
@@ -502,7 +503,7 @@ class AttemptTests(_Control):
     def test_new_refuses_before_retiring_when_the_mint_would_be_refused(self):
         live = "a" * 32
         self.tree.gens.update({live: "live", "b" * 32: "live"})
-        peercontrol.record_generation(self.cfg, live, now=NOW)
+        peercontrol.record_generation(self.cfg, live, admitted_at=AT)
         self.assert_refused_untouched("new", live)
 
     def test_every_verb_whose_audit_fails_reports_committed_and_is_repaired(self):
@@ -585,7 +586,7 @@ class AttemptTests(_Control):
     def test_retire_whose_record_removal_fails_after_the_capability_retired_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         with self.fail_once(peercontrol.os, "unlink",
                             lambda path, *_a, **_k: Path(path).name
                             == config_mod.RUNTIME_GENERATION_FILE):
@@ -603,7 +604,7 @@ class AttemptTests(_Control):
     def test_new_whose_mint_fails_after_the_retire_completes_its_planned_mint(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         with self.fail_once(peercontrol, "record_generation", lambda *_a, **_k: True):
             code, err = self.cli("new")
         self.assertEqual(code, 3, err)
@@ -623,7 +624,7 @@ class AttemptTests(_Control):
     def test_new_whose_pin_write_fails_after_the_planned_record_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         pin_before = self.pin_path()
         self.assertTrue(pin_before.is_file())
         from router import hoplink
@@ -643,7 +644,7 @@ class AttemptTests(_Control):
     def test_new_whose_record_removal_fails_mid_rotation_is_completed(self):
         a = "a" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         with self.fail_once(peercontrol.os, "unlink",
                             lambda path, *_a, **_k: Path(path).name
                             == config_mod.RUNTIME_GENERATION_FILE):
@@ -661,7 +662,7 @@ class AttemptTests(_Control):
         mint, so the plan cannot complete (Committed, pending)."""
         a, b = "a" * 32, "b" * 32
         self.tree.gens[a] = "live"
-        peercontrol.record_generation(self.cfg, a, now=NOW)
+        peercontrol.record_generation(self.cfg, a, admitted_at=AT)
         real = peercontrol._retire_idempotent
 
         def retire_then_b_live(*args, **kwargs):
@@ -1118,7 +1119,7 @@ class GenerationClassifiedTests(_Control):
         return peercontrol.capability(self.cfg, self.runtime)
 
     def recorded(self, gen):
-        peercontrol.record_generation(self.cfg, gen, now=NOW)
+        peercontrol.record_generation(self.cfg, gen, admitted_at=AT)
 
     def test_a_recorded_generation_retired_before_its_record_was_removed_is_never_reused(self):
         old = "a" * 32
@@ -1196,7 +1197,7 @@ class RetireListedOnlyTests(_Control):
     def test_retire_makes_the_record_removal_durable(self):
         live = "f" * 32
         self.tree.gens[live] = "live"
-        peercontrol.record_generation(self.cfg, live, now=NOW)
+        peercontrol.record_generation(self.cfg, live, admitted_at=AT)
         cap = peercontrol.capability(self.cfg, self.runtime)
         # The audit's own bookkeeping (which fsyncs the same directory) is
         # stubbed, so only the retire's fsync can satisfy this.
