@@ -391,7 +391,7 @@ def all_records(state_dir: Path) -> List[Dict[str, Any]]:
     state_dir = Path(state_dir)
     try:
         meta = read_meta(state_dir)
-    except (OSError, ValueError, StoreAbsent):
+    except (OSError, ValueError, StoreAbsent, peerclock.ClockUntrusted):
         return []
     out = []
     for owner in sorted(meta["roots"]):

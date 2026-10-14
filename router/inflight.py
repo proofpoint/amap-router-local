@@ -974,14 +974,17 @@ def _check_peer_header(cfg: RouterConfig, pin: Dict[str, Any]) -> None:
     delegation = peerlane.active(cfg)
     if delegation is None:
         raise HandoverDeferred("delegation is not active")
+    field, want_kind = ((peerlane.CONTROL_FIELD, "control") if pin["kind"] == "control"
+                        else (peerlane.STATEMENT_FIELD, "statement"))
     try:
         kind, k, statement, signature = delegation.codec.check1(
-            [(peerlane.STATEMENT_FIELD, pin["statement_header"])])
+            [(field, pin["statement_header"])])
     except Exception as e:  # noqa: BLE001 -- classified exactly
         if peerlane.error_kind(delegation, e) == "CodecError":
             raise HandoverUnavailable(f"the pinned header fails check 1: {e.reason}") from None
         raise
-    if (k != pin["key_id"] or statement != base64.b64decode(pin["statement"])
+    if (kind != want_kind or k != pin["key_id"]
+            or statement != base64.b64decode(pin["statement"])
             or signature != base64.b64decode(pin["signature"])):
         raise HandoverUnavailable("the pinned header does not carry the pinned statement")
 
