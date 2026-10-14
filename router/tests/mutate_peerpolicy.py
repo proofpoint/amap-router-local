@@ -265,9 +265,9 @@ M = [
   '        meta["epochs"]))))',
   [E + "RepairTests.test_a_migrated_epoch_token_survives_a_journal_loss"]),
  ("PP50 the trust verb clears the flag before the reseed", EP,
-  '    if not problems:\n        for (runtime, from_canon), claim in sorted(',
+  '    if not problems:\n        try:\n            claims = _reseed_claims(state_dir)\n',
   '    if not problems:\n        _m = pj.read_meta(state_dir)\n        _m["epochs_untrusted"] = False\n'
-  '        pj._write_meta(state_dir, _m)\n        for (runtime, from_canon), claim in sorted(',
+  '        pj._write_meta(state_dir, _m)\n        try:\n            claims = _reseed_claims(state_dir)\n',
   [E + "TrustCrashTests.test_a_crash_mid_reseed_then_a_rerun_completes"]),
  ("PP51 a disposition is not counted", PJ,
   '    EPOCH_COUNTS[key] = EPOCH_COUNTS.get(key, 0) + 1\n', '    return\n',
