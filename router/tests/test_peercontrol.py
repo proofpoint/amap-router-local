@@ -129,8 +129,9 @@ class GateTests(_Control):
 
     def test_no_production_module_reaches_the_runtime_tree_but_through_the_port(self):
         """No production module but fsops (which names the directory for its
-        binding classification) mentions the `.runtime` tree or calls a
-        runtime factory by name outside transport's table."""
+        binding classification) mentions the `.runtime` tree, by its literal
+        or by fsops's `RUNTIME_DIR` (a name, an attribute or an import), or
+        calls a runtime factory by name outside transport's table."""
         bad = []
         for path in sorted(ROUTER.glob("*.py")):
             text = path.read_text(encoding="utf-8")
@@ -139,6 +140,11 @@ class GateTests(_Control):
                 if isinstance(n, ast.Constant) and n.value == ".runtime" \
                         and path.name != "fsops.py":
                     bad.append(f"{path.name}:{n.lineno}: the .runtime literal")
+                if path.name != "fsops.py" and (
+                        (isinstance(n, ast.Name) and n.id == "RUNTIME_DIR")
+                        or (isinstance(n, ast.Attribute) and n.attr == "RUNTIME_DIR")
+                        or (isinstance(n, ast.alias) and n.name == "RUNTIME_DIR")):
+                    bad.append(f"{path.name}:{getattr(n, 'lineno', '?')}: fsops.RUNTIME_DIR")
                 if isinstance(n, ast.Constant) and n.value in ("make_runtime_sender",
                                                                "make_runtime_lister") \
                         and path.name != "transport.py":
@@ -209,7 +215,14 @@ class AttemptTests(_Control):
         self.assertEqual(req["agent_id"], "runtime")
         self.assertEqual(req["draft"]["to"], [DEST])
         self.assertEqual((req["draft"]["subject"], req["draft"]["body_text"]), ("", ""))
+        # Zero body octets and nothing else: no content type or charset is
+        # RL's to set (the downstream runtime composes them).
+        self.assertEqual(set(req["draft"]), {"to", "subject", "body_text"})
+        self.assertEqual(set(env), {"from_address", "hop_contract", "kind", "peer"})
         self.assertEqual(doc["attachments"], [])
+        rid = self.record(key)["control"]["attempt"]["id"]
+        flight = inflight.read_record(self.cfg, config_mod.RUNTIME_NS, rid) or {}
+        self.assertEqual(flight.get("recipients"), [DEST], "exactly one recipient")
         peer = env["peer"]
         attempt = self.record(key)["control"]["attempt"]
         self.assertEqual(peer["message_id"], f"<{attempt['id']}@{FD}>")
@@ -256,6 +269,37 @@ class AttemptTests(_Control):
         handed.write_text(attempt["n"])
         self.assertEqual(self.send(), {"stuck_" + peercontrol.STUCK_HANDED: 1})
         self.assertEqual(self.port().writes if self.gen() in self.tree.senders else [], [])
+        stuck = self.record(key)["control"].get("stuck") or {}
+        self.assertEqual(stuck.get("reason"), peercontrol.STUCK_HANDED, "recorded on the record")
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=NOW + timedelta(minutes=5))
+        self.assertEqual(doc["stuck"], 1)
+        self.assertEqual([(r["key"], r["reason"]) for r in doc["stuck_records"]],
+                         [(key, peercontrol.STUCK_HANDED)])
+        self.assertEqual(doc["pending"], 0, "a stuck notice is counted as stuck")
+
+    def test_an_attempt_unsettled_past_the_horizon_is_recorded_stuck_never_resent(self):
+        key = self.refused()
+        self.send()
+        n, _doc = self.handover(key)
+        writes = list(self.port().writes)
+        later = NOW + timedelta(seconds=peercontrol.SETTLE_HORIZON_S + 60)
+        self.assertEqual(self.send(now=NOW + timedelta(minutes=5)).get(
+            "stuck_" + peercontrol.STUCK_UNSETTLED), None, "not stuck within the horizon")
+        got = self.send(now=later)
+        self.assertEqual(got, {"stuck_" + peercontrol.STUCK_UNSETTLED: 1})
+        stuck = self.record(key)["control"].get("stuck") or {}
+        self.assertEqual(stuck.get("reason"), peercontrol.STUCK_UNSETTLED)
+        self.assertEqual((self.port().writes, len(self.signs)), (writes, 1),
+                         "never re-sent, never re-signed")
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=later)
+        self.assertEqual(doc["stuck"], 1)
+        self.assertEqual(doc["stuck_records"][0]["age_s"], peercontrol.SETTLE_HORIZON_S + 60)
+        # A late result still settles it, and it is no longer stuck.
+        self.port().send(n)
+        self.send(now=later)
+        control = self.record(key)["control"]
+        self.assertTrue(control["sent"])
+        self.assertIsNone(control.get("stuck"))
 
 
 class SuppressionTests(_Control):
@@ -427,6 +471,197 @@ class StatementTests(unittest.TestCase):
             with self.subTest(label):
                 with self.assertRaises(ValueError):
                     peercontrol.check_statement(d)
+
+
+class AdmissionClosedTests(_Control):
+
+    def test_nothing_is_attempted_minted_or_refilled_while_admission_is_closed(self):
+        key = self.refused()
+        before = self.record(key)
+        peerclock.close(self.state_dir, peerclock.read(self.state_dir), "restored")
+        got = self.send()
+        self.assertEqual(got, {"held_admission_closed": 1})
+        self.assertEqual(self.record(key), before, "no intent, no attempt")
+        self.assertFalse((self.state_dir / config_mod.RUNTIME_NS).exists(),
+                         "no generation minted, no bucket written")
+        self.assertEqual(self.tree.calls, [], "no runtime factory was called")
+
+
+class ControlStatusTests(_Control):
+
+    def poll_status(self, runtime):
+        from router import service
+        from router.status import StatusTracker
+        t = StatusTracker(interval_s=5.0)
+        service.poll_once(self.cfg, t, runtime)
+        return t.to_doc().get("peer_store", {}).get("controls", {})
+
+    def test_poll_once_records_the_controls_section(self):
+        self.refused()
+        doc = self.poll_status(self.runtime)
+        self.assertEqual(doc.get("pending"), 1)
+        self.assertEqual(doc.get("runtime_tree"), {"generation": None, "generations": []})
+
+    def test_without_the_capability_the_runtime_tree_is_unavailable(self):
+        self.refused()
+        self.assertEqual(self.poll_status(None).get("runtime_tree"), "unavailable")
+
+    def test_a_lost_record_lists_the_generations_to_adopt_or_retire(self):
+        self.tree.gens.update({"1" * 32: "live", "2" * 32: "unreadable", "3" * 32: "retired"})
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)
+        self.assertEqual(doc["runtime_tree"], {
+            "generation": None,
+            "generations": [["1" * 32, "live"], ["2" * 32, "unreadable"],
+                            ["3" * 32, "retired"]]})
+
+    def test_a_settled_failure_is_counted_as_failed_never_as_sent(self):
+        ok, bad = self.refused(), self.refused(id="qB2c3D4e5F6g7H8i9J0kLmx")
+        self.send()
+        n_ok, _ = self.handover(ok)
+        n_bad, _ = self.handover(bad)
+        self.port().send(n_ok)
+        self.port().send(n_bad, outcome="rejected", reason_code="no_route")
+        self.send()
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)
+        self.assertEqual((doc["sent"], doc["failed"]), (1, {"rejected": 1}))
+
+
+class GenerationClassifiedTests(_Control):
+
+    def cap(self):
+        return peercontrol.capability(self.cfg, self.runtime)
+
+    def recorded(self, gen):
+        peercontrol.record_generation(self.cfg, gen, now=NOW)
+
+    def test_a_recorded_generation_retired_before_its_record_was_removed_is_never_reused(self):
+        old = "a" * 32
+        self.recorded(old)
+        self.tree.gens[old] = "retired"     # retired through the capability, then a crash
+        got = peercontrol.generation(self.cfg, self.cap(), now=NOW)
+        self.assertNotEqual(got, old)
+        self.assertEqual(self.gen(), got, "the fresh generation is recorded")
+        self.assertEqual(self.tree.gens[old], "retired")
+
+    def test_a_recorded_generation_beside_another_live_one_holds(self):
+        self.recorded("a" * 32)
+        self.tree.gens.update({"a" * 32: "live", "b" * 32: "live"})
+        with self.assertRaises(peercontrol.Unavailable):
+            peercontrol.generation(self.cfg, self.cap(), now=NOW)
+
+    def test_a_recorded_generation_beside_an_unreadable_one_holds(self):
+        self.recorded("a" * 32)
+        self.tree.gens.update({"a" * 32: "live", "b" * 32: "unreadable"})
+        with self.assertRaises(peercontrol.Unavailable):
+            peercontrol.generation(self.cfg, self.cap(), now=NOW)
+
+    def test_an_unreadable_recorded_generation_holds(self):
+        self.recorded("a" * 32)
+        self.tree.gens["a" * 32] = "unreadable"
+        with self.assertRaises(peercontrol.Unavailable):
+            peercontrol.generation(self.cfg, self.cap(), now=NOW)
+
+    def test_a_recorded_generation_alone_and_not_yet_listed_is_used(self):
+        self.recorded("a" * 32)
+        self.assertEqual(peercontrol.generation(self.cfg, self.cap(), now=NOW), "a" * 32)
+        self.tree.gens["a" * 32] = "live"
+        self.assertEqual(peercontrol.generation(self.cfg, self.cap(), now=NOW), "a" * 32)
+
+    def test_an_attempt_whose_generation_was_retired_is_not_handed_over(self):
+        key = self.refused()
+        with mock.patch.object(inflight, "begin_reserved", side_effect=RuntimeError("crash")):
+            self.send()
+        gen = self.record(key)["control"]["attempt"]["gen"]
+        self.tree.gens[gen] = "retired"
+        self.assertEqual(self.send(), {peercontrol.UNAVAILABLE: 1})
+        port = self.tree.senders.get(gen)
+        self.assertEqual(port.writes if port is not None else [], [], "nothing handed over")
+
+
+class DeferralHorizonTests(_Control):
+
+    def test_a_notice_deferred_24_hours_is_suppressed_though_the_bucket_refilled(self):
+        with mock.patch.object(peercontrol, "_rate", return_value=1):
+            self.assertTrue(peercontrol.take_token(self.cfg, DEST, NOW), "the bucket emptied")
+            key = self.refused()
+            self.assertEqual(self.send(), {"deferred": 1})
+            peerclock.advance(self.state_dir, NOW + timedelta(days=1))
+            self.assertEqual(self.send(), {"suppressed_" + peercontrol.SUPPRESS_RATE: 1})
+            self.assertNotIn("attempt", self.record(key)["control"])
+            self.assertTrue(peercontrol.take_token(self.cfg, DEST, NOW + timedelta(days=1)),
+                            "the suppression took no token")
+
+
+class RetireListedOnlyTests(_Control):
+
+    def test_retire_refuses_a_generation_the_lister_does_not_show(self):
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        with self.assertRaises(ValueError):
+            peercontrol.operator_retire(self.cfg, cap, "9" * 32, now=NOW, evidence="x")
+        self.assertEqual([c for c in self.tree.calls if c[0] == "sender"], [],
+                         "no sender constructed for an unlisted generation")
+
+    def test_retire_makes_the_record_removal_durable(self):
+        live = "f" * 32
+        self.tree.gens[live] = "live"
+        peercontrol.record_generation(self.cfg, live, now=NOW)
+        cap = peercontrol.capability(self.cfg, self.runtime)
+        with mock.patch.object(peercontrol, "fsync_dir") as fsync:
+            peercontrol.operator_retire(self.cfg, cap, live, now=NOW, evidence="x")
+        self.assertIn(mock.call(peercontrol.runtime_dir(self.cfg)), fsync.call_args_list)
+
+
+class DestinationUnknownTests(_Control):
+
+    def test_a_notice_without_about_or_to_is_held_never_unconfigured(self):
+        key = self.refused()
+        rec = self.record(key)
+        peerjournal.write_record(self.state_dir, dict(rec, control=dict(
+            rec["control"], about=None, to=None)))
+        self.assertEqual(self.send(), {"held_" + peercontrol.HELD_NO_DESTINATION: 1})
+        control = self.record(key)["control"]
+        self.assertIsNone(control.get("suppressed"), "never suppressed")
+        self.assertEqual(control.get("held"), peercontrol.HELD_NO_DESTINATION)
+        doc = peercontrol.status_doc(self.cfg, self.runtime, now=NOW)
+        self.assertEqual((doc["held"], doc["suppressed"]),
+                         ({peercontrol.HELD_NO_DESTINATION: 1}, {}))
+
+
+class DelegationInactiveTests(_Control):
+
+    def test_no_delegation_is_one_count_and_nothing_is_tried(self):
+        key = self.refused()
+        before = self.record(key)
+        got = peercontrol.send_pending(self.cfg, self.runtime, delegation=None, now=NOW)
+        self.assertEqual(got, {peercontrol.DELEGATION_INACTIVE: 1})
+        self.assertEqual(self.record(key), before)
+
+
+class StageUnderRuntimeTests(unittest.TestCase):
+
+    def test_a_tree_staged_under_the_runtime_directory_binds_as_a_generation(self):
+        import tempfile
+        from router import fsops as fsops_mod
+        with tempfile.TemporaryDirectory() as d:
+            hop = pathlib.Path(d) / "hop"
+            (hop / ".runtime").mkdir(parents=True)
+            ops = fsops_mod.FsOps(hop_root=hop)
+            try:
+                root = ops.open_root_nofollow(str(hop))
+                rt = ops.descend_pinned(root, ".runtime")
+                try:
+                    staged = ops.stage_tree(rt, ".adm-r")
+                except fsops_mod.FsOpsError as e:
+                    self.fail(f"stage_tree refused the runtime directory: {e}")
+                up = ops.descend_pinned(staged, "up")
+                stage = ops.open_stage_dir(staged, "up")
+                self.assertEqual(ops.commit_durable(stage, up, "identity", b"{}", 0o640),
+                                 "created")
+                self.assertEqual(ops.rename_noreplace(rt, ".adm-r", rt, "a" * 32), "moved")
+                gen = ops.descend_pinned(root, ".runtime/" + "a" * 32)
+                self.assertEqual(ops.binding(gen).kind, fsops_mod.GENERATION)
+            finally:
+                ops.close()
 
 
 if __name__ == "__main__":

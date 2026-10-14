@@ -50,7 +50,19 @@ THE ATTEMPT (one per pending notice), each step durable before the next:
 Recovery resumes at the step reached: after 2 and before 3 the id is burned
 (nothing was signed); after 3 the frozen bytes are begun under the recorded
 id; after 4 the in-flight machinery drives it. A handed marker with no
-record holds (`control_stuck`), never re-sent.
+record holds, recorded on the record as `control.stuck` (reason
+`handed_without_record`), never re-sent. An attempt with no result past the
+settle horizon (`SETTLE_HORIZON_S`) is recorded stuck too (reason
+`unsettled_past_horizon`), and is still driven, so a late result settles it;
+it is never re-signed or re-sent. Status counts both, with their age.
+
+THE GENERATION IS CLASSIFIED EVERY TIME. A recorded generation is used only
+when the lister shows it `live` (or not yet listed: minted, its tree not yet
+admitted) and shows no other generation `live` or `unreadable`. A recorded
+generation the lister shows `retired` (a crash after the capability retired
+it and before the record was removed) is never written again; an
+`unreadable` one holds. An attempt whose generation is now `retired` is not
+handed over.
 
 RATE AND SUPPRESSION. Per destination runtime, a token bucket (default 60 per
 hour) in `_runtime/rate-buckets.json`, refilled on H (the store's clock,
@@ -58,7 +70,9 @@ raised only), never on raw wall time. A notice over the limit is deferred,
 released oldest first by `take_seq`, and suppressed (`rate_limited`) once
 deferred for 24 h of H. A destination no longer configured for the key's
 owner is suppressed (`unconfigured_runtime`), never redirected. While H is
-untrusted nothing is attempted and no bucket refills. `sent` means handed and
+untrusted (the clock unreadable, or peer admission closed) nothing is
+attempted, nothing is minted and no bucket refills. A notice deferred past
+the 24 h horizon is suppressed BEFORE any token is taken. `sent` means handed and
 settled by the hop, never delivered.
 """
 
@@ -76,7 +90,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from . import config as config_mod
 from . import peerbind, peerclock, peerjournal
-from .util import atomic_write, format_utc_ts, parse_utc_ts
+from .util import atomic_write, format_utc_ts, fsync_dir, parse_utc_ts
 
 logger = logging.getLogger("amap_router_local.peercontrol")
 
@@ -97,6 +111,19 @@ SUPPRESS_RATE = "rate_limited"
 SUPPRESS_COALESCED = "coalesced"
 UNAVAILABLE = "runtime_tree_unavailable"
 STUCK_HANDED = "handed_without_record"
+STUCK_UNSETTLED = "unsettled_past_horizon"
+#: A pending notice with no `about` or no `to` cannot be addressed: HELD,
+#: visibly, under this reason, never labelled `unconfigured_runtime`.
+HELD_NO_DESTINATION = "destination_unknown"
+DELEGATION_INACTIVE = "delegation_inactive"
+#: The settle horizon: an attempt with no result this long after it was
+#: signed is recorded stuck. Reporting only, the in-flight records' own
+#: staleness bound (`inflight.STALE_AFTER_S`): nothing is settled on age.
+SETTLE_HORIZON_S = 3600
+#: The settled outcomes that mean the hop took the notice; every other
+#: settled outcome (`rejected`, `halted`, `delivery_unknown`, anything
+#: unknown) is counted as a failure, never as sent.
+SENT_OUTCOMES = frozenset({"accepted", "queued_for_human"})
 #: The runtime tree's identity marker logical_id (contract W6); its settings
 #: spelling is HOP-RUNTIME-IDENTITY's to fix.
 RUNTIME_AGENT_ID = "runtime"
@@ -217,14 +244,25 @@ def generation(cfg: Any, cap: Optional[Capability], *, now: datetime) -> str:
     if cap is None:
         raise Unavailable(UNAVAILABLE, "the plugin declares no runtime capability")
     try:
-        return config_mod.runtime_generation(cfg)
+        recorded: Optional[str] = config_mod.runtime_generation(cfg)
     except config_mod.StateKeyUnresolved:
-        pass
+        recorded = None
     listed = cap.generations()
-    blocking = [(g, s) for g, s in listed if s in ("live", "unreadable")]
-    if blocking:
-        raise Unavailable(UNAVAILABLE, f"no recorded generation beside {blocking}: adopt or "
-                                       "retire one (router runtime-generation)")
+    states = dict(listed)
+    others = [(g, s) for g, s in listed if s in ("live", "unreadable") and g != recorded]
+    if recorded is not None:
+        state = states.get(recorded)
+        if state == "unreadable":
+            raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} is unreadable")
+        if state in ("live", None):
+            if others:
+                raise Unavailable(UNAVAILABLE, f"the recorded generation {recorded} beside "
+                                               f"{others}: retire one (router runtime-generation)")
+            return recorded
+        # Retired: never written again, whatever the record says.
+    if others:
+        raise Unavailable(UNAVAILABLE, f"no usable recorded generation beside {others}: adopt "
+                                       "or retire one (router runtime-generation)")
     gen = secrets.token_hex(16)
     record_generation(cfg, gen, now=now)
     return gen
@@ -281,9 +319,14 @@ def operator_retire(cfg: Any, cap: Optional[Capability], gen: str, *, now: datet
         recorded = None
     if recorded == gen and unsettled_attempts(cfg):
         raise ValueError(f"{gen} has unsettled control notices; they would settle unsent")
+    listed = dict(cap.generations())
+    if gen not in listed:
+        # Never construct a sender for a generation the lister does not show.
+        raise ValueError(f"{gen} is not a listed runtime generation: {sorted(listed.items())}")
     result = cap.retire(gen, format_utc_ts(now))
     if recorded == gen:
         os.unlink(runtime_dir(cfg) / config_mod.RUNTIME_GENERATION_FILE)
+        fsync_dir(runtime_dir(cfg))
     return {"result": f"retired {gen}: {result}"}
 
 
@@ -386,6 +429,13 @@ def send_pending(cfg: Any, runtime: Any, *, delegation: Any, now: datetime) -> D
         clock = peerclock.read(state_dir)
     except peerclock.ClockUntrusted:
         return {"held_clock_untrusted": len(pending(state_dir))}
+    if clock.admission != "open":
+        # H is untrusted until admission reopens: no token, no mint, no attempt.
+        return {"held_admission_closed": len(pending(state_dir))}
+    if delegation is None:
+        # No signing key: nothing can be signed, so nothing is tried.
+        n = len(pending(state_dir))
+        return {DELEGATION_INACTIVE: n} if n else {}
     cap = capability(cfg, runtime)
     for record in pending(state_dir):
         try:
@@ -404,10 +454,14 @@ def _one(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, delegat
     control = record["control"]
     if control.get("attempt"):
         return _resume(cfg, cap, record, delegation=delegation, now=now)
+    if control.get("about") is None or control.get("to") is None:
+        if control.get("held") != HELD_NO_DESTINATION:
+            _update(sd, record, held=HELD_NO_DESTINATION)
+        return "held_" + HELD_NO_DESTINATION
     key_id = peerjournal._snapshot_key_id(sd, record)
     dc = getattr(delegation, "config", None) or getattr(cfg, "delegation", None)
     owner = peerbind.runtime_for_key(dc, key_id) if (dc is not None and key_id) else None
-    if owner is None or control.get("to") is None or owner.runtime != control["to"]:
+    if owner is None or owner.runtime != control["to"]:
         _update(sd, record, suppressed=SUPPRESS_UNCONFIGURED)
         return "suppressed_" + SUPPRESS_UNCONFIGURED
     if cap is None:
@@ -417,11 +471,13 @@ def _one(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, delegat
     if sender_key != record["key"]:
         _update(sd, record, coalesced_with=sender_key)
         return "suppressed_" + SUPPRESS_COALESCED
+    since = parse_utc_ts(control.get("deferred_since"))
+    if since is not None and (h - since).total_seconds() >= DEFER_LIMIT_S:
+        # The horizon first: a refilled bucket never revives a notice
+        # deferred for 24 h of H, and the suppression takes no token.
+        _update(sd, record, suppressed=SUPPRESS_RATE)
+        return "suppressed_" + SUPPRESS_RATE
     if not take_token(cfg, control["to"], h):
-        since = parse_utc_ts(control.get("deferred_since")) or h
-        if (h - since).total_seconds() >= DEFER_LIMIT_S:
-            _update(sd, record, suppressed=SUPPRESS_RATE)
-            return "suppressed_" + SUPPRESS_RATE
         if "deferred_since" not in control:
             _update(sd, record, deferred_since=format_utc_ts(h))
         return "deferred"
@@ -461,7 +517,10 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
     if existing is None:
         handed = inflight.handed_path(cfg, ns, rid)
         if inflight._was_handed(handed, attempt["n"]):
+            if not record["control"].get("stuck"):
+                _update(sd, record, stuck={"reason": STUCK_HANDED, "since": format_utc_ts(now)})
             return "stuck_" + STUCK_HANDED
+        _require_writable(cap, attempt["gen"])
         existing = inflight.begin_reserved(
             cfg, ns, rid, attempt["n"], digest=None,
             request_doc=request_doc(cfg, record, attempt), recipients=[record["control"]["to"]],
@@ -469,13 +528,32 @@ def _resume(cfg: Any, cap: Optional[Capability], record: Dict[str, Any], *, dele
     port = cap.sender(attempt["gen"])
 
     def settle(verdict: Dict[str, Any], _digest: Optional[str]) -> str:
-        _update(sd, record, sent=True, settled={"outcome": verdict.get("outcome"),
-                                                 "at": format_utc_ts(clock_mod.now())})
+        _update(sd, record, sent=True, stuck=None,
+                settled={"outcome": verdict.get("outcome"), "at": format_utc_ts(clock_mod.now())})
         return verdict.get("outcome") or ""
 
+    if not inflight._was_handed(inflight.handed_path(cfg, ns, rid), attempt["n"]):
+        _require_writable(cap, attempt["gen"])
     state = inflight.advance(cfg, ns, rid, existing, port, settle=settle,
                              already_settled=bool(record["control"].get("settled")))
+    if state not in (inflight.SETTLED, inflight.CLEANED):
+        current = peerjournal.read_record(sd, record["owner"], record["key"])
+        signed = parse_utc_ts(attempt.get("ts"))
+        if (signed is not None and (now - signed).total_seconds() >= SETTLE_HORIZON_S
+                and not current["control"].get("sent")):
+            if not current["control"].get("stuck"):
+                _update(sd, current, stuck={"reason": STUCK_UNSETTLED,
+                                            "since": format_utc_ts(now)})
+            return "stuck_" + STUCK_UNSETTLED
     return f"attempt_{state}"
+
+
+def _require_writable(cap: Capability, gen: str) -> None:
+    """Nothing is handed over into a generation the lister shows retired or
+    unreadable: the record alone is never trusted."""
+    state = dict(cap.generations()).get(gen)
+    if state in ("retired", "unreadable"):
+        raise Unavailable(UNAVAILABLE, f"the attempt's generation {gen} is {state}")
 
 
 def request_doc(cfg: Any, record: Mapping[str, Any], attempt: Mapping[str, Any]) -> Dict[str, Any]:
@@ -496,22 +574,44 @@ def pin(cfg: Any, attempt: Mapping[str, Any]) -> Dict[str, Any]:
             "statement_header": attempt["header"], "in_reply_to": None, "references": []}
 
 
-def status_doc(cfg: Any, runtime: Any) -> Dict[str, Any]:
-    """Status `peer_store.controls`: pending, sent, suppressed by reason,
-    deferred, stuck, and the runtime tree's availability."""
+def status_doc(cfg: Any, runtime: Any, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Status `peer_store.controls`: pending, sent (settled with an outcome
+    in `SENT_OUTCOMES`), failed (any other settled outcome, by outcome),
+    suppressed by reason, held by reason, deferred, stuck (by reason, each with its age),
+    and the runtime tree: `unavailable` without the capability; otherwise
+    the recorded generation and, read through the read-only lister, every
+    listed generation with its state, so a lost record shows what an
+    operator must adopt or retire. Reads only."""
     sd = Path(cfg.state_dir)
-    doc: Dict[str, Any] = {"pending": 0, "sent": 0, "suppressed": {}, "deferred": 0,
-                           "attempting": 0}
+    doc: Dict[str, Any] = {"pending": 0, "sent": 0, "failed": {}, "suppressed": {},
+                           "deferred": 0, "attempting": 0, "held": {}, "stuck": 0,
+                           "stuck_records": []}
     for rec in peerjournal.all_records(sd):
         c = rec.get("control")
         if not c:
             continue
         if c.get("sent"):
-            doc["sent"] += 1
+            outcome = (c.get("settled") or {}).get("outcome")
+            if outcome in SENT_OUTCOMES:
+                doc["sent"] += 1
+            else:
+                key = outcome if isinstance(outcome, str) else "unknown"
+                doc["failed"][key] = doc["failed"].get(key, 0) + 1
         elif c.get("suppressed"):
             doc["suppressed"][c["suppressed"]] = doc["suppressed"].get(c["suppressed"], 0) + 1
         elif c.get("coalesced_with"):
             doc["suppressed"][SUPPRESS_COALESCED] = doc["suppressed"].get(SUPPRESS_COALESCED, 0) + 1
+        elif c.get("held"):
+            doc["held"][c["held"]] = doc["held"].get(c["held"], 0) + 1
+        elif c.get("stuck"):
+            doc["stuck"] += 1
+            attempt = c.get("attempt") or {}
+            since = parse_utc_ts(attempt.get("ts") or attempt.get("at"))
+            doc["stuck_records"].append({
+                "key": rec["key"], "reason": c["stuck"].get("reason"),
+                "since": c["stuck"].get("since"),
+                "age_s": (int((now - since).total_seconds())
+                          if now is not None and since is not None else None)})
         else:
             doc["pending"] += 1
             if c.get("deferred_since"):
@@ -521,9 +621,16 @@ def status_doc(cfg: Any, runtime: Any) -> Dict[str, Any]:
     cap = capability(cfg, runtime)
     if cap is None:
         doc["runtime_tree"] = "unavailable"
-    else:
-        try:
-            doc["runtime_tree"] = {"generation": config_mod.runtime_generation(cfg)}
-        except config_mod.StateKeyUnresolved:
-            doc["runtime_tree"] = {"generation": None}
+        return doc
+    try:
+        recorded: Optional[str] = config_mod.runtime_generation(cfg)
+    except config_mod.StateKeyUnresolved:
+        recorded = None
+    tree: Dict[str, Any] = {"generation": recorded}
+    try:
+        tree["generations"] = [[g, s] for g, s in cap.generations()]
+    except Exception as e:  # noqa: BLE001 -- status never fails on the lister
+        tree["generations"] = None
+        tree["lister_error"] = f"{type(e).__name__}: {e}"
+    doc["runtime_tree"] = tree
     return doc

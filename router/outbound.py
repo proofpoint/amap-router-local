@@ -1587,6 +1587,18 @@ def _drain_peer_result(
                    f"router made to {name!r}")
         return _finish(cfg, name, req_id, result, req_digest=req_digest)
     remote = got.record["remote"]
+    # The remote must still be a trusted fleet host BEFORE anything is
+    # signed: a host de-trusted since the task was placed gets no result.
+    try:
+        klass, _addr = classify_mod.address_class(cfg, remote)
+    except classify_mod.Malformed:
+        klass = None
+    if klass != classify_mod.CLASS_TRUSTED:
+        result = _result_doc(
+            req_id, "rejected", reason_code=classify_mod.REASON_NO_ROUTE, recipients=[],
+            detail=f"in_reply_to {in_reply_to!r}: {remote!r} is no longer a trusted fleet host "
+                   f"({klass})")
+        return _finish(cfg, name, req_id, result, req_digest=req_digest)
     draft = {k: v for k, v in (doc.get("draft") or {}).items() if k not in ("to", "cc", "bcc")}
     draft["to"] = [remote]
     classified = classify_mod._trusted(cfg, name, draft, [classify_mod.parse_address(remote)],

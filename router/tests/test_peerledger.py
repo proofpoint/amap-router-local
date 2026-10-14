@@ -602,6 +602,18 @@ class ResultSubmitTests(ClockMixin, tpl._Send):
         r = self.send_reply("task-1", cfg=denied)
         self.assertEqual((r["outcome"], r["reason_code"]), ("rejected", "peer_denied"))
 
+    def test_a_remote_no_longer_trusted_gets_nothing_signed_and_no_issued_record(self):
+        self.placed_for_alice("task-1")
+        untrusted = dataclasses.replace(self.cfg_, trusted_fleet_hosts=())
+        with mock.patch.object(peerlane, "sign_statement",
+                               wraps=peerlane.sign_statement) as sign, \
+                mock.patch.object(peerlane, "write_issued", wraps=peerlane.write_issued) as issue:
+            r = self.send_reply("task-1", cfg=untrusted) or {}
+        self.assertEqual(sign.call_count, 0, "nothing was signed")
+        self.assertEqual(issue.call_count, 0, "no issued record")
+        self.assertEqual(self.port.writes, [])
+        self.assertEqual((r.get("outcome"), r.get("reason_code")), ("rejected", "no_route"))
+
 
 class ResultRecheckTests(ClockMixin, tpl._Send):
     """A result is re-resolved before hand-over."""

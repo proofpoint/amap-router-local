@@ -350,6 +350,14 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
                 peer_doc["inbound"] = bool(cfg.delegation.inbound)
                 if LAST_PEER_POLL:
                     peer_doc["last_poll"] = dict(LAST_PEER_POLL)
+                # Control notices out, and the runtime tree as the loaded
+                # plugin's capability shows it (`unavailable` without one).
+                try:
+                    from . import peercontrol
+                    peer_doc["controls"] = peercontrol.status_doc(
+                        cfg, None if transport is _LOAD else transport, now=clock.now())
+                except Exception:
+                    logger.exception("error reading the control notices for status — isolated")
                 tracker.record_peer_store(peer_doc)
             except Exception:
                 logger.exception("error reading the peer store for status — isolated")
