@@ -117,6 +117,108 @@ for name, spec in sorted(instances.items()):
     # read-only here would break delivery entirely.
     want(root, "rw", f"instance {name}")
 
+# THE HOP PATHS, only when the config has a `hop` section. A router with a
+# transport plugin reads four things outside every path above: the hop tree
+# the plugin writes (`hop.root`), the host registry (`registry_dir`), the
+# delivered-domain artifact (`delivered_domains_file`) and the plugin file
+# itself (`transport_plugin.path`). Without their mounts a run.sh-started
+# router cannot see any of them: the plugin is refused at startup, the
+# registry is absent so every instance is held, and the hop tree is empty.
+#
+# IDENTITY MOUNTS, like every mount here, and checked harder than the rest,
+# because the loader uses these strings VERBATIM (`hop.root` is handed to the
+# plugin as written; the plugin path must be its own realpath):
+#   - absolute and already in normal form, never expanded or normalised here:
+#     a spelling this script repaired would mount one path and leave the
+#     router naming another;
+#   - its own realpath: a symlinked component would bind wherever it points
+#     on the host while the router names the link inside the container;
+#   - existing, as everywhere above (docker would otherwise create it, as
+#     root);
+#   - never a container system path: an identity mount over a path the image
+#     uses replaces it (a plugin in /usr/local/lib would shadow the
+#     interpreter's own library);
+#   - hop.root (rw, the tree the downstream runtime shares) nested with NO
+#     other mount, and each read-only path nested with no read-write one: a
+#     read-only path inside a writable mount, or containing one, would no
+#     longer be what its mode says.
+# The two FILES are mounted by their directory, for the reason the verdict
+# above is: a file bind binds the inode it found, and a rename replaces it.
+#
+# Gated on the `hop` section, not on each key: without `hop` the list is
+# exactly what it was, whatever else the config carries.
+hop = doc.get("hop")
+if hop is not None:
+    # Parents of everything the image itself runs: never mounted over, nor
+    # under (the interpreter, its library, the router's code, the kernel's
+    # filesystems).
+    IMAGE_TREES = ("/app", "/bin", "/dev", "/lib", "/lib32", "/lib64", "/libx32", "/proc",
+                   "/sbin", "/sys", "/usr")
+    # Directories the image populates: never mounted over as a whole.
+    IMAGE_DIRS = ("/", "/boot", "/etc", "/home", "/media", "/mnt", "/opt", "/root", "/run",
+                  "/srv", "/tmp", "/var")
+
+    def within(a, b):
+        """Whether `a` is `b` or inside it, by whole components."""
+        return a == b or a.startswith(b.rstrip("/") + "/")
+
+    def hop_path(value, what):
+        if not isinstance(value, str) or not os.path.isabs(value):
+            sys.exit(f"hop mounts: {what} must be an absolute path, got {value!r}")
+        if os.path.normpath(value) != value:
+            sys.exit(f"hop mounts: {what} ({value}) is not in normal form (a trailing '/', "
+                     "'//', '.' or '..'): the router uses it exactly as written")
+        if os.path.realpath(value) != value:
+            sys.exit(f"hop mounts: {what} ({value}) is not its own realpath (a symlinked "
+                     "component): it would mount wherever the link points")
+        if value in IMAGE_DIRS or any(within(value, t) for t in IMAGE_TREES):
+            sys.exit(f"hop mounts: {what} ({value}) is a container system path: an identity "
+                     "mount there would replace what the image needs")
+        return value
+
+    def hop_file(value, what):
+        """A file mounted by its directory: the file must be a regular file,
+        never a symlink; its directory goes through `hop_path`."""
+        if not isinstance(value, str) or not os.path.isabs(value):
+            sys.exit(f"hop mounts: {what} must be an absolute path, got {value!r}")
+        if os.path.islink(value):
+            sys.exit(f"hop mounts: {what} ({value}) is a symlink")
+        if not os.path.isfile(value):
+            missing.append(f"{what}: {value}")
+        return hop_path(os.path.dirname(value), f"{what}'s directory")
+
+    if not isinstance(hop, dict):
+        sys.exit("hop mounts: 'hop' is not an object")
+    plugin = doc.get("transport_plugin")
+    if not isinstance(plugin, dict) or "path" not in plugin:
+        sys.exit("hop mounts: 'hop' needs 'transport_plugin' with a 'path'")
+    if not doc.get("registry_dir"):
+        sys.exit("hop mounts: 'hop' needs 'registry_dir'")
+    new = [(hop_path(hop.get("root"), "hop.root"), "rw", "hop.root"),
+           (hop_path(doc["registry_dir"], "registry_dir"), "ro", "registry_dir"),
+           (hop_file(plugin["path"], "transport_plugin.path"), "ro",
+            "transport_plugin.path's directory")]
+    if doc.get("delivered_domains_file") is not None:
+        new.append((hop_file(doc["delivered_domains_file"], "delivered_domains_file"), "ro",
+                    "delivered_domains_file's directory"))
+
+    # Every mount above, RESOLVED. Comparing them as written as well would
+    # add nothing: each new path is its own realpath, so it can sit inside a
+    # spelling only if that spelling resolves to itself.
+    others = [(os.path.realpath(p), mode, "an existing mount") for p, mode in roots]
+    for i, (p, mode, what) in enumerate(new):
+        rivals = others + [n for j, n in enumerate(new) if j != i]
+        for q, qmode, qwhat in rivals:
+            if not (within(p, q) or within(q, p)):
+                continue
+            if mode == "rw" or qmode == "rw":
+                why = ("hop.root is nested with no other mount" if "hop.root" in (what, qwhat)
+                       else "a read-only path is nested with no read-write one")
+                sys.exit(f"hop mounts: {what} ({p}) overlaps {qwhat} ({q}, {qmode}): {why}")
+        if not os.path.isdir(p):
+            missing.append(f"{what}: {p}")
+        roots.append((p, mode))
+
 if missing:
     sys.exit("these paths in the config do not exist:\n  " + "\n  ".join(missing)
              + "\n\nSandy creates a handoff pair AT LAUNCH. Do not mkdir it by hand:"

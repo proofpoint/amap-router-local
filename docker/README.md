@@ -51,6 +51,31 @@ disagree without anyone noticing.
 | each instance's `handoff_dir` (or `namespace`) | `rw` | the router writes the inbound side (notices, bodies) and writes results back on the outbound side |
 | `state_dir` | `rw` | router-private: approval markers, reply ledger, quarantine |
 | the config file | `ro` | parsed, never written |
+| `hop.root` (only with a `hop` section) | `rw` | the hop tree the transport plugin writes and the downstream runtime reads |
+| `registry_dir` (only with a `hop` section) | `ro` | the host registry; without it every instance is held |
+| the directory of `delivered_domains_file` (only with a `hop` section) | `ro` | the delivered-domain artifact, by its directory: it is replaced by rename |
+| the directory of `transport_plugin.path` (only with a `hop` section) | `ro` | the pinned plugin, by its directory, for the same reason |
+
+**The hop paths are checked harder than the rest**, because the router uses
+them exactly as written: each must be absolute, in normal form and its own
+realpath (no symlinked component, and neither file a symlink); none may be a
+container system path (`/`, `/etc`, `/var` and the like as a whole, or
+anything under `/usr`, `/lib*`, `/bin`, `/sbin`, `/app`, `/proc`, `/sys` or
+`/dev`, where an identity mount would replace what the image runs);
+`hop.root` may be nested with no other mount; and a read-only path may be
+nested with no read-write one. Each refusal names the path. Without a `hop`
+section the list is exactly what it was, whatever else the config carries.
+
+**On a hop host, two things about the container's user matter** beyond the
+mounts. The plugin checks its own side's ownership against the process's
+uid and the downstream side's against `hop.peer_uid`, both as `stat()` sees
+them inside the container: so `run.sh` must be run by the account that owns
+this router's existing trees under `hop.root`, and `hop.peer_uid` is correct
+only with no user-namespace remapping. A mismatch fails closed. And the
+plugin's loader requires every directory above the plugin file to be owned
+by root and not group- or world-writable: the identity-mounted directory
+itself on the host, and the parents docker creates for it inside the
+container (root, 0755).
 
 A hand-written mount list has one failure mode worth designing against: omit
 one instance and the router **does not fail**. It starts, reports healthy, and
