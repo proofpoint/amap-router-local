@@ -1552,7 +1552,25 @@ def _rebase_after_loss(state_dir: Path, meta: Mapping[str, Any]) -> None:
         if seq not in carried and seq not in vacant:
             _mark_vacant(state_dir, seq)
     token = meta["replay"]["token"]
+    # The witnesses are part of what was found lost: each surviving journal
+    # root's and the replay store's is restored to the bookkeeping token
+    # (durably), so the same loss is not found again at the next start.
+    for child in sorted(state_dir.iterdir()):
+        if (child / JOURNAL_DIR).is_dir():
+            _restore_witness(state_dir, child / JOURNAL_DIR / WITNESS, token)
+    replay = state_dir / REPLAY_DIR
+    replay.mkdir(exist_ok=True, mode=0o700)
+    _restore_witness(state_dir, replay / WITNESS, token)
     _write_meta(state_dir, _recount(state_dir, token, meta))
+
+
+def _restore_witness(state_dir: Path, path: Path, token: str) -> None:
+    try:
+        if path.read_text(encoding="ascii") == token:
+            return
+    except (OSError, UnicodeDecodeError):
+        pass
+    atomic_write(path, token.encode("ascii"), durable_root=Path(state_dir))
 
 
 def apply_window(state_dir: Path, now: datetime, dc: Any) -> Optional["peerclock.Clock"]:

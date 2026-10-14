@@ -1341,6 +1341,34 @@ class StoreRecoveryTests(_Eval):
         self.assertEqual((r2["why"], r2["problems"]), (None, []))
         self.assertEqual(peerclock.read(self.state_dir).floor, f1, "the floor does not ratchet")
 
+    def witness_lost_once(self, path, how):
+        self.evaluate(self.take(self.raw()))
+        if how == "missing":
+            path.unlink()
+        else:
+            path.write_text("0" * 64)
+        r1 = peerjournal.startup(self.state_dir, NOW + timedelta(hours=1))
+        f1 = peerclock.read(self.state_dir).floor
+        self.assertEqual(r1["why"], "store_loss")
+        for hours in (5, 9):            # every later restart, wall time advancing
+            r = peerjournal.startup(self.state_dir, NOW + timedelta(hours=hours))
+            self.assertEqual((r["why"], r["problems"]), (None, []))
+            self.assertEqual(peerclock.read(self.state_dir).floor, f1, "the floor does not ratchet")
+        token = peerclock.read(self.state_dir).store_token
+        self.assertEqual(path.read_text(), token, "the witness is restored")
+
+    def test_a_missing_journal_witness_is_accounted_for_once(self):
+        self.witness_lost_once(self.state_dir / OWNER / "peer-candidates" / ".witness", "missing")
+
+    def test_a_mismatched_journal_witness_is_accounted_for_once(self):
+        self.witness_lost_once(self.state_dir / OWNER / "peer-candidates" / ".witness", "wrong")
+
+    def test_a_missing_replay_witness_is_accounted_for_once(self):
+        self.witness_lost_once(self.state_dir / "peer-replay" / ".witness", "missing")
+
+    def test_a_mismatched_replay_witness_is_accounted_for_once(self):
+        self.witness_lost_once(self.state_dir / "peer-replay" / ".witness", "wrong")
+
     def test_a_lost_record_is_accounted_for_once(self):
         self.evaluate(self.take(self.raw()))
         k2 = self.take(self.raw(id="qB2c3D4e5F6g7H8i9J0kLmx", subject="two"))

@@ -441,6 +441,12 @@ M = [
  ("S5 the supersession control carries no statement id",
   [("router/peerjournal.py", "        about = _about(ctx.state_dir, record)\n", "        about = None\n")],
   ["router.tests.test_peerevaluate.SupersedeTests.test_the_generation_fence_supersedes_a_decided_record"]),
+ ("J27 the rebase restores no journal witness",
+  [("router/peerjournal.py", "            _restore_witness(state_dir, child / JOURNAL_DIR / WITNESS, token)\n", "            pass\n")],
+  ["router.tests.test_peerevaluate.StoreRecoveryTests.test_a_missing_journal_witness_is_accounted_for_once", "router.tests.test_peerevaluate.StoreRecoveryTests.test_a_mismatched_journal_witness_is_accounted_for_once"]),
+ ("J28 the rebase restores no replay witness",
+  [("router/peerjournal.py", "    _restore_witness(state_dir, replay / WITNESS, token)\n    _write_meta(state_dir, _recount(state_dir, token, meta))\n", "    _write_meta(state_dir, _recount(state_dir, token, meta))\n")],
+  ["router.tests.test_peerevaluate.StoreRecoveryTests.test_a_missing_replay_witness_is_accounted_for_once", "router.tests.test_peerevaluate.StoreRecoveryTests.test_a_mismatched_replay_witness_is_accounted_for_once"]),
 ]
 
 
