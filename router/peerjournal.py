@@ -385,6 +385,27 @@ def read_record(state_dir: Path, owner: str, key: str) -> Dict[str, Any]:
     return json.loads((record_dir(state_dir, owner, key) / RECORD).read_text(encoding="utf-8"))
 
 
+def all_records(state_dir: Path) -> List[Dict[str, Any]]:
+    """Every journal record, of every owner (read only; a record that cannot
+    be read is skipped: reconcile reports it)."""
+    state_dir = Path(state_dir)
+    try:
+        meta = read_meta(state_dir)
+    except (OSError, ValueError, StoreAbsent):
+        return []
+    out = []
+    for owner in sorted(meta["roots"]):
+        root = journal_root(state_dir, owner)
+        for d in sorted(root.iterdir()) if root.is_dir() else ():
+            if not (d.is_dir() and _KEY_RE.fullmatch(d.name) and (d / RECORD).is_file()):
+                continue
+            try:
+                out.append(json.loads((d / RECORD).read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+    return out
+
+
 def write_record(state_dir: Path, record: Dict[str, Any]) -> Dict[str, Any]:
     """Replace a record with `record`, its revision raised by one, under the
     intent discipline. Returns the record as written."""

@@ -30,7 +30,10 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual(dict(transport.OPTIONAL_FACTORIES),
                          {"make_intake_remover": ((3, 1), "HopFsOps"),
                           "make_peer_codec": ((3, 3), None),
-                          "make_peer_errors": ((3, 3), transport.NO_ARGUMENTS)})
+                          "make_peer_errors": ((3, 3), transport.NO_ARGUMENTS),
+                          # Provisional until the runtime identity unit freezes.
+                          "make_runtime_sender": ((3, 5), "HopFsOps"),
+                          "make_runtime_lister": ((3, 5), "HopFsOps")})
         for name, (since, _port) in transport.OPTIONAL_FACTORIES.items():
             self.assertGreater(since[1], transport.REQUIRED_MINOR, name)
         self.assertEqual(transport.REQUIRED_FACTORIES,

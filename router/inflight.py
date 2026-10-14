@@ -920,7 +920,10 @@ def transport_request_bytes(cfg: RouterConfig, name: str, record: Dict[str, Any]
         raise HandoverUnavailable("the record has no pinned from_address")
     doc = json.loads(json.dumps(record["request"]))
     doc["req_id"] = record["transport_req_id"]
-    doc["agent_id"] = config_mod.state_key(cfg, name)
+    # The runtime tree's request is the router's own: its agent id is the
+    # runtime identity marker's logical_id, never an instance's state key.
+    doc["agent_id"] = ("runtime" if name == config_mod.RUNTIME_NS
+                       else config_mod.state_key(cfg, name))
     doc.pop("in_reply_to", None)
     doc.get("draft", {}).pop("reply_to_message_id", None)
     frontier = settled_through(cfg, name)

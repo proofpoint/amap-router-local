@@ -44,6 +44,11 @@
                                  record an operator bound B after a lost clock: refused below any
                                  receiver time the router can see; floor = B + Fmax + 1 s, then
                                  admission opens. The evidence is recorded, NOT verified.
+  runtime-generation adopt GEN --evidence TEXT | retire GEN --evidence TEXT | new --evidence TEXT
+                                 the router's own runtime control tree (router/peercontrol.py),
+                                 through the plugin's runtime capability; refused
+                                 (runtime_tree_unavailable) when the plugin declares none.
+                                 The router must be stopped.
   peer-decision drop KEY --evidence TEXT
                                  key loss only: a decision or reservation that no longer verifies
                                  is refused with decision_unrecoverable, or done if already placed
@@ -84,7 +89,7 @@ import logging
 import sys
 from pathlib import Path
 
-from .config import ConfigError, load
+from .config import ConfigError, StateKeyUnresolved, load
 from .generations import OperatorRefused, operator_migrate, operator_new
 from .lock import LockHeldError, acquire as acquire_lock
 from .peers import render_peers, render_peers_json
@@ -234,6 +239,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pcq.add_argument("key", help="the candidate record's 64-hex key")
     p_pcq.add_argument("--evidence", required=True)
 
+    p_rg = sub.add_parser("runtime-generation",
+                          help="operator verbs on the router's own runtime control tree")
+    rg_sub = p_rg.add_subparsers(dest="runtime_generation_command", required=True)
+    p_rga = rg_sub.add_parser("adopt", help="re-adopt the only live runtime generation")
+    p_rga.add_argument("gen", help="the runtime generation (32 hex)")
+    p_rga.add_argument("--evidence", required=True)
+    p_rgr = rg_sub.add_parser("retire", help="retire a runtime generation")
+    p_rgr.add_argument("gen", help="the runtime generation (32 hex)")
+    p_rgr.add_argument("--evidence", required=True)
+    p_rgn = rg_sub.add_parser("new", help="retire the recorded runtime generation, mint a new one")
+    p_rgn.add_argument("--evidence", required=True)
+
     p_q = sub.add_parser("quarantine", help="read-only inspection of the ingress quarantine")
     q_sub = p_q.add_subparsers(dest="quarantine_command", required=True)
     p_ql = q_sub.add_parser("list", help="one line per item: NAME SOURCE GEN ID and its state")
@@ -288,6 +305,41 @@ def _peer_operator(cfg, args) -> int:
             out = peerjournal.operator_restore_key(cfg, now, source=args.source)
     except (peerjournal.StoreRefused, peerjournal.DropRefused, peerclock.BoundRefused,
             peerclock.ClockUntrusted, peerjournal.StoreBlocked, OSError) as e:
+        print(f"router: {verb}: refused: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lk.release()
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def _runtime_generation(cfg, args) -> int:
+    """The runtime control tree's operator verbs, under the drain lock, each
+    audited. Every operation goes through the plugin's runtime capability;
+    without one, every verb refuses `runtime_tree_unavailable`."""
+    from . import clock, peercontrol, peerjournal, service
+    verb = f"runtime-generation {args.runtime_generation_command}"
+    try:
+        lk = acquire_lock(cfg.state_dir)
+    except LockHeldError as e:
+        print(f"router: refusing to run '{verb}': {e}", file=sys.stderr)
+        return 1
+    try:
+        runtime = service.start_transport(cfg) if cfg.transport_plugin is not None else None
+        cap = peercontrol.capability(cfg, runtime)
+        now = clock.now()
+        if args.runtime_generation_command == "adopt":
+            out = peercontrol.operator_adopt(cfg, cap, args.gen, now=now, evidence=args.evidence)
+        elif args.runtime_generation_command == "retire":
+            out = peercontrol.operator_retire(cfg, cap, args.gen, now=now, evidence=args.evidence)
+        else:
+            out = peercontrol.operator_new(cfg, cap, now=now, evidence=args.evidence)
+        peerjournal._audit(cfg.state_dir, verb, now, evidence=args.evidence,
+                           result=out["result"])
+    except peercontrol.Unavailable as e:
+        print(f"router: {verb}: refused: {e.reason}: {e.detail}", file=sys.stderr)
+        return 1
+    except (ValueError, OSError, StateKeyUnresolved) as e:
         print(f"router: {verb}: refused: {e}", file=sys.stderr)
         return 1
     finally:
@@ -720,6 +772,8 @@ def main(argv=None) -> int:
 
     if args.command in ("peer-store", "peer-bound", "peer-decision", "peer-candidate"):
         return _peer_operator(cfg, args)
+    if args.command == "runtime-generation":
+        return _runtime_generation(cfg, args)
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover — argparse prevents this
     return 2

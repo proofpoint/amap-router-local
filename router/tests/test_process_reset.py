@@ -36,11 +36,12 @@ CONSTANTS = {
     "ingress": {"TRANSITIONS", "_STATUS_DETAIL", "_V1_REQUIRED", "_V1_OPTIONAL",
                 "WAITING_REMOVE", "FAILURE_SUBJECT", "_STATUS_SUBJECT"},
     "outcomes": {"_DSN_MEANING"},
+    "peercontrol": {"CAUSES"},
     "peerjournal": {"TRANSITIONS", "_DONE_DISPOSITION", "_TOMBSTONE_DISPOSITION"},
     "provision": {"LANE_LEAVES"},
     "registry": {"_CONFUSABLES"},
     "transport": {"OPTIONAL_FACTORIES", "HOPFSOPS_OPTIONAL_METHODS", "FACTORY_PORTS",
-                  "CODEC_OPTIONAL_METHODS", "CODEC_OPTIONAL_ATTRIBUTES"},
+                  "CODEC_OPTIONAL_METHODS", "CODEC_OPTIONAL_ATTRIBUTES", "RUNTIME_CAPABILITY"},
     "validate": {"_TOP_KEYS", "_DRAFT_KEYS", "_ATTACHMENT_KEYS"},
 }
 

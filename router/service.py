@@ -289,6 +289,17 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
                 LAST_PEER_POLL.update(polled)
         except Exception:
             logger.exception("error in the signed-candidate pass — isolated")
+        # Control notices out: the pending ones, through the runtime tree,
+        # which is unavailable (and nothing is attempted) unless the plugin
+        # declares the runtime capability.
+        try:
+            from . import peercontrol
+            sent = peercontrol.send_pending(cfg, transport, delegation=peerlane.current(cfg),
+                                            now=clock.now())
+            if sent:
+                logger.info("control notices: %s", sent)
+        except Exception:
+            logger.exception("error in the control-notice pass — isolated")
     return summary
 
 
