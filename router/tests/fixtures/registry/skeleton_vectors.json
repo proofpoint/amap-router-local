@@ -1,5 +1,5 @@
 {
-  "description": "Test vectors for amap-host's name skeleton (docs/registry-model.md, Names). Any implementation of skeleton() must reproduce every vector. Copy this file verbatim; do not edit a copy.",
+  "description": "Test vectors for the host registry's name skeleton. Any implementation of skeleton() must reproduce every vector. Copy this file verbatim; do not edit a copy.",
   "fold": {
     "steps": [
       "NFC",
