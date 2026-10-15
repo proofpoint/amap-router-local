@@ -797,3 +797,154 @@ class SchemaTwoCapturedDocumentTests(_ConsoleTestCase):
         html = self.page(host_facts_path=path)
         self.assertIn("only one", html)
         self.assertIn("router-health", html)
+
+
+class SchemaThreeTests(_ConsoleTestCase):
+    """Host-facts schema 3, built from the PRODUCER'S OWN SAMPLE (its
+    `verify --host-facts` output at its schema-3 head), not from a
+    description: the same phases, ids, member names and shapes, in the same
+    order, including the two `build.hop_plugin` checks that only `host_role`
+    tells apart.
+
+    VALUES AND PROSE ARE SYNTHETIC, as in the schema-2 class: a tracked
+    fixture carries no host's digests, paths or tool names. What is under test
+    is structure: which schemas are read, that every `runtime-builds` check is
+    shown by id, and that no phase this console does not know is scored PASS.
+    """
+
+    D = "sha256:" + "a" * 64
+
+    def _doc(self, schema=3, phases=None, **extra):
+        doc = {"schema": schema, "generated_ts": _ts(0),
+               "generated_by": "amap-sandy.py verify", "exit_status": 1,
+               "exit_meaning": "failed", "phases": phases if phases is not None else self.phases()}
+        doc.update(extra)
+        return self.host_facts(doc)
+
+    def builds(self, *checks):
+        return {"id": "runtime-builds", "title": "runtime builds",
+                "deployed_roles": ["connector", "hop_router", "hub_router"],
+                "checks": list(checks)}
+
+    def sample_checks(self):
+        return [
+            {"id": "build.hop_router", "observed_image_digest": self.D,
+             "observed_commit": "1" * 40, "claim": "[1] runs its recorded image",
+             "result": "PASS", "remedy": "rebuild [1]"},
+            {"id": "build.hop_plugin", "observed_sha256": "b" * 64, "host_role": "hop_router",
+             "claim": "[1] loads the pinned plugin", "result": "PASS", "remedy": "place it"},
+            {"id": "build.hub_router", "claim": "[2] runs an image of the recorded commit",
+             "result": "UNKNOWN", "remedy": "rebuild [2]", "reason": "no revision label"},
+            {"id": "build.hop_plugin", "host_role": "hub_router",
+             "claim": "[2] loads the pinned plugin", "result": "UNKNOWN",
+             "remedy": "place it", "reason": "not mounted by identity"},
+            {"id": "build.connector", "observed_commit": "3" * 40,
+             "claim": "the connector came from its pin", "result": "PASS", "remedy": "reinstall"},
+        ]
+
+    def phases(self, builds=None):
+        return [
+            {"id": "router-container", "title": "the router's container",
+             "checks": [{"claim": "the router's container is running", "result": "PASS",
+                         "remedy": "start it"}]},
+            {"id": "router-health", "title": "the router's health",
+             "checks": [{"claim": "the router reports its health", "result": "UNKNOWN",
+                         "remedy": "start it", "reason": "synthetic"}]},
+            builds if builds is not None else self.builds(*self.sample_checks()),
+        ]
+
+    def row(self, html, phase_id):
+        """The rendered table row of `phase_id`; a missing row FAILS."""
+        m = re.search(r"<tr><td class='mono'>" + re.escape(phase_id) + r"</td>.*?</tr>",
+                      html, re.S)
+        if m is None:
+            self.fail(f"no row for phase {phase_id!r}")
+        return m.group(0)
+
+    def test_schema_two_is_still_read(self):
+        path = self._doc(schema=2, phases=self.phases()[:2], exit_meaning="ok", exit_status=0)
+        facts = console.load_host_facts(path)
+        self.assertTrue(facts["available"], facts.get("reason"))
+        html = self.page(host_facts_path=path)
+        self.assertIn("container healthy", html)
+        self.assertIn('class="pill ok">pass', self.row(html, "router-container"))
+
+    def test_schema_three_is_read_and_every_build_check_shown_by_id(self):
+        path = self._doc()
+        facts = console.load_host_facts(path)
+        self.assertTrue(facts["available"], facts.get("reason"))
+        row = self.row(self.page(host_facts_path=path), "runtime-builds")
+        for shown in ("<b>PASS</b> <span class='mono'>build.hop_router</span>",
+                      "<b>PASS</b> <span class='mono'>build.hop_plugin [hop_router]</span>",
+                      "<b>UNKNOWN</b> <span class='mono'>build.hub_router</span>",
+                      "<b>UNKNOWN</b> <span class='mono'>build.hop_plugin [hub_router]</span>",
+                      "<b>PASS</b> <span class='mono'>build.connector</span>",
+                      f"observed_image_digest: {self.D}",
+                      "deployed roles: connector, hop_router, hub_router",
+                      "no revision label"):
+            self.assertIn(shown, row)
+        self.assertIn('class="pill unk">unknown', row)
+
+    def test_an_all_pass_build_phase_is_pass(self):
+        """The control for the rows above: the phase is scored, not refused."""
+        passing = [dict(c, result="PASS") for c in self.sample_checks()]
+        row = self.row(self.page(host_facts_path=self._doc(
+            phases=self.phases(self.builds(*passing)))), "runtime-builds")
+        self.assertIn('class="pill ok">pass', row)
+
+    def test_a_failing_build_check_fails_its_phase(self):
+        checks = self.sample_checks()
+        checks[0]["result"] = "FAIL"
+        row = self.row(self.page(host_facts_path=self._doc(
+            phases=self.phases(self.builds(*checks)))), "runtime-builds")
+        self.assertIn('class="pill warn">fail', row)
+        self.assertIn("<b>FAIL</b> <span class='mono'>build.hop_router</span>", row)
+        self.assertIn("rebuild [1]", row)
+
+    def test_a_build_check_without_an_id_is_unknown_not_pass(self):
+        passing = [dict(c, result="PASS") for c in self.sample_checks()]
+        del passing[2]["id"]
+        row = self.row(self.page(host_facts_path=self._doc(
+            phases=self.phases(self.builds(*passing)))), "runtime-builds")
+        self.assertIn('class="pill unk">unknown', row)
+
+    def test_a_result_outside_the_vocabulary_is_shown_unknown(self):
+        checks = self.sample_checks()
+        checks[0]["result"] = "MAYBE"
+        row = self.row(self.page(host_facts_path=self._doc(
+            phases=self.phases(self.builds(*checks)))), "runtime-builds")
+        self.assertIn("<b>UNKNOWN (reported 'MAYBE')</b>", row)
+
+    def test_an_unknown_schema_is_refused(self):
+        for schema in (4, 1, "3", 3.0, None, True):
+            with self.subTest(schema=schema):
+                path = self._doc(schema=schema)
+                facts = console.load_host_facts(path)
+                self.assertFalse(facts["available"], schema)
+                self.assertIn("2 or 3", facts["reason"])
+                self.assertIn("unknown", self.page(host_facts_path=path).lower())
+
+    def test_an_unknown_phase_is_never_pass(self):
+        """A phase this console does not know is shown, every check of it,
+        and its verdict is never taken, however its checks read."""
+        future = {"id": "future-phase", "title": "a later phase",
+                  "checks": [{"id": "x.y", "claim": "all is well", "result": "PASS",
+                              "remedy": "r"}]}
+        html = self.page(host_facts_path=self._doc(phases=self.phases() + [future]))
+        row = self.row(html, "future-phase")
+        self.assertIn('class="pill unk">unknown', row)
+        self.assertNotIn('class="pill ok">', row)
+        self.assertIn("<b>PASS</b> <span class='mono'>x.y</span> all is well", row)
+        self.assertIn("not a phase of host-facts schema 3", row)
+        # Control: the SAME checks under a known id are scored.
+        known = dict(future, id="router-container")
+        self.assertEqual(console.host_phase_verdict(known, 3), "pass")
+
+    def test_runtime_builds_is_unknown_in_a_schema_two_document(self):
+        """Schema 2 defines no `runtime-builds`: in a schema-2 document it is a
+        phase this console does not know."""
+        passing = [dict(c, result="PASS") for c in self.sample_checks()]
+        html = self.page(host_facts_path=self._doc(
+            schema=2, phases=self.phases(self.builds(*passing))))
+        self.assertIn('class="pill unk">unknown', self.row(html, "runtime-builds"))
+        self.assertIn("not a phase of host-facts schema 2", self.row(html, "runtime-builds"))

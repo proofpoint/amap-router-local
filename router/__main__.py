@@ -144,7 +144,8 @@ def _build_parser() -> argparse.ArgumentParser:
              "carries real addresses and real message bodies)")
     p_console.add_argument(
         "--host-facts", metavar="PATH", default=None,
-        help="the adapter's `bringup.py --check` JSON document. Without it the "
+        help="the adapter's `amap-sandy.py verify --host-facts` JSON document "
+             "(schema 2 or 3; any other is refused). Without it the "
              "page reports container liveness and 'not enrolled' as UNKNOWN "
              "rather than omitting them")
 
