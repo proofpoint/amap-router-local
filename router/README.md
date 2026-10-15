@@ -1594,10 +1594,10 @@ configured; then item 5e is on.
   belongs to exactly one runtime (`domain_shared` otherwise).
 - `attachment_basis`, optional: absent, or `"closed_fleet"`, the deployment's
   basis for asserting `clean` on a signed peer task's attachments (below).
-- `inbound`, optional: absent or `false`. `true` (taking signed candidates
-  at all) is refused at load in this build: "inbound peer intake is not
-  available in this build". It is lifted only with the policy, edge and
-  reply decisions it needs.
+- `inbound`, optional: absent or `false` by default. `true` takes signed
+  candidates at all: only with it does a poll run the inbound pass (take,
+  checks, decide, place, recovery). It is opt-in per host; enable it only
+  after `router peer-store init --never-admitted` (the runbook below).
 - `windows`, optional: the receiver's window, `p` (past) and `f` (future
   skew) in seconds, within the profile's bounds (`p` in [300, 86400], `f`
   at most 900). Default `{"p": 3600, "f": 300}`.
@@ -2029,10 +2029,17 @@ accepted when `max(H - P, floor) <= ts <= now + F`, both bounds inclusive.
 H is the latest receiver time ever observed, only ever raised. A wall clock
 stepped back below H keeps the window defined: a statement outside it is
 demoted, as the profile's clock-rollback case requires, and status shows a
-`clock_behind_h` warning. ADMISSION is closed when no trustworthy bound
-exists (never initialised, a lost or untrusted clock, a declared restore):
-check 7 then holds every candidate (`admission_closed`), nothing is reserved
-or demoted, and only `peer-store init` or `peer-bound` reopens it.
+`clock_behind_h` warning. Without a trustworthy bound, nothing is admitted,
+in one of two distinct states:
+
+| state | what a poll does with candidates | status |
+|---|---|---|
+| **H lost or untrusted**: no clock file (including a store never initialised), unreadable, or its witness mismatched | **nothing is taken**: the inbound pass stops before listing any intake, and candidates stay there, untaken (no record, no hold, no disposition) | the pass reports `held: clock_untrusted` |
+| **H trusted, admission CLOSED**: a declared restore, live stores holding more than their bookkeeping | each candidate is taken, then **held** by check 7 (`admission_closed`): nothing reserved, demoted or noticed | the record's hold, `admission_closed` |
+
+Only `peer-store init` or `peer-bound` reopens either. A never-initialised
+store reads as the first row (the clock is advanced before the store is
+read), so `clock_untrusted` on a host that never ran the init means: run it.
 
 **Startup** (`peerjournal.startup`, from `run`, once, under the drain lock):
 settle an unfinished store operation, remove record directories without a
@@ -2064,6 +2071,10 @@ tombstone exists.
 **Operator runbook.** Each verb takes the drain lock (stop the router
 first), prints one JSON line, and appends to the operator audit:
 
+- **First enable of inbound intake**, in this order: stop the router; run
+  `router peer-store init --never-admitted`; set `delegation.inbound: true`;
+  start. The retention sweep stays off (`retention.sweep` is `false` by
+  default, and `true` is refused until the init has run).
 - `router peer-store init --never-admitted [--acknowledge-surviving EVIDENCE]`:
   before the first start with inbound intake. Refused over any peer
   artefact, and over placement evidence that survived a wipe (a disposal

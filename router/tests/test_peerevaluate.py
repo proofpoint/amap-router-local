@@ -977,12 +977,22 @@ class PollGateTests(_Eval):
                                           profile_factory=permissive, now=NOW), {})
 
     def test_an_untrusted_clock_takes_nothing(self):
-        from router import config as config_mod
+        """H lost (no clock file): the pass returns `held: clock_untrusted`
+        before any intake is listed, so candidates stay in their intake,
+        untaken: no record, no marker, no hold. This is NOT check 7's
+        `admission_closed` (a trusted clock with admission closed, which
+        takes and holds: PreReservationOutcomeTests)."""
         cfg = dataclasses.replace(self.cfg, delegation=dataclasses.replace(self.dc, inbound=True),
                                   hop=types.SimpleNamespace())
         (self.state_dir / peerclock.CLOCK_FILE).unlink()
-        self.assertEqual(peerjournal.poll(cfg, None, None, delegation=self.lane, profile_factory=permissive,
-                                          now=NOW), {"held": "clock_untrusted"})
+        try:
+            got = peerjournal.poll(cfg, None, None, delegation=self.lane,
+                                   profile_factory=permissive, now=NOW)
+        except peerclock.ClockUntrusted as e:
+            self.fail(f"an untrusted clock escaped the pass: {e!r}")
+        self.assertEqual(got, {"held": "clock_untrusted"})
+        self.assertEqual(peerjournal.all_records(self.state_dir), [], "nothing taken")
+        self.assertFalse(peerjournal.open_dir(self.state_dir, OWNER).exists(), "no marker")
 
 
 HID = "0123456789abcdef0123456789abcdef"

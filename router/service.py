@@ -313,9 +313,10 @@ def run_once(cfg: RouterConfig, transport: Any = _LOAD,
                 LAST_INGRESS.update(pumped)
         except Exception:
             logger.exception("error in the inbound pass — isolated")
-    # The signed-candidate pass, ONLY with `delegation.inbound` (refused at
-    # load in this build): same lock, its own log line and status, never
-    # `summary`. The production profile holds every statement at check8 and policy.
+    # The signed-candidate pass, ONLY with `delegation.inbound` (opt-in per
+    # host, off by default): same lock, its own log line and status, never
+    # `summary`. Candidates are decided by the production profile
+    # (`peerpolicy.production_hooks`): mandatory exposure and the 24 h age.
     if (cfg.delegation is not None and cfg.delegation.inbound
             and hoplink.is_runtime(transport) and report.state != "off"):
         from . import peerjournal, peerlane
