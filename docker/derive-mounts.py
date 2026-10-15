@@ -247,15 +247,25 @@ if hop is not None:
 # symlinked component is refused rather than mounted where it points (the
 # identity mount must be the path the router reads); never a container system
 # path; and read-only, so it may not sit inside a read-write mount, nor contain
-# one. What else the directory holds is the deployment's: it is a dedicated key
-# directory there, and `delegation.forbidden_roots` keeps it out of every
-# agent-reachable path at load.
+# one. And it holds EXACTLY ONE entry, the key itself, a regular file by lstat:
+# the bind exposes the whole directory, so anything else in it (a .pub, a
+# backup, a dot-file, a subdirectory) would be mounted into the container
+# with the key. The deployment checks the same rule host-side; the public key
+# lives in the config's inventory, never beside the seed.
 delegation = doc.get("delegation")
 if delegation is not None:
     if not isinstance(delegation, dict) or not isinstance(delegation.get("signing_key"), dict):
         sys.exit("key mount: 'delegation' needs 'signing_key' with a 'path'")
-    check_nesting([(hop_file(delegation["signing_key"].get("path"), "delegation.signing_key.path",
-                             "key mount"), "ro", "the signing key's directory")], "key mount")
+    key_path = delegation["signing_key"].get("path")
+    key_dir = hop_file(key_path, "delegation.signing_key.path", "key mount")
+    # Nesting first: a directory containing a read-write mount is refused for
+    # THAT, before its extra entry is ever counted.
+    check_nesting([(key_dir, "ro", "the signing key's directory")], "key mount")
+    if os.path.isdir(key_dir) and os.path.isfile(key_path):
+        extra = sorted(set(os.listdir(key_dir)) - {os.path.basename(key_path)})
+        if extra:
+            sys.exit(f"key mount: the signing key's directory ({key_dir}) must hold only the key; "
+                     f"it also holds {', '.join(repr(e) for e in extra)}")
 
 if missing:
     sys.exit("these paths in the config do not exist:\n  " + "\n  ".join(missing)

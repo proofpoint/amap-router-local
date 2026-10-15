@@ -105,6 +105,18 @@ class KeyMountTests(unittest.TestCase):
         doc = self.cfg(instances={"alice": {"handoff_dir": self.p("keys/inner")}})
         self.refused(doc, "key mount", "a read-only path is nested with no read-write one")
 
+    def test_the_key_directory_holds_only_the_key(self):
+        for extra, make in (("peer.key.pub", lambda p: p.write_text("pub")),
+                            (".hidden", lambda p: p.write_text("x")),
+                            ("backup", lambda p: p.mkdir())):
+            with self.subTest(extra=extra):
+                make(self.t / "keys" / extra)
+                self.refused(self.cfg(), "key mount", "must hold only the key", repr(extra))
+                p = self.t / "keys" / extra
+                p.rmdir() if p.is_dir() else p.unlink()
+        m, _ = self.mounts(self.cfg())
+        self.assertEqual(m.get(self.p("keys")), "ro", "the companion: the key alone mounts")
+
     def test_a_delegation_without_a_signing_key_is_refused(self):
         self.refused(self.cfg(delegation={"partition_verified": True}), "key mount",
                      "signing_key")
