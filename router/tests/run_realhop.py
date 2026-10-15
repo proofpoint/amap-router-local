@@ -508,6 +508,8 @@ def _inbound_cases():
             "hop/.disposed/{.unresolved,.control}, hop/{.unresolved,.control}":
                 "the deploy's host intakes and disposal trees (_Host), which the router never "
                 "creates",
+            "<instance outbox>/req-<n>.json (helpers.write_request), steps 1 and 5":
+                "the test plays both agents: A's task, and B's answer to the placed notice",
         }
 
         def __init__(self, plugin):

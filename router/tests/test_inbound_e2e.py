@@ -218,6 +218,14 @@ class _Hub:
     #: body, attachments): [2]'s encode_candidate arguments that are not
     #: fields (received_at, admission, admission_rule) have no place in it,
     #: and are exercised by row (b) over the real plugin.
+    #: DIRECT TEST WRITES, by name (Codex): what this module puts on disk itself rather than
+    #: through a router or plugin path.
+    DIRECT_WRITES = {
+        "hop/.disposed/{.unresolved,.control}, hop/{.unresolved,.control}":
+            "the deploy's host intakes and disposal trees (_Host), which the router never creates",
+        "<instance outbox>/req-<n>.json (helpers.write_request), steps 1 and 5":
+            "the test plays both agents: A's task, and B's answer to the placed notice",
+    }
     FABRICATED = {"Delivered-To": "the recipient's address, as the hub prefix's Delivered-To",
                   "Date": "the hub's receive time",
                   "transport Result": "accepted / allowlisted, message_id = the peer Message-ID"}
