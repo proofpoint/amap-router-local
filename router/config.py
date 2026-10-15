@@ -1939,7 +1939,8 @@ class DelegationConfig:
     #: attachments: None (absent: every one is `unscanned`, no bytes) or
     #: `ATTACHMENT_BASIS_CLOSED_FLEET`. A signature is never the basis.
     attachment_basis: Optional[str] = None
-    #: Inbound peer intake (`INBOUND_AVAILABLE`); False when absent.
+    #: Inbound peer intake: taking signed candidates at all. Opt-in per
+    #: host, False when absent; only with it does a poll run the inbound pass.
     inbound: bool = False
     #: The receiver's window: P (past) and F (future skew), in seconds.
     window_p: int = 3600
@@ -1966,10 +1967,6 @@ _DELEGATION_OPTIONAL = frozenset({"attachment_basis", "inbound", "windows", "ret
 #: no deployed config can weaken the production profile (contract §8.8).
 _OVERLAY_TOKENS = ("exposure", "sender_age", "sender_since", "age_policy", "min_age",
                    "quarantine")
-#: Inbound peer intake (taking signed candidates at all). False in this
-#: build: `delegation.inbound: true` is refused at load until the policy,
-#: edge and reply hooks exist. Tests patch it.
-INBOUND_AVAILABLE = False
 #: The peer-origin profile's window bounds: P in [300, 86400], F at most 900.
 WINDOW_P_BOUNDS, WINDOW_F_MAX = (300, 86400), 900
 #: `delegation.attachment_basis`'s one value: every trusted fleet host is
@@ -2113,8 +2110,6 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
     inbound = raw.get("inbound", False)
     if type(inbound) is not bool:
         raise ConfigError(f"{where}.inbound: absent, or true or false")
-    if inbound and not INBOUND_AVAILABLE:
-        raise ConfigError(f"{where}.inbound: inbound peer intake is not available in this build")
     window_p, window_f = 3600, 300
     if "windows" in raw:
         win = _require_object(raw["windows"], f"{where}.windows")

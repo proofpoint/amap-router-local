@@ -117,6 +117,75 @@ for name, spec in sorted(instances.items()):
     # read-only here would break delivery entirely.
     want(root, "rw", f"instance {name}")
 
+# THE PATH RULES every identity mount below shares (hop paths, the key).
+# Parents of everything the image itself runs: never mounted over, nor
+# under (the interpreter, its library, the router's code, the kernel's
+# filesystems).
+IMAGE_TREES = ("/app", "/bin", "/dev", "/lib", "/lib32", "/lib64", "/libx32", "/proc",
+               "/sbin", "/sys", "/usr")
+# Directories the image populates: never mounted over as a whole.
+IMAGE_DIRS = ("/", "/boot", "/etc", "/home", "/media", "/mnt", "/opt", "/root", "/run",
+              "/srv", "/tmp", "/var")
+
+def within(a, b):
+    """Whether `a` is `b` or inside it, by whole components."""
+    return a == b or a.startswith(b.rstrip("/") + "/")
+
+def hop_path(value, what, where="hop mounts"):
+    if not isinstance(value, str) or not os.path.isabs(value):
+        sys.exit(f"{where}: {what} must be an absolute path, got {value!r}")
+    if os.path.normpath(value) != value:
+        sys.exit(f"{where}: {what} ({value}) is not in normal form (a trailing '/', "
+                 "'//', '.' or '..'): the router uses it exactly as written")
+    if os.path.realpath(value) != value:
+        sys.exit(f"{where}: {what} ({value}) is not its own realpath (a symlinked "
+                 "component): it would mount wherever the link points")
+    if value in IMAGE_DIRS or any(within(value, t) for t in IMAGE_TREES):
+        sys.exit(f"{where}: {what} ({value}) is a container system path: an identity "
+                 "mount there would replace what the image needs")
+    return value
+
+def hop_file(value, what, where="hop mounts"):
+    """A file mounted by its directory: the file must be a regular file,
+    never a symlink; its directory goes through `hop_path`."""
+    if not isinstance(value, str) or not os.path.isabs(value):
+        sys.exit(f"{where}: {what} must be an absolute path, got {value!r}")
+    if os.path.islink(value):
+        sys.exit(f"{where}: {what} ({value}) is a symlink")
+    if not os.path.isfile(value):
+        missing.append(f"{what}: {value}")
+    return hop_path(os.path.dirname(value), f"{what}'s directory", where)
+
+
+
+def check_nesting(new, where):
+    """Each new (path, mode, what) against every mount so far, RESOLVED, and the
+    config file: hop.root nested with NO other mount, and each read-only path
+    nested with no read-write one. Then each joins the list."""
+    # Comparing them as written as well would add nothing: each new path is
+    # its own realpath, so it can sit inside a spelling only if that spelling
+    # resolves to itself.
+    others = [(os.path.realpath(p), mode, "an existing mount") for p, mode in roots]
+    # The config file too: run.sh mounts it read-only by itself, outside this
+    # list. Inside hop.root, the tree the downstream runtime's uid writes, it
+    # could be replaced on the host and would be read at the next start,
+    # plugin pin, peer uid and all; the read-only bind pins only the inode it
+    # found.
+    others.append((os.path.realpath(cfg_path), "ro", "the config file"))
+    for i, (p, mode, what) in enumerate(new):
+        rivals = others + [n for j, n in enumerate(new) if j != i]
+        for q, qmode, qwhat in rivals:
+            if not (within(p, q) or within(q, p)):
+                continue
+            if mode == "rw" or qmode == "rw":
+                why = ("hop.root is nested with no other mount" if "hop.root" in (what, qwhat)
+                       else "a read-only path is nested with no read-write one")
+                sys.exit(f"{where}: {what} ({p}) overlaps {qwhat} ({q}, {qmode}): {why}")
+        if not os.path.isdir(p):
+            missing.append(f"{what}: {p}")
+        roots.append((p, mode))
+
+
 # THE HOP PATHS, only when the config has a `hop` section. A router with a
 # transport plugin reads four things outside every path above: the hop tree
 # the plugin writes (`hop.root`), the host registry (`registry_dir`), the
@@ -149,44 +218,6 @@ for name, spec in sorted(instances.items()):
 # exactly what it was, whatever else the config carries.
 hop = doc.get("hop")
 if hop is not None:
-    # Parents of everything the image itself runs: never mounted over, nor
-    # under (the interpreter, its library, the router's code, the kernel's
-    # filesystems).
-    IMAGE_TREES = ("/app", "/bin", "/dev", "/lib", "/lib32", "/lib64", "/libx32", "/proc",
-                   "/sbin", "/sys", "/usr")
-    # Directories the image populates: never mounted over as a whole.
-    IMAGE_DIRS = ("/", "/boot", "/etc", "/home", "/media", "/mnt", "/opt", "/root", "/run",
-                  "/srv", "/tmp", "/var")
-
-    def within(a, b):
-        """Whether `a` is `b` or inside it, by whole components."""
-        return a == b or a.startswith(b.rstrip("/") + "/")
-
-    def hop_path(value, what):
-        if not isinstance(value, str) or not os.path.isabs(value):
-            sys.exit(f"hop mounts: {what} must be an absolute path, got {value!r}")
-        if os.path.normpath(value) != value:
-            sys.exit(f"hop mounts: {what} ({value}) is not in normal form (a trailing '/', "
-                     "'//', '.' or '..'): the router uses it exactly as written")
-        if os.path.realpath(value) != value:
-            sys.exit(f"hop mounts: {what} ({value}) is not its own realpath (a symlinked "
-                     "component): it would mount wherever the link points")
-        if value in IMAGE_DIRS or any(within(value, t) for t in IMAGE_TREES):
-            sys.exit(f"hop mounts: {what} ({value}) is a container system path: an identity "
-                     "mount there would replace what the image needs")
-        return value
-
-    def hop_file(value, what):
-        """A file mounted by its directory: the file must be a regular file,
-        never a symlink; its directory goes through `hop_path`."""
-        if not isinstance(value, str) or not os.path.isabs(value):
-            sys.exit(f"hop mounts: {what} must be an absolute path, got {value!r}")
-        if os.path.islink(value):
-            sys.exit(f"hop mounts: {what} ({value}) is a symlink")
-        if not os.path.isfile(value):
-            missing.append(f"{what}: {value}")
-        return hop_path(os.path.dirname(value), f"{what}'s directory")
-
     if not isinstance(hop, dict):
         sys.exit("hop mounts: 'hop' is not an object")
     plugin = doc.get("transport_plugin")
@@ -202,28 +233,29 @@ if hop is not None:
         new.append((hop_file(doc["delivered_domains_file"], "delivered_domains_file"), "ro",
                     "delivered_domains_file's directory"))
 
-    # Every mount above, RESOLVED. Comparing them as written as well would
-    # add nothing: each new path is its own realpath, so it can sit inside a
-    # spelling only if that spelling resolves to itself.
-    others = [(os.path.realpath(p), mode, "an existing mount") for p, mode in roots]
-    # The config file too: run.sh mounts it read-only by itself, outside this
-    # list. Inside hop.root, the tree the downstream runtime's uid writes, it
-    # could be replaced on the host and would be read at the next start,
-    # plugin pin, peer uid and all; the read-only bind pins only the inode it
-    # found.
-    others.append((os.path.realpath(cfg_path), "ro", "the config file"))
-    for i, (p, mode, what) in enumerate(new):
-        rivals = others + [n for j, n in enumerate(new) if j != i]
-        for q, qmode, qwhat in rivals:
-            if not (within(p, q) or within(q, p)):
-                continue
-            if mode == "rw" or qmode == "rw":
-                why = ("hop.root is nested with no other mount" if "hop.root" in (what, qwhat)
-                       else "a read-only path is nested with no read-write one")
-                sys.exit(f"hop mounts: {what} ({p}) overlaps {qwhat} ({q}, {qmode}): {why}")
-        if not os.path.isdir(p):
-            missing.append(f"{what}: {p}")
-        roots.append((p, mode))
+    check_nesting(new, "hop mounts")
+
+# THE SIGNING KEY'S DIRECTORY (KEY_DIR), READ-ONLY, whenever the config has a
+# `delegation` section: the router signs its peer tasks with the key at
+# `delegation.signing_key.path`, and without this bind a run.sh-started router
+# cannot read it. Gated on `delegation` alone, not on `hop`: the loader needs
+# the key readable whenever delegation is configured, whatever else is.
+#
+# EXACTLY THE DIRECTORY, by the same rules as the hop files above: the key FILE
+# is never a bind line (a file bind pins the inode it found, and a rotated key
+# is a rename); the path is absolute, in normal form and its own realpath, so a
+# symlinked component is refused rather than mounted where it points (the
+# identity mount must be the path the router reads); never a container system
+# path; and read-only, so it may not sit inside a read-write mount, nor contain
+# one. What else the directory holds is the deployment's: it is a dedicated key
+# directory there, and `delegation.forbidden_roots` keeps it out of every
+# agent-reachable path at load.
+delegation = doc.get("delegation")
+if delegation is not None:
+    if not isinstance(delegation, dict) or not isinstance(delegation.get("signing_key"), dict):
+        sys.exit("key mount: 'delegation' needs 'signing_key' with a 'path'")
+    check_nesting([(hop_file(delegation["signing_key"].get("path"), "delegation.signing_key.path",
+                             "key mount"), "ro", "the signing key's directory")], "key mount")
 
 if missing:
     sys.exit("these paths in the config do not exist:\n  " + "\n  ".join(missing)

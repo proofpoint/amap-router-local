@@ -429,12 +429,12 @@ class InboundConfigTests(helpers.RouterTestCase):
         self.assertEqual((d.inbound, d.window_p, d.window_f, d.retention_sweep),
                          (False, 3600, 300, False))
 
-    def test_inbound_true_is_refused_in_this_build(self):
-        self.assertFalse(self.load(inbound=False).inbound)
-        self.refused("inbound peer intake is not available in this build", inbound=True)
+    def test_inbound_true_loads_with_no_patch(self):
+        # The build interlock is gone: nothing to patch, and `true` loads.
         from router import config as config_mod
-        with mock.patch.object(config_mod, "INBOUND_AVAILABLE", True):
-            self.assertTrue(self.load(inbound=True).inbound)
+        self.assertFalse(hasattr(config_mod, "INBOUND_AVAILABLE"))
+        self.assertTrue(self.load(inbound=True).inbound)
+        self.assertFalse(self.load(inbound=False).inbound)
 
     def test_inbound_must_be_a_boolean(self):
         for bad in (1, "true", None, {}):

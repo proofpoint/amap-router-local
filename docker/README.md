@@ -55,6 +55,7 @@ disagree without anyone noticing.
 | `registry_dir` (only with a `hop` section) | `ro` | the host registry; without it every instance is held |
 | the directory of `delivered_domains_file` (only with a `hop` section) | `ro` | the delivered-domain artifact, by its directory: it is replaced by rename |
 | the directory of `transport_plugin.path` (only with a `hop` section) | `ro` | the pinned plugin, by its directory, for the same reason |
+| the directory of `delegation.signing_key.path` (only with a `delegation` section, with or without `hop`) | `ro` | the peer signing key, by its directory and never as the file (a rotated key is a rename); the same path rules as the hop paths, and never nested with a read-write mount |
 
 **The hop paths are checked harder than the rest**, because the router uses
 them exactly as written: each must be absolute, in normal form and its own
