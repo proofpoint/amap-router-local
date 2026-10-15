@@ -469,17 +469,16 @@ def _inflight(cfg, args) -> int:
         return 1
     known = None
     if cfg.registry_dir is not None:
-        report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
-                                         persist=False)
-        known = dict(report.known or {})
+        known = dict(registry_mod.report_for(
+            cfg.registry_dir, cfg.state_dir, cfg.instances, persist=False).known or {})
     names = ([] if args.name == ns else [args.name] if args.name is not None
              else sorted(cfg.instances))
     now = clock.now()
     rows = inflight.list_inflight(cfg, names, known=known, now=now,
                                   runtime=args.name in (None, ns))
     if args.json:
-        print(json.dumps({"schema": inflight.LIST_SCHEMA, "at": format_utc_ts(now), "rows": rows},
-                         sort_keys=True))
+        print(json.dumps({"schema": inflight.LIST_SCHEMA, "at": format_utc_ts(now),
+                          "rows": rows}, sort_keys=True))
     else:
         for row in rows:
             print(inflight.render_list_line(row))

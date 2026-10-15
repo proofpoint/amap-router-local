@@ -390,6 +390,8 @@ python3 -m router --config C quarantine list [NAME] [--control-dir DIR]   # --co
 python3 -m router --config C quarantine show NAME SOURCE GEN ID [--control-dir DIR]
                                                                       # read-only inspection of the ingress quarantine — see
                                                                       # "The ingress quarantine" below
+python3 -m router --config C inflight list [NAME] [--json]          # read-only: one row per in-flight entry, no lock, safe while
+                                                                      # the router runs — see "Listing what is in flight" below
 python3 -m router --config C peer-request show ID                   # read-only: a signed peer id's preserved copy, settlement,
                                                                       # claim, retransmits, and each action with why it is refused
 python3 -m router --config C peer-request retransmit ID --evidence TEXT [--allow-pending]
@@ -1186,6 +1188,42 @@ built, while re-placement is designed but not built yet.
   only for an instance with a transport or with records.
 * The downstream verdict passes through verbatim, `detail` prefixed
   `transport:`.
+
+### Listing what is in flight (`inflight list`)
+
+`python3 -m router --config C inflight list [NAME] [--json]` lists every
+entry under every `inflight/` directory, while the router runs:
+
+* **Read-only, no lock.** It takes no drain lock, writes nothing, sweeps and
+  repairs nothing, and reads the registry with `persist=False` (its seq is
+  not recorded). Every file is opened `O_NOFOLLOW` relative to its
+  directory, so a planted link is reported, never followed.
+* **Every generation.** Without a registry, `state_dir/<name>/`. Under one,
+  every generation the generations file lists, current and fenced (a fenced
+  generation's records still advance every poll), or the pre-generation
+  layout (`legacy`) when there is no generations file; and the runtime
+  control namespace, `_runtime/<generation>/`. `NAME` may be `_runtime`.
+* **Never skips an entry.** One row per record, orphan marker or stray name.
+  `state` is `not_handed`, `handed` (its marker names its own transport id),
+  `revoked` (`revocation_unenforceable` is set), `orphan_marker` (a
+  `.handed` with no record), `unreadable` (torn, outside the closed record
+  schema, a link, not a regular file, or a name that is neither `<id>.json`
+  nor `<id>.handed`) or `unresolved` (the registry resolves no logical id,
+  or the generations file is held). `reason` says why. The one entry not
+  shown is one that vanishes between the directory read and its open: the
+  live drain settled it in between.
+* **Rows.** Each row has exactly `instance`, `generation`, `current`,
+  `entry`, `req_id`, `transport_req_id`, `state`, `written_ts`, `age_s`
+  (from the record's `written_ts`), `tree` (`peer` when the record pins a
+  signed statement, else `mail`), `signed_kind`, `retransmit` and
+  `reason`; an absent fact is `null`. `--json` prints ONLY one document,
+  `{"schema": "amap-router-local.inflight-list/1", "at": <UTC ts>,
+  "rows": [...]}`, so a truncated output does not parse. Without it, one
+  escaped line per row: instance, generation, req_id, transport id, state,
+  age and tree (`-` when absent), then the reason.
+
+Exit 0 when the listing was produced, whatever its rows say; 1 for an
+unknown `NAME`; 2 for a config error.
 
 ### The transport plugin (`router/transport.py`)
 

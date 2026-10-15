@@ -93,7 +93,13 @@ class _CliMixin:
         return doc["rows"]
 
     def by_entry(self, rows):
-        return {r["entry"]: r for r in rows}
+        """The rows by entry name; a missing entry FAILS (never a KeyError)."""
+        test = self
+
+        class _Rows(dict):
+            def __missing__(self, entry):
+                test.fail(f"no row for {entry!r}: the listing skipped it ({rows})")
+        return _Rows((r["entry"], r) for r in rows)
 
 
 class _Plain(_CliMixin, helpers.RouterTestCase):
