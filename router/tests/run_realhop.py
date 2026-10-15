@@ -543,6 +543,11 @@ def _inbound_cases():
                               ("Subject", draft["subject"].encode()),
                               ("Message-ID", peer["message_id"].encode()),
                               ("Date", now.encode()),
+                              # UNFOLDED, on both legs (RE N1): the field exactly as the
+                              # envelope holds it, as raw bytes in one line. [2] passes the
+                              # header RAW AS TRANSMITTED, folds included, and the codec
+                              # unfolds; a folded field is not exercised here (HAR-14's MIME
+                              # round trip).
                               ("AMAP-Peer-Statement", peer["statement_header"].encode())]
                     if peer.get("in_reply_to"):
                         header.append(("In-Reply-To", peer["in_reply_to"].encode()))

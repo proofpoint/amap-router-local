@@ -241,6 +241,9 @@ class _Hub:
                       ["Subject", draft["subject"]], ["Message-ID", peer["message_id"]],
                       ["Delivered-To", recipient],
                       ["Date", clock.now().strftime("%a, %d %b %Y %H:%M:%S +0000")],
+                      # UNFOLDED, on both legs: the field exactly as the envelope holds it, one
+                      # line. [2]'s MIME may fold it in transit and the codec unfolds it; that
+                      # folding is not exercised here (RE N1; HAR-14's MIME round trip).
                       ["AMAP-Peer-Statement", peer["statement_header"]]]
             if peer.get("in_reply_to"):
                 fields.append(["In-Reply-To", peer["in_reply_to"]])
