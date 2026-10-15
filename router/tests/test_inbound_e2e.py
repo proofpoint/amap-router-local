@@ -125,7 +125,13 @@ class _Host:
     """One router: its own state, registry, agent, key and config."""
 
     def __init__(self, base: Path, *, name: str, domain: str, other: str, other_seed: bytes,
-                 seed: bytes, inbound: bool = True):
+                 seed: bytes, inbound: bool = True, plugin=None, crypto=None, public_key=None):
+        """`plugin`, `crypto` and `public_key` default to RL's stand-in seam
+        (W1); `run_realhop` passes the real plugin, the openssl backend and
+        the real Ed25519 public key (row (b)). `plugin`, when given, is the
+        plugin object itself, and this host's in-memory sender and intake
+        then go unused."""
+        public_key = public_key or (lambda s: si.public_key(s).hex())
         self.base, self.name, self.domain = base, name, domain
         for d in ("state", "registry", "hop", "keys", f"instances/{name}/inbox",
                   f"instances/{name}/outbox"):
@@ -152,12 +158,12 @@ class _Host:
             "delegation": {
                 "partition_verified": "inbound-e2e fixture",
                 "signing_key": {"path": str(self.seed_path), "key_id": f"key-{domain}",
-                                "public_key": si.public_key(seed).hex()},
+                                "public_key": public_key(seed)},
                 "runtimes": [{"name": other.split(".")[0], "runtime": f"amap.router@{other}",
                               "domains": [other],
                               "keys": [{"key_id": f"key-{other}",
-                                        "public_key": si.public_key(other_seed).hex()}]}],
-                "crypto": {"crypto_backend": "pyca"}}}
+                                        "public_key": public_key(other_seed)}]}],
+                "crypto": dict(crypto or {"crypto_backend": "pyca"})}}
         if inbound is not None:
             doc["delegation"]["inbound"] = inbound
         path = base / "router.json"
@@ -168,8 +174,10 @@ class _Host:
         # `start_transport` builds it; only the plugin is this module's.
         from router import fsops as fsops_mod
         fsops = fsops_mod.FsOps(hop_root=self.cfg.hop.root)
-        self.runtime = service.HopRuntime(plugin=_plugin(self.sender, self.intake),
-                                          fsops=fsops, hop=self.cfg.hop)
+        self.fsops = fsops
+        self.runtime = service.HopRuntime(
+            plugin=plugin if plugin is not None else _plugin(self.sender, self.intake),
+            fsops=fsops, hop=self.cfg.hop)
 
     def write_registry(self):
         doc = json.loads((FIXTURES / "snapshot.json").read_text())

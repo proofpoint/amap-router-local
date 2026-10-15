@@ -42,6 +42,12 @@ ROWS = (
 )
 #: The resend workflow's rows, through the plugin's REAL agent sender.
 RESEND_ROWS = ("peer_block_republished_under_new_n",)
+#: The inbound round trip (RL-INBOUND-LIFT design v1.3 §3, row (b)): RL to RL over the REAL
+#: plugin, its REAL Ed25519 backend (openssl) and a REAL hop tree per host; only the hub step
+#: between the two trees is emulated, through the plugin's own downstream factories.
+INBOUND_ROWS = ("inbound_round_trip",)
+#: The openssl binary the row's crypto backend runs (the plugin's openssl_path).
+OPENSSL = "/usr/bin/openssl"
 
 _PLUGIN_PATH: Optional[str] = None
 
@@ -442,6 +448,198 @@ def _resend_cases():
     return ResendMatrix
 
 
+def _ed25519_public_hex(seed: bytes) -> str:
+    """The REAL Ed25519 public key of `seed`, by the openssl CLI (PKCS#8 in, SPKI out): the row
+    signs and verifies with real keys, never the stand-in's synthetic ones."""
+    import subprocess
+    der = bytes.fromhex("302e020100300506032b657004220420") + seed
+    out = subprocess.run([OPENSSL, "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+                         input=der, capture_output=True, check=True).stdout
+    return out[-32:].hex()
+
+
+def _inbound_cases():
+    """Row (b): host A's agent's signed peer task, placed on host B by B's production profile,
+    answered by B's agent and delivered back to A as the endpoint-bound result, over the REAL
+    plugin loaded through this router's loader (`load`, trusted_uids (0, euid): the harness owns
+    the file; the production owner check, root only, is NOT witnessed here), injected through
+    `run_once`'s `transport` argument (never the service's own load), with the REAL openssl
+    Ed25519 backend and a REAL hop tree per host through this router's FsOps.
+
+    EMULATED, and only this: the hub step ([2]'s) between A's tree and B's, both ways. It claims
+    and reads the sent request with the plugin's own HopReceiver, builds the candidate with the
+    plugin's own IntakeWriter.encode_candidate from [2]'s field set (never the request's bytes),
+    publishes it, then commits the sender's Result and archives. Every value the hub FABRICATES
+    is in `Hub.FABRICATED`.
+
+    ABSENT, not emulated (Opus L2): both routers run in ONE process under ONE uid, so there is no
+    uid partition, no hop_root ownership split and no key-unreadable-by-[2] witness (contract
+    §11 steps 1, 2 and 7). No attachment is carried. NOT exercised of [2], HAR-14's: the MIME
+    round trip, the hub prefix and admission, the registry resolve, the carriage switch, the
+    reduce and encode refusals that park, and the Result leg's sender gate and single-recipient
+    check."""
+    import hashlib
+    import json
+    import shutil
+    import tempfile
+    from router import generations, hoplink, peerjournal, peerlane
+    from router.tests import test_inbound_e2e as e2e
+    from router.tests.helpers import write_request
+    from router.util import format_utc_ts
+
+    class Hub:
+        #: What the hub makes up rather than carries, by name, with its value (design v1.2 Δ1).
+        FABRICATED = {
+            "received_at": "the harness clock at the hub step",
+            "admission": "fleet_hosts (the peer's host is a trusted fleet host)",
+            "admission_rule": "trusted_fleet_host",
+            "recipient": "the receiving agent's address (the hub prefix's Delivered-To)",
+            "subject": "the draft's subject (under [2]'s cap)",
+            "Date header": "the harness clock at the hub step",
+            "candidate_id": "hex(sha256(Message-ID))[:32]",
+            "transport Result": "accepted / allowlisted, message_id = the peer Message-ID",
+        }
+        #: DIRECT TEST WRITES, by name (Codex): what the row puts on disk itself rather than
+        #: through a router or plugin path. The host intakes and their disposal trees are the
+        #: deploy's (test_inbound_e2e._Host); [2]'s first sight of each generation goes through
+        #: the plugin's own marker store, and every hub write through its HopReceiver and
+        #: IntakeWriter, so neither is a direct write.
+        DIRECT_WRITES = {
+            "hop/.disposed/{.unresolved,.control}, hop/{.unresolved,.control}":
+                "the deploy's host intakes and disposal trees (_Host), which the router never "
+                "creates",
+        }
+
+        def __init__(self, plugin):
+            self.plugin, self.carried = plugin, []
+
+        def carry(self, src, dst):
+            lid_s = e2e.LIDS[src.name]
+            gen_s = generations.read_doc(src.cfg.state_dir, lid_s)["current"]
+            lid_d = e2e.LIDS[dst.name]
+            gen_d = generations.read_doc(dst.cfg.state_dir, lid_d)["current"]
+            # The downstream ([2]'s) factories, from the SAME module the loader pinned: the
+            # LoadedPlugin surface carries only the factories this router itself calls.
+            ns = self.plugin.namespace
+            receiver = ns["make_hop_receiver"](
+                hoplink.reader_settings(src.cfg, lid_s, gen_s), src.fsops)
+            writer = ns["make_intake_writer"](
+                hoplink.reader_settings(dst.cfg, lid_d, gen_d), dst.fsops)
+            try:
+                outbound = Path(src.cfg.hop.root) / lid_s / gen_s / "outbound"
+                names = sorted(p.name for p in outbound.glob("req-*.json")
+                               if not p.name.endswith(".hop.json"))
+                for name in names:
+                    n = name[len("req-"):-len(".json")]
+                    assert receiver.claim(n) == "claimed", f"claim {n}"
+                    claimed = receiver.read_claimed(n)
+                    env, draft = claimed.envelope, json.loads(claimed.request)["draft"]
+                    peer = env["peer"]
+                    kind, _kid, statement, _sig = ns["make_peer_codec"]({}).check1(
+                        [("AMAP-Peer-Statement", peer["statement_header"])])
+                    sender = json.loads(statement)["from"]
+                    now = format_utc_ts(clock_now())
+                    header = [("From", sender.encode()), ("To", ", ".join(draft["to"]).encode()),
+                              ("Subject", draft["subject"].encode()),
+                              ("Message-ID", peer["message_id"].encode()),
+                              ("Date", now.encode()),
+                              ("AMAP-Peer-Statement", peer["statement_header"].encode())]
+                    if peer.get("in_reply_to"):
+                        header.append(("In-Reply-To", peer["in_reply_to"].encode()))
+                    raw = writer.encode_candidate(
+                        header=header, body=("utf-8", draft["body_text"].encode("utf-8")),
+                        attachments=[], sender=sender, recipient=dst.address,
+                        subject=draft["subject"], received_at=now, admission="fleet_hosts",
+                        admission_rule="trusted_fleet_host", over_cap=None)
+                    cid = hashlib.sha256(peer["message_id"].encode()).hexdigest()[:32]
+                    assert writer.publish_candidate(cid, raw) == "created", f"publish {cid}"
+                    result = json.dumps({"contract_version": "2", "req_id": n,
+                                         "outcome": "accepted", "reason_code": "allowlisted",
+                                         "detail": None, "message_id": peer["message_id"]},
+                                        sort_keys=True).encode()
+                    assert receiver.commit_result(n, result) == "created", f"result {n}"
+                    assert receiver.archive(n) == "archived", f"archive {n}"
+                    self.carried.append((src.name, n, dst.name, cid, peer["message_id"]))
+            finally:
+                for o in (receiver, writer):
+                    o.close()
+
+    def clock_now():
+        from router import clock
+        return clock.now()
+
+    class InboundMatrix(unittest.TestCase):
+
+        def setUp(self):
+            hoplink.reset_process_state()
+            self.addCleanup(hoplink.reset_process_state)
+            peerlane.forget_all()
+            self.addCleanup(peerlane.forget_all)
+            td = tempfile.mkdtemp(prefix="rh.")
+            self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+            tmp = Path(os.path.realpath(td))
+            self.plugin = load(_PLUGIN_PATH)
+            crypto = {"crypto_backend": "openssl", "openssl_path": OPENSSL}
+            sa, sb = e2e._seed(b"a"), e2e._seed(b"b")
+            kw = dict(plugin=self.plugin, crypto=crypto, public_key=_ed25519_public_hex)
+            self.a = e2e._Host(tmp / "a", name="planner", domain=e2e.A_D, other=e2e.B_D,
+                               seed=sa, other_seed=sb, **kw)
+            self.b = e2e._Host(tmp / "b", name="builder", domain=e2e.B_D, other=e2e.A_D,
+                               seed=sb, other_seed=sa, **kw)
+            for h in (self.a, self.b):
+                h.start()
+                h.poll()
+                # [2]'s first sight of the new generation, as the hub does it, through the
+                # plugin's OWN marker store (as this matrix's other rows do): its down/ side and
+                # the hop contract versions it reads. RL hands nothing over before that.
+                lid = e2e.LIDS[h.name]
+                gen = generations.read_doc(h.cfg.state_dir, lid)["current"]
+                store = self.plugin.namespace["make_marker_store"](
+                    hoplink.reader_settings(h.cfg, lid, gen), h.fsops)
+                store.first_sight()
+                store.write_versions([1], version_write=1)
+
+        def notices(self, h):
+            return e2e._notices(h)
+
+        def test_inbound_round_trip(self):
+            hub = Hub(self.plugin)
+            write_request(self.a.cfg, "planner", "00000001", to=[self.b.address],
+                          subject="Run the suite", body_text="Please run the suite.\n")
+            self.a.poll()
+            hub.carry(self.a, self.b)
+            self.assertEqual(len(hub.carried), 1, "A handed over exactly one request")
+            task_id = hub.carried[-1][4]
+            self.b.poll()
+            placed = self.notices(self.b)
+            self.assertEqual(len(placed), 1, "B placed exactly one notice")
+            self.assertEqual(f"<{placed[0]['message']['id']}@{e2e.A_D}>", task_id,
+                             "THIS statement, placed on B")
+            write_request(self.b.cfg, "builder", "00000001", to=[self.a.address],
+                          subject="Re: Run the suite", body_text="Done.\n",
+                          in_reply_to=placed[0]["message"]["id"])
+            self.b.poll()
+            hub.carry(self.b, self.a)
+            self.assertEqual(len(hub.carried), 2, "B handed over exactly one answer")
+            self.a.poll()
+            result = json.loads((self.a.cfg.instances["planner"].outbox_root / "results"
+                                 / "00000001.json").read_text())
+            self.assertEqual((result["req_id"], result["outcome"]), ("00000001", "accepted"))
+            got = self.notices(self.a)
+            self.assertEqual(len(got), 1, "one endpoint-bound result on A")
+            self.assertEqual((got[0]["message"].get("in_reply_to"), got[0]["message"]["from"]),
+                             (placed[0]["message"]["id"], self.b.address),
+                             "B's answer, resolved to THIS issued task")
+            self.a.poll()
+            self.b.poll()
+            self.assertEqual(len(hub.carried), 2)
+            hub.carry(self.a, self.b)
+            hub.carry(self.b, self.a)
+            self.assertEqual(len(hub.carried), 2, "no second hand-over on either side")
+
+    return InboundMatrix
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _PLUGIN_PATH
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -457,9 +655,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"run_realhop: REFUSED: the loader refused the plugin: {type(e).__name__}: {e}",
               file=sys.stderr)
         return 2
-    matrix, resend = _cases(), _resend_cases()
+    matrix, resend, inbound = _cases(), _resend_cases(), _inbound_cases()
     suite = unittest.TestSuite([matrix(f"test_{row}") for row in ROWS]
-                               + [resend(f"test_{row}") for row in RESEND_ROWS])
+                               + [resend(f"test_{row}") for row in RESEND_ROWS]
+                               + [inbound(f"test_{row}") for row in INBOUND_ROWS])
     runner = unittest.TextTestRunner(stream=open(os.devnull, "w"), resultclass=_Result,
                                      verbosity=0)
     result = runner.run(suite)
@@ -469,7 +668,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if detail:
             print("    " + detail.strip().splitlines()[-1])
     passed = sum(1 for _n, v, _d in result.rows if v == "PASS")
-    total = len(ROWS) + len(RESEND_ROWS)
+    total = len(ROWS) + len(RESEND_ROWS) + len(INBOUND_ROWS)
     print(f"{passed}/{total} rows PASS")
     return 0 if passed == total == len(result.rows) else 1
 
