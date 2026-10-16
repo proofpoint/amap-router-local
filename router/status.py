@@ -145,9 +145,16 @@ class StatusTracker:
     Construct one at process start (before the first poll) so `started_ts`
     marks the true window start."""
 
-    def __init__(self, interval_s: Optional[float] = None) -> None:
+    def __init__(self, interval_s: Optional[float] = None, *,
+                 process_started_ts: Optional[str] = None) -> None:
         self.pid = os.getpid()
         self.started_ts = utc_ts()
+        #: When this PROCESS started, at full resolution
+        #: (`util.format_utc_ts_us`), taken once by its entry point before the
+        #: config or the plugin was loaded (`__main__.main`, else
+        #: `service.run_forever`'s first statement) and never rewritten.
+        #: `started_ts` above is unchanged: whole seconds, the counter window.
+        self.process_started_ts = process_started_ts
         self.last_poll_ts: Optional[str] = None
         self.polls = 0
         self.instances: Dict[str, Dict[str, Any]] = {}
@@ -273,6 +280,10 @@ class StatusTracker:
             "polls": self.polls,
             "instances": self.instances,
         }
+        # The process's own start, at full resolution, on every write by a
+        # run loop (absent only for a tracker built without one).
+        if self.process_started_ts is not None:
+            doc["process_started_ts"] = self.process_started_ts
         # Present only when this process loaded a transport plugin: the path
         # it opened and the sha256 of the bytes it read and executed, beside
         # `started_ts`, so a reader binds the digest to this process.

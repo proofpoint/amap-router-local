@@ -20,7 +20,10 @@ import json
 import os
 from unittest import mock
 
-from router import config as config_mod, service, status as status_mod, transport
+import re
+from datetime import datetime, timedelta, timezone
+
+from router import __main__ as cli, clock, config as config_mod, service, status as status_mod, transport
 from router.tests import helpers
 from router.tests.test_transport import GOOD, ME, _PluginDir
 
@@ -101,12 +104,13 @@ class PublishedDigestTests(_Digest):
         self.assertNotIn("transport_plugin", t.to_doc())
 
 
-class RunningProcessTests(_Digest):
-    """`run_forever` itself: the record is made from the loaded runtime, and a
-    refused reload leaves it alone. The poll body is replaced by one that only
-    writes status, and the loop ends at the second sleep."""
+class _Loop(_Digest):
+    """`run_forever` itself, driven: the poll body is replaced by one that only
+    writes status (each write's document kept in `self.writes`), and the loop
+    ends at the second sleep."""
 
-    def run_loop(self, cfg_path, rt, *, between=lambda: None):
+    def run_loop(self, cfg_path, rt, *, between=lambda: None, process_started=None):
+        self.writes = []
         sleeps = []
 
         def sleep(_):
@@ -119,18 +123,26 @@ class RunningProcessTests(_Digest):
         def poll(cfg, tracker, *a, **kw):
             tracker.record_poll({})
             tracker.write(cfg.state_dir)
+            self.writes.append(json.loads(
+                (self.state / status_mod.STATUS_FILENAME).read_text()))
 
         cfg = config_mod.load(cfg_path)
         with mock.patch.object(service, "start_transport", return_value=rt), \
                 mock.patch.object(service, "peer_startup", return_value=None), \
                 mock.patch.object(service, "poll_once", side_effect=poll), \
                 mock.patch.object(service.time, "sleep", side_effect=sleep):
-            service.run_forever(cfg, 5.0, config_path=str(cfg_path))
+            service.run_forever(cfg, 5.0, config_path=str(cfg_path),
+                                process_started=process_started)
 
     def cfg_file(self, doc):
         p = self.base / "router.json"
         p.write_text(json.dumps(doc))
         return p
+
+
+class RunningProcessTests(_Loop):
+    """The record is made from the loaded runtime, and a refused reload leaves
+    it alone."""
 
     def test_the_running_process_publishes_its_loaded_digest(self):
         _, rt = self.start()
@@ -195,3 +207,92 @@ class RefusalIsRecordedTests(_Digest):
         moved.mkdir()
         self.assert_recorded(self.kept(dict(self.doc(), state_dir=str(moved))),
                              "state_dir changed")
+
+
+US_TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z")
+
+
+class ProcessStartedTests(_Loop):
+    """`process_started_ts`: this process's start at full resolution, taken
+    once before the plugin is loaded, on every write, never re-read. A clock
+    source that advances one second per read makes every re-read visible."""
+
+    def setUp(self):
+        super().setUp()
+        self.reads = []
+        t0 = datetime(2026, 10, 16, 1, 0, 0, 123456, tzinfo=timezone.utc)
+
+        def source():
+            self.reads.append(1)
+            return t0 + timedelta(seconds=len(self.reads))
+        clock.install(source)
+        self.addCleanup(clock.reset)
+
+    def test_present_with_a_fraction_on_every_write(self):
+        _, rt = self.start()
+        self.run_loop(self.cfg_file(self.doc()), rt)
+        self.assertEqual(len(self.writes), 2)
+        for doc in self.writes:
+            self.assertRegex(doc.get("process_started_ts") or "", US_TS)
+
+    def test_unchanged_across_a_reload(self):
+        _, rt = self.start()
+        cfg_path = self.cfg_file(self.doc())
+        self.run_loop(cfg_path, rt, between=lambda: cfg_path.write_text(json.dumps(self.doc())))
+        values = [d.get("process_started_ts") for d in self.writes]
+        self.assertEqual(len(values), 2)
+        self.assertIsNotNone(values[0])
+        self.assertEqual(values[0], values[1], "process_started_ts was re-read")
+
+    def test_a_new_process_gets_a_new_value(self):
+        _, rt = self.start()
+        self.run_loop(self.cfg_file(self.doc()), rt)
+        first = self.writes[-1].get("process_started_ts")
+        self.run_loop(self.cfg_file(self.doc()), rt)
+        second = self.writes[-1].get("process_started_ts")
+        self.assertIsNotNone(first)
+        self.assertNotEqual(first, second)
+
+    def test_taken_before_the_plugin_is_loaded(self):
+        """With no value passed in, run_forever takes it before start_transport."""
+        _, rt = self.start()
+        loaded_at = []
+
+        def start(cfg):
+            loaded_at.append(clock.now())
+            return rt
+        cfg_path = self.cfg_file(self.doc())
+        cfg = config_mod.load(cfg_path)
+        self.writes = []
+
+        def poll(cfg, tracker, *a, **kw):
+            tracker.record_poll({})
+            tracker.write(cfg.state_dir)
+            self.writes.append(json.loads((self.state / status_mod.STATUS_FILENAME).read_text()))
+        with mock.patch.object(service, "start_transport", side_effect=start), \
+                mock.patch.object(service, "peer_startup", return_value=None), \
+                mock.patch.object(service, "poll_once", side_effect=poll), \
+                mock.patch.object(service.time, "sleep", side_effect=KeyboardInterrupt):
+            service.run_forever(cfg, 5.0)
+        taken = datetime.strptime(self.writes[0]["process_started_ts"], "%Y-%m-%dT%H:%M:%S.%fZ"
+                                  ).replace(tzinfo=timezone.utc)
+        self.assertEqual(len(loaded_at), 1)
+        self.assertLess(taken, loaded_at[0], "taken after the plugin was loaded")
+
+    def test_main_takes_it_first_and_passes_it(self):
+        """`main` reads the clock before it loads the config, and hands that
+        value to run_forever."""
+        seen = {}
+        load_at = []
+
+        def load(path):
+            load_at.append(clock.now())
+            return config_mod.load_obj(self.doc())
+
+        def run(cfg, interval, config_path=None, process_started=None):
+            seen["process_started"] = process_started
+        with mock.patch.object(cli, "load", side_effect=load), \
+                mock.patch.object(cli, "run_forever", side_effect=run):
+            cli.main(["--config", "unused.json", "run", "--interval", "5"])
+        self.assertIsInstance(seen.get("process_started"), datetime)
+        self.assertLess(seen["process_started"], load_at[0], "taken after the config was loaded")

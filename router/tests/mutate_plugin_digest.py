@@ -26,10 +26,12 @@ import subprocess
 import sys
 
 P = "router.tests.test_plugin_digest."
-PD, RP, RR = (P + c + "." for c in ("PublishedDigestTests", "RunningProcessTests",
-                                     "RefusalIsRecordedTests"))
+PD, RP, RR, PS = (P + c + "." for c in ("PublishedDigestTests", "RunningProcessTests",
+                                         "RefusalIsRecordedTests", "ProcessStartedTests"))
 SV = "router/service.py"
 ST = "router/status.py"
+UT = "router/util.py"
+MN = "router/__main__.py"
 
 M = [
  ('D1 the digest recomputed from the file when published', SV,
@@ -71,6 +73,34 @@ M = [
   '        return _refuse_reload(current, "state_dir changed")\n',
   '        return current\n',
   [RR + 'test_a_changed_state_dir_is_recorded']),
+ ('S1 process_started_ts without a fraction', UT,
+  '    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")\n',
+  '    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")\n',
+  [PS + 'test_present_with_a_fraction_on_every_write']),
+ ('S2 process_started_ts re-read on every write', ST,
+  '            doc["process_started_ts"] = self.process_started_ts\n',
+  '            doc["process_started_ts"] = __import__("router.util", fromlist=["u"]).format_utc_ts_us(\n'
+  '                __import__("router.clock", fromlist=["c"]).now())\n',
+  [PS + 'test_unchanged_across_a_reload']),
+ ('S3 process_started_ts taken after the plugin is loaded', SV,
+  '                            process_started_ts=format_utc_ts_us(process_started))\n',
+  '                            process_started_ts=format_utc_ts_us(clock.now()))\n',
+  [PS + 'test_taken_before_the_plugin_is_loaded']),
+ ('S4 main does not pass its own start', MN,
+  '                        process_started=process_started)\n',
+  '                        process_started=None)\n',
+  [PS + 'test_main_takes_it_first_and_passes_it']),
+ ('S5 a new process reuses the first value', ST,
+  '        self.process_started_ts = process_started_ts\n',
+  '        self.process_started_ts = (StatusTracker.__dict__.get("_first")\n'
+  '                                   or setattr(StatusTracker, "_first", process_started_ts)\n'
+  '                                   or process_started_ts)\n',
+  [PS + 'test_a_new_process_gets_a_new_value']),
+ ('S6 process_started_ts omitted', ST,
+  '        if self.process_started_ts is not None:\n'
+  '            doc["process_started_ts"] = self.process_started_ts\n',
+  '',
+  [PS + 'test_present_with_a_fraction_on_every_write']),
 ]
 
 
