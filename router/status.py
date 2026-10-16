@@ -145,9 +145,16 @@ class StatusTracker:
     Construct one at process start (before the first poll) so `started_ts`
     marks the true window start."""
 
-    def __init__(self, interval_s: Optional[float] = None) -> None:
+    def __init__(self, interval_s: Optional[float] = None, *,
+                 process_started_ts: Optional[str] = None) -> None:
         self.pid = os.getpid()
         self.started_ts = utc_ts()
+        #: When this PROCESS started, at full resolution
+        #: (`util.format_utc_ts_us`), taken once by its entry point before the
+        #: config or the plugin was loaded (`__main__.main`, else
+        #: `service.run_forever`'s first statement) and never rewritten.
+        #: `started_ts` above is unchanged: whole seconds, the counter window.
+        self.process_started_ts = process_started_ts
         self.last_poll_ts: Optional[str] = None
         self.polls = 0
         self.instances: Dict[str, Dict[str, Any]] = {}
@@ -176,6 +183,22 @@ class StatusTracker:
         #: NOT serialised into status.json: the roster file's own
         #: `generated_ts` is the evidence that it is being published.
         self.roster_outcome: Optional[str] = None
+        #: The transport plugin THIS PROCESS loaded (`service.plugin_status`):
+        #: `{path, sha256}` from `transport.load_plugin`'s own single fd read,
+        #: recorded once at startup and never again, so a reload can never
+        #: rewrite it. None (and the member absent) when no plugin is loaded.
+        self.transport_plugin: Optional[Dict[str, str]] = None
+        #: Latched by the FIRST record, None included: "once" is literal.
+        self._transport_plugin_recorded = False
+
+    def record_transport_plugin(self, doc: Optional[Dict[str, str]]) -> None:
+        """The plugin this process loaded, recorded ONCE: a second record is
+        refused, because the published digest describes the loaded bytes for
+        the process's whole life and nothing later may replace it."""
+        if self._transport_plugin_recorded:
+            raise ValueError("the loaded transport plugin is recorded once per process")
+        self._transport_plugin_recorded = True
+        self.transport_plugin = None if doc is None else dict(doc)
 
     def record_registry(self, doc: Optional[Dict[str, Any]]) -> None:
         """This poll's registry reading (`registry.Report.to_doc`), or None
@@ -260,6 +283,15 @@ class StatusTracker:
             "polls": self.polls,
             "instances": self.instances,
         }
+        # The process's own start, at full resolution, on every write by a
+        # run loop (absent only for a tracker built without one).
+        if self.process_started_ts is not None:
+            doc["process_started_ts"] = self.process_started_ts
+        # Present only when this process loaded a transport plugin: the path
+        # it opened and the sha256 of the bytes it read and executed, beside
+        # `started_ts`, so a reader binds the digest to this process.
+        if self.transport_plugin is not None:
+            doc["transport_plugin"] = dict(self.transport_plugin)
         # Present only under a registry: "state" (ok / unavailable /
         # rolled_back), "seq", and every instance HELD with its reason. A
         # rolled-back registry stays held until the operator removes

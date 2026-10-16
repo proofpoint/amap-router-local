@@ -604,6 +604,10 @@ def _render_reset_summary(summary) -> str:
 
 
 def main(argv=None) -> int:
+    # FIRST: this process's start, at full resolution, for status.json's
+    # `process_started_ts` (taken before the config and any plugin load).
+    from . import clock as _clock
+    process_started = _clock.now()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -722,7 +726,8 @@ def main(argv=None) -> int:
             print(f"router: refusing to run 'run': {e}", file=sys.stderr)
             return 1
         try:
-            run_forever(cfg, args.interval, config_path=args.config)
+            run_forever(cfg, args.interval, config_path=args.config,
+                        process_started=process_started)
         finally:
             lk.release()
         return 0

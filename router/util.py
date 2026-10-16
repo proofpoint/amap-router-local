@@ -227,6 +227,13 @@ def format_utc_ts(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime(_UTC_TS_FORMAT)
 
 
+def format_utc_ts_us(dt: datetime) -> str:
+    """`dt` (aware, any zone) as RFC 3339 UTC with microseconds, e.g.
+    `2026-10-16T01:42:19.453920Z`: for a value that must order against
+    another full-resolution time (status.json's `process_started_ts`)."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def parse_utc_ts(value: object) -> Optional[datetime]:
     """Strict inverse of `utc_ts`: an aware UTC datetime, or `None` for
     anything that is not exactly that shape — never raises. Strict on

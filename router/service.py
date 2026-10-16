@@ -44,7 +44,7 @@ from . import generations, hoplink, outbound, outcomes, registry as registry_mod
 from .config import RouterConfig
 from .config import ConfigError, load
 from .status import StatusTracker, render_discovery
-from .util import parse_utc_ts, utc_ts
+from .util import format_utc_ts_us, parse_utc_ts, utc_ts
 
 logger = logging.getLogger("amap_router_local")
 
@@ -82,6 +82,18 @@ class HopRuntime:
     plugin: Any
     fsops: Any
     hop: Any
+
+
+def plugin_status(runtime: Any) -> Optional[Dict[str, str]]:
+    """status.json's `transport_plugin` for this process: the path
+    `transport.load_plugin` opened and the sha256 IT computed from its one
+    fd read of the bytes it executed (`LoadedPlugin`), never recomputed from
+    the file and never copied from the config. None without a loaded plugin
+    (no `transport_plugin` configured, or a stand-in that loaded no bytes)."""
+    plugin = getattr(runtime, "plugin", None) if isinstance(runtime, HopRuntime) else None
+    if not isinstance(plugin, transport_mod.LoadedPlugin):
+        return None
+    return {"path": plugin.path, "sha256": plugin.sha256}
 
 
 def _agent_reachable_roots(cfg: RouterConfig) -> List[Path]:
@@ -650,7 +662,8 @@ def reload_config(config_path, current: RouterConfig, runtime: Any = None) -> Ro
     return fresh
 
 
-def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
+def run_forever(cfg: RouterConfig, interval: float, config_path=None,
+                process_started=None) -> None:
     """Poll every `interval` seconds until interrupted (Ctrl-C / SIGTERM),
     writing `cfg.state_dir/status.json` after every poll.
 
@@ -680,6 +693,11 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
     read is free beside a poll, and an mtime check buys nothing while costing
     coarse-timestamp and same-second-rewrite bugs.
     """
+    # This PROCESS's start, at full resolution: `__main__.main` takes it as its
+    # first statement and passes it; a caller that passes none gets it here,
+    # still before the plugin is loaded. Taken once, never re-read.
+    if process_started is None:
+        process_started = clock.now()
     logger.info("router starting: interval=%ss, instances=%s",
                 interval, sorted(cfg.instances))
     # Once, before the loop, and allowed to raise: a refused plugin stops
@@ -687,7 +705,12 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
     transport = start_transport(cfg)
     activate_delegation(cfg, transport)
     peer_startup(cfg, transport)
-    tracker = StatusTracker(interval_s=interval)
+    tracker = StatusTracker(interval_s=interval,
+                            process_started_ts=format_utc_ts_us(process_started))
+    # The loaded plugin's own digest, recorded once for this process: the
+    # reload below can never change it (a changed `transport_plugin` is a
+    # refused reload), so nothing records it again.
+    tracker.record_transport_plugin(plugin_status(transport))
     seen_report = None
     seen_names = sorted(cfg.instances)
     try:
