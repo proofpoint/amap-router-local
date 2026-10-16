@@ -28,6 +28,7 @@ from router.tests.test_fsops import GEN, LID, _HopCase
 CONSTANTS = {
     "aliases": {"HOLD_HINT"},
     "config": {"_TOP_KEYS", "_INSTANCE_KEYS", "LANE_LEAVES", "_ROOT_KEY_MODE"},
+    "console": {"KNOWN_PHASES"},
     "fsops": {"_BAD_NAMES"},
     "generations": {"_UNKNOWN_BINDING", "_OUTCOME_VERSION"},
     "hoplink": {"LATCHED_WRITE_REASONS", "SETTLE_WRITE_REASONS", "RETRY_WRITE_REASONS", "RETRY_HINTS",

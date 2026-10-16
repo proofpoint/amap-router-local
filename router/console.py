@@ -114,7 +114,16 @@ HOST_FACTS_STALE_SECONDS = 3600
 #: `exit_meaning` schema 2 can emit and both states of `not_enrolled`. Not
 #: against a description of them; see `test_console.py`'s schema-2 class for
 #: what each one proved.
-HOST_FACTS_SCHEMA = 2
+#:
+#: 2 -> 3 on 2026-10-15: schema 3 adds a third phase, `runtime-builds`, whose
+#: checks carry a stable `id`, optional `observed_*` strings and, on one of
+#: them, a `host_role`; the phase carries `deployed_roles`. The two router
+#: phases and every top-level field are unchanged, so schema 2 is still read,
+#: with its own phase set (`KNOWN_PHASES`). Adopted against the producer's own
+#: sample (the schema-3 class in `test_console.py`), not a description of it.
+#: `HOST_FACTS_SCHEMA` is the newest understood; `HOST_FACTS_SCHEMAS` is the set.
+HOST_FACTS_SCHEMA = 3
+HOST_FACTS_SCHEMAS = (2, 3)
 
 #: The adapter's own word for a whole run, so this console never has to know
 #: their exit integers. `cannot_run` is a first-class state: the read produced
@@ -145,6 +154,18 @@ HOST_FACTS_MEANINGS = ("ok", "failed", "cannot_run", "declined")
 #: ARE. The rename is the whole of this module's cost for the bump.
 PHASE_CONTAINER = "router-container"   # running, network none, restart policy, mounts
 PHASE_ROUTER_HEALTH = "router-health"  # status.json freshness, from their side
+PHASE_RUNTIME_BUILDS = "runtime-builds"  # schema 3: which build each runtime runs
+
+#: The phases each understood schema defines. A phase outside its document's
+#: set is still SHOWN, every check of it, but its verdict is never taken: it
+#: renders UNKNOWN whatever its checks say. A console that scored a phase it
+#: does not know by its checks alone would report a pass about something it
+#: does not understand, the same false report an unrecognised schema is
+#: refused for.
+KNOWN_PHASES = {
+    2: (PHASE_CONTAINER, PHASE_ROUTER_HEALTH),
+    3: (PHASE_CONTAINER, PHASE_ROUTER_HEALTH, PHASE_RUNTIME_BUILDS),
+}
 
 
 
@@ -332,6 +353,21 @@ def phase_verdict(phase: Dict[str, Any]) -> str:
     return "pass"
 
 
+def host_phase_verdict(phase: Dict[str, Any], schema: Any) -> str:
+    """`phase_verdict`, for a phase of a host-facts document of `schema`: a
+    phase that is not one of that schema's `KNOWN_PHASES` is "unknown" whatever
+    its checks say, and a `runtime-builds` check without a string `id` makes
+    its phase "unknown" too (schema 3 names every one of them)."""
+    if not isinstance(phase, dict) or phase.get("id") not in KNOWN_PHASES.get(schema, ()):
+        return "unknown"
+    verdict = phase_verdict(phase)
+    if phase.get("id") == PHASE_RUNTIME_BUILDS and verdict == "pass" and not all(
+            isinstance(c, dict) and isinstance(c.get("id"), str) and c["id"]
+            for c in phase.get("checks") or ()):
+        return "unknown"
+    return verdict
+
+
 def find_phase(host: Dict[str, Any], phase_id: str) -> Optional[Dict[str, Any]]:
     for phase in host.get("phases") or []:
         if isinstance(phase, dict) and phase.get("id") == phase_id:
@@ -393,10 +429,10 @@ def load_host_facts(path: Optional[Path]) -> Dict[str, Any]:
         return {"available": False, "reason": f"{path} is not an object"}
 
     schema = doc.get("schema")
-    if schema != HOST_FACTS_SCHEMA:
+    if type(schema) is not int or schema not in HOST_FACTS_SCHEMAS:
         return {"available": False,
                 "reason": f"{path} declares schema {schema!r}; this console "
-                          f"understands {HOST_FACTS_SCHEMA}"}
+                          f"understands {' or '.join(map(str, HOST_FACTS_SCHEMAS))}"}
 
     age = _age_seconds(doc.get("generated_ts"))
     if age is None:
@@ -827,6 +863,33 @@ audit log and the reply ledger.</p>
 """
 
 
+_CHECK_RESULTS = ("PASS", "FAIL", "UNKNOWN")
+
+
+def _check_by_id(check: Dict[str, Any]) -> str:
+    """One check with its `id` (and `host_role`), its result, claim and
+    `observed_*` values, then its remedy and reason when it did not pass. A
+    result outside PASS/FAIL/UNKNOWN is shown as UNKNOWN with the word given."""
+    result = check.get("result")
+    shown = result if result in _CHECK_RESULTS else "UNKNOWN"
+    if result not in _CHECK_RESULTS:
+        shown += f" (reported {result!r})"
+    ident = check.get("id") if isinstance(check.get("id"), str) else "?"
+    role = check.get("host_role")
+    observed = sorted((k, v) for k, v in check.items()
+                      if isinstance(k, str) and k.startswith("observed_"))
+    out = (f"<div class='note'><b>{_esc(shown)}</b> <span class='mono'>{_esc(ident)}"
+           + (f" [{_esc(role)}]" if role is not None else "") + "</span> "
+           f"{_esc(check.get('claim'))}")
+    for k, v in observed:
+        out += f"<br><span class='mono'>{_esc(k)}: {_esc(v)}</span>"
+    if result != "PASS":
+        remedy, reason = check.get("remedy"), check.get("reason")
+        out += ((f"<br>{_esc(remedy)}" if remedy else "")
+                + (f"<div class='reason'>{_esc(reason)}</div>" if reason else ""))
+    return out + "</div>"
+
+
 def _host_phases(host: Dict[str, Any]) -> str:
     """The adapter's phases, as it reported them.
 
@@ -871,8 +934,10 @@ def _host_phases(host: Dict[str, Any]) -> str:
     kind_for = {"pass": "ok", "fail": "warn", "unknown": "unk",
                 "unrunnable": "unk", "skipped": "unk"}
     rows = []
+    schema = host.get("schema")
     for phase in phases:
-        verdict = phase_verdict(phase)
+        verdict = host_phase_verdict(phase, schema)
+        known = phase.get("id") in KNOWN_PHASES.get(schema, ())
         detail = ""
         if verdict == "unrunnable":
             # UNREACHABLE UNDER SCHEMA 2, deliberately kept. Schema 1 had
@@ -891,6 +956,23 @@ def _host_phases(host: Dict[str, Any]) -> str:
         elif verdict == "skipped":
             # Also unreachable under schema 2 — see above.
             detail = f"<div class='note'>skipped: {_esc(phase.get('skipped'))}</div>"
+        elif not known or phase.get("id") == PHASE_RUNTIME_BUILDS:
+            # EVERY check, the passing ones too. For a phase this console does
+            # not know, because its verdict is not taken and hiding its passes
+            # would leave nothing to read; for `runtime-builds`, because each
+            # check names one runtime's build and a reader needs all of them,
+            # by `id` (and `host_role`, which tells the two `build.hop_plugin`
+            # checks apart).
+            if not known:
+                detail += (f"<div class='note'>not a phase of host-facts schema "
+                           f"{_esc(schema)}: its checks are shown, its verdict is "
+                           f"not taken</div>")
+            roles = phase.get("deployed_roles")
+            if isinstance(roles, list):
+                detail += (f"<div class='note'>deployed roles: "
+                           f"{_esc(', '.join(str(r) for r in roles))}</div>")
+            for check in (c for c in (phase.get("checks") or []) if isinstance(c, dict)):
+                detail += _check_by_id(check)
         else:
             bad = [c for c in (phase.get("checks") or [])
                    if isinstance(c, dict) and c.get("result") != "PASS"]
