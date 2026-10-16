@@ -1196,8 +1196,16 @@ entry under every `inflight/` directory, while the router runs:
 
 * **Read-only, no lock.** It takes no drain lock, writes nothing, sweeps and
   repairs nothing, and reads the registry with `persist=False` (its seq is
-  not recorded). Every file is opened `O_NOFOLLOW` relative to its
-  directory, so a planted link is reported, never followed.
+  not recorded).
+* **Anchored, never following a link.** `state_dir` is opened once as the
+  trusted anchor; every component beneath it (the instance or logical-id
+  directory, the generation directory, `_runtime` and its generations,
+  `inflight/`, each file) is reached from that descriptor with `O_NOFOLLOW`,
+  and each directory's `(st_dev, st_ino)` must equal its lstat. A link, a
+  non-directory or a component replaced while it was opened, at ANY level,
+  is an `unreadable` row naming it; nothing behind it is read as this
+  router's state. The generations file and the recorded runtime generation
+  are read through the same descriptors.
 * **Every generation.** Without a registry, `state_dir/<name>/`. Under one,
   every generation the generations file lists, current and fenced (a fenced
   generation's records still advance every poll), or the pre-generation
@@ -1211,7 +1219,9 @@ entry under every `inflight/` directory, while the router runs:
   nor `<id>.handed`) or `unresolved` (the registry resolves no logical id,
   or the generations file is held). `reason` says why. The one entry not
   shown is one that vanishes between the directory read and its open: the
-  live drain settled it in between.
+  live drain settled it in between. A record being written at that moment
+  can show as a transient `unreadable` row (the writer's temporary
+  `<id>.json.<random>`); after a crash the same row is the right answer.
 * **Rows.** Each row has exactly `instance`, `generation`, `current`,
   `entry`, `req_id`, `transport_req_id`, `state`, `written_ts`, `age_s`
   (from the record's `written_ts`), `tree` (`peer` when the record pins a

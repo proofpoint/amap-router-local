@@ -23,6 +23,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 from unittest import mock
 
@@ -347,6 +348,149 @@ class RegistryTests(_CliMixin, _Gens):
         from router import registry
         registry.report_for(self.reg, self.state_dir, self.cfg.instances, persist=True)
         self.assertNotEqual(tree_digest(self.state_dir), before)
+
+
+class AnchoredTraversalTests(_Plain):
+    """Every component beneath `state_dir` is reached from the anchor without
+    following a link: a link at any level is a row naming it, and nothing
+    behind it is read as this router's state. Each outside tree holds a VALID
+    record, so a listing that followed the link would show an ordinary row."""
+
+    def outside(self, *parts):
+        """An outside directory holding `<parts>/inflight/00000042.json`, valid."""
+        root = self.tmp / "outside"
+        d = root.joinpath(*parts, inflight.INFLIGHT_DIR)
+        d.mkdir(parents=True)
+        (d / "00000042.json").write_text(json.dumps(record("00000042")))
+        return root
+
+    def assert_not_followed(self, rows, entry):
+        self.assertNotIn("00000042", [r["transport_req_id"] for r in rows],
+                         "the linked tree's record was read")
+        row = self.by_entry(rows)[entry]
+        self.assertEqual(row["state"], inflight.ROW_UNREADABLE, row)
+        self.assertIn("linked", row["reason"])
+
+    def test_a_linked_instance_directory_is_reported_not_followed(self):
+        shutil.rmtree(self.state_dir / "alice", ignore_errors=True)
+        os.symlink(self.outside(), self.state_dir / "alice")
+        self.assert_not_followed(self.rows("alice"), "alice")
+
+    def test_a_linked_inflight_directory_is_reported_not_followed(self):
+        (self.state_dir / "alice").mkdir(exist_ok=True)
+        os.symlink(self.outside() / inflight.INFLIGHT_DIR, self.d)
+        self.assert_not_followed(self.rows("alice"), inflight.INFLIGHT_DIR)
+
+    def test_a_linked_runtime_root_is_reported_not_followed(self):
+        gen = "c" * 32
+        root = self.outside(gen)
+        (root / config_mod.RUNTIME_GENERATION_FILE).write_text(json.dumps({"generation": gen}))
+        os.symlink(root, self.state_dir / config_mod.RUNTIME_NS)
+        self.assert_not_followed(self.rows(config_mod.RUNTIME_NS), config_mod.RUNTIME_NS)
+
+    def test_a_linked_runtime_generation_is_reported_not_followed(self):
+        gen = "c" * 32
+        ns = self.state_dir / config_mod.RUNTIME_NS
+        ns.mkdir()
+        (ns / config_mod.RUNTIME_GENERATION_FILE).write_text(json.dumps({"generation": gen}))
+        os.symlink(self.outside(), ns / gen)
+        rows = self.rows(config_mod.RUNTIME_NS)
+        self.assert_not_followed(rows, gen)
+        self.assertEqual(self.by_entry(rows)[gen]["current"], True)
+
+    def test_a_component_replaced_while_it_was_opened_is_reported(self):
+        self.put(f"{N1}.json", record())
+        real = os.stat
+
+        def moved(path, *a, **kw):
+            st = real(path, *a, **kw)
+            if path == "alice" and kw.get("dir_fd") is not None:
+                return os.stat_result((st.st_mode, st.st_ino + 1) + tuple(st)[2:])
+            return st
+        with mock.patch.object(inflight.os, "stat", side_effect=moved):
+            rows = self.rows("alice")
+        row = self.by_entry(rows)["alice"]
+        self.assertEqual(row["state"], inflight.ROW_UNREADABLE)
+        self.assertIn("replaced", row["reason"])
+        self.assertNotIn(N1, [r["req_id"] for r in rows])
+
+    def test_a_plain_tree_is_still_listed(self):
+        """The positive: ordinary directories at every level are followed."""
+        self.put(f"{N1}.json", record())
+        gen = "c" * 32
+        ns = self.state_dir / config_mod.RUNTIME_NS
+        (ns / gen / inflight.INFLIGHT_DIR).mkdir(parents=True)
+        (ns / config_mod.RUNTIME_GENERATION_FILE).write_text(json.dumps({"generation": gen}))
+        (ns / gen / inflight.INFLIGHT_DIR / f"{N2}.json").write_text(json.dumps(record(N2)))
+        got = {(r["instance"], r["req_id"], r["state"]) for r in self.rows()}
+        self.assertIn(("alice", N1, inflight.ROW_NOT_HANDED), got)
+        self.assertIn((config_mod.RUNTIME_NS, N2, inflight.ROW_NOT_HANDED), got)
+
+    def test_an_inflight_that_is_not_a_directory_is_a_row(self):
+        (self.state_dir / "alice").mkdir(exist_ok=True)
+        self.d.write_bytes(b"x")
+        row = self.by_entry(self.rows("alice"))[inflight.INFLIGHT_DIR]
+        self.assertEqual(row["state"], inflight.ROW_UNREADABLE)
+        self.assertIn("not a directory", row["reason"])
+
+    def test_an_unreadable_marker_beside_its_record_is_never_not_handed(self):
+        self.put(f"{N1}.json", record())
+        (self.d / f"{N1}{inflight.HANDED_SUFFIX}").mkdir()
+        row = self.by_entry(self.rows("alice"))[f"{N1}.json"]
+        self.assertEqual(row["state"], inflight.ROW_UNREADABLE)
+        self.assertIn("handed marker", row["reason"])
+
+
+class AnchoredRegistryTests(_CliMixin, _Gens):
+
+    def setUp(self):
+        super().setUp()
+        self.poll()
+
+    def outside(self):
+        d = self.tmp / "outside" / inflight.INFLIGHT_DIR
+        d.mkdir(parents=True)
+        (d / "00000042.json").write_text(json.dumps(record("00000042")))
+        return d.parent
+
+    def test_a_linked_generation_directory_is_reported_not_followed(self):
+        gdir = gen_state(self.state_dir, LIDS["alpha"])
+        shutil.rmtree(gdir)
+        os.symlink(self.outside(), gdir)
+        rows = self.rows("alpha")
+        self.assertNotIn("00000042", [r["transport_req_id"] for r in rows])
+        row = self.by_entry(rows)[gdir.name]
+        self.assertEqual((row["state"], row["generation"], row["current"]),
+                         (inflight.ROW_UNREADABLE, gdir.name[len("gen-"):], True))
+        self.assertIn("linked", row["reason"])
+
+    def test_a_linked_logical_id_directory_is_reported_not_followed(self):
+        lid = self.state_dir / LIDS["alpha"]
+        moved = self.tmp / "moved-lid"
+        shutil.move(str(lid), str(moved))
+        os.symlink(moved, lid)
+        rows = self.rows("alpha")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual((rows[0]["state"], rows[0]["entry"]),
+                         (inflight.ROW_UNREADABLE, LIDS["alpha"]))
+        self.assertIn("linked", rows[0]["reason"])
+
+    def test_a_generations_file_outside_its_schema_is_one_unresolved_row(self):
+        (self.state_dir / LIDS["alpha"] / "generations.json").write_text(
+            json.dumps({"schema": "something else"}))
+        rows = self.rows("alpha")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["state"], inflight.ROW_UNRESOLVED)
+        self.assertIn("unknown schema", rows[0]["reason"])
+
+    def test_the_pre_generation_layout_is_listed_as_legacy(self):
+        lid = self.state_dir / LIDS["alpha"]
+        (lid / "generations.json").unlink()
+        d = lid / inflight.INFLIGHT_DIR
+        d.mkdir()
+        (d / f"{N1}.json").write_text(json.dumps(record()))
+        rows = self.rows("alpha")
+        self.assertEqual([(r["generation"], r["req_id"]) for r in rows], [("legacy", N1)])
 
 
 del _Gens   # imported for subclassing only: never collected here

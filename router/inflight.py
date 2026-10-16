@@ -1709,9 +1709,19 @@ def transaction_facts(state_dir: Path, logical_id: str, gen: str,
 #
 # READ-ONLY, AND NOTHING ELSE. No drain lock (the router holding it is the
 # case this exists for), no write, no sweep, no repair, no registry seq
-# recorded: the caller resolves logical ids with `persist=False`. Every file
-# is opened O_NOFOLLOW relative to its directory's descriptor, so a link
-# planted under `inflight/` is reported, never followed.
+# recorded: the caller resolves logical ids with `persist=False`.
+#
+# EVERY COMPONENT IS ANCHORED. The configured `state_dir` is opened once, as
+# the trusted anchor, and everything beneath it is reached from that
+# descriptor one component at a time: the instance or logical-id directory,
+# the generation directory, `_runtime` and its generations, `inflight/`, and
+# each file in it. A directory is opened O_DIRECTORY|O_NOFOLLOW and its
+# (st_dev, st_ino) must equal the lstat taken just before; a file is opened
+# O_NOFOLLOW and must be regular. So a link at ANY level beneath the anchor
+# (an instance directory, a generation directory, `_runtime` itself) is a row
+# naming it, never followed and never read as this router's state; the same
+# for a component replaced while it was being opened. The generations file
+# and the recorded runtime generation are read through the same descriptors.
 #
 # NEVER SKIPS AN ENTRY, unlike `list_records`, which is the drain's reader and
 # rightly passes over strays. Here a stray is a finding: every name under
@@ -1789,18 +1799,56 @@ def _read_nofollow(dir_fd: int, entry: str, cap: int) -> bytes:
 _RECORD_READ_CAP = 16 * 1024 * 1024
 
 
-def _list_dir(instance: str, generation: Optional[str], current: Optional[bool],
-              gen_path: Path, *, runtime: bool, now: Any) -> List[Dict[str, Any]]:
-    """The rows for one generation directory's `inflight/`."""
-    d = gen_path / INFLIGHT_DIR
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+class _Unfollowed(Exception):
+    """A component beneath the anchor that is not a plain directory: a link, a
+    non-directory, or one replaced while it was opened. Never followed."""
+
+
+def _open_child(parent_fd: int, name: str) -> Optional[int]:
+    """`name`'s directory beneath `parent_fd`, opened without following a link
+    and identity-checked against its lstat; None when it does not exist.
+    Raises `_Unfollowed` (a link, not a directory, or changed) or OSError."""
     try:
-        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return []
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        raise _Unfollowed("a linked directory, not followed")
+    if not stat.S_ISDIR(st.st_mode):
+        raise _Unfollowed("not a directory")
+    try:
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise _Unfollowed("a linked directory, not followed") from None
+        raise
+    got = os.fstat(fd)
+    if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+        os.close(fd)
+        raise _Unfollowed("replaced while it was opened")
+    return fd
+
+
+def _list_dir(instance: str, generation: Optional[str], current: Optional[bool],
+              parent_fd: int, *, runtime: bool, now: Any) -> List[Dict[str, Any]]:
+    """The rows for the `inflight/` beneath one generation directory's
+    descriptor."""
+    try:
+        dfd = _open_child(parent_fd, INFLIGHT_DIR)
+    except _Unfollowed as e:
+        return [_row(instance, generation, current, entry=INFLIGHT_DIR, state=ROW_UNREADABLE,
+                     reason=f"the inflight directory: {e}")]
     except OSError as e:
         return [_row(instance, generation, current, entry=INFLIGHT_DIR, state=ROW_UNREADABLE,
                      reason=f"the inflight directory cannot be opened: "
                             f"{errno.errorcode.get(e.errno, e.errno)}")]
+    if dfd is None:
+        return []
     try:
         try:
             names = sorted(os.listdir(dfd))
@@ -1828,6 +1876,27 @@ def _list_dir(instance: str, generation: Optional[str], current: Optional[bool],
         return rows
     finally:
         os.close(dfd)
+
+
+def _child_rows(instance: str, generation: Optional[str], current: Optional[bool],
+                parent_fd: int, name: str, *, runtime: bool, now: Any) -> List[Dict[str, Any]]:
+    """The rows beneath directory `name` of `parent_fd`: its `inflight/`, or one
+    row naming why `name` itself is not followed or cannot be opened."""
+    try:
+        fd = _open_child(parent_fd, name)
+    except _Unfollowed as e:
+        return [_row(instance, generation, current, entry=name, state=ROW_UNREADABLE,
+                     reason=f"state directory {name}: {e}")]
+    except OSError as e:
+        return [_row(instance, generation, current, entry=name, state=ROW_UNREADABLE,
+                     reason=f"state directory {name} cannot be opened: "
+                            f"{errno.errorcode.get(e.errno, e.errno)}")]
+    if fd is None:
+        return []
+    try:
+        return _list_dir(instance, generation, current, fd, runtime=runtime, now=now)
+    finally:
+        os.close(fd)
 
 
 def _orphan_row(instance: str, generation: Optional[str], current: Optional[bool],
@@ -1900,62 +1969,121 @@ def _record_row(instance: str, generation: Optional[str], current: Optional[bool
                 **facts)
 
 
+#: The most bytes the listing reads of the generations file or the recorded
+#: runtime generation; both are a few hundred bytes.
+_DOC_READ_CAP = 1024 * 1024
+
+
 def list_inflight(cfg: RouterConfig, names: List[str], *, known: Optional[Dict[str, str]],
                   now: Any, runtime: bool) -> List[Dict[str, Any]]:
     """The listing's rows (section comment above), for `names` and, with
     `runtime`, the runtime control namespace. `known`: the registry's
     name -> logical_id, read with `persist=False`; `None` without a registry.
     `now`: an aware datetime for `age_s`."""
-    from . import generations as gens_mod
-    rows: List[Dict[str, Any]] = []
-    for name in names:
-        if known is None:
-            rows += _list_dir(name, None, None, Path(cfg.state_dir) / name,
-                              runtime=False, now=now)
-            continue
-        lid = known.get(name)
-        if lid is None:
-            rows.append(_row(name, None, None, state=ROW_UNRESOLVED,
-                             reason="the registry resolves no logical_id for it"))
-            continue
-        try:
-            doc = gens_mod.read_doc(Path(cfg.state_dir), lid)
-        except gens_mod.GenerationHeld as e:
-            rows.append(_row(name, None, None, state=ROW_UNRESOLVED, reason=str(e)))
-            continue
-        if doc is None:
-            rows += _list_dir(name, "legacy", None, gens_mod.lid_dir(Path(cfg.state_dir), lid),
-                              runtime=False, now=now)
-            continue
-        for g in doc["gens"]:
-            rows += _list_dir(name, g["gen"], g["gen"] == doc["current"],
-                              gens_mod.gen_dir(Path(cfg.state_dir), lid, g["gen"]),
-                              runtime=False, now=now)
-    if runtime:
-        rows += _list_runtime(cfg, now=now)
-    return rows
-
-
-def _list_runtime(cfg: RouterConfig, *, now: Any) -> List[Dict[str, Any]]:
-    ns = config_mod.RUNTIME_NS
-    root = Path(cfg.state_dir) / ns
     try:
-        entries = sorted(e.name for e in os.scandir(root)
-                         if _RUNTIME_GEN_RE.fullmatch(e.name) and e.is_dir(follow_symlinks=False))
-    except FileNotFoundError:
+        anchor = os.open(cfg.state_dir, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        why = f"state_dir {_why(e)}"
+        return ([_row(n, None, None, state=ROW_UNRESOLVED, reason=why) for n in names]
+                + ([_row(config_mod.RUNTIME_NS, None, None, state=ROW_UNRESOLVED, reason=why)]
+                   if runtime else []))
+    try:
+        rows: List[Dict[str, Any]] = []
+        for name in names:
+            if known is None:
+                rows += _child_rows(name, None, None, anchor, name, runtime=False, now=now)
+            else:
+                rows += _registry_rows(anchor, name, known.get(name), now=now)
+        if runtime:
+            rows += _list_runtime(anchor, now=now)
+        return rows
+    finally:
+        os.close(anchor)
+
+
+def _registry_rows(anchor: int, name: str, lid: Optional[str], *,
+                   now: Any) -> List[Dict[str, Any]]:
+    """`name`'s rows under a registry: every generation its generations file
+    lists, current and fenced, or the pre-generation layout without one."""
+    from . import generations as gens_mod
+    if lid is None:
+        return [_row(name, None, None, state=ROW_UNRESOLVED,
+                     reason="the registry resolves no logical_id for it")]
+    try:
+        lfd = _open_child(anchor, lid)
+    except _Unfollowed as e:
+        return [_row(name, None, None, entry=lid, state=ROW_UNREADABLE,
+                     reason=f"state directory {lid}: {e}")]
+    except OSError as e:
+        return [_row(name, None, None, state=ROW_UNRESOLVED,
+                     reason=f"state directory {lid} {_why(e)}")]
+    if lfd is None:
         return []
+    try:
+        try:
+            raw: Optional[bytes] = _read_nofollow(lfd, gens_mod.GEN_FILE, _DOC_READ_CAP)
+        except FileNotFoundError:
+            raw = None
+        except (OSError, ValueError) as e:
+            return [_row(name, None, None, state=ROW_UNRESOLVED,
+                         reason=f"{gens_mod.GEN_FILE}: {_why(e)}")]
+        if raw is None:
+            return _list_dir(name, "legacy", None, lfd, runtime=False, now=now)
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+            gens_mod._check_doc(doc)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return [_row(name, None, None, state=ROW_UNRESOLVED,
+                         reason=f"{gens_mod.GEN_FILE} is not JSON")]
+        except gens_mod.GenerationHeld as e:
+            return [_row(name, None, None, state=ROW_UNRESOLVED, reason=str(e))]
+        rows: List[Dict[str, Any]] = []
+        for g in doc["gens"]:
+            rows += _child_rows(name, g["gen"], g["gen"] == doc["current"], lfd,
+                                gens_mod.GEN_PREFIX + g["gen"], runtime=False, now=now)
+        return rows
+    finally:
+        os.close(lfd)
+
+
+def _recorded_runtime_generation(rfd: int) -> Optional[str]:
+    """The runtime namespace's recorded generation, read through its
+    descriptor (`config.runtime_generation`'s rule), or None."""
+    try:
+        doc = json.loads(_read_nofollow(rfd, config_mod.RUNTIME_GENERATION_FILE,
+                                        _DOC_READ_CAP).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    gen = doc.get("generation") if isinstance(doc, dict) else None
+    return gen if isinstance(gen, str) and _RUNTIME_GEN_RE.fullmatch(gen) else None
+
+
+def _list_runtime(anchor: int, *, now: Any) -> List[Dict[str, Any]]:
+    ns = config_mod.RUNTIME_NS
+    try:
+        rfd = _open_child(anchor, ns)
+    except _Unfollowed as e:
+        return [_row(ns, None, None, entry=ns, state=ROW_UNREADABLE,
+                     reason=f"the runtime namespace: {e}")]
     except OSError as e:
         return [_row(ns, None, None, state=ROW_UNRESOLVED,
                      reason=f"the runtime namespace {_why(e)}")]
+    if rfd is None:
+        return []
     try:
-        recorded: Optional[str] = config_mod.runtime_generation(cfg)
-    except config_mod.StateKeyUnresolved:
-        recorded = None
-    rows: List[Dict[str, Any]] = []
-    for gen in entries:
-        rows += _list_dir(ns, gen, None if recorded is None else gen == recorded,
-                          root / gen, runtime=True, now=now)
-    return rows
+        try:
+            entries = sorted(n for n in os.listdir(rfd) if _RUNTIME_GEN_RE.fullmatch(n))
+        except OSError as e:
+            return [_row(ns, None, None, state=ROW_UNRESOLVED,
+                         reason=f"the runtime namespace {_why(e)}")]
+        recorded = _recorded_runtime_generation(rfd)
+        rows: List[Dict[str, Any]] = []
+        for gen in entries:
+            rows += _child_rows(ns, gen, None if recorded is None else gen == recorded, rfd, gen,
+                                runtime=True, now=now)
+        return rows
+    finally:
+        os.close(rfd)
 
 
 def render_list_line(row: Dict[str, Any]) -> str:
