@@ -1701,3 +1701,404 @@ def transaction_facts(state_dir: Path, logical_id: str, gen: str,
             return {"req_id": p.name[: -len(".json")], "source": "record",
                     "recipients": list(rec["recipients"]), "message_id": None}
     return None
+
+
+# ---------------------------------------------------------------------------
+# THE OPERATOR LISTING (`router inflight list`): every in-flight entry, read
+# while the router runs.
+#
+# READ-ONLY, AND NOTHING ELSE. No drain lock (the router holding it is the
+# case this exists for), no write, no sweep, no repair, no registry seq
+# recorded: the caller resolves logical ids with `persist=False`.
+#
+# EVERY COMPONENT IS ANCHORED. The configured `state_dir` is opened once, as
+# the trusted anchor, and everything beneath it is reached from that
+# descriptor one component at a time: the instance or logical-id directory,
+# the generation directory, `_runtime` and its generations, `inflight/`, and
+# each file in it. A directory is opened O_DIRECTORY|O_NOFOLLOW and its
+# (st_dev, st_ino) must equal the lstat taken just before; a file is opened
+# O_NOFOLLOW and must be regular. So a link at ANY level beneath the anchor
+# (an instance directory, a generation directory, `_runtime` itself) is a row
+# naming it, never followed and never read as this router's state; the same
+# for a component replaced while it was being opened. The generations file
+# and the recorded runtime generation are read through the same descriptors.
+#
+# NEVER SKIPS AN ENTRY, unlike `list_records`, which is the drain's reader and
+# rightly passes over strays. Here a stray is a finding: every name under
+# `inflight/` produces one row. A record that is torn, outside the closed
+# schema (`check_record`), a link or not a regular file is `unreadable` with
+# its reason; a name that is neither `<id>.json` nor `<id>.handed` is
+# `unreadable` ("not a record or a handed marker"); a marker with no record
+# beside it is `orphan_marker`. An instance or generation whose directory
+# cannot be resolved is one `unresolved` row, never silence.
+#
+# The one thing deliberately NOT reported: an entry that vanishes between the
+# directory read and its open (ENOENT). The live drain settled it in between,
+# and it is no longer in flight.
+#
+# WHICH GENERATIONS. Without a registry, `state_dir/<name>/` (generation
+# `None`). Under one, EVERY generation the generations file lists, current
+# and fenced: a fenced generation's records still advance every poll
+# (`generations` module docstring), so they are in flight too. With no
+# generations file, the pre-generation layout `state_dir/<logical_id>/` is
+# listed if it has an `inflight/` (generation "legacy"). The router's own
+# runtime control namespace (`_runtime/<32 hex>/`) is listed per generation
+# directory, current being the recorded one.
+# ---------------------------------------------------------------------------
+
+LIST_SCHEMA = "amap-router-local.inflight-list/1"
+#: A row's `state`.
+ROW_NOT_HANDED = "not_handed"
+ROW_HANDED = "handed"
+ROW_REVOKED = "revoked"
+ROW_ORPHAN_MARKER = "orphan_marker"
+ROW_UNREADABLE = "unreadable"
+ROW_UNRESOLVED = "unresolved"
+LIST_STATES = (ROW_NOT_HANDED, ROW_HANDED, ROW_REVOKED, ROW_ORPHAN_MARKER,
+               ROW_UNREADABLE, ROW_UNRESOLVED)
+#: Every row carries exactly these members (absent facts are `None`).
+ROW_KEYS = ("instance", "generation", "current", "entry", "req_id", "transport_req_id",
+            "state", "written_ts", "age_s", "tree", "signed_kind", "retransmit", "reason")
+_RUNTIME_GEN_RE = re.compile(r"[0-9a-f]{32}\Z")
+#: A marker is the transport id `n` alone; anything longer is not one.
+_MARKER_MAX = 64
+
+
+def _row(instance: str, generation: Optional[str], current: Optional[bool], *,
+         state: str, reason: str = "", **facts: Any) -> Dict[str, Any]:
+    row: Dict[str, Any] = {k: None for k in ROW_KEYS}
+    row.update(instance=instance, generation=generation, current=current, state=state,
+               reason=reason, **facts)
+    assert set(row) == set(ROW_KEYS), sorted(set(row) - set(ROW_KEYS))
+    return row
+
+
+def _read_nofollow(dir_fd: int, entry: str, cap: int) -> bytes:
+    """`entry`'s bytes, at most `cap` + 1 of them, opened without following a
+    link and refused unless it is a regular file. Raises OSError (ENOENT
+    included) or ValueError (not a regular file)."""
+    fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                 dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a regular file")
+        chunks, size = [], 0
+        while size <= cap:
+            b = os.read(fd, cap + 1 - size)
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+#: The most bytes a record may be for the listing to read it. Records carry
+#: the staged request and, signed, its statement; far below this.
+_RECORD_READ_CAP = 16 * 1024 * 1024
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+class _Unfollowed(Exception):
+    """A component beneath the anchor that is not a plain directory: a link, a
+    non-directory, or one replaced while it was opened. Never followed."""
+
+
+def _open_child(parent_fd: int, name: str) -> Optional[int]:
+    """`name`'s directory beneath `parent_fd`, opened without following a link
+    and identity-checked against its lstat; None when it does not exist.
+    Raises `_Unfollowed` (a link, not a directory, or changed) or OSError."""
+    try:
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        raise _Unfollowed("a linked directory, not followed")
+    if not stat.S_ISDIR(st.st_mode):
+        raise _Unfollowed("not a directory")
+    try:
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise _Unfollowed("a linked directory, not followed") from None
+        raise
+    got = os.fstat(fd)
+    if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+        os.close(fd)
+        raise _Unfollowed("replaced while it was opened")
+    return fd
+
+
+def _list_dir(instance: str, generation: Optional[str], current: Optional[bool],
+              parent_fd: int, *, runtime: bool, now: Any) -> List[Dict[str, Any]]:
+    """The rows for the `inflight/` beneath one generation directory's
+    descriptor."""
+    try:
+        dfd = _open_child(parent_fd, INFLIGHT_DIR)
+    except _Unfollowed as e:
+        return [_row(instance, generation, current, entry=INFLIGHT_DIR, state=ROW_UNREADABLE,
+                     reason=f"the inflight directory: {e}")]
+    except OSError as e:
+        return [_row(instance, generation, current, entry=INFLIGHT_DIR, state=ROW_UNREADABLE,
+                     reason=f"the inflight directory cannot be opened: "
+                            f"{errno.errorcode.get(e.errno, e.errno)}")]
+    if dfd is None:
+        return []
+    try:
+        try:
+            names = sorted(os.listdir(dfd))
+        except OSError as e:
+            return [_row(instance, generation, current, entry=INFLIGHT_DIR,
+                         state=ROW_UNREADABLE,
+                         reason=f"the inflight directory cannot be read: "
+                                f"{errno.errorcode.get(e.errno, e.errno)}")]
+        records = {n[: -len(".json")] for n in names if n.endswith(".json")}
+        rows = []
+        for entry in names:
+            if entry.endswith(".json"):
+                row = _record_row(instance, generation, current, dfd, entry,
+                                  runtime=runtime, now=now)
+            elif entry.endswith(HANDED_SUFFIX):
+                req_id = entry[: -len(HANDED_SUFFIX)]
+                if req_id in records:
+                    continue    # read with its record
+                row = _orphan_row(instance, generation, current, dfd, entry, req_id)
+            else:
+                row = _row(instance, generation, current, entry=entry, state=ROW_UNREADABLE,
+                           reason="not a record or a handed marker")
+            if row is not None:
+                rows.append(row)
+        return rows
+    finally:
+        os.close(dfd)
+
+
+def _child_rows(instance: str, generation: Optional[str], current: Optional[bool],
+                parent_fd: int, name: str, *, runtime: bool, now: Any) -> List[Dict[str, Any]]:
+    """The rows beneath directory `name` of `parent_fd`: its `inflight/`, or one
+    row naming why `name` itself is not followed or cannot be opened."""
+    try:
+        fd = _open_child(parent_fd, name)
+    except _Unfollowed as e:
+        return [_row(instance, generation, current, entry=name, state=ROW_UNREADABLE,
+                     reason=f"state directory {name}: {e}")]
+    except OSError as e:
+        return [_row(instance, generation, current, entry=name, state=ROW_UNREADABLE,
+                     reason=f"state directory {name} cannot be opened: "
+                            f"{errno.errorcode.get(e.errno, e.errno)}")]
+    if fd is None:
+        return []
+    try:
+        return _list_dir(instance, generation, current, fd, runtime=runtime, now=now)
+    finally:
+        os.close(fd)
+
+
+def _orphan_row(instance: str, generation: Optional[str], current: Optional[bool],
+                dfd: int, entry: str, req_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        raw = _read_nofollow(dfd, entry, _MARKER_MAX)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        return _row(instance, generation, current, entry=entry, req_id=req_id,
+                    state=ROW_UNREADABLE, reason=f"handed marker: {_why(e)}")
+    n = raw.decode("ascii", "replace") if len(raw) <= _MARKER_MAX else None
+    return _row(instance, generation, current, entry=entry, req_id=req_id,
+                transport_req_id=n if n and _TRANSPORT_ID_RE.fullmatch(n) else None,
+                state=ROW_ORPHAN_MARKER, reason="a handed marker with no record beside it")
+
+
+def _why(e: BaseException) -> str:
+    if isinstance(e, OSError):
+        return f"cannot be read: {errno.errorcode.get(e.errno, e.errno)}"
+    return str(e)
+
+
+def _record_row(instance: str, generation: Optional[str], current: Optional[bool],
+                dfd: int, entry: str, *, runtime: bool, now: Any) -> Optional[Dict[str, Any]]:
+    req_id = entry[: -len(".json")]
+    base = dict(entry=entry, req_id=req_id)
+    try:
+        raw = _read_nofollow(dfd, entry, _RECORD_READ_CAP)
+    except FileNotFoundError:
+        return None     # settled by the live drain since the directory was read
+    except (OSError, ValueError) as e:
+        return _row(instance, generation, current, state=ROW_UNREADABLE,
+                    reason=f"record: {_why(e)}", **base)
+    if len(raw) > _RECORD_READ_CAP:
+        return _row(instance, generation, current, state=ROW_UNREADABLE,
+                    reason="record: larger than the listing reads", **base)
+    try:
+        rec = check_record(json.loads(raw.decode("utf-8")), runtime=runtime)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _row(instance, generation, current, state=ROW_UNREADABLE,
+                    reason="record: not JSON", **base)
+    except RecordDamaged as e:
+        return _row(instance, generation, current, state=ROW_UNREADABLE,
+                    reason=f"record: {e}", **base)
+    n = rec["transport_req_id"]
+    written = parse_utc_ts(rec["written_ts"])
+    age = None if written is None or now is None else max(0, int((now - written).total_seconds()))
+    peer = rec.get("peer")
+    facts = dict(base, transport_req_id=n, written_ts=rec["written_ts"], age_s=age,
+                 tree="peer" if peer is not None else "mail",
+                 signed_kind=peer["kind"] if peer is not None else None,
+                 retransmit="retransmit" in rec)
+    try:
+        marker = _read_nofollow(dfd, req_id + HANDED_SUFFIX, _MARKER_MAX)
+    except FileNotFoundError:
+        marker = None
+    except (OSError, ValueError) as e:
+        return _row(instance, generation, current, state=ROW_UNREADABLE,
+                    reason=f"handed marker: {_why(e)}", **facts)
+    handed = marker == n.encode("ascii")
+    if rec.get("revocation_unenforceable") is not None:
+        return _row(instance, generation, current, state=ROW_REVOKED,
+                    reason=f"revocation unenforceable since {rec['revocation_unenforceable']}",
+                    **facts)
+    if handed:
+        return _row(instance, generation, current, state=ROW_HANDED, **facts)
+    return _row(instance, generation, current, state=ROW_NOT_HANDED,
+                reason="" if marker is None else "its handed marker names another transport id",
+                **facts)
+
+
+#: The most bytes the listing reads of the generations file or the recorded
+#: runtime generation; both are a few hundred bytes.
+_DOC_READ_CAP = 1024 * 1024
+
+
+def list_inflight(cfg: RouterConfig, names: List[str], *, known: Optional[Dict[str, str]],
+                  now: Any, runtime: bool) -> List[Dict[str, Any]]:
+    """The listing's rows (section comment above), for `names` and, with
+    `runtime`, the runtime control namespace. `known`: the registry's
+    name -> logical_id, read with `persist=False`; `None` without a registry.
+    `now`: an aware datetime for `age_s`."""
+    try:
+        anchor = os.open(cfg.state_dir, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        why = f"state_dir {_why(e)}"
+        return ([_row(n, None, None, state=ROW_UNRESOLVED, reason=why) for n in names]
+                + ([_row(config_mod.RUNTIME_NS, None, None, state=ROW_UNRESOLVED, reason=why)]
+                   if runtime else []))
+    try:
+        rows: List[Dict[str, Any]] = []
+        for name in names:
+            if known is None:
+                rows += _child_rows(name, None, None, anchor, name, runtime=False, now=now)
+            else:
+                rows += _registry_rows(anchor, name, known.get(name), now=now)
+        if runtime:
+            rows += _list_runtime(anchor, now=now)
+        return rows
+    finally:
+        os.close(anchor)
+
+
+def _registry_rows(anchor: int, name: str, lid: Optional[str], *,
+                   now: Any) -> List[Dict[str, Any]]:
+    """`name`'s rows under a registry: every generation its generations file
+    lists, current and fenced, or the pre-generation layout without one."""
+    from . import generations as gens_mod
+    if lid is None:
+        return [_row(name, None, None, state=ROW_UNRESOLVED,
+                     reason="the registry resolves no logical_id for it")]
+    try:
+        lfd = _open_child(anchor, lid)
+    except _Unfollowed as e:
+        return [_row(name, None, None, entry=lid, state=ROW_UNREADABLE,
+                     reason=f"state directory {lid}: {e}")]
+    except OSError as e:
+        return [_row(name, None, None, state=ROW_UNRESOLVED,
+                     reason=f"state directory {lid} {_why(e)}")]
+    if lfd is None:
+        return []
+    try:
+        try:
+            raw: Optional[bytes] = _read_nofollow(lfd, gens_mod.GEN_FILE, _DOC_READ_CAP)
+        except FileNotFoundError:
+            raw = None
+        except (OSError, ValueError) as e:
+            return [_row(name, None, None, state=ROW_UNRESOLVED,
+                         reason=f"{gens_mod.GEN_FILE}: {_why(e)}")]
+        if raw is None:
+            return _list_dir(name, "legacy", None, lfd, runtime=False, now=now)
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+            gens_mod._check_doc(doc)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return [_row(name, None, None, state=ROW_UNRESOLVED,
+                         reason=f"{gens_mod.GEN_FILE} is not JSON")]
+        except gens_mod.GenerationHeld as e:
+            return [_row(name, None, None, state=ROW_UNRESOLVED, reason=str(e))]
+        rows: List[Dict[str, Any]] = []
+        for g in doc["gens"]:
+            rows += _child_rows(name, g["gen"], g["gen"] == doc["current"], lfd,
+                                gens_mod.GEN_PREFIX + g["gen"], runtime=False, now=now)
+        return rows
+    finally:
+        os.close(lfd)
+
+
+def _recorded_runtime_generation(rfd: int) -> Optional[str]:
+    """The runtime namespace's recorded generation, read through its
+    descriptor (`config.runtime_generation`'s rule), or None."""
+    try:
+        doc = json.loads(_read_nofollow(rfd, config_mod.RUNTIME_GENERATION_FILE,
+                                        _DOC_READ_CAP).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    gen = doc.get("generation") if isinstance(doc, dict) else None
+    return gen if isinstance(gen, str) and _RUNTIME_GEN_RE.fullmatch(gen) else None
+
+
+def _list_runtime(anchor: int, *, now: Any) -> List[Dict[str, Any]]:
+    ns = config_mod.RUNTIME_NS
+    try:
+        rfd = _open_child(anchor, ns)
+    except _Unfollowed as e:
+        return [_row(ns, None, None, entry=ns, state=ROW_UNREADABLE,
+                     reason=f"the runtime namespace: {e}")]
+    except OSError as e:
+        return [_row(ns, None, None, state=ROW_UNRESOLVED,
+                     reason=f"the runtime namespace {_why(e)}")]
+    if rfd is None:
+        return []
+    try:
+        try:
+            entries = sorted(n for n in os.listdir(rfd) if _RUNTIME_GEN_RE.fullmatch(n))
+        except OSError as e:
+            return [_row(ns, None, None, state=ROW_UNRESOLVED,
+                         reason=f"the runtime namespace {_why(e)}")]
+        recorded = _recorded_runtime_generation(rfd)
+        rows: List[Dict[str, Any]] = []
+        for gen in entries:
+            rows += _child_rows(ns, gen, None if recorded is None else gen == recorded, rfd, gen,
+                                runtime=True, now=now)
+        return rows
+    finally:
+        os.close(rfd)
+
+
+def render_list_line(row: Dict[str, Any]) -> str:
+    """One row as one line: the instance, generation, req_id, transport id,
+    state, age and tree, each `-` when absent, then the reason. Names come
+    from the directory, so every field is escaped to stay one token and the
+    row one line; an entry with no req_id is named in the reason."""
+    def esc(v: Any) -> str:
+        return json.dumps(str(v))[1:-1].replace(" ", "\\u0020")
+
+    def f(v: Any) -> str:
+        return "-" if v is None or v == "" else esc(v)
+    head = " ".join(f(row[k]) for k in ("instance", "generation", "req_id", "transport_req_id",
+                                         "state", "age_s", "tree"))
+    reason = row["reason"]
+    if row["req_id"] is None and row["entry"] is not None:
+        reason = f"entry {row['entry']}: {reason}"
+    return head if not reason else head + " " + json.dumps(reason)[1:-1]

@@ -73,6 +73,11 @@
                                  ID, or one item as escaped JSON. SOURCE is ingress or control;
                                  a control entry is NAME - GEN -. Exit 1 for an unknown instance
                                  or item.
+  inflight list [NAME] [--json]
+                                 read-only listing of every in-flight entry (router/inflight.py,
+                                 THE OPERATOR LISTING): one line, or with --json one row in one
+                                 document, per record, orphan marker or stray. No drain lock, no
+                                 write: safe while the router runs. NAME may be _runtime.
   generation adopt NAME --reason TEXT [--dry-run] [--no-transport-history=N]
   generation fence-legacy NAME --reason TEXT [--dry-run] [--no-transport-history=N]
                                  under a registry: migrate NAME's pre-generation state, held as
@@ -286,6 +291,14 @@ def _build_parser() -> argparse.ArgumentParser:
                               help="end a runtime-generation plan that cannot complete")
     p_rgp.add_argument("--evidence", required=True)
 
+    p_if = sub.add_parser("inflight", help="read-only inspection of in-flight records")
+    if_sub = p_if.add_subparsers(dest="inflight_command", required=True)
+    p_ifl = if_sub.add_parser("list", help="one row per in-flight entry; no lock, no write")
+    p_ifl.add_argument("name", nargs="?",
+                       help="one instance, or _runtime (default: every instance and _runtime)")
+    p_ifl.add_argument("--json", action="store_true",
+                       help="print ONLY one JSON document: {schema, at, rows}")
+
     p_q = sub.add_parser("quarantine", help="read-only inspection of the ingress quarantine")
     q_sub = p_q.add_subparsers(dest="quarantine_command", required=True)
     p_ql = q_sub.add_parser("list", help="one line per item: NAME SOURCE GEN ID and its state")
@@ -441,6 +454,34 @@ def _runtime_generation(cfg, args) -> int:
     finally:
         lk.release()
     print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def _inflight(cfg, args) -> int:
+    """`inflight list` (router/inflight.py, THE OPERATOR LISTING). Read-only:
+    it takes no lock, writes nothing, and reads the registry without
+    recording its seq, so it is safe while the router drains."""
+    from . import clock, config as config_mod, inflight, registry as registry_mod
+    from .util import format_utc_ts
+    ns = config_mod.RUNTIME_NS
+    if args.name is not None and args.name != ns and args.name not in cfg.instances:
+        print(f"router: inflight: unknown instance {args.name!r}", file=sys.stderr)
+        return 1
+    known = None
+    if cfg.registry_dir is not None:
+        known = dict(registry_mod.report_for(
+            cfg.registry_dir, cfg.state_dir, cfg.instances, persist=False).known or {})
+    names = ([] if args.name == ns else [args.name] if args.name is not None
+             else sorted(cfg.instances))
+    now = clock.now()
+    rows = inflight.list_inflight(cfg, names, known=known, now=now,
+                                  runtime=args.name in (None, ns))
+    if args.json:
+        print(json.dumps({"schema": inflight.LIST_SCHEMA, "at": format_utc_ts(now),
+                          "rows": rows}, sort_keys=True))
+    else:
+        for row in rows:
+            print(inflight.render_list_line(row))
     return 0
 
 
@@ -865,6 +906,8 @@ def main(argv=None) -> int:
 
     if args.command == "quarantine":
         return _quarantine(cfg, args)
+    if args.command == "inflight":
+        return _inflight(cfg, args)
 
     if args.command in ("peer-store", "peer-bound", "peer-decision", "peer-candidate",
                         "peer-epochs"):
