@@ -84,6 +84,18 @@ class HopRuntime:
     hop: Any
 
 
+def plugin_status(runtime: Any) -> Optional[Dict[str, str]]:
+    """status.json's `transport_plugin` for this process: the path
+    `transport.load_plugin` opened and the sha256 IT computed from its one
+    fd read of the bytes it executed (`LoadedPlugin`), never recomputed from
+    the file and never copied from the config. None without a loaded plugin
+    (no `transport_plugin` configured, or a stand-in that loaded no bytes)."""
+    plugin = getattr(runtime, "plugin", None) if isinstance(runtime, HopRuntime) else None
+    if not isinstance(plugin, transport_mod.LoadedPlugin):
+        return None
+    return {"path": plugin.path, "sha256": plugin.sha256}
+
+
 def _agent_reachable_roots(cfg: RouterConfig) -> List[Path]:
     """Every directory an agent can reach: no plugin may live inside one.
     The same list `config.load` checks `hop.root` against."""
@@ -688,6 +700,10 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None) -> None:
     activate_delegation(cfg, transport)
     peer_startup(cfg, transport)
     tracker = StatusTracker(interval_s=interval)
+    # The loaded plugin's own digest, recorded once for this process: the
+    # reload below can never change it (a changed `transport_plugin` is a
+    # refused reload), so nothing records it again.
+    tracker.record_transport_plugin(plugin_status(transport))
     seen_report = None
     seen_names = sorted(cfg.instances)
     try:

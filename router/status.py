@@ -176,6 +176,19 @@ class StatusTracker:
         #: NOT serialised into status.json: the roster file's own
         #: `generated_ts` is the evidence that it is being published.
         self.roster_outcome: Optional[str] = None
+        #: The transport plugin THIS PROCESS loaded (`service.plugin_status`):
+        #: `{path, sha256}` from `transport.load_plugin`'s own single fd read,
+        #: recorded once at startup and never again, so a reload can never
+        #: rewrite it. None (and the member absent) when no plugin is loaded.
+        self.transport_plugin: Optional[Dict[str, str]] = None
+
+    def record_transport_plugin(self, doc: Optional[Dict[str, str]]) -> None:
+        """The plugin this process loaded, recorded ONCE: a second record is
+        refused, because the published digest describes the loaded bytes for
+        the process's whole life and nothing later may replace it."""
+        if self.transport_plugin is not None:
+            raise ValueError("the loaded transport plugin is recorded once per process")
+        self.transport_plugin = None if doc is None else dict(doc)
 
     def record_registry(self, doc: Optional[Dict[str, Any]]) -> None:
         """This poll's registry reading (`registry.Report.to_doc`), or None
@@ -260,6 +273,11 @@ class StatusTracker:
             "polls": self.polls,
             "instances": self.instances,
         }
+        # Present only when this process loaded a transport plugin: the path
+        # it opened and the sha256 of the bytes it read and executed, beside
+        # `started_ts`, so a reader binds the digest to this process.
+        if self.transport_plugin is not None:
+            doc["transport_plugin"] = dict(self.transport_plugin)
         # Present only under a registry: "state" (ok / unavailable /
         # rolled_back), "seq", and every instance HELD with its reason. A
         # rolled-back registry stays held until the operator removes
