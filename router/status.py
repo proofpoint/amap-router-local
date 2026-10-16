@@ -188,13 +188,16 @@ class StatusTracker:
         #: recorded once at startup and never again, so a reload can never
         #: rewrite it. None (and the member absent) when no plugin is loaded.
         self.transport_plugin: Optional[Dict[str, str]] = None
+        #: Latched by the FIRST record, None included: "once" is literal.
+        self._transport_plugin_recorded = False
 
     def record_transport_plugin(self, doc: Optional[Dict[str, str]]) -> None:
         """The plugin this process loaded, recorded ONCE: a second record is
         refused, because the published digest describes the loaded bytes for
         the process's whole life and nothing later may replace it."""
-        if self.transport_plugin is not None:
+        if self._transport_plugin_recorded:
             raise ValueError("the loaded transport plugin is recorded once per process")
+        self._transport_plugin_recorded = True
         self.transport_plugin = None if doc is None else dict(doc)
 
     def record_registry(self, doc: Optional[Dict[str, Any]]) -> None:

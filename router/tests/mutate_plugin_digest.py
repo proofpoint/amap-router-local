@@ -26,8 +26,9 @@ import subprocess
 import sys
 
 P = "router.tests.test_plugin_digest."
-PD, RP, RR, PS = (P + c + "." for c in ("PublishedDigestTests", "RunningProcessTests",
-                                         "RefusalIsRecordedTests", "ProcessStartedTests"))
+PD, RP, RR, PS, PV = (P + c + "." for c in ("PublishedDigestTests", "RunningProcessTests",
+                                             "RefusalIsRecordedTests", "ProcessStartedTests",
+                                             "ProcessStartedValueTests"))
 SV = "router/service.py"
 ST = "router/status.py"
 UT = "router/util.py"
@@ -49,7 +50,7 @@ M = [
   '    pass\n',
   [RP + 'test_the_running_process_publishes_its_loaded_digest']),
  ('D4 the record-once guard dropped', ST,
-  '        if self.transport_plugin is not None:\n'
+  '        if self._transport_plugin_recorded:\n'
   '            raise ValueError("the loaded transport plugin is recorded once per process")\n',
   '',
   [PD + 'test_the_tracker_records_it_once']),
@@ -101,6 +102,18 @@ M = [
   '            doc["process_started_ts"] = self.process_started_ts\n',
   '',
   [PS + 'test_present_with_a_fraction_on_every_write']),
+ ('S7 local time formatted with a Z', UT,
+  '    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")\n',
+  '    return dt.astimezone().strftime("%Y-%m-%dT%H:%M:%S.%fZ")\n',
+  [PV + 'test_the_exact_utc_string_with_its_microseconds']),
+ ('S8 the fraction zeroed', UT,
+  '    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")\n',
+  '    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")\n',
+  [PV + 'test_the_exact_utc_string_with_its_microseconds']),
+ ('D9 a None record does not latch', ST,
+  '        self._transport_plugin_recorded = True\n',
+  '        self._transport_plugin_recorded = doc is not None\n',
+  [PD + 'test_a_none_record_latches_too']),
 ]
 
 

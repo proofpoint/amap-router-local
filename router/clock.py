@@ -19,6 +19,10 @@ middle of a scenario. It is therefore deliberately absent from
 calls `install` or `reset`; no config member, environment variable or CLI
 flag reaches them.
 
+An installed source is ALSO what status.json's `process_started_ts` records:
+`__main__.main` takes it with `now()` as its first statement, so a driver that
+installs a source before calling `main` sees that source's time there.
+
 What is NOT a clock read: a time passed in as data (a statement's `ts`, a
 record's `recorded_ts`, a bound's `at`) and a file time (`st_mtime`), which the
 kernel stamps. `time.monotonic` is allowed at exactly one site,

@@ -21,6 +21,7 @@ import os
 from unittest import mock
 
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from router import __main__ as cli, clock, config as config_mod, service, status as status_mod, transport
@@ -97,6 +98,13 @@ class PublishedDigestTests(_Digest):
         with self.assertRaises(ValueError):
             t.record_transport_plugin({"path": "/q", "sha256": "b" * 64})
         self.assertEqual(t.to_doc()["transport_plugin"], {"path": "/p", "sha256": "a" * 64})
+
+    def test_a_none_record_latches_too(self):
+        t = status_mod.StatusTracker(interval_s=5.0)
+        t.record_transport_plugin(None)
+        with self.assertRaises(ValueError):
+            t.record_transport_plugin({"path": "/p", "sha256": "a" * 64})
+        self.assertNotIn("transport_plugin", t.to_doc())
 
     def test_absent_from_the_document_without_a_plugin(self):
         t = status_mod.StatusTracker(interval_s=5.0)
@@ -296,3 +304,32 @@ class ProcessStartedTests(_Loop):
             cli.main(["--config", "unused.json", "run", "--interval", "5"])
         self.assertIsInstance(seen.get("process_started"), datetime)
         self.assertLess(seen["process_started"], load_at[0], "taken after the config was loaded")
+
+
+class ProcessStartedValueTests(_Loop):
+    """The VALUE, not only its shape: a known instant with a non-zero
+    microsecond, under a non-UTC local zone, must come out as that exact UTC
+    string. Local time with a `Z`, or a zeroed fraction, would pass a shape
+    check and fail this one."""
+
+    WHEN = datetime(2026, 10, 16, 1, 42, 19, 453920, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        old = os.environ.get("TZ")
+
+        def restore():
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+        os.environ["TZ"] = "America/Denver"
+        time.tzset()
+        self.addCleanup(restore)
+
+    def test_the_exact_utc_string_with_its_microseconds(self):
+        _, rt = self.start()
+        self.run_loop(self.cfg_file(self.doc()), rt, process_started=self.WHEN)
+        self.assertEqual([d.get("process_started_ts") for d in self.writes],
+                         ["2026-10-16T01:42:19.453920Z"] * 2)
