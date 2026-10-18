@@ -52,7 +52,7 @@ disagree without anyone noticing.
 | `state_dir` | `rw` | router-private: approval markers, reply ledger, quarantine |
 | the config file | `ro` | parsed, never written |
 | `hop.root` (only with a `hop` section) | `rw` | the hop tree the transport plugin writes and the downstream runtime reads |
-| `registry_dir` (only with a `hop` section) | `ro` | the host registry; without it every instance is held |
+| `registry_dir` (with or without a `hop` section) | `ro` | the host registry; without it every instance is held |
 | the directory of `delivered_domains_file` (only with a `hop` section) | `ro` | the delivered-domain artifact, by its directory: it is replaced by rename |
 | the directory of `transport_plugin.path` (only with a `hop` section) | `ro` | the pinned plugin, by its directory, for the same reason |
 | the directory of `delegation.signing_key.path` (only with a `delegation` section, with or without `hop`) | `ro` | the peer signing key, by its directory and never as the file (a rotated key is a rename); the same path rules as the hop paths, and never nested with a read-write mount |
@@ -103,6 +103,11 @@ mounting it read-only here would break delivery entirely.
 that sandy created as the host user, and the agent side runs as that same uid.
 Pinning a uid would write root-owned notices into the operator's home
 directory.
+
+`--group-add <gid>` adds exactly ONE supplementary group, by number, directly
+after `--user`: for a host whose shared tree is owned by a group the operator's
+primary gid is not (the hop tree's group). Decimal, never 0, never a list, at
+most once; without it the `docker run` argv is unchanged.
 
 ## Modes
 

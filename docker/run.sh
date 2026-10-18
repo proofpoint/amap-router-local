@@ -17,6 +17,7 @@
 #   docker/run.sh --config ~/.sandy/router.json --detach
 #   docker/run.sh --config ~/.sandy/router.json --interval 10
 #   docker/run.sh --config ~/.sandy/router.json -- once      # drain once, exit
+#   docker/run.sh --config ~/.sandy/router.json --detach --group-add 2100
 #
 # NO SECRETS. This container takes no --env-file and needs none: the router is
 # provider-free, holds no credential, and runs `--network none`.
@@ -32,6 +33,7 @@ CONFIG=""
 INTERVAL="${ROUTER_INTERVAL:-5}"
 DETACH=0
 MODE_ARGS=()
+GROUP_ADD=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,6 +42,17 @@ while [ $# -gt 0 ]; do
     --detach|-d) DETACH=1; shift ;;
     --image)    IMAGE="${2:?}"; shift 2 ;;
     --name)     CONTAINER="${2:?}"; shift 2 ;;
+    # ONE supplementary group, by number, for a host whose shared tree is
+    # group-owned (the hop tree's group): the container keeps the invoking
+    # user's uid and primary gid, and gains exactly this one. Decimal, never 0
+    # (root's group), never a list, at most once.
+    --group-add)
+      [ -z "$GROUP_ADD" ] || { echo "run.sh: --group-add given twice" >&2; exit 2; }
+      case "${2-}" in
+        ''|0*|*[!0-9]*) echo "run.sh: --group-add needs one decimal gid other than 0, got '${2-}'" >&2; exit 2 ;;
+      esac
+      [ "${#2}" -le 10 ] || { echo "run.sh: --group-add gid '$2' is too long" >&2; exit 2; }
+      GROUP_ADD="$2"; shift 2 ;;
     --)         shift; MODE_ARGS=("$@"); break ;;
     -h|--help)  sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "run.sh: unknown argument '$1'" >&2; exit 2 ;;
@@ -79,6 +92,11 @@ echo "run.sh: $(( ${#MOUNTS[@]} / 2 )) mount(s) derived from $CONFIG_ABS" >&2
 COMMON=(
   --network none
   --user "$(id -u):$(id -g)"
+)
+# Directly after --user, and only when asked: without --group-add the argv is
+# exactly what it was.
+[ -z "$GROUP_ADD" ] || COMMON+=(--group-add "$GROUP_ADD")
+COMMON+=(
   -e "ROUTER_CONFIG=$CONFIG_ABS"
   -e "ROUTER_INTERVAL=$INTERVAL"
   "${MOUNTS[@]}"

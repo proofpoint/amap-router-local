@@ -117,16 +117,50 @@ class HopMountsTests(unittest.TestCase):
     # --- nothing new without a hop section -------------------------------
 
     def test_without_hop_the_mount_list_is_byte_identical(self):
-        # The registry and D7 keys are present and their directories exist,
-        # so only the `hop` gate keeps them out: the companion to the full
-        # set above, where the same keys DO mount.
+        # The D7 key is present and its directory exists, so only the `hop`
+        # gate keeps it out: the companion to the full set above, where the
+        # same key DOES mount. (registry_dir is the one key mounted without
+        # `hop`: the rows below.)
         bare = self.cfg(hop=None, transport_plugin=None, registry_dir=None,
                         delivered_domains_file=None)
-        keys = self.cfg(hop=None, transport_plugin=None)
+        keys = self.cfg(hop=None, transport_plugin=None, registry_dir=None)
         a, b = self.run_script(bare), self.run_script(keys)
         self.assertEqual((a.returncode, b.returncode), (0, 0), a.stderr + b.stderr)
         self.assertEqual(b.stdout, a.stdout)
         self.assertEqual(a.stdout, f"{self.p('state')}\trw\n{self.p('alice')}\trw\n")
+
+    # --- the registry without a hop section -------------------------------
+
+    def no_hop(self, **over):
+        return self.cfg(hop=None, transport_plugin=None, delivered_domains_file=None, **over)
+
+    def test_registry_dir_without_hop_is_mounted_read_only(self):
+        # The loader reads registry_dir with or without hop; run.sh's
+        # container must see it, or every instance is held.
+        m, n = self.mounts(self.no_hop())
+        self.assertEqual(m, {self.p("state"): "rw", self.p("alice"): "rw",
+                             self.p("registry"): "ro"})
+        self.assertEqual(n, 3)
+
+    def test_registry_dir_without_hop_keeps_the_hop_paths_rules(self):
+        (self.t / "reglink").symlink_to(self.t / "registry")
+        for value, needle in (("registry", "must be an absolute path"),
+                              (self.p("registry") + "/", "not in normal form"),
+                              (self.p("reglink"), "not its own realpath"),
+                              ("/usr/share/registry", "container system path")):
+            with self.subTest(value=value):
+                self.refused(self.no_hop(registry_dir=value), "registry mount: registry_dir", needle)
+
+    def test_registry_dir_without_hop_inside_a_read_write_mount_is_refused(self):
+        (self.t / "state" / "registry").mkdir()
+        self.refused(self.no_hop(registry_dir=self.p("state/registry")),
+                     "registry mount: registry_dir", "a read-only path is nested with no read-write one")
+
+    def test_a_missing_registry_dir_without_hop_is_refused(self):
+        r = self.run_script(self.no_hop(registry_dir=self.p("absent")))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn(f"registry_dir: {self.p('absent')}", r.stderr)
+        self.assertEqual(r.stdout, "")
 
     # --- refusals, each named --------------------------------------------
 
