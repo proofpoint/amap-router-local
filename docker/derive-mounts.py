@@ -215,7 +215,8 @@ def check_nesting(new, where):
 # above is: a file bind binds the inode it found, and a rename replaces it.
 #
 # Gated on the `hop` section, not on each key: without `hop` the list is
-# exactly what it was, whatever else the config carries.
+# exactly what it was, whatever else the config carries, with ONE exception
+# below, `registry_dir`.
 hop = doc.get("hop")
 if hop is not None:
     if not isinstance(hop, dict):
@@ -234,6 +235,18 @@ if hop is not None:
                     "delivered_domains_file's directory"))
 
     check_nesting(new, "hop mounts")
+
+# THE REGISTRY WITHOUT A HOP LINK. The loader reads `registry_dir` whenever
+# the config names it, hop or no hop: a host may resolve its instances
+# through the registry before its hop link exists. Gating this mount on `hop`
+# left that router unable to see the registry inside run.sh's container, so
+# every instance was held while the same config, run on the host, was fine.
+# Read-only, by exactly the hop paths' rules (`hop_path`, `check_nesting`).
+# With `hop`, the block above mounts it; the delivered-domain file stays
+# hop-gated.
+elif "registry_dir" in doc:
+    check_nesting([(hop_path(doc["registry_dir"], "registry_dir", "registry mount"), "ro",
+                    "registry_dir")], "registry mount")
 
 # THE SIGNING KEY'S DIRECTORY (KEY_DIR), READ-ONLY, whenever the config has a
 # `delegation` section: the router signs its peer tasks with the key at

@@ -52,7 +52,7 @@ disagree without anyone noticing.
 | `state_dir` | `rw` | router-private: approval markers, reply ledger, quarantine |
 | the config file | `ro` | parsed, never written |
 | `hop.root` (only with a `hop` section) | `rw` | the hop tree the transport plugin writes and the downstream runtime reads |
-| `registry_dir` (only with a `hop` section) | `ro` | the host registry; without it every instance is held |
+| `registry_dir` (with or without a `hop` section) | `ro` | the host registry; without it every instance is held |
 | the directory of `delivered_domains_file` (only with a `hop` section) | `ro` | the delivered-domain artifact, by its directory: it is replaced by rename |
 | the directory of `transport_plugin.path` (only with a `hop` section) | `ro` | the pinned plugin, by its directory, for the same reason |
 | the directory of `delegation.signing_key.path` (only with a `delegation` section, with or without `hop`) | `ro` | the peer signing key, by its directory and never as the file (a rotated key is a rename); the same path rules as the hop paths, and never nested with a read-write mount |
