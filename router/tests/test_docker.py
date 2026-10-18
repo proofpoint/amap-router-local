@@ -384,6 +384,54 @@ class RunShDetachedActuallyRunsTest(unittest.TestCase):
                                  f"the unguarded expansion of {var} is the macOS bug")
 
 
+class RunShGroupAddTest(unittest.TestCase):
+    """`run.sh --group-add <gid>`, EXECUTED with the fake `docker`: exactly one
+    numeric supplementary group, placed directly after `--user`, and an argv
+    identical to before when the flag is absent. For a host whose shared tree
+    is group-owned, so the router starts from the operator's own shell with no
+    root step."""
+
+    RUN_SH = RunShDetachedActuallyRunsTest.RUN_SH
+    _lab = RunShDetachedActuallyRunsTest._lab
+    _fake_docker = RunShDetachedActuallyRunsTest._fake_docker
+
+    def _run(self, *args):
+        with TemporaryDirectory() as d:
+            cfg, root, state = self._lab(d)
+            bin_dir, _ = self._fake_docker(d)
+            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+            p = subprocess.run([str(self.RUN_SH), "--config", str(cfg), *args],
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+            blocks = [b.splitlines() for b in p.stdout.split("--END--\n") if b.strip()]
+            runs = [b for b in blocks if b and b[0] == "run"]
+            want = ["run", "-d", "--restart", "unless-stopped", "--name", "amp-test",
+                    "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}",
+                    "-e", f"ROUTER_CONFIG={cfg}", "-e", "ROUTER_INTERVAL=5",
+                    "-v", f"{state}:{state}:rw", "-v", f"{root}:{root}:rw",
+                    "-v", f"{cfg}:{cfg}:ro", "amap-router-local"]
+            return p, runs, want
+
+    def test_without_the_flag_the_argv_is_exactly_as_before(self):
+        p, runs, want = self._run("--name", "amp-test", "--detach")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(runs, [want])
+
+    def test_the_gid_is_added_once_directly_after_user(self):
+        p, runs, want = self._run("--name", "amp-test", "--detach", "--group-add", "2100")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        i = want.index("--user") + 2
+        self.assertEqual(runs, [want[:i] + ["--group-add", "2100"] + want[i:]])
+
+    def test_a_bad_gid_is_refused_before_docker_runs(self):
+        for bad in (["0"], ["-1"], ["abc"], ["2100,2101"], [""], ["0100"], ["12345678901"],
+                    ["2100", "--group-add", "2101"]):
+            with self.subTest(bad=bad):
+                p, runs, _ = self._run("--name", "amp-test", "--detach", "--group-add", *bad)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("--group-add", p.stderr)
+                self.assertEqual(runs, [], "docker run must never be reached")
+
+
 class StalenessWarningTest(unittest.TestCase):
     """The image BAKES the source (`COPY router/ /app/router/`), so a container
     can run code that predates the operator's edits — correctly, silently, and

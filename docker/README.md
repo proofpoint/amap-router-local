@@ -104,6 +104,11 @@ that sandy created as the host user, and the agent side runs as that same uid.
 Pinning a uid would write root-owned notices into the operator's home
 directory.
 
+`--group-add <gid>` adds exactly ONE supplementary group, by number, directly
+after `--user`: for a host whose shared tree is owned by a group the operator's
+primary gid is not (the hop tree's group). Decimal, never 0, never a list, at
+most once; without it the `docker run` argv is unchanged.
+
 ## Modes
 
 ```
