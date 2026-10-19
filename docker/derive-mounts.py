@@ -14,9 +14,33 @@ was not while embedded.
 
 Prints one `<abspath>\t<rw|ro>` line per mount. Exits non-zero with an
 operator-facing message on any problem.
+
+Usage: derive-mounts.py CONFIG [--volume PATH]...
+
+`--volume PATH` (repeatable, each PATH once) says that one of the `hop`
+section's identity mounts (hop.root, registry_dir, or the directory of
+transport_plugin.path or of delivered_domains_file), named EXACTLY as this
+script would print it, is a named VOLUME rather than a host directory: for a
+host whose bind mounts keep no uid boundary (a macOS engine shows every
+container user as a bind's owner). Its line then reads `<path>\tvolume-rw` or
+`<path>\tvolume-ro`, by the same role as the bind it replaces, and run.sh
+mounts the volume it was given there. The path exists only inside the
+container, so it takes the lexical rules and is never checked against the host.
+Without `--volume` the output is exactly what it always was.
 """
 import json, os, sys
+if len(sys.argv) < 2:
+    sys.exit("usage: derive-mounts.py CONFIG [--volume PATH]...")
 cfg_path = sys.argv[1]
+VOLUMES = []
+_rest = sys.argv[2:]
+while _rest:
+    if _rest[0] != "--volume" or len(_rest) < 2:
+        sys.exit(f"derive-mounts.py: unexpected argument {_rest[0]!r} (only --volume PATH)")
+    if _rest[1] in VOLUMES:
+        sys.exit(f"derive-mounts.py: --volume {_rest[1]} given twice")
+    VOLUMES.append(_rest[1])
+    _rest = _rest[2:]
 try:
     doc = json.loads(open(cfg_path).read())
 except json.JSONDecodeError as e:
@@ -131,13 +155,16 @@ def within(a, b):
     """Whether `a` is `b` or inside it, by whole components."""
     return a == b or a.startswith(b.rstrip("/") + "/")
 
-def hop_path(value, what, where="hop mounts"):
+def hop_path(value, what, where="hop mounts", on_host=True):
+    """`on_host=False` for a volume's destination: a path that exists only
+    INSIDE the container, so the host has nothing to resolve it against and
+    only the lexical rules apply."""
     if not isinstance(value, str) or not os.path.isabs(value):
         sys.exit(f"{where}: {what} must be an absolute path, got {value!r}")
     if os.path.normpath(value) != value:
         sys.exit(f"{where}: {what} ({value}) is not in normal form (a trailing '/', "
                  "'//', '.' or '..'): the router uses it exactly as written")
-    if os.path.realpath(value) != value:
+    if on_host and os.path.realpath(value) != value:
         sys.exit(f"{where}: {what} ({value}) is not its own realpath (a symlinked "
                  "component): it would mount wherever the link points")
     if value in IMAGE_DIRS or any(within(value, t) for t in IMAGE_TREES):
@@ -156,6 +183,42 @@ def hop_file(value, what, where="hop mounts"):
         missing.append(f"{what}: {value}")
     return hop_path(os.path.dirname(value), f"{what}'s directory", where)
 
+# THE VOLUME PATHS (`--volume`). Each is one of the hop section's identity
+# mounts, named exactly; `used` collects the ones this config really mounts, so
+# a `--volume` naming anything else is refused rather than silently ignored.
+VOLUME_RW, VOLUME_RO = "volume-rw", "volume-ro"
+CONTAINER_ONLY = (VOLUME_RW, VOLUME_RO)
+WRITABLE = ("rw", VOLUME_RW)
+# A volume's destination may not carry what `--mount`'s comma-separated value
+# would read as syntax: a comma there adds an option of the path's choosing
+# (`dst=/x,readonly`).
+MOUNT_SYNTAX = (",", '"', "=")
+used = set()
+
+def as_volume(path, what):
+    if any(c in path for c in MOUNT_SYNTAX):
+        sys.exit(f"hop mounts: {what} ({path}) holds one of {' '.join(MOUNT_SYNTAX)}, which a "
+                 "volume mount's value would read as syntax")
+    used.add(path)
+    return path
+
+def hop_dir(value, what, mode):
+    """A directory identity mount, or the volume `--volume` named for it."""
+    if isinstance(value, str) and value in VOLUMES:
+        p = hop_path(value, what, on_host=False)
+        return (as_volume(p, what), VOLUME_RW if mode == "rw" else VOLUME_RO, what)
+    return (hop_path(value, what), mode, what)
+
+def hop_file_dir(value, what):
+    """A file mounted by its directory (read-only), or that directory as the
+    volume `--volume` named: the file is then inside the volume, so neither
+    the symlink nor the existence check can see it from here."""
+    d = f"{what}'s directory"
+    if isinstance(value, str) and os.path.isabs(value) and os.path.dirname(value) in VOLUMES:
+        p = hop_path(os.path.dirname(value), d, on_host=False)
+        return (as_volume(p, d), VOLUME_RO, d)
+    return (hop_file(value, what), "ro", d)
+
 
 
 def check_nesting(new, where):
@@ -166,6 +229,12 @@ def check_nesting(new, where):
     # its own realpath, so it can sit inside a spelling only if that spelling
     # resolves to itself.
     others = [(os.path.realpath(p), mode, "an existing mount") for p, mode in roots]
+    # A volume's destination is a path as the CONTAINER sees it, and every bind
+    # is made at its path AS WRITTEN: so with a volume involved, each existing
+    # mount and the config file are compared in that spelling too.
+    if any(m in CONTAINER_ONLY for _, m, _ in new) or any(m in CONTAINER_ONLY for _, m in roots):
+        others += [(p, mode, "an existing mount") for p, mode in roots]
+        others.append((os.path.abspath(cfg_path), "ro", "the config file"))
     # The config file too: run.sh mounts it read-only by itself, outside this
     # list. Inside hop.root, the tree the downstream runtime's uid writes, it
     # could be replaced on the host and would be read at the next start,
@@ -177,11 +246,11 @@ def check_nesting(new, where):
         for q, qmode, qwhat in rivals:
             if not (within(p, q) or within(q, p)):
                 continue
-            if mode == "rw" or qmode == "rw":
+            if mode in WRITABLE or qmode in WRITABLE:
                 why = ("hop.root is nested with no other mount" if "hop.root" in (what, qwhat)
                        else "a read-only path is nested with no read-write one")
                 sys.exit(f"{where}: {what} ({p}) overlaps {qwhat} ({q}, {qmode}): {why}")
-        if not os.path.isdir(p):
+        if mode not in CONTAINER_ONLY and not os.path.isdir(p):
             missing.append(f"{what}: {p}")
         roots.append((p, mode))
 
@@ -218,6 +287,9 @@ def check_nesting(new, where):
 # exactly what it was, whatever else the config carries, with ONE exception
 # below, `registry_dir`.
 hop = doc.get("hop")
+if hop is None and VOLUMES:
+    sys.exit("--volume needs a 'hop' section: only the hop section's identity mounts "
+             "may be volumes, and this config has none")
 if hop is not None:
     if not isinstance(hop, dict):
         sys.exit("hop mounts: 'hop' is not an object")
@@ -226,13 +298,11 @@ if hop is not None:
         sys.exit("hop mounts: 'hop' needs 'transport_plugin' with a 'path'")
     if not doc.get("registry_dir"):
         sys.exit("hop mounts: 'hop' needs 'registry_dir'")
-    new = [(hop_path(hop.get("root"), "hop.root"), "rw", "hop.root"),
-           (hop_path(doc["registry_dir"], "registry_dir"), "ro", "registry_dir"),
-           (hop_file(plugin["path"], "transport_plugin.path"), "ro",
-            "transport_plugin.path's directory")]
+    new = [hop_dir(hop.get("root"), "hop.root", "rw"),
+           hop_dir(doc["registry_dir"], "registry_dir", "ro"),
+           hop_file_dir(plugin["path"], "transport_plugin.path")]
     if doc.get("delivered_domains_file") is not None:
-        new.append((hop_file(doc["delivered_domains_file"], "delivered_domains_file"), "ro",
-                    "delivered_domains_file's directory"))
+        new.append(hop_file_dir(doc["delivered_domains_file"], "delivered_domains_file"))
 
     check_nesting(new, "hop mounts")
 
@@ -279,6 +349,12 @@ if delegation is not None:
         if extra:
             sys.exit(f"key mount: the signing key's directory ({key_dir}) must hold only the key; "
                      f"it also holds {', '.join(repr(e) for e in extra)}")
+
+unused = [v for v in VOLUMES if v not in used]
+if unused:
+    sys.exit(f"--volume {unused[0]}: not one of this config's hop mounts as derived "
+             "(hop.root, registry_dir, or the directory of transport_plugin.path or of "
+             "delivered_domains_file, spelled exactly)")
 
 if missing:
     sys.exit("these paths in the config do not exist:\n  " + "\n  ".join(missing)

@@ -18,6 +18,8 @@
 #   docker/run.sh --config ~/.sandy/router.json --interval 10
 #   docker/run.sh --config ~/.sandy/router.json -- once      # drain once, exit
 #   docker/run.sh --config ~/.sandy/router.json --detach --group-add 2100
+#   docker/run.sh --config C --detach --volume /var/lib/amap/hop=amap-hop
+#     (a hop mount as a named volume, for an engine whose binds keep no uid boundary)
 #
 # NO SECRETS. This container takes no --env-file and needs none: the router is
 # provider-free, holds no credential, and runs `--network none`.
@@ -34,6 +36,9 @@ INTERVAL="${ROUTER_INTERVAL:-5}"
 DETACH=0
 MODE_ARGS=()
 GROUP_ADD=""
+# --volume PATH=NAME, as two parallel lists (bash 3.2 has no associative arrays).
+VOL_PATHS=()
+VOL_NAMES=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,8 +58,31 @@ while [ $# -gt 0 ]; do
       esac
       [ "${#2}" -le 10 ] || { echo "run.sh: --group-add gid '$2' is too long" >&2; exit 2; }
       GROUP_ADD="$2"; shift 2 ;;
+    # One of the hop section's identity mounts (hop.root, registry_dir, the
+    # plugin's or the delivered-domain file's directory), named exactly as
+    # derive-mounts.py derives it, mounted from the NAMED VOLUME instead of
+    # bound from the host: for an engine whose bind mounts keep no uid boundary
+    # (a macOS share shows every container user as the owner). Repeatable; each
+    # path and each volume at most once. The volume must already exist, made
+    # and laid out by its owner; run.sh never creates one.
+    --volume)
+      v="${2-}"
+      case "$v" in
+        /*=*) ;;
+        *) echo "run.sh: --volume needs <absolute container path>=<volume name>, got '$v'" >&2; exit 2 ;;
+      esac
+      vp="${v%%=*}"; vn="${v#*=}"
+      case "$vn" in
+        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) echo "run.sh: --volume $vp: a docker volume name ([A-Za-z0-9][A-Za-z0-9_.-]*) is needed, got '$vn'" >&2; exit 2 ;;
+      esac
+      [ "${#vn}" -le 128 ] || { echo "run.sh: --volume $vp: volume name '$vn' is too long" >&2; exit 2; }
+      for i in ${VOL_PATHS[@]+"${!VOL_PATHS[@]}"}; do
+        [ "${VOL_PATHS[$i]}" != "$vp" ] || { echo "run.sh: --volume $vp given twice" >&2; exit 2; }
+        [ "${VOL_NAMES[$i]}" != "$vn" ] || { echo "run.sh: --volume: volume $vn given twice" >&2; exit 2; }
+      done
+      VOL_PATHS+=("$vp"); VOL_NAMES+=("$vn"); shift 2 ;;
     --)         shift; MODE_ARGS=("$@"); break ;;
-    -h|--help)  sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "run.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -74,12 +102,42 @@ CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 # silently run code that predates the operator's edits.
 "$HERE/check-stale.py" "$IMAGE" || true
 
-MANIFEST="$("$HERE/derive-mounts.py" "$CONFIG_ABS")" || { echo "run.sh: $MANIFEST" >&2; exit 2; }
+# The volume paths go to derive-mounts.py, which checks each is one of this
+# config's hop mounts and names its role; without --volume its argv is exactly
+# what it always was.
+DERIVE_ARGS=()
+for vp in ${VOL_PATHS[@]+"${VOL_PATHS[@]}"}; do DERIVE_ARGS+=(--volume "$vp"); done
+MANIFEST="$("$HERE/derive-mounts.py" "$CONFIG_ABS" ${DERIVE_ARGS[@]+"${DERIVE_ARGS[@]}"})" || { echo "run.sh: $MANIFEST" >&2; exit 2; }
+
+# Each volume must exist BEFORE `docker run`, which would otherwise create an
+# empty one, owned by root, and start the router on a tree nobody laid out.
+# And it must be a plain local volume: one made with `-o type=none,o=bind` is a
+# host directory again, with the boundary this exists to keep lost.
+for i in ${VOL_NAMES[@]+"${!VOL_NAMES[@]}"}; do
+  vn="${VOL_NAMES[$i]}"
+  info="$(docker volume inspect --format '{{.Name}} {{.Driver}} {{json .Options}}' "$vn" 2>/dev/null)" \
+    || { echo "run.sh: --volume ${VOL_PATHS[$i]}=$vn: no such volume (run.sh never creates one; its owner makes and lays it out first)" >&2; exit 2; }
+  case "$info" in
+    "$vn local null"|"$vn local {}") ;;
+    *) echo "run.sh: --volume ${VOL_PATHS[$i]}=$vn is not a plain local volume ($info): a driver option can make it a host bind again" >&2; exit 2 ;;
+  esac
+done
 
 MOUNTS=()
 while IFS=$'\t' read -r path mode; do
   [ -n "$path" ] || continue
-  MOUNTS+=(-v "$path:$path:$mode")
+  case "$mode" in
+    volume-rw|volume-ro)
+      vn=""
+      for i in ${VOL_PATHS[@]+"${!VOL_PATHS[@]}"}; do
+        [ "${VOL_PATHS[$i]}" != "$path" ] || vn="${VOL_NAMES[$i]}"
+      done
+      [ -n "$vn" ] || { echo "run.sh: derive-mounts named a volume at $path that no --volume gave" >&2; exit 2; }
+      ro=""; [ "$mode" = volume-rw ] || ro=",readonly"
+      MOUNTS+=(--mount "type=volume,src=$vn,dst=$path$ro,volume-nocopy") ;;
+    rw|ro) MOUNTS+=(-v "$path:$path:$mode") ;;
+    *) echo "run.sh: derive-mounts printed an unknown mode '$mode' for $path" >&2; exit 2 ;;
+  esac
 done <<< "$MANIFEST"
 # The config itself, read-only: the router parses it and never writes it.
 MOUNTS+=(-v "$CONFIG_ABS:$CONFIG_ABS:ro")

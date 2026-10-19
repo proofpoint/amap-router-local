@@ -51,7 +51,7 @@ disagree without anyone noticing.
 | each instance's `handoff_dir` (or `namespace`) | `rw` | the router writes the inbound side (notices, bodies) and writes results back on the outbound side |
 | `state_dir` | `rw` | router-private: approval markers, reply ledger, quarantine |
 | the config file | `ro` | parsed, never written |
-| `hop.root` (only with a `hop` section) | `rw` | the hop tree the transport plugin writes and the downstream runtime reads |
+| `hop.root` (only with a `hop` section) | `rw` (a volume with `--volume`) | the hop tree the transport plugin writes and the downstream runtime reads |
 | `registry_dir` (with or without a `hop` section) | `ro` | the host registry; without it every instance is held |
 | the directory of `delivered_domains_file` (only with a `hop` section) | `ro` | the delivered-domain artifact, by its directory: it is replaced by rename |
 | the directory of `transport_plugin.path` (only with a `hop` section) | `ro` | the pinned plugin, by its directory, for the same reason |
@@ -79,6 +79,30 @@ plugin's loader requires every directory above the plugin file to be owned
 by root and not group- or world-writable: the identity-mounted directory
 itself on the host, and the parents docker creates for it inside the
 container (root, 0755).
+
+**A host whose binds keep no uid boundary** (a macOS engine: its bind mounts
+are a share that shows every container user as the owner, so `hop.peer_uid`
+means nothing there and the plugin loader sees a host plugin owned by the
+viewer, never by root) mounts any of the `hop` section's identity mounts from
+a NAMED VOLUME instead, with `--volume <path>=<name>` (repeatable):
+
+- `<path>` must be exactly one of hop.root, registry_dir, or the directory of
+  transport_plugin.path or of delivered_domains_file, as derived above;
+  anything else is refused, as is `--volume` without a `hop` section.
+- It is mounted as `--mount type=volume,src=<name>,dst=<path>,volume-nocopy`,
+  read-write for hop.root and with `readonly` for the others, and no bind is
+  made there.
+- The volume must already exist as a plain `local` volume with no driver
+  options (one made with `-o type=none,o=bind` is a host directory again),
+  made and laid out by its owner: `run.sh` checks it with `docker volume
+  inspect` and never creates one. Each path and each volume at most once.
+- The path exists only inside the container, so it is checked as written
+  (absolute, normal form, not a system path, and nested with no other mount
+  as the rules above say, against each other mount both as written and as
+  resolved), never against the host, and it may not contain `,`, `"` or `=`.
+
+Without `--volume` the derived mounts and the `docker run` argv are exactly
+what they were.
 
 A hand-written mount list has one failure mode worth designing against: omit
 one instance and the router **does not fail**. It starts, reports healthy, and
