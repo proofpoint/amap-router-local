@@ -195,6 +195,57 @@ class EntrypointUmaskTests(unittest.TestCase):
                 self.assertEqual(self._umask_seen_by(mode), "0027")
 
 
+
+class EntrypointArgvTests(unittest.TestCase):
+    """What each mode hands the CLI, argument for argument. RUN, not read:
+    the real entrypoint is executed with a stand-in `python3` first on PATH
+    that prints its argv one bracketed argument per line, so a dropped flag,
+    a split argument and an added one all show.
+
+    `peers --json` and `once --json` used to reach the CLI as plain `peers`
+    and `once`: both modes exec'd without "$@", exited 0, and printed the
+    human form, which a caller expecting JSON cannot tell from a fleet that
+    renders no graph. The string check on the status line above could never
+    have caught it, because it looks at one mode."""
+
+    def _argv_seen_by(self, *args: str) -> list:
+        with TemporaryDirectory() as tmp:
+            stub = Path(tmp, "python3")
+            stub.write_text("#!/bin/sh\nfor a in \"$@\"; do printf '[%s]\\n' \"$a\"; done\n")
+            stub.chmod(0o755)
+            cfg = Path(tmp, "router.json")
+            cfg.write_text("{}")
+            env = {**os.environ, "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+                   "ROUTER_CONFIG": str(cfg), "ROUTER_INTERVAL": "7"}
+            out = subprocess.run(
+                ["bash", str(_REPO / "docker" / "entrypoint.sh"), *args],
+                env=env, capture_output=True, text=True, timeout=30, check=True)
+            head = ["[-m]", "[router]", "[--config]", f"[{cfg}]"]
+            lines = out.stdout.splitlines()
+            self.assertEqual(lines[:4], head, msg=out.stdout)
+            return lines[4:]
+
+    def test_once_passes_its_flags(self):
+        self.assertEqual(self._argv_seen_by("once", "--json"), ["[once]", "[--json]"])
+
+    def test_peers_passes_its_flags(self):
+        self.assertEqual(self._argv_seen_by("peers", "--json"), ["[peers]", "[--json]"])
+
+    def test_status_passes_its_flags(self):
+        self.assertEqual(self._argv_seen_by("status", "--check"), ["[status]", "[--check]"])
+
+    def test_an_argument_with_a_space_stays_one_argument(self):
+        self.assertEqual(self._argv_seen_by("peers", "--html", "/out/a b.html"),
+                         ["[peers]", "[--html]", "[/out/a b.html]"])
+
+    def test_without_flags_each_mode_adds_nothing(self):
+        for mode in ("once", "peers", "status"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self._argv_seen_by(mode), [f"[{mode}]"])
+
+    def test_run_is_the_interval_loop_and_nothing_else(self):
+        self.assertEqual(self._argv_seen_by("run"), ["[run]", "[--interval]", "[7]"])
+
 class MountDerivationTests(unittest.TestCase):
     """run.sh computes mounts from the config rather than taking a hand-written
     list. A missing instance mount does not crash the router — it starts, looks
