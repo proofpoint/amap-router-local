@@ -224,10 +224,11 @@ def hop_file_dir(value, what):
 def check_nesting(new, where):
     """Each new (path, mode, what) against every mount so far, RESOLVED, and the
     config file: hop.root nested with NO other mount, and each read-only path
-    nested with no read-write one. Then each joins the list."""
-    # Comparing them as written as well would add nothing: each new path is
-    # its own realpath, so it can sit inside a spelling only if that spelling
-    # resolves to itself.
+    nested with no read-write one, and a volume overlapping nothing but a
+    volume at its very path. Then each joins the list."""
+    # For binds alone, comparing them as written as well would add nothing:
+    # each new path is its own realpath, so it can sit inside a spelling only
+    # if that spelling resolves to itself.
     others = [(os.path.realpath(p), mode, "an existing mount") for p, mode in roots]
     # A volume's destination is a path as the CONTAINER sees it, and every bind
     # is made at its path AS WRITTEN: so with a volume involved, each existing
@@ -250,6 +251,19 @@ def check_nesting(new, where):
                 why = ("hop.root is nested with no other mount" if "hop.root" in (what, qwhat)
                        else "a read-only path is nested with no read-write one")
                 sys.exit(f"{where}: {what} ({p}) overlaps {qwhat} ({q}, {qmode}): {why}")
+            # A VOLUME SHARES NO PATH WITH A BIND, and nests in no mount at
+            # all. Equal, the output keeps one line per path, so one of the two
+            # would vanish without a word: a key bind replaced by a volume
+            # whose contents nothing checked, or a volume asked for and a host
+            # bind made in its place. Nested, the engine has to make the inner
+            # mountpoint inside the outer mount's source, a read-only one or a
+            # host tree. Two volumes at ONE path are one volume (the plugin's
+            # and the delivered-domain file's directory may coincide).
+            if (mode in CONTAINER_ONLY or qmode in CONTAINER_ONLY) and not (
+                    mode in CONTAINER_ONLY and qmode in CONTAINER_ONLY and p == q):
+                why = ("a volume shares no path with a bind" if p == q
+                       else "a volume is nested with no other mount")
+                sys.exit(f"{where}: {what} ({p}, {mode}) overlaps {qwhat} ({q}, {qmode}): {why}")
         if mode not in CONTAINER_ONLY and not os.path.isdir(p):
             missing.append(f"{what}: {p}")
         roots.append((p, mode))

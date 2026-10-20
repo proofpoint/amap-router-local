@@ -10,6 +10,7 @@ a fake `docker` that records its argv and answers `volume inspect`. Without
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -216,6 +217,58 @@ class DeriveTests(unittest.TestCase):
         doc = self.lab.cfg(delivered_domains_file=PLUGIN_DIR + "/delivered.json")
         self.assertEqual(dict(self.lines(doc, "--volume", HOP, "--volume", PLUGIN_DIR))[PLUGIN_DIR], "volume-ro")
 
+    # --- a volume and a bind never share a path ---------------------------
+    # One output line per path: a volume and a bind at one path would leave
+    # ONE of them, silently. Each direction, and each --volume order.
+
+    def refused_in_each_order(self, doc, vols, needle):
+        for order in (vols, vols[::-1]):
+            with self.subTest(order=order):
+                self.refused(doc, *[a for v in order for a in ("--volume", v)], needle=needle)
+
+    def test_a_volume_never_replaces_the_signing_key_bind(self):
+        """The volume first (a hop path), the bind after it (the key): the key
+        rules would have run against the host directory, and the router would
+        read whatever the volume holds."""
+        kv = self.lab.t / "kv"
+        kv.mkdir()
+        (kv / "seed").write_text("k")
+        doc = self.lab.cfg(transport_plugin={"path": self.p("kv/hop_plugin.py"), "sha256": "0" * 64},
+                           delegation={"signing_key": {"path": self.p("kv/seed")}})
+        self.refused_in_each_order(doc, [HOP, self.p("kv"), D7_DIR],
+                                   needle="a volume shares no path with a bind")
+
+    def test_a_volume_is_never_dropped_for_a_bind_at_its_path(self):
+        """The bind first (the verdict's directory), the volume after it: the
+        volume was counted as used and the host bind mounted in its place."""
+        for d in ("instances", "verdict"):
+            (self.lab.t / d).mkdir()
+        doc = self.lab.cfg(instances=None, instances_dir=self.p("instances"),
+                           selected_json=self.p("verdict/selected.json"),
+                           transport_plugin={"path": self.p("verdict/hop_plugin.py"), "sha256": "0" * 64})
+        self.refused_in_each_order(doc, [HOP, self.p("verdict"), D7_DIR],
+                                   needle="a volume shares no path with a bind")
+
+    def test_a_volume_nested_in_a_read_only_bind_is_refused(self):
+        doc = self.lab.cfg(transport_plugin={"path": self.p("registry/plug/p.py"), "sha256": "0" * 64})
+        self.refused_in_each_order(doc, [HOP, self.p("registry/plug"), D7_DIR],
+                                   needle="a volume is nested with no other mount")
+
+    def test_a_bind_nested_in_a_read_only_volume_is_refused(self):
+        (self.lab.t / "pv" / "k").mkdir(parents=True)
+        (self.lab.t / "pv" / "k" / "seed").write_text("k")
+        doc = self.lab.cfg(transport_plugin={"path": self.p("pv/hop_plugin.py"), "sha256": "0" * 64},
+                           delegation={"signing_key": {"path": self.p("pv/k/seed")}})
+        self.refused_in_each_order(doc, [HOP, self.p("pv"), D7_DIR],
+                                   needle="a volume is nested with no other mount")
+
+    def test_two_read_only_volumes_nested_are_refused(self):
+        reg = "/private/var/amap/registry"
+        doc = self.lab.cfg(registry_dir=reg,
+                           transport_plugin={"path": reg + "/plug/p.py", "sha256": "0" * 64})
+        self.refused_in_each_order(doc, [HOP, reg, reg + "/plug", D7_DIR],
+                                   needle="a volume is nested with no other mount")
+
     # --- what --volume may name -------------------------------------------
 
     def test_a_path_this_config_does_not_mount_from_its_hop_section_is_refused(self):
@@ -256,21 +309,36 @@ class RunShTests(unittest.TestCase):
                         'printf -- "--END--\\n" >> "$FAKE_LOG"\n'
                         'if [ "$1 $2" = "volume inspect" ]; then\n'
                         '  n="${@: -1}"; var="VOL_${n//[^A-Za-z0-9]/_}"\n'
-                        '  [ -n "${!var-}" ] || exit 1\n'
+                        '  [ -n "${!var-}" ] || { echo "Error response from daemon: get $n: no such volume" >&2; exit 1; }\n'
+                        '  case "${!var}" in "!"*) echo "${!var#!}" >&2; exit 1 ;; esac\n'
                         '  printf "%s\\n" "${!var}"\n'
                         "fi\n"
                         "exit 0\n")
         fake.chmod(0o755)
         self.log = self.lab.t / "docker.log"
 
-    def run_sh(self, doc, *args, vols=None):
+    def stand_in(self, manifest):
+        """run.sh copied beside a STAND-IN derive-mounts.py printing
+        `manifest`: the one way to hand run.sh a manifest the real script
+        never prints, which is what its own check on it is for."""
+        d = self.lab.t / "dk"
+        d.mkdir(exist_ok=True)
+        shutil.copy(RUN_SH, d / "run.sh")
+        (d / "manifest").write_text(manifest)
+        (d / "derive-mounts.py").write_text(f"#!/bin/sh\ncat '{d / 'manifest'}'\n")
+        (d / "check-stale.py").write_text("#!/bin/sh\nexit 0\n")
+        for f in ("run.sh", "derive-mounts.py", "check-stale.py"):
+            (d / f).chmod(0o755)
+        return d / "run.sh"
+
+    def run_sh(self, doc, *args, vols=None, script=RUN_SH):
         vols = {"amap-hop": "amap-hop local null", "amap-plugin": "amap-plugin local null",
                 "amap-d7": "amap-d7 local {}"} if vols is None else vols
         cfg = self.lab.write(doc)
         self.log.write_text("")
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", FAKE_LOG=str(self.log))
         env.update({"VOL_" + "".join(c if c.isalnum() else "_" for c in k): v for k, v in vols.items()})
-        p = subprocess.run([str(RUN_SH), "--config", str(cfg), "--name", "amp-test", "--detach", *args],
+        p = subprocess.run([str(script), "--config", str(cfg), "--name", "amp-test", "--detach", *args],
                            capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
         blocks = [b.splitlines() for b in self.log.read_text().split("--END--\n") if b.strip()]
         return (p, cfg, [b for b in blocks if b[0] == "run"],
@@ -319,9 +387,39 @@ class RunShTests(unittest.TestCase):
         p, _, runs, inspects = self.run_sh(self.lab.cfg(), *self.ARGS,
                                            vols={"amap-hop": "amap-hop local null", "amap-d7": "amap-d7 local null"})
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn("amap-plugin: no such volume", p.stderr)
+        self.assertIn("amap-plugin: docker volume inspect failed: Error response from daemon: "
+                      "get amap-plugin: no such volume", p.stderr)
         self.assertIn("amap-plugin", inspects)
         self.assertEqual(runs, [], "docker run would create it, empty and root's")
+
+    def test_a_failed_inspect_says_what_docker_said(self):
+        """Not every failure is a missing volume: an operator told "no such
+        volume" when the daemon refused the call would go and make one."""
+        p, _, runs, _ = self.run_sh(self.lab.cfg(), *self.ARGS,
+                                    vols={"amap-hop": "amap-hop local null", "amap-d7": "amap-d7 local null",
+                                          "amap-plugin": "!permission denied while trying to connect "
+                                                         "to the docker daemon socket"})
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("inspect failed: permission denied while trying to connect", p.stderr)
+        self.assertNotIn("no such volume", p.stderr)
+        self.assertEqual(runs, [])
+
+    def test_every_volume_becomes_exactly_one_mount(self):
+        st, al, reg = self.p("state"), self.p("alice"), self.p("registry")
+        base = f"{st}\trw\n{al}\trw\n{reg}\tro\n"
+        for manifest, n in ((base, 0), (base + f"{HOP}\tvolume-rw\n{HOP}\tvolume-rw\n", 2)):
+            with self.subTest(n=n):
+                p, _, runs, _ = self.run_sh(self.lab.cfg(), "--volume", f"{HOP}=amap-hop",
+                                            script=self.stand_in(manifest))
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn(f"run.sh: --volume {HOP}=amap-hop became {n} mount(s), not one", p.stderr)
+                self.assertEqual(runs, [])
+        # The control: the same stand-in printing the volume once starts.
+        p, _, runs, _ = self.run_sh(self.lab.cfg(), "--volume", f"{HOP}=amap-hop",
+                                    script=self.stand_in(base + f"{HOP}\tvolume-rw\n"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(runs), 1)
+        self.assertIn(f"type=volume,src=amap-hop,dst={HOP},volume-nocopy", runs[0])
 
     def test_a_volume_with_driver_options_or_another_driver_is_refused(self):
         for info in ('amap-hop local {"device":"/x","o":"bind","type":"none"}', "amap-hop nfs null",
@@ -335,7 +433,7 @@ class RunShTests(unittest.TestCase):
                 self.assertEqual(runs, [])
 
     def test_a_bad_volume_argument_is_refused_before_any_docker_call(self):
-        for bad in (["amap-hop"], [f"{HOP}="], [f"{HOP}=a,readonly"], [f"{HOP}=-x"], [f"{HOP}=_x"],
+        for bad in (["amap-hop"], [f"{HOP}="], [f"{HOP}=a"], [f"{HOP}=a,readonly"], [f"{HOP}=-x"], [f"{HOP}=_x"],
                     [f"{HOP}=a/b"], [f"{HOP}=a b"], [f"{HOP}=" + "v" * 129], ["relative=amap-hop"], [""],
                     [f"{HOP}=amap-hop", "--volume", f"{HOP}=amap-hop2"],
                     [f"{HOP}=amap-hop", "--volume", f"{PLUGIN_DIR}=amap-hop"]):

@@ -100,6 +100,13 @@ a NAMED VOLUME instead, with `--volume <path>=<name>` (repeatable):
   (absolute, normal form, not a system path, and nested with no other mount
   as the rules above say, against each other mount both as written and as
   resolved), never against the host, and it may not contain `,`, `"` or `=`.
+- A volume shares no path with a bind and nests in no other mount, nor any
+  mount in it. One line per path is all the mount list can carry, so a
+  volume and a bind at one path would silently leave one of them; nested,
+  the engine would have to make a mountpoint inside the outer mount's source.
+  Two volumes at ONE path (the plugin's and the delivered-domain file's
+  directory) are the same volume and are allowed. `run.sh` also refuses
+  unless each `--volume` became exactly one `--mount`.
 
 Without `--volume` the derived mounts and the `docker run` argv are exactly
 what they were.

@@ -73,7 +73,7 @@ while [ $# -gt 0 ]; do
       esac
       vp="${v%%=*}"; vn="${v#*=}"
       case "$vn" in
-        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) echo "run.sh: --volume $vp: a docker volume name ([A-Za-z0-9][A-Za-z0-9_.-]*) is needed, got '$vn'" >&2; exit 2 ;;
+        ''|?|[!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) echo "run.sh: --volume $vp: a docker volume name ([A-Za-z0-9][A-Za-z0-9_.-]+) is needed, got '$vn'" >&2; exit 2 ;;
       esac
       [ "${#vn}" -le 128 ] || { echo "run.sh: --volume $vp: volume name '$vn' is too long" >&2; exit 2; }
       for i in ${VOL_PATHS[@]+"${!VOL_PATHS[@]}"}; do
@@ -115,8 +115,10 @@ MANIFEST="$("$HERE/derive-mounts.py" "$CONFIG_ABS" ${DERIVE_ARGS[@]+"${DERIVE_AR
 # host directory again, with the boundary this exists to keep lost.
 for i in ${VOL_NAMES[@]+"${!VOL_NAMES[@]}"}; do
   vn="${VOL_NAMES[$i]}"
-  info="$(docker volume inspect --format '{{.Name}} {{.Driver}} {{json .Options}}' "$vn" 2>/dev/null)" \
-    || { echo "run.sh: --volume ${VOL_PATHS[$i]}=$vn: no such volume (run.sh never creates one; its owner makes and lays it out first)" >&2; exit 2; }
+  # docker's own words on a failure: "no such volume" is only one of the
+  # reasons it can give, and the daemon or a permission is another.
+  info="$(docker volume inspect --format '{{.Name}} {{.Driver}} {{json .Options}}' "$vn" 2>&1)" \
+    || { echo "run.sh: --volume ${VOL_PATHS[$i]}=$vn: docker volume inspect failed: $info (run.sh never creates a volume; its owner makes and lays it out first)" >&2; exit 2; }
   case "$info" in
     "$vn local null"|"$vn local {}") ;;
     *) echo "run.sh: --volume ${VOL_PATHS[$i]}=$vn is not a plain local volume ($info): a driver option can make it a host bind again" >&2; exit 2 ;;
@@ -124,13 +126,14 @@ for i in ${VOL_NAMES[@]+"${!VOL_NAMES[@]}"}; do
 done
 
 MOUNTS=()
+VOL_MOUNTED=()
 while IFS=$'\t' read -r path mode; do
   [ -n "$path" ] || continue
   case "$mode" in
     volume-rw|volume-ro)
       vn=""
       for i in ${VOL_PATHS[@]+"${!VOL_PATHS[@]}"}; do
-        [ "${VOL_PATHS[$i]}" != "$path" ] || vn="${VOL_NAMES[$i]}"
+        [ "${VOL_PATHS[$i]}" != "$path" ] || { vn="${VOL_NAMES[$i]}"; VOL_MOUNTED+=("$i"); }
       done
       [ -n "$vn" ] || { echo "run.sh: derive-mounts named a volume at $path that no --volume gave" >&2; exit 2; }
       ro=""; [ "$mode" = volume-rw ] || ro=",readonly"
@@ -139,6 +142,13 @@ while IFS=$'\t' read -r path mode; do
     *) echo "run.sh: derive-mounts printed an unknown mode '$mode' for $path" >&2; exit 2 ;;
   esac
 done <<< "$MANIFEST"
+# Every --volume became exactly ONE mount: a volume that was checked and then
+# never mounted would leave a host bind, or nothing, where it was asked for.
+for i in ${VOL_PATHS[@]+"${!VOL_PATHS[@]}"}; do
+  n=0
+  for j in ${VOL_MOUNTED[@]+"${VOL_MOUNTED[@]}"}; do [ "$j" != "$i" ] || n=$((n + 1)); done
+  [ "$n" = 1 ] || { echo "run.sh: --volume ${VOL_PATHS[$i]}=${VOL_NAMES[$i]} became $n mount(s), not one" >&2; exit 2; }
+done
 # The config itself, read-only: the router parses it and never writes it.
 MOUNTS+=(-v "$CONFIG_ABS:$CONFIG_ABS:ro")
 
