@@ -9,6 +9,12 @@
 #   status  -> print the last-written status document and exit
 #   shell   -> exec whatever follows, for debugging
 #
+# once, peers and status pass every further argument to the CLI unchanged
+# (`once --json`, `peers --json`, `status --check`). A mode that dropped them
+# would still exit 0 and print the HUMAN form, so a caller asking for JSON
+# gets text it cannot parse and nothing says the flag was lost: `peers` and
+# `once` shipped that way, and a deploy verify read the graph as UNKNOWN.
+#
 # There is no `approve` mode, and there is no longer a command to refuse:
 # `approve` was retired. The staged-request snapshot it used to take is now
 # taken by the drain itself, the first time it sees an instance root, and
@@ -44,8 +50,8 @@ fi
 
 case "$MODE" in
   run)    exec python3 -m router --config "$ROUTER_CONFIG" run --interval "$INTERVAL" ;;
-  once)   exec python3 -m router --config "$ROUTER_CONFIG" once ;;
-  peers)  exec python3 -m router --config "$ROUTER_CONFIG" peers ;;
+  once)   exec python3 -m router --config "$ROUTER_CONFIG" once "$@" ;;
+  peers)  exec python3 -m router --config "$ROUTER_CONFIG" peers "$@" ;;
   status) exec python3 -m router --config "$ROUTER_CONFIG" status "$@" ;;
   shell)  exec "$@" ;;
   *)
