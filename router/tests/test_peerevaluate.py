@@ -289,6 +289,35 @@ class UnconfiguredRuntimeTests(_Eval):
         self.assertEqual(len(self.notices()), 1, "configured, the same bytes are placed")
 
 
+class KeyValidityTests(_Eval):
+    """A statement under a configured key that is outside its validity at
+    `now` is the codec's `key_validity` at check 3, before 5(b): demoted, no
+    control, nothing reserved or placed. The companion places the same bytes
+    with the key valid, so the validity window is the only cause."""
+
+    def lane_with(self, **validity):
+        key = {"key_id": KEY_ID, "public_key": si.public_key(SEED).hex(), **validity}
+        table = si.load_key_table([{"domains": [T1], "runtime": f"amap.router@{T1}",
+                                    "keys": [key]}])
+        return dataclasses.replace(self.lane, key_table=table)
+
+    def test_a_statement_under_a_key_outside_its_validity_is_demoted_without_control(self):
+        self.lane = self.lane_with(not_after="2026-10-13T11:00:00Z")
+        rec = self.evaluate(self.take(self.raw()))
+        self.assertEqual((rec["state"], rec["disposed"], rec["cause"]),
+                         ("done", "demoted", "key_validity"))
+        self.assertIsNone(rec["control"], "no control before check 5(b)")
+        self.assertEqual(self.replay_files(), [], "nothing reserved")
+        self.assertEqual(self.notices(), [], "nothing placed")
+        self.assertEqual([q[1:] for q in self.effects.quarantined], [("demoted", "key_validity")])
+
+    def test_the_same_statement_with_the_key_valid_is_placed(self):
+        self.lane = self.lane_with(not_after="2026-10-13T13:00:00Z")
+        rec = self.evaluate(self.take(self.raw()))
+        self.assertEqual((rec["state"], rec["disposed"]), ("done", "placed"))
+        self.assertEqual(len(self.notices()), 1)
+
+
 class ViewTests(_Eval):
 
     def refusing(self, reason):
