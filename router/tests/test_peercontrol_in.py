@@ -196,10 +196,18 @@ class AcceptedControlTests(_ControlIn):
 
 class DroppedControlTests(_ControlIn):
 
+    def logged_drop(self, cm, key, intake, cause):
+        """The drop is LOGGED: `_drop_control`'s warning, the one producer of
+        this line, names this record, its intake and its own cause."""
+        self.assertIn(f"control notice {key} ({intake}) dropped: {cause}",
+                      [r.getMessage() for r in cm.records if r.levelname == "WARNING"])
+
     def dropped(self, raw, cause):
         self.issued()
         self.entry(raw)
-        self.poll()
+        with self.assertLogs("amap_router_local.peerjournal", level="WARNING") as cm:
+            self.poll()
+        self.logged_drop(cm, self.rec()["key"], ".control", cause)
         self.assertEqual(self.outcome(), ("done", "dropped", cause, None))
         self.assertEqual(self.inbox_notices(), [], "never placed")
         self.assertIsNone(self.rec()["control"], "never answered")
@@ -239,10 +247,12 @@ class DroppedControlTests(_ControlIn):
     def test_a_control_in_an_agents_candidates_is_dropped(self):
         self.issued()
         key = self.take(self.control_raw())
-        try:
-            self.evaluate(key)
-        except Exception:  # noqa: BLE001 -- a wrong outcome must FAIL below, not error
-            pass
+        with self.assertLogs("amap_router_local.peerjournal", level="WARNING") as cm:
+            try:
+                self.evaluate(key)
+            except Exception:  # noqa: BLE001 -- a wrong outcome must FAIL below, not error
+                pass
+        self.logged_drop(cm, key, "candidates", peerjournal.CONTROL_OUTSIDE_INTAKE)
         rec = peerjournal.read_record(self.state_dir, tpe.OWNER, key)
         self.assertEqual((rec["state"], rec["disposed"], rec["cause"]),
                          ("done", "dropped", peerjournal.CONTROL_OUTSIDE_INTAKE))
