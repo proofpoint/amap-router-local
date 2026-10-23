@@ -202,41 +202,40 @@ class DroppedControlTests(_ControlIn):
         self.assertIn(f"control notice {key} ({intake}) dropped: {cause}",
                       [r.getMessage() for r in cm.records if r.levelname == "WARNING"])
 
-    def admission(self):
-        """The mail-admission boundary as `poll_host` actually wires it: the
-        `HostEffects` it builds for the intake, whose `quarantine` `_finish`
-        calls for a `mail` or `demoted` disposition (the tombstone then
-        carries that disposition downstream). Patched on the class, so the
-        object `poll_host` constructs is the one observed."""
-        return mock.patch.object(peerjournal.HostEffects, "quarantine", autospec=True,
-                                 return_value=None)
+    def handoff(self):
+        """What this host intake handed downstream: `{entry id: disposition}`
+        for every tombstone committed under `.disposed/.control/`. On a host
+        intake the tombstone IS the handoff: `HostEffects.quarantine` is a
+        no-op and "the tombstone carries the disposition"
+        (`peerjournal.HostEffects`), committed by `HostEffects.dispose` from
+        the bytes frozen at the transition. So handing a candidate to mail
+        admission on this path is committing its tombstone as `mail`."""
+        d = self.hop / ".disposed" / ".control"
+        return {p.name: json.loads(p.read_bytes())["disposition"]
+                for p in d.iterdir() if p.is_file() and len(p.name) == 32}
 
     def dropped(self, raw, cause):
         self.issued()
         self.entry(raw)
-        with self.admission() as admit, \
-                self.assertLogs("amap_router_local.peerjournal", level="WARNING") as cm:
+        with self.assertLogs("amap_router_local.peerjournal", level="WARNING") as cm:
             self.poll()
         self.logged_drop(cm, self.rec()["key"], ".control", cause)
         self.assertEqual(self.outcome(), ("done", "dropped", cause, None))
         self.assertEqual(self.inbox_notices(), [], "never placed")
         self.assertIsNone(self.rec()["control"], "never answered")
-        self.assertEqual(self.tomb()["disposition"], "dropped", "the tombstone says dropped, not mail")
-        self.assertEqual(admit.call_count, 0, "never handed to mail admission")
+        self.assertEqual(self.handoff(), {CID: "dropped"},
+                         "one handoff, as dropped: never handed to mail admission")
 
-    def test_the_admission_boundary_sees_a_mail_disposition(self):
-        """Positive control for `admission()`: plain mail in `.control/`,
-        once its quarantine expires, IS handed to mail admission through the
-        observed object, once, for its own record."""
+    def test_the_handoff_observation_sees_a_mail_disposition(self):
+        """Positive control for `handoff()`: plain mail in `.control/`, once
+        its quarantine expires, IS handed to mail admission, and the
+        observation shows it as exactly that entry's `mail` tombstone."""
         self.entry(self.raw(signed=False))
         self.poll()
-        with self.admission() as admit:
-            self.poll(now=NOW + timedelta(days=self.cfg.ingress_quarantine_days))
+        self.assertEqual(self.handoff(), {}, "nothing handed over while held")
+        self.poll(now=NOW + timedelta(days=self.cfg.ingress_quarantine_days))
         self.assertEqual(self.outcome(), ("done", "mail", "control_plain_mail", None))
-        self.assertEqual(admit.call_count, 1)
-        effects, record = admit.call_args.args
-        self.assertIsInstance(effects, peerjournal.HostEffects)
-        self.assertEqual(record["key"], self.rec()["key"])
+        self.assertEqual(self.handoff(), {CID: "mail"})
 
     def test_from_not_the_keys_runtime(self):
         self.dropped(self.control_raw(**{"from": f"planner@{T1}"}), "control_signer")
