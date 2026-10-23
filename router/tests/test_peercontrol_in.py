@@ -58,15 +58,15 @@ class _ControlIn(tpe._Eval):
             peer_id=rid, logical_id=lid or self.lid, local_address=f"bob@{FD}", remote=remote,
             generation="g" * 32, expires_at=expires))
 
-    def control_raw(self, *, both=False, bad_signature=False, **over):
+    def control_raw(self, *, both=False, bad_signature=False, seed=None, **over):
         doc = {"v": 1, "key_id": KEY_ID, "kind": "control", "id": "cTRL0123456789abcdefgh",
                "from": SIGNER, "to": OWN, "ts": "2026-10-13T11:59:00Z", "about": ABOUT,
                "outcome": "refused", "cause": "no_edge"}
         doc.update(over)
         st = si.encode_control({k: v for k, v in doc.items() if v is not None})
-        sig = si._sign(tpe.SEED, st if not bad_signature else st + b"x")
+        sig = si._sign(seed or tpe.SEED, st if not bad_signature else st + b"x")
         fields = [["Message-ID", f"<{doc['id']}@{T1}>"],
-                  [peerlane.CONTROL_FIELD, si.format_field(KEY_ID, st, sig)]]
+                  [peerlane.CONTROL_FIELD, si.format_field(doc["key_id"], st, sig)]]
         if both:
             _sdoc, sraw = tpe.statement()
             fields.append([peerlane.STATEMENT_FIELD,
@@ -220,6 +220,18 @@ class DroppedControlTests(_ControlIn):
 
     def test_a_bad_signature(self):
         self.dropped(self.control_raw(bad_signature=True), "signature")
+
+    def test_a_key_no_configured_runtime_owns(self):
+        self.dropped(self.control_raw(key_id="stranger-key-1",
+                                      seed=hashlib.sha256(b"control-stranger-seed").digest()),
+                     "unknown_key")
+
+    def test_a_key_outside_its_validity(self):
+        self.lane = dataclasses.replace(self.lane, key_table=si.load_key_table([
+            {"domains": [T1], "runtime": SIGNER,
+             "keys": [{"key_id": KEY_ID, "public_key": si.public_key(tpe.SEED).hex(),
+                       "not_after": "2026-10-13T11:00:00Z"}]}]))
+        self.dropped(self.control_raw(), "key_validity")
 
     def test_both_fields(self):
         self.dropped(self.control_raw(both=True), "header_count")
