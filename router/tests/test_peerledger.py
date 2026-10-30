@@ -18,6 +18,10 @@ from router import peerjournal, peerlane, peerledger, peerpolicy
 from router.tests.test_peerbind import FD, KEY_ID, T1, T2, _Base
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
+#: The production policy part at the release default, through the ONE
+#: constructor (`peerpolicy.production_policy`).
+PRODUCTION_AT_DEFAULT = peerpolicy.production_policy(
+    types.SimpleNamespace(min_sender_age_s=config_mod.MIN_SENDER_AGE_S_DEFAULT))
 LATER = "2026-10-20T00:00:00Z"
 EARLIER = "2026-10-13T11:00:00Z"
 PLANNER = f"planner@{T1}"
@@ -370,12 +374,12 @@ class BuilderTests(_Hooks):
     def test_every_part_must_be_data(self):
         ctx = self.ctx()
         for label, prof in (
-                ("callable edge", peerpolicy.Profile(ctx, lambda *_a: None, peerpolicy.PRODUCTION_POLICY)),
+                ("callable edge", peerpolicy.Profile(ctx, lambda *_a: None, PRODUCTION_AT_DEFAULT)),
                 ("callable policy", peerpolicy.Profile(ctx, peerpolicy.TRUSTED_HOST_DEFAULT,
                                                        lambda *_a: None)),
-                ("a set of non-pairs", peerpolicy.Profile(ctx, frozenset({"x"}), peerpolicy.PRODUCTION_POLICY)),
+                ("a set of non-pairs", peerpolicy.Profile(ctx, frozenset({"x"}), PRODUCTION_AT_DEFAULT)),
                 ("a foreign context", peerpolicy.Profile(object(), peerpolicy.TRUSTED_HOST_DEFAULT,
-                                                         peerpolicy.PRODUCTION_POLICY))):
+                                                         PRODUCTION_AT_DEFAULT))):
             with self.subTest(label):
                 with self.assertRaises(TypeError):
                     peerpolicy.decide_hooks(prof)
@@ -407,7 +411,10 @@ class PassFactoryTests(unittest.TestCase):
     pass entry builds its hooks."""
 
     def test_the_factory_gets_this_pass_context_and_must_return_it(self):
-        cfg, delegation, clock = object(), object(), object()
+        # A config-shaped value: production reads `min_sender_age_s` off the
+        # pass's config, and nothing else here.
+        cfg = types.SimpleNamespace(min_sender_age_s=config_mod.MIN_SENDER_AGE_S_DEFAULT)
+        delegation, clock = object(), object()
         seen = []
 
         def probe(hctx):
@@ -429,7 +436,8 @@ class PassFactoryTests(unittest.TestCase):
                                                                 clock=clock)))
 
     def test_no_factory_is_production(self):
-        hooks = peerjournal._pass_hooks(object(), delegation=object(), state_dir=pathlib.Path("/x"),
+        cfg = types.SimpleNamespace(min_sender_age_s=config_mod.MIN_SENDER_AGE_S_DEFAULT)
+        hooks = peerjournal._pass_hooks(cfg, delegation=object(), state_dir=pathlib.Path("/x"),
                                         now=NOW, clock=object(), profile_factory=None)
         self.assertEqual(outcome(hooks.policy(payload(), "bob", RUNTIME)),
                          ("refuse", "policy", "sender_age_missing"))

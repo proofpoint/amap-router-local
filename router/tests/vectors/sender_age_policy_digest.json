@@ -1,0 +1,35 @@
+{
+  "description": "Known answers for the canonical sender-age policy object and its digest (ENROL-AGE-CONFIG, D2; contract \u00a78.6 as amended by E30). canonical is the exact UTF-8 text hashed: json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False). Written from these literal strings, not from router.config, so the test compares two producers. A deployment renders the fleet artifact with exactly these bytes.",
+  "cases": [
+    {
+      "min_sender_age_s": 0,
+      "canonical": "{\"min_sender_age_s\":0,\"v\":1}",
+      "digest": "sha256:1b3083aed757ac7358acb763ee1a383d6572e9836754b59966e3e08f0459f120"
+    },
+    {
+      "min_sender_age_s": 1,
+      "canonical": "{\"min_sender_age_s\":1,\"v\":1}",
+      "digest": "sha256:a42d61732ba010a29c8db8ce1cdb6efe153d8805ecf3311f90ae7c36d62b9888"
+    },
+    {
+      "min_sender_age_s": 300,
+      "canonical": "{\"min_sender_age_s\":300,\"v\":1}",
+      "digest": "sha256:51c734c3f4fc7093631e08c82500ae53a43b14ca19146de8d3b15a5fa3da93c6"
+    },
+    {
+      "min_sender_age_s": 7200,
+      "canonical": "{\"min_sender_age_s\":7200,\"v\":1}",
+      "digest": "sha256:7a02aea3cffcbcb73ae405030b125ec21ade90dd18174b5f04410c1ec20bd766"
+    },
+    {
+      "min_sender_age_s": 86400,
+      "canonical": "{\"min_sender_age_s\":86400,\"v\":1}",
+      "digest": "sha256:21fa4954dd837c9a0d7b352ccfb7a26b5bbd943c071fd0c0acce622a6bc233ce"
+    },
+    {
+      "min_sender_age_s": 31536000,
+      "canonical": "{\"min_sender_age_s\":31536000,\"v\":1}",
+      "digest": "sha256:0084e55493d49c220577d19129a32ee10f2de7c7adaaa3e47b00b03adeb0d37f"
+    }
+  ]
+}

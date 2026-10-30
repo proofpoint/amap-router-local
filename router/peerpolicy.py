@@ -46,9 +46,12 @@ own, a future value quarantined); then `exposure_missing`. With no age
 policy the epoch store is not consulted at all. An unreadable or untrusted
 epoch store HOLDS (`epoch_store_unavailable`), never refuses.
 
-PRODUCTION is pinned: `PolicyPart(exposure_required=True,
-min_sender_age_s=86400)`. No config member selects another profile or
-weakens it; a delegation naming either overlay is refused at load.
+PRODUCTION is `production_policy(cfg)`: `PolicyPart(exposure_required=True,
+min_sender_age_s=cfg.min_sender_age_s)`, built in that ONE function from the
+pass's config (contract §8.6 as amended by E30). The top-level
+`min_sender_age_s` is the only member that changes it (default 86400; 0 is
+an active policy, never None); exposure stays required; a delegation naming
+either overlay is refused at load (contract §8.8).
 """
 
 from __future__ import annotations
@@ -82,8 +85,13 @@ class PolicyPart:
     min_sender_age_s: Optional[int]
 
 
-#: Production's policy part (contract §8.8), pinned.
-PRODUCTION_POLICY = PolicyPart(exposure_required=True, min_sender_age_s=86400)
+def production_policy(cfg: Any) -> PolicyPart:
+    """Production's policy part, from `cfg` (contract §8.6/§8.8): exposure
+    required, and the sender-age duration the config sets. The ONLY place
+    the production `PolicyPart` is built; `production_profile` calls it, and
+    the sender side reads the same `cfg.min_sender_age_s`
+    (`classify.sender_age_refusal`), so the two cannot diverge."""
+    return PolicyPart(exposure_required=True, min_sender_age_s=cfg.min_sender_age_s)
 
 #: The edge part production uses: the edge exists when the key's runtime owns
 #: the domain of `from` (`peerbind.check6`, the same predicate check 6 runs).
@@ -121,7 +129,7 @@ class Profile:
 
 def production_profile(ctx: HookContext) -> Profile:
     """The only profile the router builds."""
-    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT, policy=PRODUCTION_POLICY)
+    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT, policy=production_policy(ctx.cfg))
 
 
 def conformance_edges(pairs) -> FrozenSet[Tuple[str, str]]:
