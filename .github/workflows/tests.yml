@@ -11,8 +11,9 @@ jobs:
       fail-fast: false
       matrix:
         # The floor and the ceiling. `pyproject.toml` claims
-        # `requires-python = ">=3.9"` and until this job ran, nothing checked it.
-        python: ["3.9", "3.13"]
+        # `requires-python = ">=3.11"` (the image's python:3.11-slim); the floor
+        # was 3.9 until the hosted runner image stopped offering it.
+        python: ["3.11", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
