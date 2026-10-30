@@ -58,15 +58,15 @@ class _ControlIn(tpe._Eval):
             peer_id=rid, logical_id=lid or self.lid, local_address=f"bob@{FD}", remote=remote,
             generation="g" * 32, expires_at=expires))
 
-    def control_raw(self, *, both=False, bad_signature=False, **over):
+    def control_raw(self, *, both=False, bad_signature=False, seed=None, **over):
         doc = {"v": 1, "key_id": KEY_ID, "kind": "control", "id": "cTRL0123456789abcdefgh",
                "from": SIGNER, "to": OWN, "ts": "2026-10-13T11:59:00Z", "about": ABOUT,
                "outcome": "refused", "cause": "no_edge"}
         doc.update(over)
         st = si.encode_control({k: v for k, v in doc.items() if v is not None})
-        sig = si._sign(tpe.SEED, st if not bad_signature else st + b"x")
+        sig = si._sign(seed or tpe.SEED, st if not bad_signature else st + b"x")
         fields = [["Message-ID", f"<{doc['id']}@{T1}>"],
-                  [peerlane.CONTROL_FIELD, si.format_field(KEY_ID, st, sig)]]
+                  [peerlane.CONTROL_FIELD, si.format_field(doc["key_id"], st, sig)]]
         if both:
             _sdoc, sraw = tpe.statement()
             fields.append([peerlane.STATEMENT_FIELD,
@@ -196,15 +196,46 @@ class AcceptedControlTests(_ControlIn):
 
 class DroppedControlTests(_ControlIn):
 
+    def logged_drop(self, cm, key, intake, cause):
+        """The drop is LOGGED: `_drop_control`'s warning, the one producer of
+        this line, names this record, its intake and its own cause."""
+        self.assertIn(f"control notice {key} ({intake}) dropped: {cause}",
+                      [r.getMessage() for r in cm.records if r.levelname == "WARNING"])
+
+    def handoff(self):
+        """What this host intake handed downstream: `{entry id: disposition}`
+        for every tombstone committed under `.disposed/.control/`. On a host
+        intake the tombstone IS the handoff: `HostEffects.quarantine` is a
+        no-op and "the tombstone carries the disposition"
+        (`peerjournal.HostEffects`), committed by `HostEffects.dispose` from
+        the bytes frozen at the transition. So handing a candidate to mail
+        admission on this path is committing its tombstone as `mail`."""
+        d = self.hop / ".disposed" / ".control"
+        return {p.name: json.loads(p.read_bytes())["disposition"]
+                for p in d.iterdir() if p.is_file() and len(p.name) == 32}
+
     def dropped(self, raw, cause):
         self.issued()
         self.entry(raw)
-        self.poll()
+        with self.assertLogs("amap_router_local.peerjournal", level="WARNING") as cm:
+            self.poll()
+        self.logged_drop(cm, self.rec()["key"], ".control", cause)
         self.assertEqual(self.outcome(), ("done", "dropped", cause, None))
         self.assertEqual(self.inbox_notices(), [], "never placed")
         self.assertIsNone(self.rec()["control"], "never answered")
-        self.assertEqual(self.tomb()["disposition"], "dropped")
-        self.assertEqual(self.effects.quarantined, [], "never handed to mail admission")
+        self.assertEqual(self.handoff(), {CID: "dropped"},
+                         "one handoff, as dropped: never handed to mail admission")
+
+    def test_the_handoff_observation_sees_a_mail_disposition(self):
+        """Positive control for `handoff()`: plain mail in `.control/`, once
+        its quarantine expires, IS handed to mail admission, and the
+        observation shows it as exactly that entry's `mail` tombstone."""
+        self.entry(self.raw(signed=False))
+        self.poll()
+        self.assertEqual(self.handoff(), {}, "nothing handed over while held")
+        self.poll(now=NOW + timedelta(days=self.cfg.ingress_quarantine_days))
+        self.assertEqual(self.outcome(), ("done", "mail", "control_plain_mail", None))
+        self.assertEqual(self.handoff(), {CID: "mail"})
 
     def test_from_not_the_keys_runtime(self):
         self.dropped(self.control_raw(**{"from": f"planner@{T1}"}), "control_signer")
@@ -221,21 +252,38 @@ class DroppedControlTests(_ControlIn):
     def test_a_bad_signature(self):
         self.dropped(self.control_raw(bad_signature=True), "signature")
 
+    def test_a_key_no_configured_runtime_owns(self):
+        self.dropped(self.control_raw(key_id="stranger-key-1",
+                                      seed=hashlib.sha256(b"control-stranger-seed").digest()),
+                     "unknown_key")
+
+    def test_a_key_outside_its_validity(self):
+        self.lane = dataclasses.replace(self.lane, key_table=si.load_key_table([
+            {"domains": [T1], "runtime": SIGNER,
+             "keys": [{"key_id": KEY_ID, "public_key": si.public_key(tpe.SEED).hex(),
+                       "not_after": "2026-10-13T11:00:00Z"}]}]))
+        self.dropped(self.control_raw(), "key_validity")
+
     def test_both_fields(self):
         self.dropped(self.control_raw(both=True), "header_count")
 
     def test_a_control_in_an_agents_candidates_is_dropped(self):
         self.issued()
         key = self.take(self.control_raw())
-        try:
-            self.evaluate(key)
-        except Exception:  # noqa: BLE001 -- a wrong outcome must FAIL below, not error
-            pass
+        with self.assertLogs("amap_router_local.peerjournal", level="WARNING") as cm:
+            try:
+                self.evaluate(key)
+            except Exception:  # noqa: BLE001 -- a wrong outcome must FAIL below, not error
+                pass
+        self.logged_drop(cm, key, "candidates", peerjournal.CONTROL_OUTSIDE_INTAKE)
         rec = peerjournal.read_record(self.state_dir, tpe.OWNER, key)
         self.assertEqual((rec["state"], rec["disposed"], rec["cause"]),
                          ("done", "dropped", peerjournal.CONTROL_OUTSIDE_INTAKE))
         self.assertIsNone(rec["control"])
         self.assertEqual(self.inbox_notices(), [])
+        # An agent intake's effects ARE `self.effects` (`tpe._Eval.ctx`), so
+        # the spy observes the real admission boundary here.
+        self.assertEqual(self.effects.quarantined, [], "never handed to mail admission")
 
 
 class DuplicateTests(_ControlIn):

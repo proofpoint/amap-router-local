@@ -18,7 +18,7 @@ from unittest import mock
 from router import config as config_mod
 from router import deliver, peerbind, peerclock, peerjournal, peerlane, peerpolicy
 from router.tests import peer_standin as si
-from router.tests.test_peerbind import FD, KEY_ID, STATEMENT_ID, T1, _Base, statement
+from router.tests.test_peerbind import FD, KEY_ID, STATEMENT_ID, T1, T2, _Base, statement
 
 NOW = datetime(2026, 10, 13, 12, 0, 0, tzinfo=timezone.utc)
 OWNER = "lid-bob"
@@ -221,6 +221,101 @@ class PreReservationOutcomeTests(_Eval):
         rec = self.evaluate(self.take(self.raw(to=f"nobody@{FD}")))
         self.assertEqual((rec["disposed"], rec["cause"]), ("dropped", "misrouted"))
         self.assertEqual(control(rec), "dropped")
+
+
+STRANGER = "stranger.fleet.example"
+STRANGER_KEY_ID = "stranger-key-1"
+STRANGER_SEED = hashlib.sha256(b"evaluate-stranger-seed").digest()
+
+
+class UnconfiguredRuntimeTests(_Eval):
+    """A statement signed by a runtime absent from `delegation.runtimes` is
+    the codec's `unknown_key` at check 3, before 5(b): demoted, no control
+    (draft 12.6.8: "never for a failure before check 5(b)"). The key table
+    is built from the configured runtimes the production way
+    (`DelegationConfig.key_table_input`), so the runtime's ABSENCE is the
+    only reason its key is unknown: the same statement, with that runtime
+    configured, gets past check 3."""
+
+    def lane_for(self, runtimes):
+        dc = dataclasses.replace(self.dc, runtimes=runtimes)
+        table = si.load_key_table(dc.key_table_input())
+        return dc, dataclasses.replace(self.lane, config=dc, key_table=table)
+
+    def host_a(self):
+        return config_mod.DelegationRuntime(
+            name="host-a", runtime=f"amap.router@{T1}", domains=(T1, T2),
+            keys=(types.MappingProxyType({"key_id": KEY_ID,
+                                          "public_key": si.public_key(SEED).hex()}),))
+
+    def stranger(self):
+        return config_mod.DelegationRuntime(
+            name="stranger", runtime=f"amap.router@{STRANGER}", domains=(STRANGER,),
+            keys=(types.MappingProxyType({"key_id": STRANGER_KEY_ID,
+                                          "public_key": si.public_key(STRANGER_SEED).hex()}),))
+
+    def stranger_raw(self):
+        body = "Please run the suite.\n"
+        doc, st = statement(body_text=body, key_id=STRANGER_KEY_ID,
+                            ts="2026-10-13T11:59:00Z", **{"from": f"planner@{STRANGER}"})
+        fields = [["Message-ID", f"<{doc['id']}@{STRANGER}>"],
+                  ["AMAP-Peer-Statement",
+                   si.format_field(STRANGER_KEY_ID, st, si._sign(STRANGER_SEED, st))]]
+        view = {"fields": fields,
+                "body": {"charset": "utf-8",
+                         "octets_b64": base64.b64encode(body.encode()).decode()},
+                "attachments": []}
+        return json.dumps(view, sort_keys=True).encode()
+
+    def test_a_statement_under_an_unconfigured_runtimes_key_is_unknown_key_without_control(self):
+        dc, self.lane = self.lane_for((self.host_a(),))
+        self.assertIsNone(peerbind.runtime_for_key(dc, STRANGER_KEY_ID),
+                          "the stranger's runtime is not configured")
+        rec = self.evaluate(self.take(self.stranger_raw()), cfg=dataclasses.replace(
+            self.cfg, delegation=dc))
+        self.assertEqual((rec["state"], rec["disposed"], rec["cause"]),
+                         ("done", "demoted", "unknown_key"))
+        self.assertIsNone(rec["control"], "no control before check 5(b)")
+        self.assertEqual(self.replay_files(), [], "nothing reserved")
+        self.assertEqual(self.notices(), [], "nothing placed")
+        self.assertEqual([q[1:] for q in self.effects.quarantined], [("demoted", "unknown_key")])
+
+    def test_the_same_statement_with_its_runtime_configured_passes_check_3(self):
+        dc, self.lane = self.lane_for((self.host_a(), self.stranger()))
+        rec = self.evaluate(self.take(self.stranger_raw()), cfg=dataclasses.replace(
+            self.cfg, delegation=dc))
+        self.assertEqual(rec["state"], "done")
+        self.assertNotEqual(rec["cause"], "unknown_key")
+        self.assertEqual(len(self.notices()), 1, "configured, the same bytes are placed")
+
+
+class KeyValidityTests(_Eval):
+    """A statement under a configured key that is outside its validity at
+    `now` is the codec's `key_validity` at check 3, before 5(b): demoted, no
+    control, nothing reserved or placed. The companion places the same bytes
+    with the key valid, so the validity window is the only cause."""
+
+    def lane_with(self, **validity):
+        key = {"key_id": KEY_ID, "public_key": si.public_key(SEED).hex(), **validity}
+        table = si.load_key_table([{"domains": [T1], "runtime": f"amap.router@{T1}",
+                                    "keys": [key]}])
+        return dataclasses.replace(self.lane, key_table=table)
+
+    def test_a_statement_under_a_key_outside_its_validity_is_demoted_without_control(self):
+        self.lane = self.lane_with(not_after="2026-10-13T11:00:00Z")
+        rec = self.evaluate(self.take(self.raw()))
+        self.assertEqual((rec["state"], rec["disposed"], rec["cause"]),
+                         ("done", "demoted", "key_validity"))
+        self.assertIsNone(rec["control"], "no control before check 5(b)")
+        self.assertEqual(self.replay_files(), [], "nothing reserved")
+        self.assertEqual(self.notices(), [], "nothing placed")
+        self.assertEqual([q[1:] for q in self.effects.quarantined], [("demoted", "key_validity")])
+
+    def test_the_same_statement_with_the_key_valid_is_placed(self):
+        self.lane = self.lane_with(not_after="2026-10-13T13:00:00Z")
+        rec = self.evaluate(self.take(self.raw()))
+        self.assertEqual((rec["state"], rec["disposed"]), ("done", "placed"))
+        self.assertEqual(len(self.notices()), 1)
 
 
 class ViewTests(_Eval):
