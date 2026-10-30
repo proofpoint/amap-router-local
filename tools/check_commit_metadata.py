@@ -78,6 +78,11 @@ EXCEPTED_TAG_SHAS: frozenset = frozenset({
     "77f355bf80bb0a3d90b9d96d4863de38d9349672",  # refs/tags/amap-2026-10-28
     "ed86f883acafa82cc8863cc5e4f9c520fde8b168",  # refs/tags/amap-m1p1-rc1
     "e1dccc2c9561c497aa986d3d84b9826d7f089b8a",  # refs/tags/amap-m1p1-rc1-hop
+    # Two more annotated tags pushed 2026-10-30 with the same kind of tagger
+    # address, accepted as published on 2026-10-30 (RL-TAGS-TAGGER-EMAIL-2,
+    # go a). Shas read from `git ls-remote --tags origin`.
+    "e08ffc42e16cfd9664410e2d66ee2a59c25f1bda",  # refs/tags/amap-2026-10-30
+    "e9c4d54a3b19281d3f464189a86214203b348e1e",  # refs/tags/amap-2026-10-30.1
 })
 
 

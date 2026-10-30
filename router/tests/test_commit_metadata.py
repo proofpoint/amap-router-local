@@ -285,13 +285,15 @@ class CheckerTests(unittest.TestCase):
             cm.EXCEPTED_SHAS = original
 
     def test_the_tag_exception_list_is_exact_and_tag_only(self):
-        """The three decided tag objects (2026-10-30), as full shas; a prefix
+        """The five decided tag objects (2026-10-30), as full shas; a prefix
         does not exempt; and the commit and tag lists do not excuse each
         other."""
         self.assertEqual(cm.EXCEPTED_TAG_SHAS,
                          frozenset({
                                    "77f355bf80bb0a3d90b9d96d4863de38d9349672",
+                                   "e08ffc42e16cfd9664410e2d66ee2a59c25f1bda",
                                    "e1dccc2c9561c497aa986d3d84b9826d7f089b8a",
+                                   "e9c4d54a3b19281d3f464189a86214203b348e1e",
                                    "ed86f883acafa82cc8863cc5e4f9c520fde8b168",
                          }))
         for sha in cm.EXCEPTED_TAG_SHAS:
