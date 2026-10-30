@@ -170,9 +170,11 @@ class ReloadRefusalTests(helpers.RouterTestCase):
 
     def test_a_refused_delegation_refuses_the_reload(self):
         current = types.SimpleNamespace(state_dir=self.state_dir, delegation=object(),
-                                        reload_failed=False, transport_plugin=None, hop=None)
+                                        reload_failed=False, transport_plugin=None, hop=None,
+                                        min_sender_age_s=86400)
         fresh = types.SimpleNamespace(state_dir=self.state_dir, delegation=object(),
-                                      transport_plugin=None, hop=None, reload_failed=False)
+                                      transport_plugin=None, hop=None, min_sender_age_s=86400,
+                                      reload_failed=False)
         refused = peerlane.DelegationRefused("signing_key_mismatch", "no")
         with mock.patch.object(service, "load", return_value=fresh), \
                 mock.patch.object(service, "activate_delegation", side_effect=refused), \
@@ -189,9 +191,10 @@ class ReloadRefusalTests(helpers.RouterTestCase):
     def test_a_good_reload_clears_the_failure(self):
         service._RELOAD_FAILURE[str(self.state_dir)] = {"since": NOW, "error": "x"}
         current = types.SimpleNamespace(state_dir=self.state_dir, delegation=None,
-                                        reload_failed=True, transport_plugin=None, hop=None)
+                                        reload_failed=True, transport_plugin=None, hop=None,
+                                        min_sender_age_s=86400)
         fresh = types.SimpleNamespace(state_dir=self.state_dir, delegation=None,
-                                      transport_plugin=None, hop=None)
+                                      transport_plugin=None, hop=None, min_sender_age_s=86400)
         with mock.patch.object(service, "load", return_value=fresh):
             got = service.reload_config("cfg.json", current)
         self.assertIs(got, fresh)
