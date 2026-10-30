@@ -38,7 +38,7 @@ import router
 from router import classify, config as config_mod, console, outbound, peerjournal, peerpolicy
 from router import service, status as status_mod
 from router.config import ConfigError, load_obj
-from router.tests import helpers
+from router.tests import helpers, peer_standin as si
 from router.tests import test_classify as tcl
 from router.tests import test_peer_policy_e2e as te2e
 from router.tests import test_peerepochs as tep
@@ -69,6 +69,12 @@ class LoadTests(helpers.RouterTestCase):
     def load(self, **top):
         return tcl.make_cfg(self, top=top)
 
+    def accepted(self, value):
+        try:
+            return self.load(min_sender_age_s=value).min_sender_age_s
+        except ConfigError as e:   # a wrong refusal must FAIL, not error
+            self.fail(f"{value!r} was refused: {e}")
+
     def refused(self, value):
         with self.assertRaises(ConfigError) as cm:
             self.load(min_sender_age_s=value)
@@ -86,10 +92,10 @@ class LoadTests(helpers.RouterTestCase):
     def test_accepted_values(self):
         for v in (0, 1, 300, DEFAULT):
             with self.subTest(v=v):
-                self.assertEqual(self.load(min_sender_age_s=v).min_sender_age_s, v)
+                self.assertEqual(self.accepted(v), v)
 
     def test_max_accepted(self):
-        self.assertEqual(self.load(min_sender_age_s=31536000).min_sender_age_s, 31536000)
+        self.assertEqual(self.accepted(31536000), 31536000)
 
     def test_above_max_refused(self):
         self.refused(31536001)
@@ -250,8 +256,11 @@ class ReceiverZeroTests(ReceiverDivergenceTests):
             "sender_since_inconsistent")
 
     def test_receiver_zero_refuses_a_future_sender_since(self):
-        # Skew: a sending host's clock 30 s ahead puts sender_since in this
-        # receiver's future. Refused `quarantined` at 0 too; at `now` it passes.
+        # The POLICY HOOK alone, pre-existing behaviour unchanged by this unit
+        # (the same rule `test_peerepochs` pins at the default): a future
+        # sender_since that reached it is `quarantined` at 0 too. In the
+        # production pipeline the codec's check 5(b) demotes it first
+        # (FutureSinceStaysCheck5bTests); this is the hook's own backstop.
         cfg = self.zero()
         self.assertEqual(self.production_decide(cfg, tep.payload(
             sender_since=tep.ts(30), sender_exposure=tep.EXPOSED,
@@ -517,6 +526,53 @@ def _deployed_values():
     if env is not None:
         vals.insert(0, int(env))   # the render-go integer: a non-int is an ERROR, never skipped
     return vals
+
+
+class _FutureSinceDemoting:
+    """The stand-in codec, plus contract v4.6.2 §8.6's check 5(b) for a
+    `sender_since` later than the receiver's clock: a `statement_value`
+    demotion BEFORE reservation (the codec's check, not the router's)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def verify_checked(self, kind, k, statement, signature, key_table, verifier, now):
+        out = self._inner.verify_checked(kind, k, statement, signature, key_table, verifier, now)
+        since = parse_utc_ts(json.loads(statement).get("sender_since"))
+        if since is not None and since > now:
+            raise si.CodecError("value", "statement_value")
+        return out
+
+
+class FutureSinceStaysCheck5bTests(te2e._E2E):
+    """Contract owner's byte check (M2, 2026-10-30): a future `sender_since`
+    FAILS CHECK 5(b) and is demoted `statement_value` before reservation, at
+    EVERY duration, 0 included. This unit adds no refusal for it: the router
+    passes the codec's demotion through unchanged, reserves nothing and
+    counts no `quarantined`."""
+
+    def test_a_future_sender_since_is_a_5b_demotion_at_every_duration(self):
+        for i, v in enumerate((0, 7200) + tuple(_deployed_values()[:1])):
+            with self.subTest(v=v):
+                self.cfg = dataclasses.replace(self.cfg, min_sender_age_s=v)
+                self.lane = dataclasses.replace(self.lane,
+                                                codec=_FutureSinceDemoting(self.lane.codec))
+                before = self.quarantined_count()
+                replays = len(self.replay_files())
+                rec = self.evaluate_production(self.take(self.raw(
+                    id=f"fut{i}".ljust(23, "f"), sender_since=te2e.ts(30),
+                    sender_exposure=te2e.EXPOSED, **{"from": f"fut{i}@{te2e.T1}"})))
+                self.assertEqual((rec["disposed"], rec["cause"]), ("demoted", "statement_value"))
+                self.assertEqual(len(self.replay_files()), replays, "ahead of reservation")
+                self.assertEqual(self.quarantined_count(), before, "not a policy refusal")
+                # Companion: the same codec passes a sender exactly v old.
+                rec = self.evaluate_production(self.take(self.raw(
+                    id=f"now{i}".ljust(23, "n"), sender_since=te2e.ts(-v),
+                    sender_exposure=te2e.EXPOSED, **{"from": f"now{i}@{te2e.T1}"})))
+                self.assertEqual(rec["disposed"], "placed")
 
 
 class DeployedValueTests(te2e._E2E):

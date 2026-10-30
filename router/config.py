@@ -93,7 +93,9 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
     this. ONE value governs both (`classify.sender_age_refusal`,
     `peerpolicy.production_policy`). `0` is an ACTIVE policy, never "off":
     `sender_since` stays mandatory, the epoch rules still run, and a future
-    `sender_since` is still refused. Restart-only: a reload that changes
+    `sender_since` still fails the codec's check 5(b) (a `statement_value`
+    demotion before reservation, unchanged at every duration). Restart-only:
+    a reload that changes
     the effective value is refused (`service.reload_config`). The only
     configuration that may change the duration; `delegation` may never
     name it (`_OVERLAY_TOKENS`).
