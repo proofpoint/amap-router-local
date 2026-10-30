@@ -12,15 +12,22 @@ Each class pins one claim on the surface only its producer reaches:
   * ReportedTests — what the operator and a fleet check SEE (startup line,
     status.json, `status` text, console) is the value ENFORCED, never the
     default filled in.
-  * ZeroTests / SkewTests — 0 is an active zero-second policy, and a future
-    `sender_since` is refused at every value, 0 included.
+  * ZeroTests / FutureSinceStaysCheck5bTests — 0 is an active zero-second
+    policy; a future `sender_since` is NOT a refusal this unit adds: it
+    fails the codec's check 5(b), a `statement_value` demotion before
+    reservation, at every duration, 0 included. (The receiver hook's own
+    `quarantined` for a future value, if one reached it, is pre-existing.)
   * ReloadTests — restart-only, by effective value.
   * DigestVectorTests — the D2 digest against literal known answers.
   * StructuralTests — a tripwire against a reintroduced 86400 literal; the
     behavioural tests above, not this, are the proof.
-  * DeployedValueTests — the production receiver path at the deployed value
-    (E30 r4 clause 5: suite evidence at the ACTUAL V), plus supporting
-    values. Set AMAP_M1_SENDER_AGE_V to the render-go integer to add it.
+  * ActualV* and DeployedValueTests — E30 r4 clause 5's evidence at the
+    ACTUAL deployed V: sender item 5c, the pre-publication re-check, the
+    receiver policy, the deployed-value policy e2e and R02's RetentionTests,
+    ALL at one V. ACTUAL_V comes from AMAP_M1_SENDER_AGE_V; unset, it is 0,
+    the value Dan decided for M1 (Decision 3, V reopened 2026-10-30). Every
+    run prints the V it used. 300, 7200 and the maximum are SUPPORTING
+    values only, and never repeat ACTUAL_V.
 """
 import ast
 import dataclasses
@@ -28,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import types
 import unittest
 from datetime import timedelta
@@ -35,13 +43,14 @@ from pathlib import Path
 from unittest import mock
 
 import router
-from router import classify, config as config_mod, console, outbound, peerjournal, peerpolicy
+from router import classify, config as config_mod, console, outbound, peerclock, peerjournal, peerpolicy
 from router import service, status as status_mod
 from router.config import ConfigError, load_obj
 from router.tests import helpers, peer_standin as si
 from router.tests import test_classify as tcl
 from router.tests import test_peer_policy_e2e as te2e
 from router.tests import test_peerepochs as tep
+from router.tests import test_peerevaluate as tpe
 from router.tests import test_peerlane as tpl
 from router.tests.helpers import write_request
 from router.util import format_utc_ts, parse_utc_ts, utc_ts
@@ -117,6 +126,13 @@ class LoadTests(helpers.RouterTestCase):
         for v in ("0", "86400", None):
             with self.subTest(v=v):
                 self.refused(v)
+
+    def test_an_instance_member_cannot_set_it(self):
+        # Top-level only: inside an instance block the key is unknown there
+        # and refused at load, naming it.
+        with self.assertRaises(ConfigError) as cm:
+            tcl.make_cfg(self, alice={"min_sender_age_s": 0})
+        self.assertIn("min_sender_age_s", str(cm.exception))
 
     def test_a_delegation_member_cannot_set_it(self):
         # The top-level key is the ONLY way: inside `delegation` the overlay
@@ -215,13 +231,16 @@ class ReceiverDivergenceTests(tep._Epochs):
 
 
 # ---------------------------------------------------------------------------
-# Zero is active; a future sender_since is refused at every value
+# Zero is active; a future sender_since stays a 5(b) demotion
 # ---------------------------------------------------------------------------
 
 class SenderZeroTests(helpers.RouterTestCase):
 
     def test_zero_is_kept(self):
-        cfg = tcl.make_cfg(self, top={"min_sender_age_s": 0})
+        try:
+            cfg = tcl.make_cfg(self, top={"min_sender_age_s": 0})
+        except ConfigError as e:   # a refused 0 must FAIL, not error
+            self.fail(f"0 was refused: {e}")
         self.assertEqual(cfg.min_sender_age_s, 0)
         # A just-registered sender passes at 0 (and would not at the default).
         self.assertIsNone(classify.sender_age_refusal(
@@ -520,12 +539,19 @@ class StructuralTests(unittest.TestCase):
 # The production receiver at the deployed value (E30 r4 clause 5)
 # ---------------------------------------------------------------------------
 
-def _deployed_values():
-    vals = [0, 300, 7200]
-    env = os.environ.get("AMAP_M1_SENDER_AGE_V")
-    if env is not None:
-        vals.insert(0, int(env))   # the render-go integer: a non-int is an ERROR, never skipped
-    return vals
+#: E30 r4 clause 5: the ACTUAL deployed V. The slot run sets it to the
+#: render-go integer; unset, it is Dan's decided M1 value, 0 (Decision 3, V
+#: reopened 2026-10-30). A non-integer is an ERROR at import, never a skip.
+ACTUAL_V = int(os.environ.get("AMAP_M1_SENDER_AGE_V", "0"))
+#: Supporting values: never ACTUAL_V, so nothing silently repeats it.
+SUPPORTING = tuple(v for v in (300, 7200, MAX) if v != ACTUAL_V)
+
+
+def setUpModule():
+    # In the transcript, so the evidence names the V it was produced at.
+    print(f"[ENROL-AGE-CONFIG] ACTUAL_V={ACTUAL_V} "
+          f"(AMAP_M1_SENDER_AGE_V={os.environ.get('AMAP_M1_SENDER_AGE_V', '<unset: 0>')}) "
+          f"supporting={SUPPORTING}", file=sys.stderr)
 
 
 class _FutureSinceDemoting:
@@ -555,7 +581,7 @@ class FutureSinceStaysCheck5bTests(te2e._E2E):
     counts no `quarantined`."""
 
     def test_a_future_sender_since_is_a_5b_demotion_at_every_duration(self):
-        for i, v in enumerate((0, 7200) + tuple(_deployed_values()[:1])):
+        for i, v in enumerate((ACTUAL_V,) + SUPPORTING):
             with self.subTest(v=v):
                 self.cfg = dataclasses.replace(self.cfg, min_sender_age_s=v)
                 self.lane = dataclasses.replace(self.lane,
@@ -594,10 +620,138 @@ class DeployedValueTests(te2e._E2E):
             sender_exposure=te2e.EXPOSED, **{"from": f"old{i}@{te2e.T1}"})))
         self.assertEqual(rec["disposed"], "placed")
 
-    def test_the_production_receiver_at_each_deployed_value(self):
-        for i, v in enumerate(_deployed_values()):
+    def test_the_production_receiver_at_the_actual_v(self):
+        self.run_at(ACTUAL_V, 0)
+
+    def test_the_production_receiver_at_supporting_values(self):
+        for i, v in enumerate(SUPPORTING, start=1):
             with self.subTest(v=v):
                 self.run_at(v, i)
+
+
+# ---------------------------------------------------------------------------
+# E30 r4 clause 5: every named path at the ACTUAL V
+# ---------------------------------------------------------------------------
+
+class ActualVSenderTests(helpers.RouterTestCase):
+    """Sender item 5c at ACTUAL_V."""
+
+    def test_item_5c_at_the_actual_v(self):
+        cfg = dataclasses.replace(tcl.make_cfg(self), min_sender_age_s=ACTUAL_V)
+        if ACTUAL_V > 0:
+            self.assertEqual(classify.sender_age_refusal(
+                tcl.with_age(cfg, _ago(tcl.NOW, ACTUAL_V - 1)), "alice", tcl.NOW),
+                f"the sender registered {ACTUAL_V - 1}s ago, under {ACTUAL_V}s")
+        self.assertIsNone(classify.sender_age_refusal(
+            tcl.with_age(cfg, _ago(tcl.NOW, ACTUAL_V)), "alice", tcl.NOW))
+        # Active at any V: unknown age and a future registration still refuse.
+        self.assertEqual(classify.sender_age_refusal(tcl.with_age(cfg, None), "alice", tcl.NOW),
+                         "sender age unknown")
+        self.assertEqual(classify.sender_age_refusal(
+            tcl.with_age(cfg, _ago(tcl.NOW, -1)), "alice", tcl.NOW),
+            "the sender's first_registered_ts is in the future")
+
+
+class ActualVRecheckTests(tpl._Send):
+    """The pre-publication re-check at ACTUAL_V (real clock, 60 s margins)."""
+
+    def stage(self, cfg):
+        write_request(cfg, "alice", "00000001", to=[tpl.TRUSTED])
+        self.drain(dataclasses.replace(cfg, reload_failed=True))
+        self.assertEqual(self.port.writes, [])
+
+    def test_the_recheck_publishes_at_the_actual_v(self):
+        cfg = self.cfg()
+        self.activate(cfg)
+        self.stage(cfg)
+        at = tcl.with_age(dataclasses.replace(cfg, min_sender_age_s=ACTUAL_V),
+                          _ago(utc_ts(), ACTUAL_V + 60))
+        self.drain(at)
+        self.assertEqual(self.port.writes, ["00000001"])
+
+    def test_the_recheck_refuses_under_the_actual_v(self):
+        cfg = self.cfg()
+        self.activate(cfg)
+        self.stage(cfg)
+        # Under V: younger than V by 60 s when V allows it; at V = 0 the only
+        # sender under V is one registered in the future.
+        age = ACTUAL_V - 60 if ACTUAL_V >= 120 else -60
+        at = tcl.with_age(dataclasses.replace(cfg, min_sender_age_s=ACTUAL_V),
+                          _ago(utc_ts(), age))
+        self.drain(at)
+        self.assertEqual(self.port.writes, [])
+        self.assertEqual(self.answered(cfg)["detail"],
+                         "policy changed before publication: now peer_quarantined")
+
+
+class ActualVReceiverTests(ReceiverDivergenceTests):
+    """The receiver policy hook (`production_profile`) at ACTUAL_V."""
+
+    def test_the_receiver_policy_at_the_actual_v(self):
+        cfg = dataclasses.replace(self.cfg, min_sender_age_s=ACTUAL_V)
+        self.assertEqual(peerpolicy.production_policy(cfg).min_sender_age_s, ACTUAL_V)
+        if ACTUAL_V > 0:
+            self.assertEqual(self.production_decide(cfg, tep.payload(
+                sender_since=tep.ts(-(ACTUAL_V - 1)), sender_exposure=tep.EXPOSED,
+                **{"from": f"youngv@{tep.T1}"})), "quarantined")
+        self.assertIsNone(self.production_decide(cfg, tep.payload(
+            sender_since=tep.ts(-ACTUAL_V), sender_exposure=tep.EXPOSED,
+            **{"from": f"oldv@{tep.T1}"})))
+        self.assertEqual(self.production_decide(cfg, tep.payload(
+            sender_exposure=tep.EXPOSED, **{"from": f"nosince@{tep.T1}"})),
+            "sender_age_missing")
+
+    # The inherited fixed-value case already runs in ReceiverDivergenceTests.
+    test_receiver_tracks_cfg = None
+
+
+class ActualVRetentionTests(tpe.RetentionTests):
+    """R02's RetentionTests, UNEDITED, re-run at ACTUAL_V with the PRODUCTION
+    hook set in place of the suite's stub hooks (`test_peerevaluate.hooks()`,
+    whose policy accepts everything and so has no age at all). Every signed
+    statement carries a `sender_since` V + 120 s old and an asserted
+    exposure, so the production policy admits it at V; a test that passes
+    its own hook set keeps it. The positive control below shows the
+    production policy is really in force."""
+
+    def ctx(self, *, now=tpe.NOW, hk=None, view=None, retired=None, cfg=None):
+        cfg = dataclasses.replace(cfg or self.cfg, min_sender_age_s=ACTUAL_V)
+        clock = peerclock.advance(self.state_dir, now)
+        if hk is None:
+            hk = peerpolicy.production_hooks(peerpolicy.hook_context(
+                cfg, delegation=self.lane, state_dir=self.state_dir, now=now, clock=clock))
+        return peerjournal.Ctx(state_dir=self.state_dir, cfg=cfg, delegation=self.lane,
+                               hooks=hk, now=now, clock=clock,
+                               view=view or (lambda raw: json.loads(raw)), effects=self.effects,
+                               retired=retired or (lambda _r: False))
+
+    def raw(self, *, signed=True, body="Please run the suite.\n", **over):
+        if signed:
+            over.setdefault("sender_since", format_utc_ts(
+                tpe.NOW - timedelta(seconds=ACTUAL_V + 120)))
+            over.setdefault("sender_exposure", te2e.EXPOSED)
+        return super().raw(signed=signed, body=body, **over)
+
+    def replay_files(self):
+        # The production policy runs the epoch store, which appends its audit
+        # log (`peerepochs.AUDIT_FILE`) under the same replay directory. It is
+        # an append-only audit record, not a reservation, marker or digest, so
+        # retention leaves it; R02's "pruned together" listing excludes only it.
+        from router import peerepochs
+        return [f for f in super().replay_files() if f != peerepochs.AUDIT_FILE]
+
+    def test_the_epoch_audit_is_the_only_file_excluded(self):
+        # Companion: under production the audit log IS written here, so the
+        # exclusion above is not hiding an empty directory.
+        from router import peerepochs
+        self.placed()
+        self.assertIn(peerepochs.AUDIT_FILE, tpe._Eval.replay_files(self))
+
+    def test_the_production_policy_is_in_force_here(self):
+        # A statement with no sender_since is refused by the production
+        # policy (the stub hooks would have placed it).
+        rec = self.evaluate(self.take(tpe._Eval.raw(self, sender_exposure=te2e.EXPOSED)))
+        self.assertEqual((rec["disposed"], rec["policy_code"]), ("refused", "sender_age_missing"))
 
 
 if __name__ == "__main__":

@@ -188,6 +188,8 @@ class StatusTracker:
         #: recorded once at startup and never again, so a reload can never
         #: rewrite it. None (and the member absent) when no plugin is loaded.
         self.transport_plugin: Optional[Dict[str, str]] = None
+        #: The `policy` section (`record_policy`); None until a run loop feeds it.
+        self.policy: Optional[Dict[str, Any]] = None
         #: Latched by the FIRST record, None included: "once" is literal.
         self._transport_plugin_recorded = False
 
@@ -302,7 +304,7 @@ class StatusTracker:
         # (contract §8.6 as amended by E30). Absent only for a tracker no run
         # loop fed — an older router has no such section either, and a fleet
         # check treats absence as a FAIL, never as the default.
-        if getattr(self, "policy", None) is not None:
+        if self.policy is not None:
             doc["policy"] = dict(self.policy)
         # Present only under a registry: "state" (ok / unavailable /
         # rolled_back), "seq", and every instance HELD with its reason. A

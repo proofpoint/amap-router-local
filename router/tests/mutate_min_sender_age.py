@@ -16,8 +16,9 @@ FAILURE (an ERROR is not red). Exit 0 only when the named tests are green
 unmutated and every mutant turns every named test red. Not a test module
 itself (its name keeps it out of discovery).
 
-Numbering follows design d8 §6.3 (M24-M27 belonged to the operator hold,
-which is not in this unit). The bool guard in `_min_sender_age_s` is
+Numbering follows design d8 §6.3; d8's M24-M27 belonged to the operator
+hold, which is not in this unit, so M24 here is a different rule (0 itself
+refused, review b90b434 Opus (b)5). The bool guard in `_min_sender_age_s` is
 redundant beside the exact-type test (`type(True) is bool`), so M3 loosens
 the type test AND drops the guard: the rule pinned is "a bool is refused".
 """
@@ -122,6 +123,10 @@ M = [
   "        return _refuse_reload(current, \"min_sender_age_s changed (restart required)\")\n",
   "        return _refuse_reload(fresh, \"min_sender_age_s changed (restart required)\")\n",
   [T + "ReloadTests.test_refused_reload_keeps_last_good_policy"]),
+ ("M24 zero itself is refused", CF,
+  "    if isinstance(v, bool) or type(v) is not int or not (0 <= v <= MIN_SENDER_AGE_S_MAX):\n",
+  "    if isinstance(v, bool) or type(v) is not int or not (1 <= v <= MIN_SENDER_AGE_S_MAX):\n",
+  [T + "LoadTests.test_accepted_values", T + "SenderZeroTests.test_zero_is_kept"]),
  ("M23 production_profile bypasses production_policy", PP,
   "    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT, policy=production_policy(ctx.cfg))\n",
   "    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT,\n"
