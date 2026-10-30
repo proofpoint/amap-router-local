@@ -770,6 +770,22 @@ def _health_section(data: Dict[str, Any]) -> str:
             f'checked {_esc(_human_age(host.get("age_seconds")))}'
             f'{" — STALE" if host.get("stale") else ""}')
 
+    # The sender-age duration this router ENFORCES, from status.json's
+    # `policy` section (`service.policy_status`) — never a default filled in
+    # here: no section means "not reported", shown as such.
+    policy = status.get("policy") if status else None
+    if not isinstance(policy, dict):
+        age_pill = _pill("unk", "not reported")
+        age_detail = "status.json has no policy section"
+    else:
+        value, default = policy.get("min_sender_age_s"), policy.get("default")
+        below = (isinstance(value, int) and isinstance(default, int)
+                 and not isinstance(value, bool) and value < default)
+        age_pill = _pill("warn" if below else "ok", f"{value}s")
+        age_detail = _esc(f"default {default}s"
+                          + (" — below the release default" if below else "")
+                          + f"; {policy.get('digest', '?')}")
+
     def count(totals: Dict[str, Any], key: str, observed: bool) -> str:
         """One counter cell: the number, blank for zero, a marker for a
         counter that does not exist yet.
@@ -841,6 +857,8 @@ def _health_section(data: Dict[str, Any]) -> str:
       {_esc(f"{status.get('polls', 0)} polls, pid {status.get('pid', '?')}")}</div></div>
   <div class="card"><div class="k">Container</div><div class="v">{host_pill}</div>
     <div class="k" style="text-transform:none;margin-top:5px">{host_detail}</div></div>
+  <div class="card"><div class="k">Sender age</div><div class="v">{age_pill}</div>
+    <div class="k" style="text-transform:none;margin-top:5px">{age_detail}</div></div>
 </div>
 <p class="note"><b>These are two facts, not one light.</b> The drain loop's age
 says this router polled recently; only the adapter's docker check can say the
