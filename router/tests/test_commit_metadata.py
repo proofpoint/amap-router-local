@@ -284,6 +284,37 @@ class CheckerTests(unittest.TestCase):
         finally:
             cm.EXCEPTED_SHAS = original
 
+    def test_the_tag_exception_list_is_exact_and_tag_only(self):
+        """The three decided tag objects (2026-10-30), as full shas; a prefix
+        does not exempt; and the commit and tag lists do not excuse each
+        other."""
+        self.assertEqual(cm.EXCEPTED_TAG_SHAS,
+                         frozenset({
+                                   "77f355bf80bb0a3d90b9d96d4863de38d9349672",
+                                   "e1dccc2c9561c497aa986d3d84b9826d7f089b8a",
+                                   "ed86f883acafa82cc8863cc5e4f9c520fde8b168",
+                         }))
+        for sha in cm.EXCEPTED_TAG_SHAS:
+            self.assertRegex(sha, r"^[0-9a-f]{40}$")
+        self.assertFalse(cm.EXCEPTED_TAG_SHAS & cm.EXCEPTED_SHAS)
+        self.commit("one")
+        self.git("tag", "-a", "-m", "planted", "bad-tag", author=CLEAN, committer=("Jane", PLANTED))
+        tag = self.git("rev-parse", "bad-tag").strip()
+        rows, tag_rows = cm.identities(self.repo), cm.tags(self.repo)
+        self.assertEqual(cm.findings(rows, tag_rows), [(tag, "tagger")])
+        original_tags, original_commits = cm.EXCEPTED_TAG_SHAS, cm.EXCEPTED_SHAS
+        try:
+            cm.EXCEPTED_TAG_SHAS = frozenset({tag[:12]})
+            self.assertEqual(len(cm.findings(rows, tag_rows)), 1, "a prefix must not exempt")
+            cm.EXCEPTED_SHAS = frozenset({tag})
+            self.assertEqual(len(cm.findings(rows, tag_rows)), 1,
+                             "a COMMIT exception must not excuse a tag")
+            cm.EXCEPTED_SHAS = original_commits
+            cm.EXCEPTED_TAG_SHAS = frozenset({tag})
+            self.assertEqual(cm.findings(rows, tag_rows), [])
+        finally:
+            cm.EXCEPTED_TAG_SHAS, cm.EXCEPTED_SHAS = original_tags, original_commits
+
 
 if __name__ == "__main__":
     unittest.main()

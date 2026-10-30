@@ -89,7 +89,8 @@ jobs:
   # committer. This repository is public and so are those fields. The job
   # goes red, by design, while any commit with a personal address is
   # reachable; `tools/check_commit_metadata.py` says why and how exceptions
-  # would be recorded (exact shas, by decision, none yet).
+  # are recorded (exact shas, by decision: EXCEPTED_SHAS for commits,
+  # EXCEPTED_TAG_SHAS for tag objects).
   commit-metadata:
     runs-on: ubuntu-latest
     steps:

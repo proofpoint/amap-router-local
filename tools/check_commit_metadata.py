@@ -64,6 +64,23 @@ EXCEPTED_SHAS: frozenset = frozenset({
 })
 
 
+#: Annotated TAG OBJECTS exempted by an explicit, recorded decision, as FULL
+#: 40-hex tag-object shas (what `git ls-remote --tags` prints for the tag ref
+#: itself, not the `^{}` target), matched exactly. Kept apart from
+#: `EXCEPTED_SHAS` so a commit exception can never excuse a tag, or the
+#: reverse. Like that set, an entry does not make an address acceptable; it
+#: records that one already-published tag was accepted as it is.
+EXCEPTED_TAG_SHAS: frozenset = frozenset({
+    # Three annotated tags pushed 2026-10-28 with a tagger address that is not
+    # a no-reply one. Accepted as published by the repository owner on
+    # 2026-10-30 (RL-TAGS-TAGGER-EMAIL, go B), rather than deleting and
+    # re-creating published tags. Shas read from `git ls-remote --tags origin`.
+    "77f355bf80bb0a3d90b9d96d4863de38d9349672",  # refs/tags/amap-2026-10-28
+    "ed86f883acafa82cc8863cc5e4f9c520fde8b168",  # refs/tags/amap-m1p1-rc1
+    "e1dccc2c9561c497aa986d3d84b9826d7f089b8a",  # refs/tags/amap-m1p1-rc1-hop
+})
+
+
 def email_allowed(email: str) -> bool:
     """Exact matches only: no case folding, no stripping."""
     return email in ALLOWED_EXACT or NOREPLY_RE.fullmatch(email) is not None
@@ -152,6 +169,8 @@ def findings(rows: List[Tuple[str, str, str, List[str]]],
         if not all(trailer_allowed(v) for v in trailers):
             bad.append((sha, "trailer"))
     for sha, email in tag_rows:
+        if sha in EXCEPTED_TAG_SHAS:
+            continue
         if not email_allowed(email):
             bad.append((sha, "tagger"))
     return bad
