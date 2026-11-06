@@ -47,7 +47,8 @@ THE TRUSTED-HOST ORDER (item 5):
      stays the same-host peer lane's code;
   b. `task_deny` removes the edge: `peer_denied`. A deny matches every
      spelling of its target (the registry's skeleton); permits stay exact;
-  c. the sender is under 24 h old by its CURRENT registry entry, its
+  c. the sender is younger than `config.min_sender_age_s` (default 24 h) by
+     its CURRENT registry entry, its
      `first_registered_ts` lies in the future, or there is no such value:
      `peer_quarantined` (the last with detail "sender age unknown");
   d. `exposure.assess` returns None or raises: `exposure_unavailable`. The
@@ -119,9 +120,6 @@ REMOTE_ROUTES = (CLASS_FLEET, CLASS_INTERNET)
 #: The domain of the legacy address scheme, `agent.<name>@local`, which is
 #: this router's own domain when the fleet has no `fleet_domain`.
 LEGACY_DOMAIN = "local"
-
-#: Item 5c: a sender younger than this, by its registry entry, is refused.
-QUARANTINE_S = 24 * 3600
 
 #: Item 5f: the largest signed peer statement, in bytes.
 STATEMENT_MAX_BYTES = 8192
@@ -481,8 +479,13 @@ def sender_age_refusal(cfg: "config_mod.RouterConfig", sender: str,
     age = (now_dt - first).total_seconds()
     if age < 0:
         return "the sender's first_registered_ts is in the future"
-    if age < QUARANTINE_S:
-        return f"the sender registered {int(age)}s ago, under {QUARANTINE_S}s"
+    # The ONE sender-side threshold, from the config (`min_sender_age_s`).
+    # Item 5c and the pre-publication re-check both come through here, with
+    # the process's effective config; 0 is an active zero-second policy, and
+    # the two refusals above still fire at it.
+    threshold = cfg.min_sender_age_s
+    if age < threshold:
+        return f"the sender registered {int(age)}s ago, under {threshold}s"
     return None
 
 

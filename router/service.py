@@ -43,6 +43,7 @@ from . import inflight as inflight_mod, quarantine as quarantine_mod
 from . import generations, hoplink, outbound, outcomes, registry as registry_mod, roster, transport as transport_mod
 from .config import RouterConfig
 from .config import ConfigError, load
+from .config import MIN_SENDER_AGE_S_DEFAULT, sender_age_policy_digest
 from .status import StatusTracker, render_discovery
 from .util import format_utc_ts_us, parse_utc_ts, utc_ts
 
@@ -82,6 +83,33 @@ class HopRuntime:
     plugin: Any
     fsops: Any
     hop: Any
+
+
+def policy_status(cfg: RouterConfig) -> Dict[str, Any]:
+    """status.json's `policy` section: the sender-age duration this process
+    ENFORCES (`cfg.min_sender_age_s`, the value both enforcing paths read),
+    the release default, and the digest of the canonical sender-age policy
+    object for the enforced value (`config.sender_age_policy_digest`).
+    Never the default in place of the value: a fleet check compares this
+    against the fleet artifact."""
+    value = cfg.min_sender_age_s
+    return {"min_sender_age_s": value, "default": MIN_SENDER_AGE_S_DEFAULT,
+            "digest": sender_age_policy_digest(value)}
+
+
+def log_sender_age_policy(cfg: RouterConfig) -> None:
+    """The startup audit line for the sender-age duration (E30: logged at
+    startup, INFO), and a WARNING beside it when the value is BELOW the
+    release default. The warning says what the gate still does: ages at or
+    above the value pass, younger ones are still refused, and every other
+    policy check still runs."""
+    value = cfg.min_sender_age_s
+    logger.info("min_sender_age_s=%d (default %d) policy_digest=%s",
+                value, MIN_SENDER_AGE_S_DEFAULT, sender_age_policy_digest(value))
+    if value < MIN_SENDER_AGE_S_DEFAULT:
+        logger.warning(
+            "sender-age gate allows ages >= %ds; this is below the %ds release "
+            "default; other policy checks still apply", value, MIN_SENDER_AGE_S_DEFAULT)
 
 
 def plugin_status(runtime: Any) -> Optional[Dict[str, str]]:
@@ -640,6 +668,16 @@ def reload_config(config_path, current: RouterConfig, runtime: Any = None) -> Ro
             "pinned to the hop binding it was admitted under; changing it needs a "
             "restart, and a changed root holds the generations pinned to the old one.")
         return _refuse_reload(current, "hop changed")
+    if fresh.min_sender_age_s != current.min_sender_age_s:
+        # EFFECTIVE values are compared, so an absent key and an explicit
+        # default are the same value and reload cleanly. A change is a
+        # restart: the startup audit line and every enforcement stay on the
+        # value this process started with (contract §8.6 as amended by E30).
+        logger.error(
+            "config reload changed min_sender_age_s (%d -> %d) — REFUSED and "
+            "ignored; restart required", current.min_sender_age_s,
+            fresh.min_sender_age_s)
+        return _refuse_reload(current, "min_sender_age_s changed (restart required)")
     if fresh.delegation is not None or current.delegation is not None:
         # Delegation is re-activated against the fresh config BEFORE it is
         # adopted: a key gate, signing-key or probe failure refuses the
@@ -700,6 +738,7 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None,
         process_started = clock.now()
     logger.info("router starting: interval=%ss, instances=%s",
                 interval, sorted(cfg.instances))
+    log_sender_age_policy(cfg)
     # Once, before the loop, and allowed to raise: a refused plugin stops
     # startup here (`start_transport`).
     transport = start_transport(cfg)
@@ -711,12 +750,17 @@ def run_forever(cfg: RouterConfig, interval: float, config_path=None,
     # reload below can never change it (a changed `transport_plugin` is a
     # refused reload), so nothing records it again.
     tracker.record_transport_plugin(plugin_status(transport))
+    tracker.record_policy(policy_status(cfg))
     seen_report = None
     seen_names = sorted(cfg.instances)
     try:
         while True:
             if config_path is not None:
                 cfg = reload_config(config_path, cfg, runtime=transport)
+                # The policy section always describes the config this poll
+                # runs on: a refused reload returns `current`, so a rejected
+                # value is never reported.
+                tracker.record_policy(policy_status(cfg))
                 # THE ADMITTED SET IS ANNOUNCED WHEN IT CHANGES. The startup
                 # line above names it once, and before this it was the ONLY
                 # line that ever did — so a sandbox that appeared was visible

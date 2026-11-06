@@ -441,6 +441,7 @@ Field glossary:
 | `polls` | number of polls this process has run |
 | `process_started_ts` | when THIS PROCESS started, at full resolution: RFC 3339 UTC with microseconds (`2026-10-16T01:42:19.453920Z`). Taken ONCE by `clock.now()` as the first statement of `__main__.main()` (after Python has imported the package's modules, BEFORE the config is loaded and before any transport plugin is loaded), passed to `run_forever`, and written unchanged on every status write of that process; a caller of `run_forever` that passes none gets it as `run_forever`'s first statement, still before the plugin load. Never re-read or rewritten. `started_ts` is unchanged: whole seconds, the counter window |
 | `transport_plugin` | present only when THIS process loaded a transport plugin: `{path, sha256}`, the path `load_plugin` opened and the sha256 IT computed from its one read of the bytes it executed, recorded once at startup and never rewritten (a reload that changes `transport_plugin` is refused). Never recomputed from the file and never copied from the config, so it describes the running process; bind it to that process with `process_started_ts`, which is no earlier than the container's creation (`Created`) and its previous exit (`State.FinishedAt`), both recorded by the engine before this process exists. `State.StartedAt` is not a bound: the engine records it after the task starts. Absent without a plugin |
+| `policy` | written by every run loop: `{min_sender_age_s, default, digest}`, the sender-age duration this process ENFORCES (from the config the poll runs on, never the default filled in), the release default (86400), and the digest of the canonical sender-age policy object for the enforced value. A refused reload leaves it at the running value. Absent in a router older than this field, and a fleet check treats absence as a FAIL, never as 86400 |
 | `instances.<name>.last_summary` | the most recent poll's `drain_instance` summary, verbatim — carries `first_sight: 1` on the poll that snapshotted this instance |
 | `instances.<name>.totals` | cumulative per-outcome + per-refusal-path counts, this process lifetime, including `first_sight` and `quarantined`, and on the peer lane the `peer_*` outcome counters (see "Peer lane") |
 | `instances.<name>.peer_alerts` | peer lane only: the most recent `held` / `refused` / `ambiguous_target` outcomes (notice id, sender, recipient, ts), rendered as banners by `status` |
@@ -726,6 +727,26 @@ view.
 - `delivered_domains_file` — optional, an absolute path: the set of domains
   the downstream hub delivers to, as the deployment renders it. Below,
   "Bound replies over the hop".
+- `min_sender_age_s` — optional, a whole number of seconds from 0 to
+  31536000, default 86400: the sender-age duration (contract §8.6 as
+  amended by E30). ONE value governs the sender's `peer_quarantined` check
+  (item 5c, and the pre-publication re-check) and the receiver's
+  `quarantined` refusal. `0` is an active zero-second policy, never "off":
+  `sender_since` stays mandatory, the epoch rules still run, and a future
+  `sender_since` still fails the codec's check 5(b). Booleans, floats,
+  strings and `null` are refused at load. Restart-only: a reload that
+  changes the effective value is refused (`config_reload_failed`, with
+  `config_reload_failure.error` = `min_sender_age_s changed (restart
+  required)`); an absent key and an explicit 86400 are the same value. It is
+  the only configuration that may change the duration: a `delegation` member
+  naming it is refused. At startup the router logs `min_sender_age_s=<v>
+  (default 86400) policy_digest=sha256:<hex>` at INFO, and, below the
+  default, `sender-age gate allows ages >= <v>s; this is below the 86400s
+  release default; other policy checks still apply` at WARNING. Every enforcing
+  router in a fleet carries the same value, rendered from one fleet artifact
+  `{"v": 1, "min_sender_age_s": <v>}`; `status.json`'s `policy.digest` is the
+  digest of that object for the value this router enforces (known answers:
+  `router/tests/vectors/sender_age_policy_digest.json`).
 - `delegation` — optional: cross-host SIGNED peer tasks to trusted fleet
   hosts. Below, "Signed peer tasks (delegation)".
 - `intake_dir` — the cross-host intake spool's parent; `provision` creates
@@ -1028,7 +1049,7 @@ Every result this router writes carries a `reason_code` (AMAP §4:
 | `rejected` | `no_route` | Cold send to the internet, and this host has no `egress`. Decided before `send_to`. Also a bound reply whose counterparty is not a fleet host: "no reply path to this counterparty in this deployment", with nothing allocated |
 | `rejected` | `fleet_mail_disabled` | Cold send to a trusted fleet host that cannot be a peer task: more than one recipient, or any `cc` |
 | `rejected` | `peer_denied` | Trusted fleet host: the sender's `task_deny` removes the edge (an exact address or `@domain`) |
-| `rejected` | `peer_quarantined` | Trusted fleet host: the sender's registry `first_registered_ts` is under 24 h old, in the future, or absent ("sender age unknown") |
+| `rejected` | `peer_quarantined` | Trusted fleet host: the sender's registry `first_registered_ts` is younger than `min_sender_age_s` (default 86400 s), in the future, or absent ("sender age unknown") |
 | `rejected` | `exposure_unavailable` | Trusted fleet host: the `sender_exposure` assessment returned nothing or failed; a cross-host peer task never goes without it |
 | `rejected` | `peer_statement_too_large` | Trusted fleet host: the signed statement would exceed 8192 bytes, measured exactly before anything is allocated or signed |
 | `rejected` | `unresolved_reply` | Reply: `in_reply_to` doesn't resolve to a ledger record for this sender; or, for a bound reply, the record binds another agent, has expired, lacks its binding members, or cannot make a valid `bound` |
@@ -1068,8 +1089,8 @@ and the first step that answers decides:
    nothing below runs;
 5. more than one class across `to` ∪ `cc`: `mixed_recipient_classes`;
 6. the one class's rule: **local** (the same-host decision, unchanged);
-   **trusted fleet host** (in order: the shape, `task_deny`, the 24 h
-   quarantine, the exposure stamp, the peer lane's availability, the
+   **trusted fleet host** (in order: the shape, `task_deny`, the sender-age
+   quarantine (`min_sender_age_s`), the exposure stamp, the peer lane's availability, the
    statement size; see the reason codes above); **fleet host not in the
    trusted list** (permitted when the sender's `remote_fleet` names it,
    else held); **internet** (`no_route` without egress, first; then permitted
@@ -2178,7 +2199,8 @@ these stores are not an instance's.
 
 **Sender age and the epoch store.** The production profile requires
 `sender_exposure` and `sender_since` on every signed task, and refuses a
-sender younger than 24 hours by the router's own clock (`quarantined`).
+sender younger than `min_sender_age_s` (default 86400 s) by the router's own
+clock (`quarantined`).
 Each (sending runtime, `from`) pair's accepted `sender_since` is kept in
 `state_dir/peer-epochs/`, one immutable file per pair, counted in the
 store bookkeeping like the journal and the replay index.

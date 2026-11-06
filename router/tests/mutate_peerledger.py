@@ -103,7 +103,7 @@ M = [
   [T + "BuilderTests.test_production_is_the_pinned_real_policy"]),
  ("L15 conformance with production's policy part", POL,
   "                   policy=PolicyPart(exposure_required=False, min_sender_age_s=age))\n",
-  "                   policy=PRODUCTION_POLICY)\n",
+  "                   policy=production_policy(ctx.cfg))\n",
   [T + "BuilderTests.test_conformance_differs_only_in_the_policy_and_edge_members"]),
  ("L16 a hook bound to the first context it saw", POL,
   "    return peerledger.resolve(ctx.cfg, in_reply_to=payload[\"in_reply_to\"],\n",
@@ -149,7 +149,7 @@ M = [
   [T + "PlacedBeforeNoticeTests.test_the_placed_record_exists_when_the_notice_is_written",
    T + "PlacedBeforeNoticeTests.test_a_crash_between_placed_and_the_notice_places_once"]),
  ("L25 production with the permissive policy", POL,
-  "    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT, policy=PRODUCTION_POLICY)\n",
+  "    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT, policy=production_policy(ctx.cfg))\n",
   "    return Profile(context=ctx, edges=TRUSTED_HOST_DEFAULT,\n"
   "                   policy=PolicyPart(exposure_required=False, min_sender_age_s=None))\n",
   [T + "BuilderTests.test_production_is_the_pinned_real_policy",

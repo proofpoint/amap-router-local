@@ -86,6 +86,19 @@ AMAP 3.1.0; see `router/README.md` "Peer lane"):
   - `delivered_domains_file` — optional absolute path to the delivered-domain
     file (`_delivered_domains`); while its set differs from `fleet_hosts`,
     every bound reply is held and mail is unaffected.
+  - `min_sender_age_s` (default 86400, from 0 to 31536000) — the sender-age
+    duration (contract §8.6 as amended by E30): the receiver refuses a
+    signed statement `quarantined`, and the sender refuses a cross-host
+    task `peer_quarantined`, while the sender's identity is younger than
+    this. ONE value governs both (`classify.sender_age_refusal`,
+    `peerpolicy.production_policy`). `0` is an ACTIVE policy, never "off":
+    `sender_since` stays mandatory, the epoch rules still run, and a future
+    `sender_since` still fails the codec's check 5(b) (a `statement_value`
+    demotion before reservation, unchanged at every duration). Restart-only:
+    a reload that changes
+    the effective value is refused (`service.reload_config`). The only
+    configuration that may change the duration; `delegation` may never
+    name it (`_OVERLAY_TOKENS`).
   - `intake_dir` — the parent of the cross-host intake spool
     (`<intake_dir>/<instance>/`, created by `provision`). Same containment
     rules as `state_dir`. Nothing in this repo reads it yet: it exists so the
@@ -245,6 +258,7 @@ _TOP_KEYS = {
     "transport_plugin", "registry_dir", "aliases", "hop",
     "trusted_fleet_hosts", "fleet_hosts", "egress", "ingress_quarantine_days",
     "ingress_dedup_horizon_days", "delivered_domains_file", "delegation",
+    "min_sender_age_s",
 }
 _INSTANCE_KEYS = {"namespace", "handoff_dir", "peers", "peer_senders",
                   "task_deny", "send_to", "remote_fleet"}
@@ -354,6 +368,13 @@ ROUTER_LOCAL_PART = "amap.router"
 
 #: `sender_exposure` window (seconds) — see `router/exposure.py`.
 SENDER_EXPOSURE_WINDOW_SECONDS_DEFAULT = 86400
+#: `min_sender_age_s` (module docstring): the default, and the largest value
+#: accepted. The ONLY sender-age literal in the package: `classify` and
+#: `peerpolicy` read `RouterConfig.min_sender_age_s`, never this.
+MIN_SENDER_AGE_S_DEFAULT = 86400
+MIN_SENDER_AGE_S_MAX = 31536000
+#: The canonical sender-age policy object's version (`sender_age_policy`).
+SENDER_AGE_POLICY_VERSION = 1
 #: reverse-edge reply window (seconds) — see `router/outbound.py`.
 PEER_REPLY_WINDOW_SECONDS_DEFAULT = 604800
 #: The mail-reply binding window (seconds): a placed inbound hop mail may be
@@ -587,6 +608,9 @@ class RouterConfig:
     fleet_hosts: Tuple[str, ...] = ()
     egress: bool = False
     ingress_quarantine_days: int = INGRESS_QUARANTINE_DAYS_DEFAULT
+    #: `min_sender_age_s` (module docstring): the sender-age duration, in
+    #: seconds. The ONE runtime source both enforcing paths read.
+    min_sender_age_s: int = MIN_SENDER_AGE_S_DEFAULT
     #: The ingress dedup horizon (`router/ingress.py`): a completed entry's
     #: tombstone is kept at least this long. It must exceed the longest time
     #: the downstream runtime can be down after a crash.
@@ -1783,6 +1807,7 @@ def load_obj(
         state_dir=state_dir, instances=instances, connector_outcome_ids=tuple(outcome_ids),
         trusted_fleet_hosts=trusted, fleet_hosts=fleet_hosts, egress=egress,
         ingress_quarantine_days=_ingress_quarantine_days(top),
+        min_sender_age_s=_min_sender_age_s(top),
         ingress_dedup_horizon_days=_days(top, "ingress_dedup_horizon_days",
                                          INGRESS_DEDUP_HORIZON_DAYS_DEFAULT,
                                          INGRESS_DEDUP_HORIZON_DAYS_MAX),
@@ -1963,8 +1988,10 @@ class DelegationConfig:
 
 _DELEGATION_KEYS = frozenset({"partition_verified", "signing_key", "runtimes", "crypto"})
 _DELEGATION_OPTIONAL = frozenset({"attachment_basis", "inbound", "windows", "retention"})
-#: Any delegation key naming the exposure or sender-age overlay: refused, so
-#: no deployed config can weaken the production profile (contract §8.8).
+#: Any delegation key naming the exposure or sender-age overlay: refused. The
+#: top-level `min_sender_age_s` is the ONLY configuration that may change the
+#: sender-age duration, and nothing may weaken the exposure policy (contract
+#: §8.8, consequential to E30).
 _OVERLAY_TOKENS = ("exposure", "sender_age", "sender_since", "age_policy", "min_age",
                    "quarantine")
 #: The peer-origin profile's window bounds: P in [300, 86400], F at most 900.
@@ -2013,8 +2040,9 @@ def _delegation(raw_value: Any, cfg: "RouterConfig") -> "DelegationConfig":
     overlays = sorted(k for k in raw if isinstance(k, str) and any(
         t in k.lower() for t in _OVERLAY_TOKENS))
     if overlays:
-        raise ConfigError(f"{where}: {overlays}: the exposure and sender-age policy is fixed "
-                          "by the production profile and is not configurable")
+        raise ConfigError(f"{where}: {overlays}: the exposure and sender-age policy is not "
+                          "configurable here; the sender-age duration is set only by the "
+                          "top-level min_sender_age_s")
     if not (_DELEGATION_KEYS <= set(raw) <= _DELEGATION_KEYS | _DELEGATION_OPTIONAL):
         raise ConfigError(f"{where}: needs exactly {sorted(_DELEGATION_KEYS)}, and may have "
                           f"{sorted(_DELEGATION_OPTIONAL)}; got {sorted(raw)}")
@@ -2156,6 +2184,40 @@ def _days(top: Dict[str, Any], key: str, default: int, maximum: int) -> int:
     if isinstance(v, bool) or not isinstance(v, int) or not (1 <= v <= maximum):
         raise ConfigError(f"config.{key}: expected an integer from 1 to {maximum}, got {v!r}")
     return v
+
+
+def _min_sender_age_s(top: Dict[str, Any]) -> int:
+    """`min_sender_age_s`: absent is the default; otherwise an exact int from
+    0 to the maximum. A bool is refused BEFORE the int test (a bool is an
+    int in Python), and so is every float, integral or not: the contract
+    says a whole number of seconds, and `86400.0` is a different JSON
+    value."""
+    if "min_sender_age_s" not in top:
+        return MIN_SENDER_AGE_S_DEFAULT
+    v = top["min_sender_age_s"]
+    if isinstance(v, bool) or type(v) is not int or not (0 <= v <= MIN_SENDER_AGE_S_MAX):
+        raise ConfigError(
+            f"config.min_sender_age_s: expected an integer from 0 to "
+            f"{MIN_SENDER_AGE_S_MAX}, got {v!r}")
+    return v
+
+
+def sender_age_policy(value: int) -> Dict[str, Any]:
+    """The canonical sender-age policy object for `value` (D2, contract §8.6
+    as amended by E30): the fleet artifact's content."""
+    return {"v": SENDER_AGE_POLICY_VERSION, "min_sender_age_s": value}
+
+
+def sender_age_policy_digest(value: int) -> str:
+    """`"sha256:" + hex` of the canonical sender-age policy object, in the
+    pinned canonical form of the policy digest (`classify`'s module
+    docstring). A pure function of `value`: each router reports the digest
+    of the value it ENFORCES, and the fleet artifact carries the same
+    bytes, so equality of digests is equality of values in a form a receipt
+    can record. Known answers: `tests/vectors/sender_age_policy_digest.json`."""
+    text = json.dumps(sender_age_policy(value), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _ingress_quarantine_days(top: Dict[str, Any]) -> int:

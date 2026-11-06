@@ -188,8 +188,15 @@ class StatusTracker:
         #: recorded once at startup and never again, so a reload can never
         #: rewrite it. None (and the member absent) when no plugin is loaded.
         self.transport_plugin: Optional[Dict[str, str]] = None
+        #: The `policy` section (`record_policy`); None until a run loop feeds it.
+        self.policy: Optional[Dict[str, Any]] = None
         #: Latched by the FIRST record, None included: "once" is literal.
         self._transport_plugin_recorded = False
+
+    def record_policy(self, doc: Optional[Dict[str, Any]]) -> None:
+        """The `policy` section (`service.policy_status`): the sender-age
+        duration this process enforces, the default and the digest."""
+        self.policy = doc
 
     def record_transport_plugin(self, doc: Optional[Dict[str, str]]) -> None:
         """The plugin this process loaded, recorded ONCE: a second record is
@@ -292,6 +299,13 @@ class StatusTracker:
         # `started_ts`, so a reader binds the digest to this process.
         if self.transport_plugin is not None:
             doc["transport_plugin"] = dict(self.transport_plugin)
+        # Written by every run loop (`service.run`): the sender-age duration
+        # this process ENFORCES, the release default and the policy digest
+        # (contract §8.6 as amended by E30). Absent only for a tracker no run
+        # loop fed — an older router has no such section either, and a fleet
+        # check treats absence as a FAIL, never as the default.
+        if self.policy is not None:
+            doc["policy"] = dict(self.policy)
         # Present only under a registry: "state" (ok / unavailable /
         # rolled_back), "seq", and every instance HELD with its reason. A
         # rolled-back registry stays held until the operator removes
@@ -482,6 +496,7 @@ def render(doc: Dict[str, Any]) -> str:
         f"last poll {age_str} ({doc.get('polls', 0)} polls since {doc.get('started_ts', '?')}, "
         f"pid {doc.get('pid', '?')})"
     )
+    lines.extend(_policy_lines(doc.get("policy")))
     instances = doc.get("instances") or {}
     for name in sorted(instances):
         totals = instances[name].get("totals") or {}
@@ -540,6 +555,21 @@ def render(doc: Dict[str, Any]) -> str:
         lines.append("(no instances polled yet)")
     lines.extend(_classification_banners(doc.get("classification") or {}))
     return "\n".join(lines)
+
+
+def _policy_lines(section: Any) -> List[str]:
+    """The `policy` section as text: the enforced sender-age duration, and a
+    banner when it is below the release default. Nothing for a document
+    without the section (an older router, or a tracker no run loop fed)."""
+    if not isinstance(section, dict):
+        return []
+    value, default = section.get("min_sender_age_s"), section.get("default")
+    out = [f"sender age: {value}s (default {default}s)  {section.get('digest', '?')}"]
+    if (isinstance(value, int) and isinstance(default, int)
+            and not isinstance(value, bool) and value < default):
+        out.append(f"  ** sender-age gate allows ages >= {value}s; below the "
+                   f"{default}s release default **")
+    return out
 
 
 def _classification_banners(section: Dict[str, Any]) -> List[str]:

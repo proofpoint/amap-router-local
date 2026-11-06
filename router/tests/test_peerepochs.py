@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import types
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -27,6 +28,10 @@ NOW = tpe.NOW
 RUNTIME = f"amap.router@{T1}"
 SENDER = f"planner@{T1}"
 DAY = 86400
+#: The production policy part at the release default, built through the ONE
+#: constructor (`peerpolicy.production_policy`) from a config-shaped value.
+PRODUCTION_AT_DEFAULT = peerpolicy.production_policy(
+    types.SimpleNamespace(min_sender_age_s=config_mod.MIN_SENDER_AGE_S_DEFAULT))
 
 
 def ts(delta_s: int) -> str:
@@ -49,7 +54,7 @@ class _Epochs(tpe._Eval):
         return peerpolicy.decide_hooks(peerpolicy.Profile(
             hctx, peerpolicy.TRUSTED_HOST_DEFAULT, policy))
 
-    def decide(self, p, policy=peerpolicy.PRODUCTION_POLICY, now=NOW):
+    def decide(self, p, policy=PRODUCTION_AT_DEFAULT, now=NOW):
         try:
             out = self.hooks(policy, now).policy(p, "bob", RUNTIME)
         except Exception as e:  # noqa: BLE001 -- a wrong outcome must FAIL, not error
@@ -191,7 +196,7 @@ class HeldRecordTests(_Epochs):
 
 class Check8Tests(_Epochs):
 
-    def check8(self, asserted_by, profile=peerpolicy.PRODUCTION_POLICY):
+    def check8(self, asserted_by, profile=PRODUCTION_AT_DEFAULT):
         return self.hooks(profile).check8(payload(sender_exposure={"asserted_by": asserted_by}),
                                           KEY_ID)
 
@@ -204,7 +209,7 @@ class Check8Tests(_Epochs):
         self.assertEqual(self.check8(f"amap.router@{FD}"), "exposure_signer")
 
     def test_absence_is_never_check_8s(self):
-        self.assertIsNone(self.hooks(peerpolicy.PRODUCTION_POLICY).check8(payload(), KEY_ID))
+        self.assertIsNone(self.hooks(PRODUCTION_AT_DEFAULT).check8(payload(), KEY_ID))
 
     def test_check_8_is_profile_independent(self):
         for asserted in (RUNTIME, f"amap.router@{FD}"):
@@ -924,4 +929,5 @@ class ConfigRefusalTests(tpe._Eval):
                 doc = tpl.DelegationConfigTests.doc(base, **{key: False})
                 with self.assertRaises(config_mod.ConfigError) as cm:
                     config_mod.load_obj(doc)
-                self.assertIn("fixed by the production profile", str(cm.exception))
+                self.assertIn("set only by the top-level min_sender_age_s",
+                              str(cm.exception))
