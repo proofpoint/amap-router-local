@@ -208,6 +208,25 @@ class EntrypointArgvTests(unittest.TestCase):
     renders no graph. The string check on the status line above could never
     have caught it, because it looks at one mode."""
 
+    def _refused(self, *args: str) -> "subprocess.CompletedProcess":
+        """A refusal: exit 2, a message on stderr, and the CLI never ran
+        (the stand-in `python3` prints its argv, so empty stdout is the
+        proof it was not exec'd)."""
+        with TemporaryDirectory() as tmp:
+            stub = Path(tmp, "python3")
+            stub.write_text("#!/bin/sh\nfor a in \"$@\"; do printf '[%s]\\n' \"$a\"; done\n")
+            stub.chmod(0o755)
+            cfg = Path(tmp, "router.json")
+            cfg.write_text("{}")
+            env = {**os.environ, "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+                   "ROUTER_CONFIG": str(cfg), "ROUTER_INTERVAL": "7"}
+            out = subprocess.run(
+                ["bash", str(_REPO / "docker" / "entrypoint.sh"), *args],
+                env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 2, msg=out.stdout + out.stderr)
+        self.assertEqual(out.stdout, "", "the CLI must not have been exec'd")
+        return out
+
     def _argv_seen_by(self, *args: str) -> list:
         with TemporaryDirectory() as tmp:
             stub = Path(tmp, "python3")
@@ -245,6 +264,18 @@ class EntrypointArgvTests(unittest.TestCase):
 
     def test_run_is_the_interval_loop_and_nothing_else(self):
         self.assertEqual(self._argv_seen_by("run"), ["[run]", "[--interval]", "[7]"])
+
+    def test_run_refuses_extra_arguments(self):
+        # Dropping them is the defect this class pins: exit 0 with a flag
+        # silently lost. `--interval` is the likely one, so it is the case.
+        out = self._refused("run", "--interval", "10")
+        self.assertIn("entrypoint: run takes no arguments (got: --interval 10)", out.stderr)
+        self.assertIn("ROUTER_INTERVAL", out.stderr)
+
+    def test_an_unknown_mode_is_refused(self):
+        out = self._refused("approve")
+        self.assertIn("entrypoint: unknown mode 'approve' (run|once|peers|status|shell)",
+                      out.stderr)
 
 class MountDerivationTests(unittest.TestCase):
     """run.sh computes mounts from the config rather than taking a hand-written

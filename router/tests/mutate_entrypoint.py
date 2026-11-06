@@ -24,6 +24,14 @@ EP = "docker/entrypoint.sh"
 ONCE = 'exec python3 -m router --config "$ROUTER_CONFIG" once "$@" ;;\n'
 PEERS = 'exec python3 -m router --config "$ROUTER_CONFIG" peers "$@" ;;\n'
 STATUS = 'exec python3 -m router --config "$ROUTER_CONFIG" status "$@" ;;\n'
+RUN_GUARD = ('    if [ "$#" -gt 0 ]; then\n'
+             '      echo "entrypoint: run takes no arguments (got: $*); set ROUTER_INTERVAL for the poll interval" >&2\n'
+             '      exit 2\n'
+             '    fi\n'
+             '    exec python3 -m router --config "$ROUTER_CONFIG" run --interval "$INTERVAL" ;;\n')
+RUN_EXEC = '    exec python3 -m router --config "$ROUTER_CONFIG" run --interval "$INTERVAL"'
+UNKNOWN = ('    echo "entrypoint: unknown mode \'$MODE\' (run|once|peers|status|shell)" >&2\n'
+           '    exit 2 ;;\n')
 
 M = [
  ('E1 once drops its arguments', EP, ONCE, ONCE.replace(' "$@"', ''),
@@ -42,6 +50,12 @@ M = [
  ('E7 run takes a different interval', EP, 'run --interval "$INTERVAL" ;;\n',
   'run --interval 5 ;;\n',
   [T + 'test_run_is_the_interval_loop_and_nothing_else']),
+ ('E8 run forwards "$@" instead of refusing', EP, RUN_GUARD, RUN_EXEC + ' "$@" ;;\n',
+  [T + 'test_run_refuses_extra_arguments']),
+ ('E9 run drops extra arguments silently', EP, RUN_GUARD, RUN_EXEC + ' ;;\n',
+  [T + 'test_run_refuses_extra_arguments']),
+ ('E10 an unknown mode exits 0', EP, UNKNOWN, UNKNOWN.replace('exit 2', 'exit 0'),
+  [T + 'test_an_unknown_mode_is_refused']),
 ]
 
 

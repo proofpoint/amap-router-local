@@ -14,6 +14,10 @@
 # would still exit 0 and print the HUMAN form, so a caller asking for JSON
 # gets text it cannot parse and nothing says the flag was lost: `peers` and
 # `once` shipped that way, and a deploy verify read the graph as UNKNOWN.
+# `run` takes NO further argument and REFUSES one (exit 2) rather than drop
+# it: its only knob is the poll interval, from ROUTER_INTERVAL (run.sh sets
+# it from --interval), so `run --interval 10` would otherwise poll at the
+# default and say nothing. An unknown mode is refused the same way.
 #
 # There is no `approve` mode, and there is no longer a command to refuse:
 # `approve` was retired. The staged-request snapshot it used to take is now
@@ -49,7 +53,12 @@ if [ ! -r "$ROUTER_CONFIG" ]; then
 fi
 
 case "$MODE" in
-  run)    exec python3 -m router --config "$ROUTER_CONFIG" run --interval "$INTERVAL" ;;
+  run)
+    if [ "$#" -gt 0 ]; then
+      echo "entrypoint: run takes no arguments (got: $*); set ROUTER_INTERVAL for the poll interval" >&2
+      exit 2
+    fi
+    exec python3 -m router --config "$ROUTER_CONFIG" run --interval "$INTERVAL" ;;
   once)   exec python3 -m router --config "$ROUTER_CONFIG" once "$@" ;;
   peers)  exec python3 -m router --config "$ROUTER_CONFIG" peers "$@" ;;
   status) exec python3 -m router --config "$ROUTER_CONFIG" status "$@" ;;
