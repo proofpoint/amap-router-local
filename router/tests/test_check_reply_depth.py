@@ -222,8 +222,11 @@ class SameHostTests(_Verdicts, RouterTestCase):
         self.assertResult(self.check(), "STOP", "disagrees with its audit line")
 
     def test_an_instance_without_its_tree_stops(self):
+        # b's log is read and b has no tree: the logged-instance rule stops it
+        # before the placement rule (test_a_declaration_cannot_excuse_...).
         self._chain()
-        self.assertResult(run(self.hosts(), self.trees("a")), "STOP", "no --peer-tree")
+        self.assertResult(run(self.hosts(), self.trees("a")), "STOP",
+                          "instance b on host example.invalid has an audit log but no --peer-tree")
 
     def test_a_tree_for_an_unsupplied_host_stops(self):
         self._chain()
@@ -239,11 +242,90 @@ class SameHostTests(_Verdicts, RouterTestCase):
         (self.tree("a") / "notices" / "stray.txt").write_text("x")
         self.assertResult(self.check(), "STOP", "not a notice, a sidecar or a write leftover")
 
+    def test_a_reset_after_the_window_cannot_hide_a_lost_depth2_line(self):
+        # Opus r2 probe "reset-after-window-deep-lost": the depth-2 line was
+        # lost, then a reset of b after `until` emptied its notice too.
+        task, first = self._chain()
+        self.send("a", "b", in_reply_to=first)
+        self._one_change("b", lambda docs: docs.pop())          # the lost append
+        for f in (self.tree("b") / "notices").iterdir():         # what the reset emptied
+            f.unlink()
+        self._reset_line("b")
+        for name in ("a", "b"):
+            self._one_change(name, lambda docs: [
+                d.update(ts="2001-01-01T00:00:00Z" if d["event"] == "peer_notice_placed"
+                         else "2001-06-01T00:00:00Z") for d in docs])
+        self.assertResult(self.check(since="2000-12-01T00:00:00Z",
+                                     until="2001-03-01T00:00:00Z"),
+                          "STOP", "was reset at or after the window start")
+
     def test_a_write_leftover_is_counted_not_fatal(self):
-        self._chain()
-        (self.tree("a") / "notices" / ".notice-abc.json.tmp.123.0123456789abcdef").write_text("")
+        # A leftover for a notice whose audit line exists: an ordinary crash
+        # mid-write (the append precedes the notice), not a lost append.
+        task, reply = self._chain()
+        (self.tree("a") / "notices" / f".notice-{reply}.json.tmp.123.0123456789abcdef"
+         ).write_text("")
         lines = self.assertResult(self.check(), "PASS")
         self.assertIn(f"tree {FLEET_DOMAIN} a notices=1 leftovers=1", lines)
+
+    def test_a_write_leftover_without_an_audit_line_stops(self):
+        self._chain()
+        (self.tree("a") / "notices" / ".notice-abc.json.tmp.123.0123456789abcdef").write_text("")
+        self.assertResult(self.check(), "STOP", "write leftover for notice abc",
+                          "has no audit line")
+
+    def _dup_notice(self, first):
+        """A copy of the real reply line with a distinct 64-hex message_id
+        under the SAME notice_id, read first or last (Codex r2 B1's probe)."""
+        def dup(docs):
+            line = next(d for d in docs if d["event"] == "peer_notice_placed")
+            copy = dict(line, message_id="ab" * 32)
+            if first:
+                docs.insert(0, copy)
+            else:
+                docs.append(copy)
+        self._one_change("a", dup)
+
+    def test_two_message_ids_on_one_notice_stop(self):
+        self._chain()
+        self._dup_notice(first=True)        # the real line is read last
+        self.assertResult(self.check(), "STOP", "has two audit lines with different message ids")
+
+    def test_two_message_ids_on_one_notice_stop_in_either_order(self):
+        self._chain()
+        self._dup_notice(first=False)       # the real line is read first
+        self.assertResult(self.check(), "STOP", "has two audit lines with different message ids")
+
+    def test_a_logged_instance_needs_a_tree_or_a_declaration(self):
+        task = self.send("a", "b")          # only b is placed to; a logs nothing yet
+        self._reset_line("a")               # now a has a log, and no placements
+        self._one_change("a", lambda docs: [d.update(ts="2001-01-01T00:00:00Z") for d in docs])
+        trees = self.trees("b")
+        self.assertResult(run(self.hosts(), trees, since="2002-01-01T00:00:00Z"), "STOP",
+                          "instance a on host example.invalid has an audit log but no "
+                          "--peer-tree")
+        argv = argv_for(self.hosts(), trees, since="2002-01-01T00:00:00Z")
+        lines = self.assertResult(run(argv=argv + ["--no-peer-tree", f"{FLEET_DOMAIN}/a"]),
+                                  "FAIL", "first_level=0")
+        self.assertIn(f"declared {FLEET_DOMAIN} a has no peer tree", lines)
+
+    def test_a_declaration_cannot_excuse_an_instance_placed_to(self):
+        self._chain()
+        argv = argv_for(self.hosts(), self.trees("b")) + ["--no-peer-tree", f"{FLEET_DOMAIN}/a"]
+        # Only the placement rule can say this: the declaration satisfied the
+        # logged-instance rule.
+        self.assertResult(run(argv=argv), "STOP",
+                          "no --peer-tree example.invalid/a for the instance it places to")
+
+    def test_bad_declarations_stop(self):
+        self._chain()
+        base = argv_for(self.hosts(), self.trees())
+        for extra, cause in (
+                (["--no-peer-tree", f"{FLEET_DOMAIN}/a"], "given a --peer-tree and a --no-peer-tree"),
+                (["--no-peer-tree", "other.example/c"], "has no --host"),
+                (["--no-peer-tree", "nodomain"], "expected <domain>/<instance>")):
+            with self.subTest(extra=extra):
+                self.assertResult(run(argv=base + extra), "STOP", cause)
 
     def _reset_line(self, name):
         # The producer reset.py calls; it stamps the line with the clock.
@@ -252,7 +334,19 @@ class SameHostTests(_Verdicts, RouterTestCase):
     def test_a_reset_in_the_window_stops(self):
         self._chain()
         self._reset_line("a")
-        self.assertResult(self.check(), "STOP", "was reset in the window")
+        self.assertResult(self.check(), "STOP", "was reset at or after the window start")
+
+    def test_a_reset_after_the_window_stops(self):
+        task, reply = self._chain()
+        notice_file(self.tree("a"), reply).unlink()          # what the reset emptied
+        self._reset_line("a")
+        self._one_change("a", lambda docs: [
+            d.update(ts="2001-01-01T00:00:00Z" if d["event"] == "peer_notice_placed"
+                     else "2001-06-01T00:00:00Z") for d in docs])
+        # The reply is in the window; the reset after `until` emptied its notice.
+        self.assertResult(self.check(since="2000-12-01T00:00:00Z",
+                                     until="2001-03-01T00:00:00Z"),
+                          "STOP", "was reset at or after the window start")
 
     def test_lines_before_a_reset_need_no_notice(self):
         task, reply = self._chain()
@@ -302,6 +396,11 @@ class SameHostTests(_Verdicts, RouterTestCase):
             with self.subTest(since=since, until=until):
                 self.assertResult(self.check(since=since, until=until), "STOP",
                                   "expected a valid")
+
+    def test_a_line_without_an_instance_stops(self):
+        self._chain()
+        self._one_change("a", lambda docs: docs[0].pop("instance"))
+        self.assertResult(self.check(), "STOP", "line without an instance name")
 
     def test_an_unknown_origin_stops(self):
         self._chain()
@@ -490,7 +589,7 @@ class CrossHostTests(_Verdicts, tpb._Chain):
         """The real line and notice, with these fields replaced."""
         doc = dict(line, **{"from": frm, "to": to, "message_id": message_id,
                             "notice_id": notice_id, "to_instance": to_instance,
-                            "in_reply_to": in_reply_to})
+                            "instance": to_instance, "in_reply_to": in_reply_to})
         notice = json.loads(notice_file(self.bob_tree(), line["notice_id"]).read_text())
         notice["notice_id"] = notice_id
         notice["message"] = dict(notice["message"], id=message_id, **{"from": frm})

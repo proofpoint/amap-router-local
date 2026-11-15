@@ -36,15 +36,19 @@ copied short) is an overcount and a STOP. Only `deliver_peer` and
 read-only, so the two sets must agree. The one sanctioned removal is
 `reset`, which empties the peer tree and keeps the audit log, recording
 itself there (`router/reset.py`): placements before an instance's last
-`reset` line are exempt from the overcount check, and a `reset` inside the
-window is a STOP. The log is append-only and `reset` skips it
+`reset` line are exempt from the overcount check, and a `reset` at or after
+the window start is a STOP (it emptied the tree the window's lines must be
+checked against; copy before any reset). The log is append-only and `reset` skips it
 (`router/audit.py` module docstring), and it lives under `state_dir`, which
 no agent uid reaches. A host records only what it PLACED, so a cross-host
 chain spans two hosts' logs: hence every host, and the domain checks below.
 
 What remains on the operator: an instance whose audit log AND peer tree are
-both left out of the copies is invisible. The output lists every log and
-every tree read, so that can be checked against the hosts' configs.
+both left out of the copies is invisible (one whose log is read needs its
+tree, or a `--no-peer-tree` declaration, which is printed). The output lists
+every log, tree and declaration, so that can be checked against the hosts'
+configs. And the copies must be taken before any `reset` of a run instance:
+a reset at or after the window start is a STOP.
 
 DEPTH. A placed message is a TASK when `in_reply_to` is null. Otherwise its
 parent is the placed message whose `message_id` equals its `in_reply_to`
@@ -59,25 +63,29 @@ INPUT.
 
     check_reply_depth.py --since 2026-11-15T15:00:00Z --until 2026-11-15T16:00:00Z \\
         --host <host domain>=<copy of that host's state_dir> [--host ...] \\
-        --peer-tree <host domain>/<instance>=<copy of that instance's peer/> [...]
+        --peer-tree <host domain>/<instance>=<copy of that instance's peer/> [...] \\
+        [--no-peer-tree <host domain>/<instance> ...]
 
 Each `--host` names one host by the domain its agents' addresses carry and a
 directory holding a copy of its `state_dir` (only `*/audit/log.jsonl` is
 read). Each `--peer-tree` names one hosted instance by its NAME (the audit
 line's `to_instance`) and a copy of its peer tree, `<root>/peer`
-(`config.PEER_TREE`); only `notices/` is read. Every instance that any audit
-line places to needs its tree. The window is `[since, until)` on the line's
+(`config.PEER_TREE`); only `notices/` is read. Every instance named in any
+log read (its lines' `instance`) needs its tree, unless the operator declares
+it with `--no-peer-tree` (an instance with no peer lane); an instance that any
+line places to needs its tree regardless. The window is `[since, until)` on the line's
 `ts`. The router has no notion of a run id: the operator maps a run to its
 window.
 
 OUTPUT. First, one line per log read, `read <host> <dir> lines=N
 peer_notice_placed=M` (`<dir>` is the state directory: the instance name, or
 its state key on a registry host), and one per tree, `tree <host> <instance>
-notices=N leftovers=K`, so the operator can check that every hosted instance
-of every host was supplied. Then the window, what was reconciled, and per
-lane (`local`, `fleet`): tasks, first-level replies and depth-2+ replies in
-the window, each with its message ids. Then EXACTLY ONE line beginning
-`RESULT `, and it is the last line:
+notices=N leftovers=K`, and one per `--no-peer-tree` declaration, so the
+operator can check that every hosted instance of every host was supplied.
+Then the window, what was reconciled, and per lane (`local`, `fleet`):
+tasks, first-level replies and depth-2+ replies in the window, each with its
+message ids. Then EXACTLY ONE line beginning `RESULT `, and it is the last
+line:
 
   * `RESULT PASS` -- first-level >= 1 (both lanes together) and depth-2+ = 0;
   * `RESULT FAIL` -- the records are sound and the assertion does not hold;
@@ -97,10 +105,12 @@ is not UTF-8 JSON with a string `event` and a valid UTC `ts`; a
 logged on; an address on a host that was not supplied; two `--host` with one
 domain; a peer tree for a host not supplied, or supplied twice; an instance
 placed to with no tree; a notice with no audit line, or one that disagrees
-with its line; an audit line with no notice (after the instance's last
-`reset`); a `reset` in the window; an unknown entry in `notices/`; a reply
-whose parent is in no supplied log, or does not run the reverse direction;
-an empty window.
+with its line; two audit lines for one notice; an audit line with no notice
+(after the instance's last `reset`); a write leftover in `notices/` with no
+audit line (a lost append); an instance whose log was read with neither a
+tree nor a `--no-peer-tree`; a line without an `instance` name; a `reset` at
+or after `since`; an unknown entry in `notices/`; a reply whose parent is in
+no supplied log, or does not run the reverse direction; an empty window.
 """
 from __future__ import annotations
 
@@ -126,7 +136,8 @@ NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 #: leaves behind (`attachments._write_blob_pinned`).
 NOTICE_RE = re.compile(r"notice-([A-Za-z0-9_][A-Za-z0-9_.-]*)\.json\Z")
 SIDECAR_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.attachments\Z")
-LEFTOVER_RE = re.compile(r"\.notice-[A-Za-z0-9_][A-Za-z0-9_.-]*\.json\.tmp\.[0-9]+\.[0-9a-f]{16}\Z")
+LEFTOVER_RE = re.compile(
+    r"\.notice-([A-Za-z0-9_][A-Za-z0-9_.-]*)\.json\.tmp\.[0-9]+\.[0-9a-f]{16}\Z")
 #: The members a placed message is compared on when it appears twice.
 IDENTITY = ("notice_id", "from", "to", "to_instance", "in_reply_to", "origin", "tree")
 
@@ -253,11 +264,16 @@ class Records:
         self.resets: Dict[Tuple[str, str], List[str]] = {}
         #: (host, instance name) -> {notice_id: notice doc}
         self.trees: Dict[Tuple[str, str], Dict[str, dict]] = {}
+        #: (host, instance name) -> the notice id of every write leftover
+        self.leftovers: Dict[Tuple[str, str], List[str]] = {}
+        #: (host, instance name) of every log read (the `instance` of its lines)
+        self.logged: set = set()
         self.read: List[str] = []
 
 
 def load(hosts: List[Tuple[str, Path]], trees: List[Tuple[str, str, Path]],
-         recs: Optional[Records] = None) -> Records:
+         recs: Optional[Records] = None,
+         no_tree: Optional[List[Tuple[str, str]]] = None) -> Records:
     """Every placed message in every supplied log, keyed by `message_id`,
     every `reset` line, and every notice in every supplied tree."""
     domains = [d for d, _ in hosts]
@@ -274,10 +290,11 @@ def load(hosts: List[Tuple[str, Path]], trees: List[Tuple[str, str, Path]],
             docs = _lines(path, _read_file(path, root))
             n_placed = 0
             for n, doc in docs:
+                inst = doc.get("instance")
+                if not isinstance(inst, str) or not NAME_RE.fullmatch(inst):
+                    raise Stop(f"{path}:{n}: line without an instance name")
+                recs.logged.add((host, inst))
                 if doc["event"] == RESET:
-                    inst = doc.get("instance")
-                    if not isinstance(inst, str) or not NAME_RE.fullmatch(inst):
-                        raise Stop(f"{path}:{n}: reset line without an instance name")
                     recs.resets.setdefault((host, inst), []).append(doc["ts"])
                     continue
                 if doc["event"] != EVENT:
@@ -306,17 +323,31 @@ def load(hosts: List[Tuple[str, Path]], trees: List[Tuple[str, str, Path]],
             raise Stop(f"--peer-tree {host}/{inst}: host {host!r} has no --host")
         if (host, inst) in recs.trees:
             raise Stop(f"--peer-tree {host}/{inst} supplied twice")
-        recs.trees[(host, inst)] = _read_tree(host, inst, root, recs.read)
+        recs.trees[(host, inst)], recs.leftovers[(host, inst)] = _read_tree(
+            host, inst, root, recs.read)
+    declared = set()
+    for host, inst in no_tree or []:
+        if host not in supplied:
+            raise Stop(f"--no-peer-tree {host}/{inst}: host {host!r} has no --host")
+        if (host, inst) in recs.trees or (host, inst) in declared:
+            raise Stop(f"{host}/{inst} is given a --peer-tree and a --no-peer-tree, or "
+                       f"--no-peer-tree twice")
+        declared.add((host, inst))
+        recs.read.append(f"declared {host} {inst} has no peer tree")
+    for host, inst in sorted(recs.logged - set(recs.trees) - declared):
+        raise Stop(f"instance {inst} on host {host} has an audit log but no --peer-tree "
+                   f"(declare --no-peer-tree {host}/{inst} if it has no peer lane)")
     return recs
 
 
-def _read_tree(host: str, inst: str, root: Path, read: List[str]) -> Dict[str, dict]:
+def _read_tree(host: str, inst: str, root: Path,
+               read: List[str]) -> Tuple[Dict[str, dict], List[str]]:
     notices = root / "notices"
     _no_symlink(notices, root)
     if not notices.is_dir():
         raise Stop(f"{notices}: not a directory")
     found: Dict[str, dict] = {}
-    leftovers = 0
+    leftovers: List[str] = []
     for entry in sorted(notices.iterdir()):
         name = entry.name
         m = NOTICE_RE.fullmatch(name)
@@ -336,26 +367,31 @@ def _read_tree(host: str, inst: str, root: Path, read: List[str]) -> Dict[str, d
         elif SIDECAR_RE.fullmatch(name) and entry.is_dir() and not entry.is_symlink():
             continue
         elif LEFTOVER_RE.fullmatch(name) and not entry.is_symlink():
-            leftovers += 1
+            leftovers.append(LEFTOVER_RE.fullmatch(name).group(1))
         else:
             raise Stop(f"{entry}: not a notice, a sidecar or a write leftover")
-    read.append(f"tree {host} {inst} notices={len(found)} leftovers={leftovers}")
-    return found
+    read.append(f"tree {host} {inst} notices={len(found)} leftovers={len(leftovers)}")
+    return found, leftovers
 
 
 def reconcile(recs: Records, since: str, until: str) -> str:
     """The audit set against the notice trees, both directions."""
     for (host, inst), stamps in sorted(recs.resets.items()):
-        inside = [t for t in stamps if since <= t < until]
-        if inside:
-            raise Stop(f"instance {inst} on host {host} was reset in the window ({inside[0]})")
+        after = sorted(t for t in stamps if t >= since)
+        if after:
+            raise Stop(f"instance {inst} on host {host} was reset at or after the window start "
+                       f"({after[0]}): its window notices cannot be reconciled")
     by_notice: Dict[Tuple[str, str], Dict[str, dict]] = {}
     for rec in recs.placed.values():
         key = (rec["host"], rec["to_instance"])
         if key not in recs.trees:
             raise Stop(f"{rec['where']}: no --peer-tree {key[0]}/{key[1]} for the instance it "
                        f"places to")
-        by_notice.setdefault(key, {})[rec["notice_id"]] = rec
+        other = by_notice.setdefault(key, {}).get(rec["notice_id"])
+        if other is not None:
+            raise Stop(f"notice {rec['notice_id']} in {key[0]}/{key[1]} has two audit lines with "
+                       f"different message ids ({other['where']}, {rec['where']})")
+        by_notice[key][rec["notice_id"]] = rec
     lines = 0
     for key, recs_by_notice in sorted(by_notice.items()):
         last_reset = max(recs.resets.get(key, []), default=None)
@@ -368,6 +404,14 @@ def reconcile(recs: Records, since: str, until: str) -> str:
             raise Stop(f"{rec['where']}: audit line for notice {nid} but no notice in "
                        f"{key[0]}/{key[1]} (an overcount: a placement never completed?)")
         lines += len(recs_by_notice)
+    for key, ids in sorted(recs.leftovers.items()):
+        for nid in ids:
+            # The audit append precedes the notice write, and a page-cache
+            # append survives a process crash: a leftover with no line
+            # implies a power loss or kernel crash.
+            if nid not in by_notice.get(key, {}):
+                raise Stop(f"a write leftover for notice {nid} in {key[0]}/{key[1]} has no "
+                           f"audit line (a lost audit append: power loss?)")
     notices = 0
     for key, tree in sorted(recs.trees.items()):
         known = by_notice.get(key, {})
@@ -460,6 +504,14 @@ def _tree(value: str) -> Tuple[str, str, Path]:
     return host.lower(), inst, Path(path)
 
 
+def _no_tree(value: str) -> Tuple[str, str]:
+    host, slash, inst = value.partition("/")
+    if (not slash or not host.isascii() or not DOMAIN_RE.fullmatch(host)
+            or not NAME_RE.fullmatch(inst)):
+        raise Stop(f"--no-peer-tree {value!r}: expected <domain>/<instance>")
+    return host.lower(), inst
+
+
 def _ascii(line: str) -> str:
     # Ids and paths come from the copied records: escape anything that could
     # start a second line or fail to encode, so the RESULT line is always
@@ -476,6 +528,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--until", required=True)
         p.add_argument("--host", action="append", required=True)
         p.add_argument("--peer-tree", action="append", required=True)
+        p.add_argument("--no-peer-tree", action="append", default=[])
         a = p.parse_args(argv)
         for name in ("since", "until"):
             if not valid_ts(getattr(a, name)):
@@ -483,7 +536,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                            f"YYYY-MM-DDTHH:MM:SSZ")
         if not a.since < a.until:
             raise Stop("--since must be before --until")
-        load([_host(h) for h in a.host], [_tree(t) for t in a.peer_tree], recs)
+        load([_host(h) for h in a.host], [_tree(t) for t in a.peer_tree], recs,
+             [_no_tree(t) for t in a.no_peer_tree])
         verdict, lines = analyse(recs, a.since, a.until)
     except Stop as e:
         verdict, lines = STOP, [f"RESULT STOP {e}"]
