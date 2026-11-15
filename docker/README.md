@@ -117,7 +117,13 @@ docker/run.sh --config C --detach        # same, daemonized, restart unless-stop
 docker/run.sh --config C -- once         # drain every instance once, exit
 docker/run.sh --config C -- peers        # print the derived peer matrix
 docker/run.sh --config C -- status       # print the last-written status
+docker/run.sh --config C -- peers --json # the graph alone, as JSON
 ```
+
+Every flag after `once`, `peers` or `status` reaches the router unchanged
+(`once --json`, `peers --json`, `status --check`). `run` takes none and
+refuses one (exit 2): its interval comes from `--interval` on `run.sh`
+(`ROUTER_INTERVAL` inside the container), never from an argument after `--`.
 
 ## What the container will not do
 
