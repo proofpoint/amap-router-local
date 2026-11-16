@@ -2152,6 +2152,36 @@ first), prints one JSON line, and appends to the operator audit:
   before the first start with inbound intake. Refused over any peer
   artefact, and over placement evidence that survived a wipe (a disposal
   tombstone, or a signed peer notice in any peer tree) unless acknowledged.
+  Every failure line carries a bracketed cause token that a script branches
+  on (never on the text): `router: refusing to run 'peer-store init'
+  [lock_held]: …` (the router is running), and `router: peer-store init:
+  refused [<cause>]: …` with `artefacts_exist`, `evidence_survives`,
+  `io_error` (any OSError, including one after the store was written but
+  before the audit line and the stdout object) or `refused`; all rc 1. A
+  config error is the usual `router: config error: …`, rc 2; a kill leaves no
+  line. Success is rc 0, exactly one stdout line `{"H", "admission", "f",
+  "p"}`, and an empty stderr. A failed init is never retried blindly: a
+  retry is refused over whatever the first attempt left, and recovering a
+  half-written store is an operator decision.
+- `router peer-store show --json`: READ-ONLY and lock-free (it answers with
+  the router stopped or running, writes nothing, and creates neither the
+  lock file nor `state_dir`); rc 0 with exactly one JSON object, or rc 2 on a
+  config error. `{"v": 1, "store", "artefacts", "clock", "meta",
+  "problems"}`: `store` is `absent` (no peer artefact), `ready` (the clock
+  and its bookkeeping closed and both witnesses equal to the recorded
+  tokens), `partial` (anything else non-empty: `clock_absent`,
+  `meta_absent` or `witness_mismatch` says what is short, in init's write
+  order) or `unknown` (`clock` null; one of `read_error`, `corrupt`,
+  `symlink`, `not_regular`, `too_large`, `concurrent_change`).
+  `artefacts` are the names init's own check refuses over, sorted; `clock`
+  is `{admission, H, floor, p, f}` or null; `meta` is `present` or
+  `absent`. Every path below `state_dir` is opened component by component
+  without following symlinks, every read is capped, JSON is parsed with
+  duplicate keys refused, and every directory consulted is listed (with its
+  identity) before and after the reads, every file re-stat'ed: any change is
+  `unknown`/`concurrent_change`, never a mixed answer. While the router runs
+  it may therefore say `unknown`; the stopped-router reading is the one to
+  act on.
 - `router peer-store declare-restored --evidence TEXT`: after ANY restore of
   `state_dir`. Admission closes.
 - `router peer-bound --at B --evidence TEXT [--b-not-from-wall-clock]`: after

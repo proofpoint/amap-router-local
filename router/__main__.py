@@ -38,6 +38,9 @@
                                  a fresh signed-peer store, admission open, no floor: refused over
                                  any peer artefact, and over surviving placement evidence unless
                                  acknowledged (router/peerjournal.py). The router must be stopped.
+  peer-store show --json        read-only, takes no lock, writes nothing: the store's on-disk state
+                                 (absent, ready, partial or unknown) as one JSON object, rc 0
+                                 (router/peerjournal.py, `peer_store_show`)
   peer-store declare-restored --evidence TEXT
                                  after ANY restore of state_dir: admission closes until peer-bound
   peer-bound --at TS --evidence TEXT [--b-not-from-wall-clock]
@@ -231,6 +234,11 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="attest that this router has never admitted a signed peer candidate")
     p_psi.add_argument("--acknowledge-surviving", metavar="EVIDENCE", default=None,
                        help="proceed over surviving placement evidence, recording why")
+    p_pss = ps_sub.add_parser("show", help="read-only, no lock: the peer store's on-disk "
+                                           "state as one JSON object (absent, ready, partial "
+                                           "or unknown)")
+    p_pss.add_argument("--json", action="store_true", required=True,
+                       help="the only output form: one JSON object on stdout")
     p_psr = ps_sub.add_parser("declare-restored", help="state_dir was restored: close admission")
     p_psr.add_argument("--evidence", required=True)
     p_pe = sub.add_parser("peer-epochs", help="operator verbs on the receiver's epoch store")
@@ -326,10 +334,20 @@ def _peer_operator(cfg, args) -> int:
                                 getattr(args, "peer_decision_command", None),
                                 getattr(args, "peer_candidate_command", None),
                                 getattr(args, "peer_epochs_command", None)) if v)
+    if verb == "peer-store show":
+        # Read-only, NO lock: it must answer with the router stopped AND
+        # running, and must not create the lock file (or state_dir).
+        print(json.dumps(peerjournal.peer_store_show(cfg.state_dir), sort_keys=True))
+        return 0
+    # `peer-store init` alone carries a bracketed cause token on every
+    # failure line (A2-05): the S8 step branches on the token, never on the
+    # text. The other verbs' lines are unchanged.
+    init = verb == "peer-store init"
     try:
         lk = acquire_lock(cfg.state_dir)
     except LockHeldError as e:
-        print(f"router: refusing to run '{verb}': {e}", file=sys.stderr)
+        tok = " [lock_held]" if init else ""
+        print(f"router: refusing to run '{verb}'{tok}: {e}", file=sys.stderr)
         return 1
     now = clock.now()
     try:
@@ -361,7 +379,12 @@ def _peer_operator(cfg, args) -> int:
             out = peerjournal.operator_restore_key(cfg, now, source=args.source)
     except (peerjournal.StoreRefused, peerjournal.DropRefused, peerclock.BoundRefused,
             peerclock.ClockUntrusted, peerjournal.StoreBlocked, OSError, ValueError) as e:
-        print(f"router: {verb}: refused: {e}", file=sys.stderr)
+        if init:
+            cause = (getattr(e, "cause", "refused") if isinstance(e, peerjournal.StoreRefused)
+                     else "io_error" if isinstance(e, OSError) else "refused")
+            print(f"router: {verb}: refused [{cause}]: {e}", file=sys.stderr)
+        else:
+            print(f"router: {verb}: refused: {e}", file=sys.stderr)
         return 1
     finally:
         lk.release()

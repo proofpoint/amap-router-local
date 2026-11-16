@@ -93,7 +93,16 @@ class StoreBlocked(Exception):
 
 
 class StoreRefused(Exception):
-    """`init_store` refused: a peer artefact already exists."""
+    """`init_store` refused: a peer artefact already exists.
+
+    `cause` is the stable token an operator script branches on (ALPHA-2
+    W10, A2-05), set where the refusal is raised and never parsed back out
+    of the text: `artefacts_exist` and `evidence_survives` for init's two
+    checks, `refused` for every other raiser."""
+
+    def __init__(self, message: str, cause: str = "refused") -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +310,11 @@ def init_store(state_dir: Path, now: datetime, *, hop_root: Optional[Path],
     state_dir = Path(state_dir)
     existing = _artefacts(state_dir)
     if existing:
-        raise StoreRefused(f"peer artefacts already exist: {existing}")
+        raise StoreRefused(f"peer artefacts already exist: {existing}", "artefacts_exist")
     surviving = _surviving(hop_root, peer_roots)
     if surviving and not (acknowledge_surviving and acknowledge_surviving.strip()):
         raise StoreRefused(f"placement evidence survives (pass --acknowledge-surviving with "
-                           f"evidence): {surviving[:5]}")
+                           f"evidence): {surviving[:5]}", "evidence_survives")
     clock = peerclock.initial(now, p=p, f=f)
     replay = state_dir / REPLAY_DIR
     replay.mkdir(mode=0o700)
@@ -322,6 +331,310 @@ def init_store(state_dir: Path, now: datetime, *, hop_root: Optional[Path],
     peerclock.write(state_dir, clock, previous=None)
     _write_meta(state_dir, meta)
     return clock
+
+
+# ---------------------------------------------------------------------------
+# Read-only readers (ALPHA-2 W10): the shared safe-read and census rules
+# ---------------------------------------------------------------------------
+#
+# `peer-store show` and `peer-evidence` answer an operator script, with the
+# router stopped or running, and must never report a mixed snapshot as a
+# state. So both:
+#
+#   * open every path component by component below `state_dir`
+#     (O_DIRECTORY|O_NOFOLLOW for directories, O_RDONLY|O_NOFOLLOW|O_NONBLOCK
+#     for files, each relative to its parent's fd), refuse a symlink or a
+#     non-regular file by name, and cap every read;
+#   * parse JSON strictly (UTF-8, no duplicate keys);
+#   * take a CENSUS of every directory they consult -- its (dev, ino,
+#     mtime_ns) and its complete entry set -- before any read and again
+#     after, and re-stat every file read. A file created after the first
+#     listing is caught by the entry sets; a file replaced in place, by the
+#     re-stat. Any difference is `concurrent_change`, never a verdict.
+#
+# `state_dir` itself is the configured root and is opened as configured
+# (the lock and every writer do the same); everything below it is not
+# followed. These readers write nothing: no lock file, no directory.
+
+READER_JSON_CAP = 64 * 1024
+
+
+class ReadProblem(Exception):
+    """A closed problem code from the readers' rules, and a detail."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+
+
+def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ReadProblem("duplicate_key", k)
+        out[k] = v
+    return out
+
+
+def strict_json(raw: bytes) -> Any:
+    """UTF-8 JSON with duplicate keys refused (`duplicate_key`), else
+    `corrupt`."""
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except ReadProblem:
+        raise
+    except (UnicodeDecodeError, ValueError):
+        raise ReadProblem("corrupt") from None
+
+
+def _os_problem(e: OSError) -> Exception:
+    if isinstance(e, FileNotFoundError):
+        return e
+    if e.errno == errno.ELOOP:
+        return ReadProblem("symlink")
+    if e.errno == errno.ENOTDIR:
+        return ReadProblem("not_regular", "not a directory")
+    return ReadProblem("read_error", type(e).__name__)
+
+
+def _open_dir(state_dir: Path, parts: Tuple[str, ...]) -> int:
+    """An fd on `state_dir/parts...`; FileNotFoundError when absent."""
+    try:
+        fd = os.open(str(state_dir), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        raise _os_problem(e) from None
+    for part in parts:
+        try:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError as e:
+            # O_DIRECTORY|O_NOFOLLOW on a symlink says ENOTDIR (Linux), the
+            # same as on a plain file: classify by lstat, so a symlinked
+            # directory is `symlink` and never mistaken for a file.
+            err: Exception = _os_problem(e)
+            if e.errno in (errno.ENOTDIR, errno.ELOOP):
+                try:
+                    if stat.S_ISLNK(os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode):
+                        err = ReadProblem("symlink", part)
+                except OSError:
+                    err = ReadProblem("concurrent_change", part)
+            os.close(fd)
+            raise err from None
+        os.close(fd)
+        fd = nxt
+    return fd
+
+
+def census(state_dir: Path, parts: Tuple[str, ...]) -> Optional[Tuple[Any, ...]]:
+    """`(dev, ino, mtime_ns, (sorted entries))` of a directory, or None when
+    it is absent."""
+    try:
+        fd = _open_dir(state_dir, parts)
+    except FileNotFoundError:
+        return None
+    try:
+        st = os.fstat(fd)
+        names = tuple(sorted(os.listdir(fd)))
+    except OSError as e:
+        raise ReadProblem("read_error", type(e).__name__) from None
+    finally:
+        os.close(fd)
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, names)
+
+
+def read_capped(state_dir: Path, parts: Tuple[str, ...], cap: int
+                ) -> Tuple[bytes, Tuple[int, int, int, int]]:
+    """The bytes of the regular file `state_dir/parts...` (at most `cap`)
+    and its `(dev, ino, size, mtime_ns)`. FileNotFoundError when absent."""
+    dfd = _open_dir(state_dir, parts[:-1])
+    try:
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except OSError as e:
+            raise _os_problem(e) from None
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ReadProblem("not_regular", "/".join(parts))
+        # The cap is enforced on what is READ (at most cap+1 bytes), so a file
+        # that grows after the fstat is caught the same way.
+        chunks, got = [], 0
+        while got <= cap:
+            b = os.read(fd, cap + 1 - got)
+            if not b:
+                break
+            chunks.append(b)
+            got += len(b)
+        if got > cap:
+            raise ReadProblem("too_large", "/".join(parts))
+    except OSError as e:
+        raise ReadProblem("read_error", type(e).__name__) from None
+    finally:
+        os.close(fd)
+    return b"".join(chunks), (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def restat(state_dir: Path, parts: Tuple[str, ...]) -> Optional[Tuple[int, int, int, int]]:
+    """`(dev, ino, size, mtime_ns)` of `state_dir/parts...` by lstat through
+    its parent's fd, or None when absent (or no longer reachable)."""
+    try:
+        dfd = _open_dir(state_dir, parts[:-1])
+    except (FileNotFoundError, ReadProblem):
+        return None
+    try:
+        st = os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+class Census:
+    """One consistent read: `dir` takes a directory's census, `read` a
+    capped file read; `consistent` re-takes every census and re-stats every
+    file, and is True only when nothing moved."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = Path(state_dir)
+        self.dirs: Dict[Tuple[str, ...], Any] = {}
+        self.files: Dict[Tuple[str, ...], Any] = {}
+
+    def dir(self, *parts: str) -> Optional[Tuple[Any, ...]]:
+        got = census(self.state_dir, tuple(parts))
+        self.dirs[tuple(parts)] = got
+        return got
+
+    def read(self, cap: int, *parts: str) -> Optional[bytes]:
+        try:
+            data, sig = read_capped(self.state_dir, tuple(parts), cap)
+        except FileNotFoundError:
+            self.files[tuple(parts)] = None
+            return None
+        self.files[tuple(parts)] = sig
+        return data
+
+    def consistent(self) -> bool:
+        for parts, before in self.dirs.items():
+            if census(self.state_dir, parts) != before:
+                return False
+        for parts, before in self.files.items():
+            if restat(self.state_dir, parts) != before:
+                return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# `router peer-store show --json` (A2-05)
+# ---------------------------------------------------------------------------
+
+SHOW_V = 1
+#: The closed problem codes `show` reports.
+SHOW_PROBLEMS = ("clock_absent", "meta_absent", "witness_mismatch", "read_error", "corrupt",
+                 "symlink", "not_regular", "too_large", "concurrent_change")
+_FIXED_ARTEFACTS = (peerclock.CLOCK_FILE, REPLAY_DIR, VACANT_DIR, "peer-epochs")
+
+
+def _show_census(c: "Census") -> List[str]:
+    """Census every directory `_artefacts` consults; return the artefact
+    names (sorted) as the census saw them."""
+    top = c.dir()
+    if top is None:
+        return []
+    names = top[3]
+    found = [n for n in _FIXED_ARTEFACTS if n in names]
+    for child in names:
+        try:
+            got = c.dir(child)
+        except ReadProblem as e:
+            if e.code == "not_regular":       # a plain file: no journal inside
+                c.dirs.pop((child,), None)
+                continue
+            raise
+        if got is not None and JOURNAL_DIR in got[3]:
+            found.append(f"{child}/{JOURNAL_DIR}")
+    return sorted(found)
+
+
+def peer_store_show(state_dir: Path) -> Dict[str, Any]:
+    """`router peer-store show --json`: the store's on-disk state, read only
+    and lock-free. Never raises for anything on disk: every failure is a
+    closed problem code and `store: "unknown"`.
+
+    `store`, by init's write order (replay+witness, epochs+witness, the
+    clock, then the store bookkeeping inside the clock file):
+      * `absent`  -- no artefact at all;
+      * `ready`   -- clock and bookkeeping present and closed, and both
+                     witnesses equal to the tokens the bookkeeping records
+                     (the replay witness also equal to the clock's);
+      * `partial` -- anything else non-empty, with `clock_absent`,
+                     `meta_absent` or `witness_mismatch` saying what is short;
+      * `unknown` -- a read the rules refuse, or a concurrent change.
+    """
+    state_dir = Path(state_dir)
+    c = Census(state_dir)
+    problems: set = set()
+    artefacts: List[str] = []
+    clock_obj: Optional[peerclock.Clock] = None
+    store: Any = None
+    witness: Dict[str, Optional[str]] = {}
+    try:
+        artefacts = _show_census(c)
+        if peerclock.CLOCK_FILE in artefacts:
+            raw = c.read(READER_JSON_CAP, peerclock.CLOCK_FILE)
+            if raw is not None:
+                doc = strict_json(raw)
+                try:
+                    clock_obj = peerclock._parse(raw)
+                except peerclock.ClockUntrusted:
+                    raise ReadProblem("corrupt", peerclock.CLOCK_FILE) from None
+                store = doc["store"]
+                if store is not None and not (
+                        isinstance(store, dict) and set(store) == set(_META_MEMBERS)
+                        and store["v"] == STORE_V
+                        and isinstance(store.get("replay"), dict)
+                        and isinstance(store.get("epochs"), dict)):
+                    raise ReadProblem("corrupt", "store")
+        for d in (REPLAY_DIR, "peer-epochs"):
+            if d in artefacts:
+                got = c.dir(d)
+                if got is not None and WITNESS in got[3]:
+                    raw = c.read(READER_JSON_CAP, d, WITNESS)
+                    witness[d] = raw.decode("ascii", "replace") if raw is not None else None
+                else:
+                    witness[d] = None
+        if not c.consistent():
+            raise ReadProblem("concurrent_change")
+    except ReadProblem as e:
+        problems.add("corrupt" if e.code == "duplicate_key" else e.code)
+    except FileNotFoundError:
+        problems.add("concurrent_change")     # listed by the census, gone at the read
+    except OSError:   # anything else the OS says is a read error
+        problems.add("read_error")
+    if problems:
+        return {"v": SHOW_V, "store": "unknown", "artefacts": artefacts, "clock": None,
+                "meta": "absent", "problems": sorted(problems)}
+    clock_doc = None if clock_obj is None else {
+        "admission": clock_obj.admission, "H": format_utc_ts(clock_obj.H),
+        "floor": format_utc_ts(clock_obj.floor) if clock_obj.floor else None,
+        "p": clock_obj.p, "f": clock_obj.f}
+    meta = "present" if store is not None else "absent"
+    if not artefacts:
+        state = "absent"
+    else:
+        if clock_obj is None:
+            problems.add("clock_absent")
+        elif store is None:
+            problems.add("meta_absent")
+        else:
+            if not (witness.get(REPLAY_DIR) == clock_obj.store_token
+                    == store["replay"].get("token")
+                    and witness.get("peer-epochs") == store["epochs"].get("token")):
+                problems.add("witness_mismatch")
+        state = "partial" if problems else "ready"
+    return {"v": SHOW_V, "store": state, "artefacts": artefacts, "clock": clock_doc,
+            "meta": meta, "problems": sorted(problems)}
 
 
 # ---------------------------------------------------------------------------
