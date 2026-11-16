@@ -469,6 +469,16 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
             "error running a full poll — isolated, continuing the loop"
         )
         summary = {}
+    # What this process ACTIVATED (status `delegation`), every poll and
+    # outside the poll's own try: a failed poll still replaces it, so the
+    # section is never one poll older than the rest of the document.
+    try:
+        from . import peerlane
+        tracker.record_delegation(peerlane.status_doc(cfg))
+    except Exception:
+        logger.exception("error reading the activated delegation for status — isolated; "
+                         "the section is left out of this poll's document")
+        tracker.record_delegation(None)
     tracker.record_poll(summary)
     try:
         tracker.write(cfg.state_dir)

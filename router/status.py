@@ -192,6 +192,9 @@ class StatusTracker:
         self.policy: Optional[Dict[str, Any]] = None
         #: Latched by the FIRST record, None included: "once" is literal.
         self._transport_plugin_recorded = False
+        #: The `delegation` section (`peerlane.status_doc`): what this process
+        #: ACTIVATED, replaced every poll; None (member absent) without one.
+        self.delegation: Optional[Dict[str, Any]] = None
 
     def record_policy(self, doc: Optional[Dict[str, Any]]) -> None:
         """The `policy` section (`service.policy_status`): the sender-age
@@ -237,6 +240,12 @@ class StatusTracker:
         None without `delegation`. Replaced every poll: it is state."""
         self.peer_store = doc
 
+    def record_delegation(self, doc: Optional[Dict[str, Any]]) -> None:
+        """This poll's `delegation` section (`peerlane.status_doc`), or None
+        without one. Replaced EVERY poll, never carried over: a verifier
+        binds it to the same poll as everything else in the document."""
+        self.delegation = doc
+
     def record_admitted(self, names: Iterable[str]) -> None:
         """Replace the admitted set. Called every poll, INCLUDING a poll that
         errored — the set the loader accepted is known even when draining it
@@ -257,6 +266,12 @@ class StatusTracker:
                 name, {"last_summary": {}, "totals": _empty_totals(), "last_error_ts": None}
             )
             inst["last_summary"] = dict(s)
+            # WHICH poll this summary is from (`polls`, just incremented).
+            # `instances` keeps every name it has ever seen, so without this
+            # an instance skipped this poll (held, or a poll that failed
+            # before summarising) shows an old clean summary that reads as
+            # "drained now". A reader requires `poll == polls`.
+            inst["poll"] = self.polls
             totals = inst["totals"]
             for k, v in s.items():
                 if k in totals:
@@ -340,6 +355,8 @@ class StatusTracker:
         # retry with its age (router/peerjournal.py).
         if getattr(self, "peer_store", None) is not None:
             doc["peer_store"] = self.peer_store
+        if self.delegation is not None:
+            doc["delegation"] = self.delegation
         # Omitted, never defaulted, when this tracker cannot answer. A
         # consumer distinguishes "a router older than this field" from a
         # wrong value only if the absence is real.
