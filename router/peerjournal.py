@@ -712,6 +712,42 @@ def _obj(c: "Census", cap: int, *parts: str, members: Optional[frozenset] = None
     return doc
 
 
+_B64URL_RE = re.compile(r"[A-Za-z0-9_-]*\Z")
+
+
+def _unb64url(value: str) -> bytes:
+    if not _B64URL_RE.fullmatch(value) or len(value) % 4 == 1:
+        raise ValueError("not unpadded base64url")
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def header_binds(header: Any, *, statement: bytes, key_id: Any, signature: bytes) -> bool:
+    """Whether a pinned AMAP-Peer-Statement field body carries exactly this
+    statement, key id and signature. The grammar is the draft's (§12.6.3,
+    check 1): with every SP, HTAB, CR and LF removed, exactly the tags k, s
+    and b, each once, separated by ";"; s and b unpadded base64url. The
+    record pins the statement twice (`statement` and inside
+    `statement_header`); `inflight.check_record` binds the statement to the
+    pin's id and key id but leaves the header to the codec at hand-over, so
+    a reader that selects on the statement checks this binding itself."""
+    if not isinstance(header, str) or not header.isascii():
+        return False
+    body = re.sub(r"[ \t\r\n]", "", header)
+    tags: Dict[str, str] = {}
+    for part in body.split(";"):
+        name, eq, value = part.partition("=")
+        if not eq or name not in ("k", "s", "b") or name in tags:
+            return False
+        tags[name] = value
+    if set(tags) != {"k", "s", "b"}:
+        return False
+    try:
+        return (tags["k"] == key_id and _unb64url(tags["s"]) == statement
+                and _unb64url(tags["b"]) == signature)
+    except ValueError:
+        return False
+
+
 def _sent_copy(c: "Census", lid: str, pid: str, *, entries: Tuple[str, ...]
                ) -> Dict[str, Any]:
     """The SENT record of one committed copy (its directory already
@@ -735,9 +771,13 @@ def _sent_copy(c: "Census", lid: str, pid: str, *, entries: Tuple[str, ...]
     peer = record.get("peer") or {}
     try:
         statement = base64.b64decode(peer["statement"], validate=True)
+        signature = base64.b64decode(peer["signature"], validate=True)
         payload = strict_json(statement)
     except (KeyError, TypeError, ValueError, ReadProblem):
         raise _Bad("invalid_field") from None
+    if not header_binds(peer.get("statement_header"), statement=statement,
+                        key_id=peer.get("key_id"), signature=signature):
+        raise _Bad("invalid_field")
     # `check_record` already binds the statement's id to the pin's; what it
     # cannot know is the directory the copy sits in.
     if not (isinstance(payload, dict) and peer.get("id") == pid):
@@ -764,22 +804,6 @@ def _sent_copy(c: "Census", lid: str, pid: str, *, entries: Tuple[str, ...]
             "handed_ts": handed["handed_ts"] if handed else None,
             "settled": None if settled is None else {"outcome": settled["outcome"],
                                                      "settled_ts": settled["settled_ts"]}}
-
-
-def _statement_of(c: "Census", lid: str, pid: str) -> Optional[Dict[str, Any]]:
-    """The preserved statement's payload of one copy (for `--in-reply-to`)."""
-    from . import peerresend
-    record = _obj(c, EVIDENCE_RECORD_CAP, lid, peerresend.PEER_SENT_DIR, pid, peerresend.RECORD)
-    if record is None:
-        return None
-    try:
-        payload = strict_json(base64.b64decode((record.get("peer") or {})["statement"],
-                                               validate=True))
-    except (KeyError, TypeError, ValueError, ReadProblem):
-        raise _Bad("invalid_field") from None
-    if not isinstance(payload, dict):
-        raise _Bad("invalid_field")
-    return payload
 
 
 def _evidence(form: str, query: Dict[str, Any], found: str, record: Any,
@@ -827,26 +851,28 @@ def evidence_sent(cfg: Any, *, instance: str, id: Optional[str] = None,
                 if not peerresend._PEER_ID_RE.fullmatch(name):
                     problems.add("invalid_entry")
                     continue
+                # A candidate is excluded only once it is PROVED not to match:
+                # every copy met is validated in full (`_sent_copy`: the
+                # files present, the record closed and its statement bound,
+                # `inflight.check_record`) before its selector is compared. A
+                # copy that cannot be validated is a closed problem, so it can
+                # never vanish into a clean "none".
                 try:
                     listing = c.dir(lid, peerresend.PEER_SENT_DIR, name)
                     if listing is None:
                         raise ReadProblem("concurrent_change")
-                    if peerresend.COMMIT not in listing[3]:
-                        raise _Bad("not_committed")
-                    if req_id is not None:
-                        origin = _obj(c, READER_JSON_CAP, lid, peerresend.PEER_SENT_DIR, name,
-                                      peerresend.ORIGIN, members=_ORIGIN_MEMBERS)
-                        match = origin is not None and origin["req_id"] == req_id
-                    else:
-                        payload = _statement_of(c, lid, name)
-                        match = payload is not None and payload.get("in_reply_to") == in_reply_to
+                    cand = _sent_copy(c, lid, name, entries=listing[3])
                 except (_Bad, ReadProblem) as e:
                     problems.add(e.code)
                     continue
+                if req_id is not None:
+                    match = cand["req_id"] == req_id
+                else:
+                    match = cand["in_reply_to"] == in_reply_to
                 if match:
-                    hits.append((name, listing[3]))
+                    hits.append(cand)
             if len(hits) == 1:
-                record = _sent_copy(c, lid, hits[0][0], entries=hits[0][1])
+                record = hits[0]
                 found = "one"
             elif len(hits) > 1:
                 found = "ambiguous"

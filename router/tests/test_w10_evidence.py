@@ -308,7 +308,10 @@ class TamperTests(_RoundTrip):
     def test_an_uncommitted_copy_met_in_a_scan_makes_it_incomplete(self):
         """A copy still being written could be the match: the scan says so
         instead of answering a clean result."""
-        (self.a_copy().parent / "ZyXwVuTsRqPoNmLkJiHgFeD").mkdir()
+        import shutil
+        other = self.a_copy().parent / "ZyXwVuTsRqPoNmLkJiHgFeD"
+        shutil.copytree(self.a_copy(), other)      # every file present...
+        (other / peerresend.COMMIT).unlink()       # ...but never committed
         got = ev(self.a, "sent", "--instance", "planner", "--req-id", "00000001")
         self.assertEqual((got["found"], got["complete"], got["problems"]),
                          ("one", False, ["not_committed"]))
@@ -348,6 +351,54 @@ class TamperTests(_RoundTrip):
         self.rewrite(moved / peerresend.ORIGIN, json.dumps(origin).encode())
         got = ev(self.a, "sent", "--instance", "planner", "--id", other)
         self.assertEqual((got["found"], got["problems"]), ("none", ["invalid_field"]))
+
+    # -- Codex r1 AMEND: a scanned candidate is never dropped unproved --------
+
+    def b_result_copy(self):
+        r = ev(self.b, "sent", "--instance", "builder", "--in-reply-to", self.task_id)
+        self.assertEqual(r["found"], "one")
+        return self.copy(self.b, e2e.LIDS["builder"], r["record"]["id"])
+
+    def test_a_missing_origin_is_never_a_clean_none_for_req_id(self):
+        (self.a_copy() / peerresend.ORIGIN).unlink()
+        got = ev(self.a, "sent", "--instance", "planner", "--req-id", "00000001")
+        self.assertEqual((got["found"], got["complete"], got["problems"]),
+                         ("none", False, ["not_committed"]))
+
+    def test_a_missing_record_is_never_a_clean_none_for_in_reply_to(self):
+        d = self.b_result_copy()
+        (d / peerresend.RECORD).unlink()
+        got = ev(self.b, "sent", "--instance", "builder", "--in-reply-to", self.task_id)
+        self.assertEqual((got["found"], got["complete"], got["problems"]),
+                         ("none", False, ["not_committed"]))
+
+    def test_a_statement_changed_out_of_its_binding_is_never_a_clean_none(self):
+        """Only the preserved statement's in_reply_to changed, to another
+        valid id: the enclosing record's binding no longer holds, so the copy
+        is invalid -- not a non-match."""
+        d = self.b_result_copy()
+        p = d / peerresend.RECORD
+        rec = json.loads(p.read_bytes())
+        st = json.loads(base64.b64decode(rec["peer"]["statement"]))
+        st["in_reply_to"] = "AbCdEfGhIjKlMnOpQrStUvW"
+        rec["peer"]["statement"] = base64.b64encode(
+            json.dumps(st, sort_keys=True, separators=(",", ":")).encode()).decode()
+        self.rewrite(p, json.dumps(rec).encode())
+        got = ev(self.b, "sent", "--instance", "builder", "--in-reply-to", self.task_id)
+        self.assertEqual((got["found"], got["complete"], got["problems"]),
+                         ("none", False, ["invalid_field"]))
+        # The exact-id lookup of the same copy agrees.
+        got = ev(self.b, "sent", "--instance", "builder", "--id", d.name)
+        self.assertEqual((got["found"], got["problems"]), ("none", ["invalid_field"]))
+
+    def test_valid_non_matching_copies_are_still_a_clean_answer(self):
+        """The positive control: with every copy valid, a selector nobody
+        carries is a clean none, and the real one is found."""
+        got = ev(self.b, "sent", "--instance", "builder", "--in-reply-to",
+                 "AbCdEfGhIjKlMnOpQrStUvW")
+        self.assertEqual((got["found"], got["complete"], got["problems"]), ("none", True, []))
+        got = ev(self.b, "sent", "--instance", "builder", "--in-reply-to", self.task_id)
+        self.assertEqual((got["found"], got["complete"]), ("one", True))
 
     def test_an_invalid_entry_in_the_scanned_directory(self):
         (self.a_copy().parent / "not-an-id").mkdir()
@@ -405,6 +456,48 @@ class TamperTests(_RoundTrip):
             got = ev(self.a, "sent", "--instance", "planner", "--req-id", "00000001")
         self.assertIn("concurrent_change", got["problems"])
         self.assertFalse(got["complete"])
+
+
+class HeaderBindingTests(__import__("unittest").TestCase):
+    """`peerjournal.header_binds`: the draft's field grammar (§12.6.3 check
+    1) and the binding to the pinned statement, key id and signature."""
+
+    ST, SIG, KID = b'{"id":"x"}', bytes(range(64)), "key-a.example"
+
+    def h(self, **over):
+        u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        tags = {"k": self.KID, "s": u(self.ST), "b": u(self.SIG)}
+        tags.update(over)
+        return "; ".join(f"{k}={v}" for k, v in tags.items() if v is not None)
+
+    def binds(self, header, st=None):
+        try:
+            return peerjournal.header_binds(header, statement=st or self.ST, key_id=self.KID,
+                                            signature=self.SIG)
+        except Exception as e:  # noqa: BLE001 -- a crash is a wrong answer, so it FAILS
+            return f"raised {type(e).__name__}"
+
+    def test_the_exact_field_binds_whatever_the_order_and_spacing(self):
+        self.assertTrue(self.binds(self.h()))
+        u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        self.assertTrue(self.binds(f" b={u(self.SIG)} ;\ts={u(self.ST)};\r\nk={self.KID}"))
+
+    def test_another_statement_does_not_bind(self):
+        self.assertFalse(self.binds(self.h(), st=b'{"id":"y"}'))
+
+    def test_another_key_or_signature_does_not_bind(self):
+        u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        self.assertFalse(self.binds(self.h(k="key-b.example")))
+        self.assertFalse(self.binds(self.h(b=u(bytes(64)))))
+
+    def test_the_grammar(self):
+        u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        for header in (self.h(k=None), self.h() + "; k=" + self.KID, self.h() + "; x=1",
+                       self.h(s=base64.urlsafe_b64encode(self.ST).decode() + "=="),
+                       self.h(s=base64.b64encode(self.ST).decode().replace("=", "") + "+"),
+                       "k=" + self.KID, "", None, self.h() + "\u00e9"):
+            with self.subTest(header=header):
+                self.assertFalse(self.binds(header))
 
 
 class ArgumentTests(_RoundTrip):
