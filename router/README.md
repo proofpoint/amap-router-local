@@ -2283,6 +2283,51 @@ else `<invalid>` with an ERROR): `signed sent: instance <name> id <id> kind
 is unchanged. The round-trip proof is `router peer-evidence`, over the
 durable records.
 
+**`router peer-evidence` (ALPHA-2 W10, the S10 proof).** READ-ONLY and
+lock-free; one JSON object on stdout, rc 0, or rc 2 with `router:
+peer-evidence: bad argument [<arg>]` and nothing on stdout (every argument
+is checked before any state is read). Exact lookups of DURABLE records only,
+so a restart changes nothing about the answer:
+
+- `peer-evidence sent --instance NAME (--id ID | --req-id REQ | --in-reply-to
+  ID) [--not-before TS]`: this router's preserved copy of a signed statement
+  it handed over, `state_dir/<lid>/peer-sent/<id>/` (`router/peerresend.py`),
+  which exists only where the resend workflow does (a registry and a hop;
+  elsewhere the answer is `not_preserved`, never a clean "none"). `--req-id`
+  binds the agent's request id to the statement id; `--in-reply-to` finds the
+  statement that answers a given id. Those two scan ONE instance's
+  `peer-sent/` (at most 4096 entries, else `scan_limit`), and more than one
+  match is `found: "ambiguous"`, never a pick. The record: `{id, kind:
+  task|result, in_reply_to, instance, req_id, statement_sha256 (of the exact
+  signed bytes), handed_ts, settled: null|{outcome, settled_ts}}`.
+- `peer-evidence verified --runtime NAME --id ID [--not-before TS]`: this
+  router's check-12 reservation of a signed statement it received, at its
+  exact path (keyed by the configured runtime's ADDRESS, which `NAME` maps
+  to), and its `.done`. The reservation's MAC is ALWAYS verified, under the
+  state_dir's decision key: the reader needs no delegation activation and
+  does no signing or private-key operation, but it never skips the MAC (an
+  unreadable key is `read_error`, a mismatch `mac_invalid`). The record:
+  `{runtime, id, ts, key_id, statement_sha256, state: reserved|done,
+  disposition, done_ts}`.
+
+`{v: 1, form, query, found: one|none|ambiguous, complete, problems,
+record}`; `complete` is true iff `problems` is empty, from the closed set
+`read_error`, `corrupt`, `duplicate_key`, `symlink`, `not_regular`,
+`too_large`, `invalid_field`, `invalid_entry`, `mac_invalid`,
+`not_committed`, `concurrent_change`, `scan_limit`, `stale`,
+`not_preserved`, `instance_unresolved`. The read rules are `peer-store
+show`'s (component-wise opens without following symlinks, capped reads, a
+fixed 16 MiB cap on a preserved `record.json`, strict JSON, and a census of
+every directory read before and after); nothing free-form is output.
+`--not-before` is a window guard (`stale`), never a selector.
+
+The S10 round trip is four lookups, each `found: "one"` and `complete`:
+on A, `sent --req-id <the S9 request id>` gives task T and its sha; on B,
+`verified --runtime <A> --id T` has that sha, `done`, `placed`; on B, `sent
+--in-reply-to T` gives result R and its sha; on A, `verified --runtime <B>
+--id R` has that sha, `done`, `placed`. Equal sha256 on the two hosts means
+they hold the same signed object.
+
 ## The ingress journal (`router/ingress.py`)
 
 Inbound from the external leg arrives through the plugin's intake reader

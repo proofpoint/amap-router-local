@@ -47,6 +47,7 @@ This detects corruption and rollback; it is not a defence against a writer of
 """
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -635,6 +636,305 @@ def peer_store_show(state_dir: Path) -> Dict[str, Any]:
         state = "partial" if problems else "ready"
     return {"v": SHOW_V, "store": state, "artefacts": artefacts, "clock": clock_doc,
             "meta": meta, "problems": sorted(problems)}
+
+
+# ---------------------------------------------------------------------------
+# `router peer-evidence` (A2-15, S10): a closed, bounded, exact-id reader
+# ---------------------------------------------------------------------------
+#
+# The round-trip proof, read from DURABLE records only, so a restart changes
+# nothing about it:
+#
+#   sent      the sender's preserved copy, `state_dir/<lid>/peer-sent/<id>/`
+#             (peerresend): COMMIT, origin.json, record.json (the in-flight
+#             record as handed, carrying the exact signed statement),
+#             handed.json, settled.json;
+#   verified  the receiver's check-12 reservation for (runtime, id) at
+#             `peer-replay/<sha256(runtime address)[:32]>/<sha256(id)>.json`
+#             (the runtime ADDRESS `amap.router@<domain>`, which a configured
+#             runtime's name maps to), its MAC
+#             verified under the state_dir's decision key (MANDATORY: no
+#             activation is needed and no signing or private-key operation is
+#             done, but the MAC is never skipped), and its `.done`.
+#
+# sha256 of the sender's preserved statement bytes equals the reservation's
+# `statement_sha256` exactly when both VMs hold the same signed object.
+# Exact lookups only: the receiver journal is never listed; the two sender
+# selectors (by request id, by what a statement answers) scan ONE instance's
+# `peer-sent/`, capped. Nothing free-form is ever output (no subject, body,
+# address local part or reason text). Read rules: the census above.
+
+EVIDENCE_V = 1
+#: The closed problem codes. `complete` is true iff none is present.
+EVIDENCE_PROBLEMS = ("read_error", "corrupt", "duplicate_key", "symlink", "not_regular",
+                     "too_large", "invalid_field", "invalid_entry", "mac_invalid",
+                     "not_committed", "concurrent_change", "scan_limit", "stale",
+                     "not_preserved", "instance_unresolved")
+EVIDENCE_SCAN_CAP = 4096
+#: A FIXED hard cap for a preserved `record.json`: the configured hop request
+#: cap has no validated maximum, and the record carries more than the
+#: request, so no config value bounds it.
+EVIDENCE_RECORD_CAP = 16 * 1024 * 1024
+EVIDENCE_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}\Z")
+EVIDENCE_REQ_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+#: The statement schema's `key_id` grammar (1-64 characters, dots allowed).
+EVIDENCE_KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_OUTCOMES = ("accepted", "queued_for_human", "rejected")
+_HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_ORIGIN_MEMBERS = frozenset({"v", "id", "logical_id", "generation", "transport_req_id",
+                             "req_id", "preserved_ts"})
+
+
+def evidence_ts_ok(value: Any) -> bool:
+    """`YYYY-MM-DDTHH:MM:SSZ`, a real instant, written exactly that way."""
+    if not isinstance(value, str):
+        return False
+    got = parse_utc_ts(value)
+    return got is not None and format_utc_ts(got) == value
+
+
+class _Bad(Exception):
+    """One problem code, for a value that fails its rule."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _obj(c: "Census", cap: int, *parts: str, members: Optional[frozenset] = None
+         ) -> Optional[Dict]:
+    raw = c.read(cap, *parts)
+    if raw is None:
+        return None
+    doc = strict_json(raw)
+    if not isinstance(doc, dict) or (members is not None and set(doc) != members):
+        raise _Bad("invalid_field")
+    return doc
+
+
+def _sent_copy(c: "Census", lid: str, pid: str, *, entries: Tuple[str, ...]
+               ) -> Dict[str, Any]:
+    """The SENT record of one committed copy (its directory already
+    censused, `entries` its listing). `_Bad` / `ReadProblem` otherwise."""
+    from . import inflight, peerresend
+    base = (lid, peerresend.PEER_SENT_DIR, pid)
+    if peerresend.COMMIT not in entries:
+        raise _Bad("not_committed")
+    origin = _obj(c, READER_JSON_CAP, *base, peerresend.ORIGIN, members=_ORIGIN_MEMBERS)
+    record = _obj(c, EVIDENCE_RECORD_CAP, *base, peerresend.RECORD)
+    if origin is None or record is None:
+        raise _Bad("not_committed")
+    if not (origin["v"] == 1 and origin["id"] == pid and origin["logical_id"] == lid
+            and isinstance(origin["req_id"], str)
+            and EVIDENCE_REQ_ID_RE.fullmatch(origin["req_id"])):
+        raise _Bad("invalid_field")
+    try:
+        inflight.check_record(record)
+    except inflight.RecordDamaged:
+        raise _Bad("invalid_field") from None
+    peer = record.get("peer") or {}
+    try:
+        statement = base64.b64decode(peer["statement"], validate=True)
+        payload = strict_json(statement)
+    except (KeyError, TypeError, ValueError, ReadProblem):
+        raise _Bad("invalid_field") from None
+    # `check_record` already binds the statement's id to the pin's; what it
+    # cannot know is the directory the copy sits in.
+    if not (isinstance(payload, dict) and peer.get("id") == pid):
+        raise _Bad("invalid_field")
+    irt = payload.get("in_reply_to")
+    if irt is not None and not (isinstance(irt, str) and EVIDENCE_ID_RE.fullmatch(irt)):
+        raise _Bad("invalid_field")
+    handed = _obj(c, READER_JSON_CAP, *base, peerresend.HANDED,
+                  members=frozenset({"v", "handed_ts"})) \
+        if peerresend.HANDED in entries else None
+    if handed is not None and not (handed["v"] == 1 and evidence_ts_ok(handed["handed_ts"])):
+        raise _Bad("invalid_field")
+    settled = _obj(c, READER_JSON_CAP, *base, peerresend.SETTLED,
+                   members=frozenset({"v", "outcome", "reason_code", "settled_ts"})) \
+        if peerresend.SETTLED in entries else None
+    if settled is not None and not (settled["v"] == 1 and settled["outcome"] in _OUTCOMES
+                                    and evidence_ts_ok(settled["settled_ts"])
+                                    and (settled["reason_code"] is None
+                                         or isinstance(settled["reason_code"], str))):
+        raise _Bad("invalid_field")
+    return {"id": pid, "kind": "result" if irt is not None else "task", "in_reply_to": irt,
+            "req_id": origin["req_id"],
+            "statement_sha256": hashlib.sha256(statement).hexdigest(),
+            "handed_ts": handed["handed_ts"] if handed else None,
+            "settled": None if settled is None else {"outcome": settled["outcome"],
+                                                     "settled_ts": settled["settled_ts"]}}
+
+
+def _statement_of(c: "Census", lid: str, pid: str) -> Optional[Dict[str, Any]]:
+    """The preserved statement's payload of one copy (for `--in-reply-to`)."""
+    from . import peerresend
+    record = _obj(c, EVIDENCE_RECORD_CAP, lid, peerresend.PEER_SENT_DIR, pid, peerresend.RECORD)
+    if record is None:
+        return None
+    try:
+        payload = strict_json(base64.b64decode((record.get("peer") or {})["statement"],
+                                               validate=True))
+    except (KeyError, TypeError, ValueError, ReadProblem):
+        raise _Bad("invalid_field") from None
+    if not isinstance(payload, dict):
+        raise _Bad("invalid_field")
+    return payload
+
+
+def _evidence(form: str, query: Dict[str, Any], found: str, record: Any,
+              problems: set) -> Dict[str, Any]:
+    return {"v": EVIDENCE_V, "form": form, "query": query, "found": found,
+            "complete": not problems, "problems": sorted(problems), "record": record}
+
+
+def evidence_sent(cfg: Any, *, instance: str, id: Optional[str] = None,
+                  req_id: Optional[str] = None, in_reply_to: Optional[str] = None,
+                  not_before: Optional[str] = None) -> Dict[str, Any]:
+    """`router peer-evidence sent`: exactly one of `id`, `req_id`,
+    `in_reply_to` (validated by the caller). `cfg` is the config keyed the
+    way `peer-request show` keys it (the registry read without recording
+    its seq), so `instance` resolves to its state key."""
+    from . import config as config_mod, peerresend
+    query = {k: v for k, v in (("instance", instance), ("id", id), ("req_id", req_id),
+                               ("in_reply_to", in_reply_to), ("not_before", not_before))
+             if v is not None}
+    problems: set = set()
+    if not peerresend.enabled(cfg):
+        return _evidence("sent", query, "none", None, {"not_preserved"})
+    try:
+        lid = config_mod.state_key(cfg, instance)
+    except config_mod.StateKeyUnresolved:
+        return _evidence("sent", query, "none", None, {"instance_unresolved"})
+    c = Census(cfg.state_dir)
+    record = None
+    found = "none"
+    try:
+        if id is not None:
+            listing = c.dir(lid, peerresend.PEER_SENT_DIR, id) \
+                if peerresend._PEER_ID_RE.fullmatch(id) else None
+            if listing is not None:
+                record = _sent_copy(c, lid, id, entries=listing[3])
+                found = "one"
+        else:
+            root = c.dir(lid, peerresend.PEER_SENT_DIR)
+            names = root[3] if root is not None else ()
+            if len(names) > EVIDENCE_SCAN_CAP:
+                problems.add("scan_limit")
+                names = names[:EVIDENCE_SCAN_CAP]
+            hits = []
+            for name in names:
+                if not peerresend._PEER_ID_RE.fullmatch(name):
+                    problems.add("invalid_entry")
+                    continue
+                try:
+                    listing = c.dir(lid, peerresend.PEER_SENT_DIR, name)
+                    if listing is None:
+                        raise ReadProblem("concurrent_change")
+                    if peerresend.COMMIT not in listing[3]:
+                        raise _Bad("not_committed")
+                    if req_id is not None:
+                        origin = _obj(c, READER_JSON_CAP, lid, peerresend.PEER_SENT_DIR, name,
+                                      peerresend.ORIGIN, members=_ORIGIN_MEMBERS)
+                        match = origin is not None and origin["req_id"] == req_id
+                    else:
+                        payload = _statement_of(c, lid, name)
+                        match = payload is not None and payload.get("in_reply_to") == in_reply_to
+                except (_Bad, ReadProblem) as e:
+                    problems.add(e.code)
+                    continue
+                if match:
+                    hits.append((name, listing[3]))
+            if len(hits) == 1:
+                record = _sent_copy(c, lid, hits[0][0], entries=hits[0][1])
+                found = "one"
+            elif len(hits) > 1:
+                found = "ambiguous"
+        if not c.consistent():
+            raise ReadProblem("concurrent_change")
+    except (_Bad, ReadProblem) as e:
+        problems.add(e.code)
+        record, found = (None, "none") if found == "one" and e.code != "concurrent_change" \
+            else (record, found)
+    except FileNotFoundError:
+        problems.add("concurrent_change")
+    except OSError:
+        problems.add("read_error")
+    if record is not None:
+        record = dict(record, instance=instance)
+        if not_before is not None and record["handed_ts"] is not None \
+                and record["handed_ts"] < not_before:
+            problems.add("stale")
+    return _evidence("sent", query, found, record, problems)
+
+
+def evidence_verified(state_dir: Path, *, runtime: str, runtime_address: str, id: str,
+                      not_before: Optional[str] = None) -> Dict[str, Any]:
+    """`router peer-evidence verified`: the reservation for (runtime, id),
+    by its exact path, MAC verified, and its `.done`. `runtime` is the
+    configured runtime's NAME (as status `delegation.runtimes[].name` shows
+    it); the replay store keys on its runtime ADDRESS (`amap.router@<domain>`,
+    `DelegationRuntime.runtime`), which the caller passes as
+    `runtime_address`."""
+    query = {k: v for k, v in (("runtime", runtime), ("id", id), ("not_before", not_before))
+             if v is not None}
+    problems: set = set()
+    record = None
+    found = "none"
+    rt, idk = peerbind.replay_keys(runtime_address, id)
+    c = Census(state_dir)
+    try:
+        listing = c.dir(REPLAY_DIR, rt)
+        name = idk + peerbind.RESERVATION_SUFFIX
+        if listing is not None and name in listing[3]:
+            raw = c.read(READER_JSON_CAP, REPLAY_DIR, rt, name)
+            if raw is None:
+                raise ReadProblem("concurrent_change")
+            strict_json(raw)                       # duplicate keys: their own code
+            try:
+                key = peerbind._decision_key(Path(state_dir))
+            except Exception:  # noqa: BLE001 -- no key read means no verdict, never "skip"
+                raise ReadProblem("read_error", "decision key") from None
+            try:
+                members = peerbind.parse_reservation(raw, key)
+            except peerbind.RecoveryCorrupt as e:
+                raise _Bad("mac_invalid" if e.reason == "mac" else "invalid_field") from None
+            if "kind" in members or not (
+                    members["runtime"] == runtime_address and members["id"] == id
+                    and members["rt"] == rt and members["idk"] == idk
+                    and evidence_ts_ok(members["ts"])
+                    and isinstance(members["key_id"], str)
+                    and EVIDENCE_KEY_ID_RE.fullmatch(members["key_id"])
+                    and isinstance(members["statement_sha256"], str)
+                    and _HEX64_RE.fullmatch(members["statement_sha256"])):
+                raise _Bad("invalid_field")
+            done = None
+            if idk + DONE_SUFFIX in listing[3]:
+                done = _obj(c, READER_JSON_CAP, REPLAY_DIR, rt, idk + DONE_SUFFIX,
+                            members=frozenset({"done_ts", "disposition"}))
+                if done is None:
+                    raise ReadProblem("concurrent_change")
+                if not (done["disposition"] in DISPOSITIONS and evidence_ts_ok(done["done_ts"])):
+                    raise _Bad("invalid_field")
+            record = {"runtime": runtime, "id": id, "ts": members["ts"],
+                      "key_id": members["key_id"], "statement_sha256": members["statement_sha256"],
+                      "state": "done" if done else "reserved",
+                      "disposition": done["disposition"] if done else None,
+                      "done_ts": done["done_ts"] if done else None}
+            found = "one"
+        if not c.consistent():
+            raise ReadProblem("concurrent_change")
+    except (_Bad, ReadProblem) as e:
+        problems.add(e.code)
+        if e.code != "concurrent_change":
+            record, found = None, "none"
+    except FileNotFoundError:
+        problems.add("concurrent_change")
+    except OSError:
+        problems.add("read_error")
+    if record is not None and not_before is not None and record["ts"] < not_before:
+        problems.add("stale")
+    return _evidence("verified", query, found, record, problems)
 
 
 # ---------------------------------------------------------------------------

@@ -304,9 +304,9 @@ class ShowUnknownTests(_Cli):
         self.clock.unlink()
         os.mkfifo(self.clock)
         try:
-            p = subprocess.run([sys.executable, "-B", "-c",
-                                "import json,sys; from router import peerjournal; "
-                                f"print(json.dumps(peerjournal.peer_store_show({str(self.sd)!r})))"],
+            code = ("import json,sys; from router import peerjournal; "
+                    f"print(json.dumps(peerjournal.peer_store_show({str(self.sd)!r})))")
+            p = subprocess.run([sys.executable, "-B", "-c", code],
                                capture_output=True, text=True, timeout=30,
                                cwd=str(Path(__file__).resolve().parents[2]))
         except subprocess.TimeoutExpired:
