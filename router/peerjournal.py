@@ -47,6 +47,7 @@ This detects corruption and rollback; it is not a defence against a writer of
 """
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -93,7 +94,16 @@ class StoreBlocked(Exception):
 
 
 class StoreRefused(Exception):
-    """`init_store` refused: a peer artefact already exists."""
+    """`init_store` refused: a peer artefact already exists.
+
+    `cause` is the stable token an operator script branches on (ALPHA-2
+    W10, A2-05), set where the refusal is raised and never parsed back out
+    of the text: `artefacts_exist` and `evidence_survives` for init's two
+    checks, `refused` for every other raiser."""
+
+    def __init__(self, message: str, cause: str = "refused") -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +311,11 @@ def init_store(state_dir: Path, now: datetime, *, hop_root: Optional[Path],
     state_dir = Path(state_dir)
     existing = _artefacts(state_dir)
     if existing:
-        raise StoreRefused(f"peer artefacts already exist: {existing}")
+        raise StoreRefused(f"peer artefacts already exist: {existing}", "artefacts_exist")
     surviving = _surviving(hop_root, peer_roots)
     if surviving and not (acknowledge_surviving and acknowledge_surviving.strip()):
         raise StoreRefused(f"placement evidence survives (pass --acknowledge-surviving with "
-                           f"evidence): {surviving[:5]}")
+                           f"evidence): {surviving[:5]}", "evidence_survives")
     clock = peerclock.initial(now, p=p, f=f)
     replay = state_dir / REPLAY_DIR
     replay.mkdir(mode=0o700)
@@ -322,6 +332,648 @@ def init_store(state_dir: Path, now: datetime, *, hop_root: Optional[Path],
     peerclock.write(state_dir, clock, previous=None)
     _write_meta(state_dir, meta)
     return clock
+
+
+# ---------------------------------------------------------------------------
+# Read-only readers (ALPHA-2 W10): the shared safe-read and census rules
+# ---------------------------------------------------------------------------
+#
+# `peer-store show` and `peer-evidence` answer an operator script, with the
+# router stopped or running, and must never report a mixed snapshot as a
+# state. So both:
+#
+#   * open every path component by component below `state_dir`
+#     (O_DIRECTORY|O_NOFOLLOW for directories, O_RDONLY|O_NOFOLLOW|O_NONBLOCK
+#     for files, each relative to its parent's fd), refuse a symlink or a
+#     non-regular file by name, and cap every read;
+#   * parse JSON strictly (UTF-8, no duplicate keys);
+#   * take a CENSUS of every directory they consult -- its (dev, ino,
+#     mtime_ns) and its complete entry set -- before any read and again
+#     after, and re-stat every file read. A file created after the first
+#     listing is caught by the entry sets; a file replaced in place, by the
+#     re-stat. Any difference is `concurrent_change`, never a verdict.
+#
+# `state_dir` itself is the configured root and is opened as configured
+# (the lock and every writer do the same); everything below it is not
+# followed. These readers write nothing: no lock file, no directory.
+
+READER_JSON_CAP = 64 * 1024
+
+
+class ReadProblem(Exception):
+    """A closed problem code from the readers' rules, and a detail."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+
+
+def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ReadProblem("duplicate_key", k)
+        out[k] = v
+    return out
+
+
+def strict_json(raw: bytes) -> Any:
+    """UTF-8 JSON with duplicate keys refused (`duplicate_key`), else
+    `corrupt`."""
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except ReadProblem:
+        raise
+    except (UnicodeDecodeError, ValueError):
+        raise ReadProblem("corrupt") from None
+
+
+def _os_problem(e: OSError) -> Exception:
+    if isinstance(e, FileNotFoundError):
+        return e
+    if e.errno == errno.ELOOP:
+        return ReadProblem("symlink")
+    if e.errno == errno.ENOTDIR:
+        return ReadProblem("not_regular", "not a directory")
+    return ReadProblem("read_error", type(e).__name__)
+
+
+def _open_dir(state_dir: Path, parts: Tuple[str, ...]) -> int:
+    """An fd on `state_dir/parts...`; FileNotFoundError when absent."""
+    try:
+        fd = os.open(str(state_dir), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        raise _os_problem(e) from None
+    for part in parts:
+        try:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError as e:
+            # O_DIRECTORY|O_NOFOLLOW on a symlink says ENOTDIR (Linux), the
+            # same as on a plain file: classify by lstat, so a symlinked
+            # directory is `symlink` and never mistaken for a file.
+            err: Exception = _os_problem(e)
+            if e.errno in (errno.ENOTDIR, errno.ELOOP):
+                try:
+                    if stat.S_ISLNK(os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode):
+                        err = ReadProblem("symlink", part)
+                except OSError:
+                    err = ReadProblem("concurrent_change", part)
+            os.close(fd)
+            raise err from None
+        os.close(fd)
+        fd = nxt
+    return fd
+
+
+def census(state_dir: Path, parts: Tuple[str, ...]) -> Optional[Tuple[Any, ...]]:
+    """`(dev, ino, mtime_ns, (sorted entries))` of a directory, or None when
+    it is absent."""
+    try:
+        fd = _open_dir(state_dir, parts)
+    except FileNotFoundError:
+        return None
+    try:
+        st = os.fstat(fd)
+        names = tuple(sorted(os.listdir(fd)))
+    except OSError as e:
+        raise ReadProblem("read_error", type(e).__name__) from None
+    finally:
+        os.close(fd)
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, names)
+
+
+def read_capped(state_dir: Path, parts: Tuple[str, ...], cap: int
+                ) -> Tuple[bytes, Tuple[int, int, int, int]]:
+    """The bytes of the regular file `state_dir/parts...` (at most `cap`)
+    and its `(dev, ino, size, mtime_ns)`. FileNotFoundError when absent."""
+    dfd = _open_dir(state_dir, parts[:-1])
+    try:
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except OSError as e:
+            raise _os_problem(e) from None
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ReadProblem("not_regular", "/".join(parts))
+        # The cap is enforced on what is READ (at most cap+1 bytes), so a file
+        # that grows after the fstat is caught the same way.
+        chunks, got = [], 0
+        while got <= cap:
+            b = os.read(fd, cap + 1 - got)
+            if not b:
+                break
+            chunks.append(b)
+            got += len(b)
+        if got > cap:
+            raise ReadProblem("too_large", "/".join(parts))
+    except OSError as e:
+        raise ReadProblem("read_error", type(e).__name__) from None
+    finally:
+        os.close(fd)
+    return b"".join(chunks), (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def restat(state_dir: Path, parts: Tuple[str, ...]) -> Optional[Tuple[int, int, int, int]]:
+    """`(dev, ino, size, mtime_ns)` of `state_dir/parts...` by lstat through
+    its parent's fd, or None when absent (or no longer reachable)."""
+    try:
+        dfd = _open_dir(state_dir, parts[:-1])
+    except (FileNotFoundError, ReadProblem):
+        return None
+    try:
+        st = os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+class Census:
+    """One consistent read: `dir` takes a directory's census, `read` a
+    capped file read; `consistent` re-takes every census and re-stats every
+    file, and is True only when nothing moved."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = Path(state_dir)
+        self.dirs: Dict[Tuple[str, ...], Any] = {}
+        self.files: Dict[Tuple[str, ...], Any] = {}
+
+    def dir(self, *parts: str) -> Optional[Tuple[Any, ...]]:
+        got = census(self.state_dir, tuple(parts))
+        self.dirs[tuple(parts)] = got
+        return got
+
+    def read(self, cap: int, *parts: str) -> Optional[bytes]:
+        try:
+            data, sig = read_capped(self.state_dir, tuple(parts), cap)
+        except FileNotFoundError:
+            self.files[tuple(parts)] = None
+            return None
+        self.files[tuple(parts)] = sig
+        return data
+
+    def consistent(self) -> bool:
+        for parts, before in self.dirs.items():
+            if census(self.state_dir, parts) != before:
+                return False
+        for parts, before in self.files.items():
+            if restat(self.state_dir, parts) != before:
+                return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# `router peer-store show --json` (A2-05)
+# ---------------------------------------------------------------------------
+
+SHOW_V = 1
+#: The closed problem codes `show` reports.
+SHOW_PROBLEMS = ("clock_absent", "meta_absent", "witness_mismatch", "read_error", "corrupt",
+                 "symlink", "not_regular", "too_large", "concurrent_change")
+_FIXED_ARTEFACTS = (peerclock.CLOCK_FILE, REPLAY_DIR, VACANT_DIR, "peer-epochs")
+
+
+def _show_census(c: "Census") -> List[str]:
+    """Census every directory `_artefacts` consults; return the artefact
+    names (sorted) as the census saw them."""
+    top = c.dir()
+    if top is None:
+        return []
+    names = top[3]
+    found = [n for n in _FIXED_ARTEFACTS if n in names]
+    for child in names:
+        try:
+            got = c.dir(child)
+        except ReadProblem as e:
+            if e.code == "not_regular":       # a plain file: no journal inside
+                c.dirs.pop((child,), None)
+                continue
+            raise
+        if got is not None and JOURNAL_DIR in got[3]:
+            found.append(f"{child}/{JOURNAL_DIR}")
+    return sorted(found)
+
+
+def peer_store_show(state_dir: Path) -> Dict[str, Any]:
+    """`router peer-store show --json`: the store's on-disk state, read only
+    and lock-free. Never raises for anything on disk: every failure is a
+    closed problem code and `store: "unknown"`.
+
+    `store`, by init's write order (replay+witness, epochs+witness, the
+    clock, then the store bookkeeping inside the clock file):
+      * `absent`  -- no artefact at all;
+      * `ready`   -- clock and bookkeeping present and closed, and both
+                     witnesses equal to the tokens the bookkeeping records
+                     (the replay witness also equal to the clock's);
+      * `partial` -- anything else non-empty, with `clock_absent`,
+                     `meta_absent` or `witness_mismatch` saying what is short;
+      * `unknown` -- a read the rules refuse, or a concurrent change.
+    """
+    state_dir = Path(state_dir)
+    c = Census(state_dir)
+    problems: set = set()
+    artefacts: List[str] = []
+    clock_obj: Optional[peerclock.Clock] = None
+    store: Any = None
+    witness: Dict[str, Optional[str]] = {}
+    try:
+        artefacts = _show_census(c)
+        if peerclock.CLOCK_FILE in artefacts:
+            raw = c.read(READER_JSON_CAP, peerclock.CLOCK_FILE)
+            if raw is not None:
+                doc = strict_json(raw)
+                try:
+                    clock_obj = peerclock._parse(raw)
+                except peerclock.ClockUntrusted:
+                    raise ReadProblem("corrupt", peerclock.CLOCK_FILE) from None
+                store = doc["store"]
+                if store is not None and not (
+                        isinstance(store, dict) and set(store) == set(_META_MEMBERS)
+                        and store["v"] == STORE_V
+                        and isinstance(store.get("replay"), dict)
+                        and isinstance(store.get("epochs"), dict)):
+                    raise ReadProblem("corrupt", "store")
+        for d in (REPLAY_DIR, "peer-epochs"):
+            if d in artefacts:
+                got = c.dir(d)
+                if got is not None and WITNESS in got[3]:
+                    raw = c.read(READER_JSON_CAP, d, WITNESS)
+                    witness[d] = raw.decode("ascii", "replace") if raw is not None else None
+                else:
+                    witness[d] = None
+        if not c.consistent():
+            raise ReadProblem("concurrent_change")
+    except ReadProblem as e:
+        problems.add("corrupt" if e.code == "duplicate_key" else e.code)
+    except FileNotFoundError:
+        problems.add("concurrent_change")     # listed by the census, gone at the read
+    except OSError:   # anything else the OS says is a read error
+        problems.add("read_error")
+    if problems:
+        return {"v": SHOW_V, "store": "unknown", "artefacts": artefacts, "clock": None,
+                "meta": "absent", "problems": sorted(problems)}
+    clock_doc = None if clock_obj is None else {
+        "admission": clock_obj.admission, "H": format_utc_ts(clock_obj.H),
+        "floor": format_utc_ts(clock_obj.floor) if clock_obj.floor else None,
+        "p": clock_obj.p, "f": clock_obj.f}
+    meta = "present" if store is not None else "absent"
+    if not artefacts:
+        state = "absent"
+    else:
+        if clock_obj is None:
+            problems.add("clock_absent")
+        elif store is None:
+            problems.add("meta_absent")
+        else:
+            if not (witness.get(REPLAY_DIR) == clock_obj.store_token
+                    == store["replay"].get("token")
+                    and witness.get("peer-epochs") == store["epochs"].get("token")):
+                problems.add("witness_mismatch")
+        state = "partial" if problems else "ready"
+    return {"v": SHOW_V, "store": state, "artefacts": artefacts, "clock": clock_doc,
+            "meta": meta, "problems": sorted(problems)}
+
+
+# ---------------------------------------------------------------------------
+# `router peer-evidence` (A2-15, S10): a closed, bounded, exact-id reader
+# ---------------------------------------------------------------------------
+#
+# The round-trip proof, read from DURABLE records only, so a restart changes
+# nothing about it:
+#
+#   sent      the sender's preserved copy, `state_dir/<lid>/peer-sent/<id>/`
+#             (peerresend): COMMIT, origin.json, record.json (the in-flight
+#             record as handed, carrying the exact signed statement),
+#             handed.json, settled.json;
+#   verified  the receiver's check-12 reservation for (runtime, id) at
+#             `peer-replay/<sha256(runtime address)[:32]>/<sha256(id)>.json`
+#             (the runtime ADDRESS `amap.router@<domain>`, which a configured
+#             runtime's name maps to), its MAC
+#             verified under the state_dir's decision key (MANDATORY: no
+#             activation is needed and no signing or private-key operation is
+#             done, but the MAC is never skipped), and its `.done`.
+#
+# sha256 of the sender's preserved statement bytes equals the reservation's
+# `statement_sha256` exactly when both VMs hold the same signed object.
+# Exact lookups only: the receiver journal is never listed; the two sender
+# selectors (by request id, by what a statement answers) scan ONE instance's
+# `peer-sent/`, capped. Nothing free-form is ever output (no subject, body,
+# address local part or reason text). Read rules: the census above.
+
+EVIDENCE_V = 1
+#: The closed problem codes. `complete` is true iff none is present.
+EVIDENCE_PROBLEMS = ("read_error", "corrupt", "duplicate_key", "symlink", "not_regular",
+                     "too_large", "invalid_field", "invalid_entry", "mac_invalid",
+                     "not_committed", "concurrent_change", "scan_limit", "stale",
+                     "not_preserved", "instance_unresolved")
+EVIDENCE_SCAN_CAP = 4096
+#: A FIXED hard cap for a preserved `record.json`: the configured hop request
+#: cap has no validated maximum, and the record carries more than the
+#: request, so no config value bounds it.
+EVIDENCE_RECORD_CAP = 16 * 1024 * 1024
+EVIDENCE_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}\Z")
+EVIDENCE_REQ_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+#: The statement schema's `key_id` grammar (1-64 characters, dots allowed).
+EVIDENCE_KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_OUTCOMES = ("accepted", "queued_for_human", "rejected")
+_HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_ORIGIN_MEMBERS = frozenset({"v", "id", "logical_id", "generation", "transport_req_id",
+                             "req_id", "preserved_ts"})
+
+
+def evidence_ts_ok(value: Any) -> bool:
+    """`YYYY-MM-DDTHH:MM:SSZ`, a real instant, written exactly that way."""
+    if not isinstance(value, str):
+        return False
+    got = parse_utc_ts(value)
+    return got is not None and format_utc_ts(got) == value
+
+
+class _Bad(Exception):
+    """One problem code, for a value that fails its rule."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _obj(c: "Census", cap: int, *parts: str, members: Optional[frozenset] = None
+         ) -> Optional[Dict]:
+    raw = c.read(cap, *parts)
+    if raw is None:
+        return None
+    doc = strict_json(raw)
+    if not isinstance(doc, dict) or (members is not None and set(doc) != members):
+        raise _Bad("invalid_field")
+    return doc
+
+
+_B64URL_RE = re.compile(r"[A-Za-z0-9_-]*\Z")
+
+
+def _unb64url(value: str) -> bytes:
+    if not _B64URL_RE.fullmatch(value) or len(value) % 4 == 1:
+        raise ValueError("not unpadded base64url")
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def header_binds(header: Any, *, statement: bytes, key_id: Any, signature: bytes) -> bool:
+    """Whether a pinned AMAP-Peer-Statement field body carries exactly this
+    statement, key id and signature. The shape is the draft's (§12.6.3,
+    check 1): an ASCII field body that is not oversize -- here at most
+    `hoplink.STATEMENT_HEADER_MAX`, the hand-over's own bound and tighter
+    than the draft's 12288 octets, measured BEFORE any whitespace is
+    removed -- which, with every SP, HTAB, CR and LF removed, is exactly
+    the tags k, s and b, each once, separated by ";"; k matches the key_id
+    pattern; s and b are unpadded base64url, s decoding to at most 8192
+    bytes (`peerlane.STATEMENT_MAX_BYTES`). (b's 64 bytes is
+    `inflight.check_record`'s, on the pinned signature it must equal.) The
+    record pins the statement twice (`statement` and inside
+    `statement_header`); `inflight.check_record` binds the statement to the
+    pin's id and key id but leaves the header to the codec at hand-over, so
+    a reader that selects on the statement checks this binding itself."""
+    from . import peerlane
+    if not isinstance(header, str) or not header.isascii() \
+            or len(header) > hoplink.STATEMENT_HEADER_MAX:
+        return False
+    body = re.sub(r"[ \t\r\n]", "", header)
+    tags: Dict[str, str] = {}
+    for part in body.split(";"):
+        name, eq, value = part.partition("=")
+        if not eq or name not in ("k", "s", "b") or name in tags:
+            return False
+        tags[name] = value
+    if set(tags) != {"k", "s", "b"}:
+        return False
+    if not EVIDENCE_KEY_ID_RE.fullmatch(tags["k"]):
+        return False
+    try:
+        pinned = _unb64url(tags["s"])
+        if len(pinned) > peerlane.STATEMENT_MAX_BYTES:
+            return False
+        return (tags["k"] == key_id and pinned == statement
+                and _unb64url(tags["b"]) == signature)
+    except ValueError:
+        return False
+
+
+def _sent_copy(c: "Census", lid: str, pid: str, *, entries: Tuple[str, ...]
+               ) -> Dict[str, Any]:
+    """The SENT record of one committed copy (its directory already
+    censused, `entries` its listing). `_Bad` / `ReadProblem` otherwise."""
+    from . import inflight, peerresend
+    base = (lid, peerresend.PEER_SENT_DIR, pid)
+    if peerresend.COMMIT not in entries:
+        raise _Bad("not_committed")
+    origin = _obj(c, READER_JSON_CAP, *base, peerresend.ORIGIN, members=_ORIGIN_MEMBERS)
+    record = _obj(c, EVIDENCE_RECORD_CAP, *base, peerresend.RECORD)
+    if origin is None or record is None:
+        raise _Bad("not_committed")
+    if not (origin["v"] == 1 and origin["id"] == pid and origin["logical_id"] == lid
+            and isinstance(origin["req_id"], str)
+            and EVIDENCE_REQ_ID_RE.fullmatch(origin["req_id"])):
+        raise _Bad("invalid_field")
+    try:
+        inflight.check_record(record)
+    except inflight.RecordDamaged:
+        raise _Bad("invalid_field") from None
+    peer = record.get("peer") or {}
+    try:
+        statement = base64.b64decode(peer["statement"], validate=True)
+        signature = base64.b64decode(peer["signature"], validate=True)
+        payload = strict_json(statement)
+    except (KeyError, TypeError, ValueError, ReadProblem):
+        raise _Bad("invalid_field") from None
+    if not header_binds(peer.get("statement_header"), statement=statement,
+                        key_id=peer.get("key_id"), signature=signature):
+        raise _Bad("invalid_field")
+    # `check_record` already binds the statement's id to the pin's; what it
+    # cannot know is the directory the copy sits in.
+    if not (isinstance(payload, dict) and peer.get("id") == pid):
+        raise _Bad("invalid_field")
+    irt = payload.get("in_reply_to")
+    if irt is not None and not (isinstance(irt, str) and EVIDENCE_ID_RE.fullmatch(irt)):
+        raise _Bad("invalid_field")
+    handed = _obj(c, READER_JSON_CAP, *base, peerresend.HANDED,
+                  members=frozenset({"v", "handed_ts"})) \
+        if peerresend.HANDED in entries else None
+    if handed is not None and not (handed["v"] == 1 and evidence_ts_ok(handed["handed_ts"])):
+        raise _Bad("invalid_field")
+    settled = _obj(c, READER_JSON_CAP, *base, peerresend.SETTLED,
+                   members=frozenset({"v", "outcome", "reason_code", "settled_ts"})) \
+        if peerresend.SETTLED in entries else None
+    if settled is not None and not (settled["v"] == 1 and settled["outcome"] in _OUTCOMES
+                                    and evidence_ts_ok(settled["settled_ts"])
+                                    and (settled["reason_code"] is None
+                                         or isinstance(settled["reason_code"], str))):
+        raise _Bad("invalid_field")
+    return {"id": pid, "kind": "result" if irt is not None else "task", "in_reply_to": irt,
+            "req_id": origin["req_id"],
+            "statement_sha256": hashlib.sha256(statement).hexdigest(),
+            "handed_ts": handed["handed_ts"] if handed else None,
+            "settled": None if settled is None else {"outcome": settled["outcome"],
+                                                     "settled_ts": settled["settled_ts"]}}
+
+
+def _evidence(form: str, query: Dict[str, Any], found: str, record: Any,
+              problems: set) -> Dict[str, Any]:
+    return {"v": EVIDENCE_V, "form": form, "query": query, "found": found,
+            "complete": not problems, "problems": sorted(problems), "record": record}
+
+
+def evidence_sent(cfg: Any, *, instance: str, id: Optional[str] = None,
+                  req_id: Optional[str] = None, in_reply_to: Optional[str] = None,
+                  not_before: Optional[str] = None) -> Dict[str, Any]:
+    """`router peer-evidence sent`: exactly one of `id`, `req_id`,
+    `in_reply_to` (validated by the caller). `cfg` is the config keyed the
+    way `peer-request show` keys it (the registry read without recording
+    its seq), so `instance` resolves to its state key."""
+    from . import config as config_mod, peerresend
+    query = {k: v for k, v in (("instance", instance), ("id", id), ("req_id", req_id),
+                               ("in_reply_to", in_reply_to), ("not_before", not_before))
+             if v is not None}
+    problems: set = set()
+    if not peerresend.enabled(cfg):
+        return _evidence("sent", query, "none", None, {"not_preserved"})
+    try:
+        lid = config_mod.state_key(cfg, instance)
+    except config_mod.StateKeyUnresolved:
+        return _evidence("sent", query, "none", None, {"instance_unresolved"})
+    c = Census(cfg.state_dir)
+    record = None
+    found = "none"
+    try:
+        if id is not None:
+            listing = c.dir(lid, peerresend.PEER_SENT_DIR, id) \
+                if peerresend._PEER_ID_RE.fullmatch(id) else None
+            if listing is not None:
+                record = _sent_copy(c, lid, id, entries=listing[3])
+                found = "one"
+        else:
+            root = c.dir(lid, peerresend.PEER_SENT_DIR)
+            names = root[3] if root is not None else ()
+            if len(names) > EVIDENCE_SCAN_CAP:
+                problems.add("scan_limit")
+                names = names[:EVIDENCE_SCAN_CAP]
+            hits = []
+            for name in names:
+                if not peerresend._PEER_ID_RE.fullmatch(name):
+                    problems.add("invalid_entry")
+                    continue
+                # A candidate is excluded only once it is PROVED not to match:
+                # every copy met is validated in full (`_sent_copy`: the
+                # files present, the record closed and its statement bound,
+                # `inflight.check_record`) before its selector is compared. A
+                # copy that cannot be validated is a closed problem, so it can
+                # never vanish into a clean "none".
+                try:
+                    listing = c.dir(lid, peerresend.PEER_SENT_DIR, name)
+                    if listing is None:
+                        raise ReadProblem("concurrent_change")
+                    cand = _sent_copy(c, lid, name, entries=listing[3])
+                except (_Bad, ReadProblem) as e:
+                    problems.add(e.code)
+                    continue
+                if req_id is not None:
+                    match = cand["req_id"] == req_id
+                else:
+                    match = cand["in_reply_to"] == in_reply_to
+                if match:
+                    hits.append(cand)
+            if len(hits) == 1:
+                record = hits[0]
+                found = "one"
+            elif len(hits) > 1:
+                found = "ambiguous"
+        if not c.consistent():
+            raise ReadProblem("concurrent_change")
+    except (_Bad, ReadProblem) as e:
+        problems.add(e.code)
+        record, found = (None, "none") if found == "one" and e.code != "concurrent_change" \
+            else (record, found)
+    except FileNotFoundError:
+        problems.add("concurrent_change")
+    except OSError:
+        problems.add("read_error")
+    if record is not None:
+        record = dict(record, instance=instance)
+        if not_before is not None and record["handed_ts"] is not None \
+                and record["handed_ts"] < not_before:
+            problems.add("stale")
+    return _evidence("sent", query, found, record, problems)
+
+
+def evidence_verified(state_dir: Path, *, runtime: str, runtime_address: str, id: str,
+                      not_before: Optional[str] = None) -> Dict[str, Any]:
+    """`router peer-evidence verified`: the reservation for (runtime, id),
+    by its exact path, MAC verified, and its `.done`. `runtime` is the
+    configured runtime's NAME (as status `delegation.runtimes[].name` shows
+    it); the replay store keys on its runtime ADDRESS (`amap.router@<domain>`,
+    `DelegationRuntime.runtime`), which the caller passes as
+    `runtime_address`."""
+    query = {k: v for k, v in (("runtime", runtime), ("id", id), ("not_before", not_before))
+             if v is not None}
+    problems: set = set()
+    record = None
+    found = "none"
+    rt, idk = peerbind.replay_keys(runtime_address, id)
+    c = Census(state_dir)
+    try:
+        listing = c.dir(REPLAY_DIR, rt)
+        name = idk + peerbind.RESERVATION_SUFFIX
+        if listing is not None and name in listing[3]:
+            raw = c.read(READER_JSON_CAP, REPLAY_DIR, rt, name)
+            if raw is None:
+                raise ReadProblem("concurrent_change")
+            strict_json(raw)                       # duplicate keys: their own code
+            try:
+                key = peerbind._decision_key(Path(state_dir))
+            except Exception:  # noqa: BLE001 -- no key read means no verdict, never "skip"
+                raise ReadProblem("read_error", "decision key") from None
+            try:
+                members = peerbind.parse_reservation(raw, key)
+            except peerbind.RecoveryCorrupt as e:
+                raise _Bad("mac_invalid" if e.reason == "mac" else "invalid_field") from None
+            if "kind" in members or not (
+                    members["runtime"] == runtime_address and members["id"] == id
+                    and members["rt"] == rt and members["idk"] == idk
+                    and evidence_ts_ok(members["ts"])
+                    and isinstance(members["key_id"], str)
+                    and EVIDENCE_KEY_ID_RE.fullmatch(members["key_id"])
+                    and isinstance(members["statement_sha256"], str)
+                    and _HEX64_RE.fullmatch(members["statement_sha256"])):
+                raise _Bad("invalid_field")
+            done = None
+            if idk + DONE_SUFFIX in listing[3]:
+                done = _obj(c, READER_JSON_CAP, REPLAY_DIR, rt, idk + DONE_SUFFIX,
+                            members=frozenset({"done_ts", "disposition"}))
+                if done is None:
+                    raise ReadProblem("concurrent_change")
+                if not (done["disposition"] in DISPOSITIONS and evidence_ts_ok(done["done_ts"])):
+                    raise _Bad("invalid_field")
+            record = {"runtime": runtime, "id": id, "ts": members["ts"],
+                      "key_id": members["key_id"], "statement_sha256": members["statement_sha256"],
+                      "state": "done" if done else "reserved",
+                      "disposition": done["disposition"] if done else None,
+                      "done_ts": done["done_ts"] if done else None}
+            found = "one"
+        if not c.consistent():
+            raise ReadProblem("concurrent_change")
+    except (_Bad, ReadProblem) as e:
+        problems.add(e.code)
+        if e.code != "concurrent_change":
+            record, found = None, "none"
+    except FileNotFoundError:
+        problems.add("concurrent_change")
+    except OSError:
+        problems.add("read_error")
+    if record is not None and not_before is not None and record["ts"] < not_before:
+        problems.add("stale")
+    return _evidence("verified", query, found, record, problems)
 
 
 # ---------------------------------------------------------------------------
@@ -1227,6 +1879,7 @@ def mark_done(state_dir: Path, rt: str, idk: str, *, disposition: str, now: date
     _apply(meta, delta)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
+    count_signed(state_dir, f"decided.{disposition}")
 
 
 def done_marker(state_dir: Path, rt: str, idk: str) -> Optional[Dict[str, Any]]:
@@ -1402,6 +2055,48 @@ def transition(state_dir: Path, record: Dict[str, Any], to: str, now: datetime,
 #: Counted once each, when the disposition or the hold is written; a record
 #: pruned later is still counted, and a new process starts again at zero.
 EPOCH_COUNTS: Dict[str, int] = {}
+
+
+#: PROCESS state (ALPHA-2 W10, A2-15): signed traffic SINCE THIS PROCESS
+#: STARTED, per state_dir: `sent.<task|result>` (this process newly linked a
+#: `peer-sent/<id>/handed.json`), `verified.<task|result|control>` (a check-12
+#: reservation committed), `decided.<disposition>` (a `.done` newly linked),
+#: `duplicate` (a check-2 refusal) and `codec_demoted` (a codec refusal that
+#: demotes before check 12). LIVENESS AND DIAGNOSTICS ONLY: a new process
+#: starts at zero, an event begun in one process and finished in the next is
+#: counted only where it finished, and no arithmetic on these is a
+#: correctness check. The round-trip proof is `peer_evidence`, over the
+#: durable records, never these.
+SIGNED_COUNTS: Dict[str, Dict[str, int]] = {}
+SIGNED_KEYS = ("sent.task", "sent.result", "verified.task", "verified.result",
+               "verified.control") + tuple(f"decided.{d}" for d in
+                                           ("placed", "refused", "dropped", "demoted", "mail")) \
+    + ("duplicate", "codec_demoted")
+
+
+def count_signed(state_dir: Path, key: str) -> None:
+    if key not in SIGNED_KEYS:
+        raise ValueError(f"not a signed counter: {key!r}")
+    c = SIGNED_COUNTS.setdefault(str(state_dir), {})
+    c[key] = c.get(key, 0) + 1
+
+
+def signed_status(state_dir: Path, since: Optional[str]) -> Dict[str, Any]:
+    """status `peer_store.signed`: every counter present, zeros included."""
+    c = SIGNED_COUNTS.get(str(state_dir), {})
+    out: Dict[str, Any] = {"v": 1, "since": since}
+    for key in SIGNED_KEYS:
+        group, _, kind = key.partition(".")
+        if kind:
+            out.setdefault(group, {})[kind] = c.get(key, 0)
+        else:
+            out[group] = c.get(key, 0)
+    return out
+
+
+def statement_kind(payload: Any) -> str:
+    """`result` for a statement that answers one (`in_reply_to`), else `task`."""
+    return "result" if isinstance(payload, Mapping) and "in_reply_to" in payload else "task"
 
 
 def _count_epoch_disposition(to: str, fields: Mapping[str, Any]) -> None:
@@ -1781,6 +2476,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
         if cause == NO_STATEMENT:
             return _finish(ctx, transition(ctx.state_dir, record, "mail", now, cause=cause))
         if cause == peerverify.CHECK2_DUPLICATE:
+            count_signed(ctx.state_dir, "duplicate")
             return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE))
         control = None
         if cause in CONTROL_CODEC_CAUSES and verdict.statement is not None:
@@ -1793,6 +2489,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             if about is not None:
                 control = _control("demoted", cause, about,
                                    to=_control_to(ctx, verdict.key_id))
+        count_signed(ctx.state_dir, "codec_demoted")
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=cause,
                                        control=control))
     about = verdict.payload.get("id") if hasattr(verdict.payload, "get") else None
@@ -1823,6 +2520,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     except peerbind.ReservationCollision:
         return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE,
                                        control=_control("dropped", DUPLICATE, about, to=to)))
+    count_signed(ctx.state_dir, f"verified.{statement_kind(verdict.payload)}")
     return _reserved(ctx, record)
 
 
@@ -1869,6 +2567,8 @@ def _control_pending(ctx: Ctx, record: Dict[str, Any], view: Any, fields: Any
     verdict = peerverify.verify(fields, delegation=ctx.delegation, now=now,
                                 known=_known(ctx, record))
     if isinstance(verdict, peerverify.Refused):
+        if verdict.cause == peerverify.CHECK2_DUPLICATE:
+            count_signed(ctx.state_dir, "duplicate")
         cause = DUPLICATE if verdict.cause == peerverify.CHECK2_DUPLICATE else verdict.cause
         return _drop_control(ctx, record, cause)
     if verdict.kind != "control":
@@ -1890,6 +2590,7 @@ def _control_pending(ctx: Ctx, record: Dict[str, Any], view: Any, fields: Any
             notice_ts=format_utc_ts(now), state_dir=ctx.state_dir)
     try:
         _rcp, record = reserve_control(ctx.state_dir, build, record=record)
+        count_signed(ctx.state_dir, "verified.control")
     except peerbind.ReservationCollision:
         return _drop_control(ctx, record, DUPLICATE)
     return _reserved(ctx, record)

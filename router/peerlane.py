@@ -183,6 +183,138 @@ def forget_all() -> None:
 
 
 # ---------------------------------------------------------------------------
+# status.json `delegation` (ALPHA-2 W10, A2-06)
+# ---------------------------------------------------------------------------
+#
+# What THIS PROCESS ACTIVATED, for a verifier to read rather than re-derive
+# from the config: an operator's router.json says what was meant, this
+# section says what is in force. Built every poll from `active(cfg).config`
+# -- the `DelegationConfig` captured when activation succeeded -- so a
+# config edited on disk without a successful reload does not show here.
+#
+# Exactly three closed forms, and nothing else:
+#
+#   {"v": 1, "active": true, "signing_key_id", "signing_public_key",
+#    "runtimes": [{"name", "domains": [...], "keys": [{"key_id", "public_key"}]}],
+#    "window": {"p", "f"}, "inbound"}
+#   {"v": 1, "active": true, "error": <one of DELEGATION_STATUS_ERRORS>}
+#   {"v": 1, "active": false}          -- configured, not (yet) activated
+#
+# and the section is ABSENT when no delegation is configured. Public keys and
+# ids only: never the seed path, the crypto settings or the fingerprint.
+
+DELEGATION_STATUS_V = 1
+#: The closed `error` codes. The writer checks its own output against the
+#: formats below; a snapshot that fails them is published as one code, never
+#: as a partial object. (The config validates a signing key_id only as a
+#: non-empty string and leaves peer key formats to the plugin's key gate, so
+#: these checks are not redundant with loading.)
+DELEGATION_STATUS_ERRORS = frozenset({
+    "invalid_key_id", "invalid_public_key", "invalid_runtime_name", "invalid_domain",
+    "duplicate_runtime", "duplicate_key_id", "duplicate_domain", "invalid_window",
+    "no_runtimes"})
+#: The statement schema's `key_id` grammar (1-64 characters).
+STATUS_KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+STATUS_HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_STATUS_FULL_KEYS = frozenset({"v", "active", "signing_key_id", "signing_public_key",
+                               "runtimes", "window", "inbound"})
+
+
+def delegation_status_problem(doc: Mapping[str, Any]) -> Optional[str]:
+    """The first closed error code the FULL form `doc` violates, or None.
+    The order is fixed, so one snapshot always yields one code."""
+    from . import classify as classify_mod  # local: classify imports config
+    runtimes = doc["runtimes"]
+    if not runtimes:
+        return "no_runtimes"
+    key_ids = [doc["signing_key_id"]] + [k["key_id"] for r in runtimes for k in r["keys"]]
+    if not all(isinstance(k, str) and STATUS_KEY_ID_RE.fullmatch(k) for k in key_ids):
+        return "invalid_key_id"
+    pubs = [doc["signing_public_key"]] + [k["public_key"] for r in runtimes for k in r["keys"]]
+    if not all(isinstance(k, str) and STATUS_HEX64_RE.fullmatch(k) for k in pubs):
+        return "invalid_public_key"
+    names = [r["name"] for r in runtimes]
+    if not all(isinstance(n, str) and config_mod._NAME_RE.fullmatch(n) for n in names):
+        return "invalid_runtime_name"
+    if len(set(names)) != len(names):
+        return "duplicate_runtime"
+    for r in runtimes:
+        for d in r["domains"]:
+            try:
+                ok = isinstance(d, str) and classify_mod.canonical_host(d) == d
+            except Exception:  # noqa: BLE001 -- any refusal is "not a domain"
+                ok = False
+            if not ok:
+                return "invalid_domain"
+        if not r["domains"] or len(set(r["domains"])) != len(r["domains"]):
+            return "duplicate_domain" if r["domains"] else "invalid_domain"
+    if len(set(key_ids)) != len(key_ids):
+        return "duplicate_key_id"
+    p, f = doc["window"]["p"], doc["window"]["f"]
+    if not (type(p) is int and type(f) is int
+            and config_mod.WINDOW_P_BOUNDS[0] <= p <= config_mod.WINDOW_P_BOUNDS[1]
+            and 0 <= f <= config_mod.WINDOW_F_MAX):
+        return "invalid_window"
+    return None
+
+
+def status_doc(cfg: RouterConfig) -> Optional[Dict[str, Any]]:
+    """The `delegation` section of status.json for this poll (see above), or
+    None when `cfg` configures no delegation."""
+    if getattr(cfg, "delegation", None) is None:
+        return None
+    d = active(cfg)
+    if d is None:
+        return {"v": DELEGATION_STATUS_V, "active": False}
+    dc = d.config
+    doc: Dict[str, Any] = {
+        "v": DELEGATION_STATUS_V, "active": True,
+        "signing_key_id": dc.signing_key_id, "signing_public_key": dc.signing_public_key,
+        "runtimes": [
+            {"name": r.name, "domains": sorted(r.domains),
+             "keys": sorted(({"key_id": k["key_id"], "public_key": k["public_key"]}
+                             for k in r.keys), key=lambda k: str(k["key_id"]))}
+            for r in sorted(dc.runtimes, key=lambda r: str(r.name))],
+        "window": {"p": dc.window_p, "f": dc.window_f},
+        "inbound": bool(dc.inbound),
+    }
+    code = delegation_status_problem(doc)
+    if code is not None:
+        logger.error("status: the activated delegation fails its published format (%s); "
+                      "status shows the error code only", code)
+        return {"v": DELEGATION_STATUS_V, "active": True, "error": code}
+    return doc
+
+
+def check_delegation_status(doc: Any) -> Optional[str]:
+    """A READER's check of a published `delegation` section: None when `doc`
+    is exactly one of the three closed forms (a full form passing every
+    format), else a short reason. The writer never emits anything else; this
+    is what a verifier (and the tests) hold it to."""
+    if not isinstance(doc, dict) or doc.get("v") != DELEGATION_STATUS_V:
+        return "not a v1 object"
+    keys = set(doc)
+    if keys == {"v", "active"}:
+        return None if doc["active"] is False else "active without content"
+    if keys == {"v", "active", "error"}:
+        return (None if doc["active"] is True and doc["error"] in DELEGATION_STATUS_ERRORS
+                else "unknown error form")
+    if keys != _STATUS_FULL_KEYS or doc["active"] is not True or type(doc["inbound"]) is not bool:
+        return "not a closed form"
+    if not isinstance(doc["runtimes"], list) or not isinstance(doc["window"], dict) \
+            or set(doc["window"]) != {"p", "f"}:
+        return "not a closed form"
+    for r in doc["runtimes"]:
+        if not (isinstance(r, dict) and set(r) == {"name", "domains", "keys"}
+                and isinstance(r["domains"], list) and isinstance(r["keys"], list)
+                and all(isinstance(k, dict) and set(k) == {"key_id", "public_key"}
+                        for k in r["keys"])):
+            return "not a closed form"
+    code = delegation_status_problem(doc)
+    return None if code is None else code
+
+
+# ---------------------------------------------------------------------------
 # The signing key
 # ---------------------------------------------------------------------------
 

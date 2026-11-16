@@ -447,6 +447,8 @@ Field glossary:
 | `instances.<name>.peer_alerts` | peer lane only: the most recent `held` / `refused` / `ambiguous_target` outcomes (notice id, sender, recipient, ts), rendered as banners by `status` |
 | `instances.<name>.placed_but_denied` | peer lane only, and NOT per process lifetime: the notices this router's ledger says it placed in `<name>`'s peer tree whose latest recorded outcome is `denied` or `refused` (`notice_id`, `sender`, `recipient`, `outcome`, `outcome_ts`, `recorded_ts`, `req_id`), recomputed from `state_dir/<name>/outcomes/` every poll and replaced, never accumulated; `status` banners it as `PLACED BUT DENIED` |
 | `instances.<name>.last_error_ts` | timestamp of the most recent poll that saw `instance_errored` or any `outbound_errored`, or `null` |
+| `instances.<name>.poll` | the value of `polls` on the poll whose summary this is. `instances` keeps every name it has ever seen, so an instance skipped by a poll (held by the registry, or a poll that failed before summarising) keeps an OLDER clean `last_summary`; "drained this poll" is `poll == polls`, never the presence of a summary |
+| `delegation` | with `delegation` configured: what THIS PROCESS ACTIVATED, rebuilt every poll from the activated snapshot (`peerlane.status_doc`), never from the config on disk. Exactly one of three closed forms: `{v: 1, active: true, signing_key_id, signing_public_key, runtimes: [{name, domains, keys: [{key_id, public_key}]}], window: {p, f}, inbound}` (sorted, public material only: never a path, a seed or crypto settings); `{v: 1, active: true, error}` with `error` one of `peerlane.DELEGATION_STATUS_ERRORS` when the snapshot fails the published formats; `{v: 1, active: false}` when configured but not activated. Absent without `delegation`, and absent for a poll whose build of it raised (never left over from an earlier poll). `peerlane.check_delegation_status` is the reader's check |
 
 An instance whose most recent poll's `last_summary` carries `first_sight`
 says so on its line, in one of two texts: the loud
@@ -2150,6 +2152,36 @@ first), prints one JSON line, and appends to the operator audit:
   before the first start with inbound intake. Refused over any peer
   artefact, and over placement evidence that survived a wipe (a disposal
   tombstone, or a signed peer notice in any peer tree) unless acknowledged.
+  Every failure line carries a bracketed cause token that a script branches
+  on (never on the text): `router: refusing to run 'peer-store init'
+  [lock_held]: …` (the router is running), and `router: peer-store init:
+  refused [<cause>]: …` with `artefacts_exist`, `evidence_survives`,
+  `io_error` (any OSError, including one after the store was written but
+  before the audit line and the stdout object) or `refused`; all rc 1. A
+  config error is the usual `router: config error: …`, rc 2; a kill leaves no
+  line. Success is rc 0, exactly one stdout line `{"H", "admission", "f",
+  "p"}`, and an empty stderr. A failed init is never retried blindly: a
+  retry is refused over whatever the first attempt left, and recovering a
+  half-written store is an operator decision.
+- `router peer-store show --json`: READ-ONLY and lock-free (it answers with
+  the router stopped or running, writes nothing, and creates neither the
+  lock file nor `state_dir`); rc 0 with exactly one JSON object, or rc 2 on a
+  config error. `{"v": 1, "store", "artefacts", "clock", "meta",
+  "problems"}`: `store` is `absent` (no peer artefact), `ready` (the clock
+  and its bookkeeping closed and both witnesses equal to the recorded
+  tokens), `partial` (anything else non-empty: `clock_absent`,
+  `meta_absent` or `witness_mismatch` says what is short, in init's write
+  order) or `unknown` (`clock` null; one of `read_error`, `corrupt`,
+  `symlink`, `not_regular`, `too_large`, `concurrent_change`).
+  `artefacts` are the names init's own check refuses over, sorted; `clock`
+  is `{admission, H, floor, p, f}` or null; `meta` is `present` or
+  `absent`. Every path below `state_dir` is opened component by component
+  without following symlinks, every read is capped, JSON is parsed with
+  duplicate keys refused, and every directory consulted is listed (with its
+  identity) before and after the reads, every file re-stat'ed: any change is
+  `unknown`/`concurrent_change`, never a mixed answer. While the router runs
+  it may therefore say `unknown`; the stopped-router reading is the one to
+  act on.
 - `router peer-store declare-restored --evidence TEXT`: after ANY restore of
   `state_dir`. Admission closes.
 - `router peer-bound --at B --evidence TEXT [--b-not-from-wall-clock]`: after
@@ -2232,6 +2264,69 @@ last poll's counts. Its `epochs` section: the tracked pairs, pairs caught
 mid-prune, `untrusted`, and, counted since this process started, the
 policy refusals by code, the `exposure_signer` demotions and the
 `epoch_store_unavailable` holds.
+
+Its `signed` section (ALPHA-2 W10), always present with zeros: `{v: 1,
+since, sent: {task, result}, verified: {task, result, control}, decided:
+{placed, refused, dropped, demoted, mail}, duplicate, codec_demoted}`, each a
+count of events IN THIS PROCESS since `since` (= `process_started_ts`).
+`sent` moves when this process newly links a `peer-sent/<id>/handed.json`
+(so a copy handed before a restart, or a retransmit of a handed id, is not
+counted again); `verified` when a check-12 reservation commits (a replay is
+`duplicate`, a codec failure `codec_demoted`, and neither is ever
+`verified`); `decided.<d>` when a `.done` with that disposition is newly
+linked. These are LIVENESS AND DIAGNOSTICS: an event begun in one process
+and finished in the next counts only where it finished, and no arithmetic
+on them proves anything. The sender also logs one INFO line per newly
+recorded hand-over, ids only (validated against the statement id grammar,
+else `<invalid>` with an ERROR): `signed sent: instance <name> id <id> kind
+<task|result> in_reply_to <id|->`. The receiver's `signed candidates:` line
+is unchanged. The round-trip proof is `router peer-evidence`, over the
+durable records.
+
+**`router peer-evidence` (ALPHA-2 W10, the S10 proof).** READ-ONLY and
+lock-free; one JSON object on stdout, rc 0, or rc 2 with `router:
+peer-evidence: bad argument [<arg>]` and nothing on stdout (every argument
+is checked before any state is read). Exact lookups of DURABLE records only,
+so a restart changes nothing about the answer:
+
+- `peer-evidence sent --instance NAME (--id ID | --req-id REQ | --in-reply-to
+  ID) [--not-before TS]`: this router's preserved copy of a signed statement
+  it handed over, `state_dir/<lid>/peer-sent/<id>/` (`router/peerresend.py`),
+  which exists only where the resend workflow does (a registry and a hop;
+  elsewhere the answer is `not_preserved`, never a clean "none"). `--req-id`
+  binds the agent's request id to the statement id; `--in-reply-to` finds the
+  statement that answers a given id. Those two scan ONE instance's
+  `peer-sent/` (at most 4096 entries, else `scan_limit`), and more than one
+  match is `found: "ambiguous"`, never a pick. The record: `{id, kind:
+  task|result, in_reply_to, instance, req_id, statement_sha256 (of the exact
+  signed bytes), handed_ts, settled: null|{outcome, settled_ts}}`.
+- `peer-evidence verified --runtime NAME --id ID [--not-before TS]`: this
+  router's check-12 reservation of a signed statement it received, at its
+  exact path (keyed by the configured runtime's ADDRESS, which `NAME` maps
+  to), and its `.done`. The reservation's MAC is ALWAYS verified, under the
+  state_dir's decision key: the reader needs no delegation activation and
+  does no signing or private-key operation, but it never skips the MAC (an
+  unreadable key is `read_error`, a mismatch `mac_invalid`). The record:
+  `{runtime, id, ts, key_id, statement_sha256, state: reserved|done,
+  disposition, done_ts}`.
+
+`{v: 1, form, query, found: one|none|ambiguous, complete, problems,
+record}`; `complete` is true iff `problems` is empty, from the closed set
+`read_error`, `corrupt`, `duplicate_key`, `symlink`, `not_regular`,
+`too_large`, `invalid_field`, `invalid_entry`, `mac_invalid`,
+`not_committed`, `concurrent_change`, `scan_limit`, `stale`,
+`not_preserved`, `instance_unresolved`. The read rules are `peer-store
+show`'s (component-wise opens without following symlinks, capped reads, a
+fixed 16 MiB cap on a preserved `record.json`, strict JSON, and a census of
+every directory read before and after); nothing free-form is output.
+`--not-before` is a window guard (`stale`), never a selector.
+
+The S10 round trip is four lookups, each `found: "one"` and `complete`:
+on A, `sent --req-id <the S9 request id>` gives task T and its sha; on B,
+`verified --runtime <A> --id T` has that sha, `done`, `placed`; on B, `sent
+--in-reply-to T` gives result R and its sha; on A, `verified --runtime <B>
+--id R` has that sha, `done`, `placed`. Equal sha256 on the two hosts means
+they hold the same signed object.
 
 ## The ingress journal (`router/ingress.py`)
 

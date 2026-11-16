@@ -38,12 +38,21 @@
                                  a fresh signed-peer store, admission open, no floor: refused over
                                  any peer artefact, and over surviving placement evidence unless
                                  acknowledged (router/peerjournal.py). The router must be stopped.
+  peer-store show --json        read-only, takes no lock, writes nothing: the store's on-disk state
+                                 (absent, ready, partial or unknown) as one JSON object, rc 0
+                                 (router/peerjournal.py, `peer_store_show`)
   peer-store declare-restored --evidence TEXT
                                  after ANY restore of state_dir: admission closes until peer-bound
   peer-bound --at TS --evidence TEXT [--b-not-from-wall-clock]
                                  record an operator bound B after a lost clock: refused below any
                                  receiver time the router can see; floor = B + Fmax + 1 s, then
                                  admission opens. The evidence is recorded, NOT verified.
+  peer-evidence sent --instance NAME (--id ID | --req-id REQ | --in-reply-to ID) [--not-before TS]
+  peer-evidence verified --runtime NAME --id ID [--not-before TS]
+                                 read-only, takes no lock, writes nothing: ONE durable record of a
+                                 signed statement by exact id, as one JSON object (rc 0; a bad
+                                 argument is rc 2). The sender's preserved copy, or the receiver's
+                                 MAC-verified check-12 reservation (router/peerjournal.py)
   peer-request show ID | retransmit ID --evidence TEXT [--allow-pending]
                                  a signed peer task this router sent (router/peerresend.py):
                                  reconcile it, or hand its ORIGINAL bytes over again under a new
@@ -231,6 +240,11 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="attest that this router has never admitted a signed peer candidate")
     p_psi.add_argument("--acknowledge-surviving", metavar="EVIDENCE", default=None,
                        help="proceed over surviving placement evidence, recording why")
+    p_pss = ps_sub.add_parser("show", help="read-only, no lock: the peer store's on-disk "
+                                           "state as one JSON object (absent, ready, partial "
+                                           "or unknown)")
+    p_pss.add_argument("--json", action="store_true", required=True,
+                       help="the only output form: one JSON object on stdout")
     p_psr = ps_sub.add_parser("declare-restored", help="state_dir was restored: close admission")
     p_psr.add_argument("--evidence", required=True)
     p_pe = sub.add_parser("peer-epochs", help="operator verbs on the receiver's epoch store")
@@ -238,6 +252,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pet = pe_sub.add_parser("trust", help="reseed, recount and verify the epoch store, then "
                                             "clear its untrusted flag")
     p_pet.add_argument("--evidence", required=True)
+    p_ev = sub.add_parser("peer-evidence", help="read-only, no lock: one durable record of a "
+                                                "signed statement, by exact id (the S10 proof)")
+    ev_sub = p_ev.add_subparsers(dest="peer_evidence_command", required=True)
+    p_evs = ev_sub.add_parser("sent", help="this router's preserved copy of a signed statement "
+                                           "it handed over")
+    p_evs.add_argument("--instance", required=True)
+    one = p_evs.add_mutually_exclusive_group(required=True)
+    one.add_argument("--id")
+    one.add_argument("--req-id")
+    one.add_argument("--in-reply-to")
+    p_evs.add_argument("--not-before", default=None)
+    p_evv = ev_sub.add_parser("verified", help="this router's check-12 reservation of a signed "
+                                               "statement it received, MAC verified")
+    p_evv.add_argument("--runtime", required=True)
+    p_evv.add_argument("--id", required=True)
+    p_evv.add_argument("--not-before", default=None)
     p_pr = sub.add_parser("peer-request", help="reconcile or retransmit a signed peer task "
                                                 "this router sent")
     pr_sub = p_pr.add_subparsers(dest="peer_request_command", required=True)
@@ -326,10 +356,20 @@ def _peer_operator(cfg, args) -> int:
                                 getattr(args, "peer_decision_command", None),
                                 getattr(args, "peer_candidate_command", None),
                                 getattr(args, "peer_epochs_command", None)) if v)
+    if verb == "peer-store show":
+        # Read-only, NO lock: it must answer with the router stopped AND
+        # running, and must not create the lock file (or state_dir).
+        print(json.dumps(peerjournal.peer_store_show(cfg.state_dir), sort_keys=True))
+        return 0
+    # `peer-store init` alone carries a bracketed cause token on every
+    # failure line (A2-05): the S8 step branches on the token, never on the
+    # text. The other verbs' lines are unchanged.
+    init = verb == "peer-store init"
     try:
         lk = acquire_lock(cfg.state_dir)
     except LockHeldError as e:
-        print(f"router: refusing to run '{verb}': {e}", file=sys.stderr)
+        tok = " [lock_held]" if init else ""
+        print(f"router: refusing to run '{verb}'{tok}: {e}", file=sys.stderr)
         return 1
     now = clock.now()
     try:
@@ -361,10 +401,57 @@ def _peer_operator(cfg, args) -> int:
             out = peerjournal.operator_restore_key(cfg, now, source=args.source)
     except (peerjournal.StoreRefused, peerjournal.DropRefused, peerclock.BoundRefused,
             peerclock.ClockUntrusted, peerjournal.StoreBlocked, OSError, ValueError) as e:
-        print(f"router: {verb}: refused: {e}", file=sys.stderr)
+        if init:
+            cause = (getattr(e, "cause", "refused") if isinstance(e, peerjournal.StoreRefused)
+                     else "io_error" if isinstance(e, OSError) else "refused")
+            print(f"router: {verb}: refused [{cause}]: {e}", file=sys.stderr)
+        else:
+            print(f"router: {verb}: refused: {e}", file=sys.stderr)
         return 1
     finally:
         lk.release()
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def _peer_evidence(cfg, args) -> int:
+    """`peer-evidence sent|verified` (router/peerjournal.py, `evidence_*`):
+    read-only, NO lock. Every argument is checked before any state is read;
+    a bad one is rc 2 naming it, and nothing on stdout."""
+    from . import peerjournal, registry as registry_mod
+
+    def bad(arg: str) -> int:
+        print(f"router: peer-evidence: bad argument [{arg}]", file=sys.stderr)
+        return 2
+    nb = args.not_before
+    if nb is not None and not peerjournal.evidence_ts_ok(nb):
+        return bad("--not-before")
+    if args.peer_evidence_command == "verified":
+        by_name = ({r.name: r.runtime for r in cfg.delegation.runtimes}
+                   if cfg.delegation is not None else {})
+        if args.runtime not in by_name:
+            return bad("--runtime")
+        if not peerjournal.EVIDENCE_ID_RE.fullmatch(args.id):
+            return bad("--id")
+        out = peerjournal.evidence_verified(cfg.state_dir, runtime=args.runtime,
+                                            runtime_address=by_name[args.runtime], id=args.id,
+                                            not_before=nb)
+    else:
+        if args.instance not in cfg.instances:
+            return bad("--instance")
+        for arg, value, rx in (("--id", args.id, peerjournal.EVIDENCE_ID_RE),
+                               ("--req-id", args.req_id, peerjournal.EVIDENCE_REQ_ID_RE),
+                               ("--in-reply-to", args.in_reply_to, peerjournal.EVIDENCE_ID_RE)):
+            if value is not None and not rx.fullmatch(value):
+                return bad(arg)
+        view = cfg
+        if cfg.registry_dir is not None:
+            report = registry_mod.report_for(cfg.registry_dir, cfg.state_dir, cfg.instances,
+                                             persist=False)
+            view = registry_mod.keyed_config(cfg, report)
+        out = peerjournal.evidence_sent(view, instance=args.instance, id=args.id,
+                                        req_id=args.req_id, in_reply_to=args.in_reply_to,
+                                        not_before=nb)
     print(json.dumps(out, sort_keys=True))
     return 0
 
@@ -921,6 +1008,8 @@ def main(argv=None) -> int:
         return _runtime_generation(cfg, args)
     if args.command == "peer-request":
         return _peer_request(cfg, args)
+    if args.command == "peer-evidence":
+        return _peer_evidence(cfg, args)
 
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover — argparse prevents this
     return 2
