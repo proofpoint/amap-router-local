@@ -2265,6 +2265,24 @@ mid-prune, `untrusted`, and, counted since this process started, the
 policy refusals by code, the `exposure_signer` demotions and the
 `epoch_store_unavailable` holds.
 
+Its `signed` section (ALPHA-2 W10), always present with zeros: `{v: 1,
+since, sent: {task, result}, verified: {task, result, control}, decided:
+{placed, refused, dropped, demoted, mail}, duplicate, codec_demoted}`, each a
+count of events IN THIS PROCESS since `since` (= `process_started_ts`).
+`sent` moves when this process newly links a `peer-sent/<id>/handed.json`
+(so a copy handed before a restart, or a retransmit of a handed id, is not
+counted again); `verified` when a check-12 reservation commits (a replay is
+`duplicate`, a codec failure `codec_demoted`, and neither is ever
+`verified`); `decided.<d>` when a `.done` with that disposition is newly
+linked. These are LIVENESS AND DIAGNOSTICS: an event begun in one process
+and finished in the next counts only where it finished, and no arithmetic
+on them proves anything. The sender also logs one INFO line per newly
+recorded hand-over, ids only (validated against the statement id grammar,
+else `<invalid>` with an ERROR): `signed sent: instance <name> id <id> kind
+<task|result> in_reply_to <id|->`. The receiver's `signed candidates:` line
+is unchanged. The round-trip proof is `router peer-evidence`, over the
+durable records.
+
 ## The ingress journal (`router/ingress.py`)
 
 Inbound from the external leg arrives through the plugin's intake reader

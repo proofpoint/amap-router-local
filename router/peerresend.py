@@ -48,6 +48,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -57,6 +58,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from . import config as config_mod
 from .util import atomic_write, format_utc_ts, fsync_dir, parse_utc_ts
+
+logger = logging.getLogger("amap_router_local.peerresend")
 
 PEER_SENT_DIR = "peer-sent"
 COMMIT = "COMMIT"
@@ -240,8 +243,44 @@ def note_handed(cfg: Any, name: str, record: Mapping[str, Any]) -> bool:
     d = copy_dir(cfg.state_dir, lid, record["peer"]["id"])
     if not committed(d) or (d / HANDED).exists():
         return False
-    return _link_once(d / HANDED, _canonical({"v": 1, "handed_ts": format_utc_ts(clock.now())}),
-                      Path(cfg.state_dir))
+    linked = _link_once(d / HANDED, _canonical({"v": 1, "handed_ts": format_utc_ts(clock.now())}),
+                        Path(cfg.state_dir))
+    if linked:
+        _note_sent(cfg, name, record)
+    return linked
+
+
+def _safe_id(value: Any) -> str:
+    """A statement id as it may be logged: the statement grammar (at most 64
+    characters), else `<invalid>`."""
+    if isinstance(value, str) and _LOG_ID_RE.fullmatch(value):
+        return value
+    return "<invalid>"
+
+
+_LOG_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}\Z")
+
+
+def _note_sent(cfg: Any, name: str, record: Mapping[str, Any]) -> None:
+    """A signed statement this process just recorded as handed over (A2-15):
+    the `sent` counter and ONE INFO line carrying ids only -- never an
+    address, a subject or any payload."""
+    from . import peerjournal
+    payload: Any = None
+    try:
+        payload = json.loads(base64.b64decode(record["peer"]["statement"], validate=True))
+    except (KeyError, TypeError, ValueError):
+        payload = None
+    kind = peerjournal.statement_kind(payload)
+    peerjournal.count_signed(cfg.state_dir, f"sent.{kind}")
+    sid = _safe_id(record["peer"].get("id"))
+    irt = payload.get("in_reply_to") if isinstance(payload, dict) else None
+    shown_irt = "-" if irt is None else _safe_id(irt)
+    if "<invalid>" in (sid, shown_irt):
+        logger.error("instance %r: a signed statement recorded as sent carries an id outside "
+                     "the statement grammar", name)
+    logger.info("signed sent: instance %s id %s kind %s in_reply_to %s",
+                name, sid, kind, shown_irt)
 
 
 def note_settled(cfg: Any, name: str, record: Mapping[str, Any],

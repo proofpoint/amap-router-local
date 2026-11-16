@@ -428,6 +428,11 @@ def poll_once(cfg: RouterConfig, tracker: StatusTracker,
                 peer_doc = peerjournal.status_doc(cfg.state_dir, clock.now(),
                                                   PEER_STARTUP.get(str(cfg.state_dir)))
                 peer_doc["inbound"] = bool(cfg.delegation.inbound)
+                # Signed traffic since this process started (A2-15):
+                # liveness only, present with zeros; the proof is
+                # `peer-evidence`, over the durable records.
+                peer_doc["signed"] = peerjournal.signed_status(
+                    cfg.state_dir, tracker.process_started_ts or tracker.started_ts)
                 if LAST_PEER_POLL:
                     peer_doc["last_poll"] = dict(LAST_PEER_POLL)
                 # Control notices out, and the runtime tree as the loaded

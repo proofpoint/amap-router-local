@@ -1540,6 +1540,7 @@ def mark_done(state_dir: Path, rt: str, idk: str, *, disposition: str, now: date
     _apply(meta, delta)
     meta["pending_op"] = None
     _write_meta(state_dir, meta)
+    count_signed(state_dir, f"decided.{disposition}")
 
 
 def done_marker(state_dir: Path, rt: str, idk: str) -> Optional[Dict[str, Any]]:
@@ -1715,6 +1716,48 @@ def transition(state_dir: Path, record: Dict[str, Any], to: str, now: datetime,
 #: Counted once each, when the disposition or the hold is written; a record
 #: pruned later is still counted, and a new process starts again at zero.
 EPOCH_COUNTS: Dict[str, int] = {}
+
+
+#: PROCESS state (ALPHA-2 W10, A2-15): signed traffic SINCE THIS PROCESS
+#: STARTED, per state_dir: `sent.<task|result>` (this process newly linked a
+#: `peer-sent/<id>/handed.json`), `verified.<task|result|control>` (a check-12
+#: reservation committed), `decided.<disposition>` (a `.done` newly linked),
+#: `duplicate` (a check-2 refusal) and `codec_demoted` (a codec refusal that
+#: demotes before check 12). LIVENESS AND DIAGNOSTICS ONLY: a new process
+#: starts at zero, an event begun in one process and finished in the next is
+#: counted only where it finished, and no arithmetic on these is a
+#: correctness check. The round-trip proof is `peer_evidence`, over the
+#: durable records, never these.
+SIGNED_COUNTS: Dict[str, Dict[str, int]] = {}
+SIGNED_KEYS = ("sent.task", "sent.result", "verified.task", "verified.result",
+               "verified.control") + tuple(f"decided.{d}" for d in
+                                           ("placed", "refused", "dropped", "demoted", "mail")) \
+    + ("duplicate", "codec_demoted")
+
+
+def count_signed(state_dir: Path, key: str) -> None:
+    if key not in SIGNED_KEYS:
+        raise ValueError(f"not a signed counter: {key!r}")
+    c = SIGNED_COUNTS.setdefault(str(state_dir), {})
+    c[key] = c.get(key, 0) + 1
+
+
+def signed_status(state_dir: Path, since: Optional[str]) -> Dict[str, Any]:
+    """status `peer_store.signed`: every counter present, zeros included."""
+    c = SIGNED_COUNTS.get(str(state_dir), {})
+    out: Dict[str, Any] = {"v": 1, "since": since}
+    for key in SIGNED_KEYS:
+        group, _, kind = key.partition(".")
+        if kind:
+            out.setdefault(group, {})[kind] = c.get(key, 0)
+        else:
+            out[group] = c.get(key, 0)
+    return out
+
+
+def statement_kind(payload: Any) -> str:
+    """`result` for a statement that answers one (`in_reply_to`), else `task`."""
+    return "result" if isinstance(payload, Mapping) and "in_reply_to" in payload else "task"
 
 
 def _count_epoch_disposition(to: str, fields: Mapping[str, Any]) -> None:
@@ -2094,6 +2137,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
         if cause == NO_STATEMENT:
             return _finish(ctx, transition(ctx.state_dir, record, "mail", now, cause=cause))
         if cause == peerverify.CHECK2_DUPLICATE:
+            count_signed(ctx.state_dir, "duplicate")
             return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE))
         control = None
         if cause in CONTROL_CODEC_CAUSES and verdict.statement is not None:
@@ -2106,6 +2150,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
             if about is not None:
                 control = _control("demoted", cause, about,
                                    to=_control_to(ctx, verdict.key_id))
+        count_signed(ctx.state_dir, "codec_demoted")
         return _finish(ctx, transition(ctx.state_dir, record, "demoted", now, cause=cause,
                                        control=control))
     about = verdict.payload.get("id") if hasattr(verdict.payload, "get") else None
@@ -2136,6 +2181,7 @@ def _pending(ctx: Ctx, record: Dict[str, Any]) -> Dict[str, Any]:
     except peerbind.ReservationCollision:
         return _finish(ctx, transition(ctx.state_dir, record, "dropped", now, cause=DUPLICATE,
                                        control=_control("dropped", DUPLICATE, about, to=to)))
+    count_signed(ctx.state_dir, f"verified.{statement_kind(verdict.payload)}")
     return _reserved(ctx, record)
 
 
@@ -2182,6 +2228,8 @@ def _control_pending(ctx: Ctx, record: Dict[str, Any], view: Any, fields: Any
     verdict = peerverify.verify(fields, delegation=ctx.delegation, now=now,
                                 known=_known(ctx, record))
     if isinstance(verdict, peerverify.Refused):
+        if verdict.cause == peerverify.CHECK2_DUPLICATE:
+            count_signed(ctx.state_dir, "duplicate")
         cause = DUPLICATE if verdict.cause == peerverify.CHECK2_DUPLICATE else verdict.cause
         return _drop_control(ctx, record, cause)
     if verdict.kind != "control":
@@ -2203,6 +2251,7 @@ def _control_pending(ctx: Ctx, record: Dict[str, Any], view: Any, fields: Any
             notice_ts=format_utc_ts(now), state_dir=ctx.state_dir)
     try:
         _rcp, record = reserve_control(ctx.state_dir, build, record=record)
+        count_signed(ctx.state_dir, "verified.control")
     except peerbind.ReservationCollision:
         return _drop_control(ctx, record, DUPLICATE)
     return _reserved(ctx, record)
