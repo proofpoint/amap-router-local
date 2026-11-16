@@ -723,14 +723,22 @@ def _unb64url(value: str) -> bytes:
 
 def header_binds(header: Any, *, statement: bytes, key_id: Any, signature: bytes) -> bool:
     """Whether a pinned AMAP-Peer-Statement field body carries exactly this
-    statement, key id and signature. The grammar is the draft's (§12.6.3,
-    check 1): with every SP, HTAB, CR and LF removed, exactly the tags k, s
-    and b, each once, separated by ";"; s and b unpadded base64url. The
+    statement, key id and signature. The shape is the draft's (§12.6.3,
+    check 1): an ASCII field body that is not oversize -- here at most
+    `hoplink.STATEMENT_HEADER_MAX`, the hand-over's own bound and tighter
+    than the draft's 12288 octets, measured BEFORE any whitespace is
+    removed -- which, with every SP, HTAB, CR and LF removed, is exactly
+    the tags k, s and b, each once, separated by ";"; k matches the key_id
+    pattern; s and b are unpadded base64url, s decoding to at most 8192
+    bytes (`peerlane.STATEMENT_MAX_BYTES`). (b's 64 bytes is
+    `inflight.check_record`'s, on the pinned signature it must equal.) The
     record pins the statement twice (`statement` and inside
     `statement_header`); `inflight.check_record` binds the statement to the
     pin's id and key id but leaves the header to the codec at hand-over, so
     a reader that selects on the statement checks this binding itself."""
-    if not isinstance(header, str) or not header.isascii():
+    from . import peerlane
+    if not isinstance(header, str) or not header.isascii() \
+            or len(header) > hoplink.STATEMENT_HEADER_MAX:
         return False
     body = re.sub(r"[ \t\r\n]", "", header)
     tags: Dict[str, str] = {}
@@ -741,8 +749,13 @@ def header_binds(header: Any, *, statement: bytes, key_id: Any, signature: bytes
         tags[name] = value
     if set(tags) != {"k", "s", "b"}:
         return False
+    if not EVIDENCE_KEY_ID_RE.fullmatch(tags["k"]):
+        return False
     try:
-        return (tags["k"] == key_id and _unb64url(tags["s"]) == statement
+        pinned = _unb64url(tags["s"])
+        if len(pinned) > peerlane.STATEMENT_MAX_BYTES:
+            return False
+        return (tags["k"] == key_id and pinned == statement
                 and _unb64url(tags["b"]) == signature)
     except ValueError:
         return False

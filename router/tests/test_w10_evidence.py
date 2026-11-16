@@ -391,6 +391,63 @@ class TamperTests(_RoundTrip):
         got = ev(self.b, "sent", "--instance", "builder", "--id", d.name)
         self.assertEqual((got["found"], got["problems"]), ("none", ["invalid_field"]))
 
+    # -- Codex r2 AMEND: the pinned field's check-1 shape, through the CLI ----
+
+    def rebuild(self, d, *, statement=None, key_id=None, prefix=""):
+        """Rewrite a preserved copy CONSISTENTLY: the statement (changed by
+        `statement`), the pin's key_id, and the header rebuilt around them,
+        so every equality the reader checks still holds and only the
+        check-1 rule under test is broken."""
+        p = d / peerresend.RECORD
+        rec = json.loads(p.read_bytes())
+        st = json.loads(base64.b64decode(rec["peer"]["statement"]))
+        if key_id is not None:
+            st["key_id"] = rec["peer"]["key_id"] = key_id
+        if statement is not None:
+            statement(st)
+        raw = json.dumps(st, sort_keys=True, separators=(",", ":")).encode()
+        sig = base64.b64decode(rec["peer"]["signature"])
+        u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        rec["peer"]["statement"] = base64.b64encode(raw).decode()
+        rec["peer"]["statement_header"] = (
+            prefix + f"k={rec['peer']['key_id']}; s={u(raw)}; b={u(sig)}")
+        self.rewrite(p, json.dumps(rec).encode())
+        return rec
+
+    def assertInvalidResult(self):
+        got = ev(self.b, "sent", "--instance", "builder", "--in-reply-to", self.task_id)
+        self.assertEqual((got["found"], got["complete"], got["problems"]),
+                         ("none", False, ["invalid_field"]))
+
+    def test_a_consistent_rebuild_still_binds(self):
+        """The control for the three below: the rebuild alone breaks nothing."""
+        self.rebuild(self.b_result_copy())
+        got = ev(self.b, "sent", "--instance", "builder", "--in-reply-to", self.task_id)
+        self.assertEqual((got["found"], got["complete"]), ("one", True))
+
+    def test_a_key_id_outside_its_grammar(self):
+        self.rebuild(self.b_result_copy(), key_id="bad/key")
+        self.assertInvalidResult()
+
+    def test_an_oversize_field_body(self):
+        rec = self.rebuild(self.b_result_copy(), prefix=" " * 12289)
+        self.assertGreater(len(rec["peer"]["statement_header"]), 12288)
+        self.assertInvalidResult()
+
+    def test_a_statement_over_8192_bytes(self):
+        def pad(st):
+            # Exactly 8200 bytes: over the 8192-byte statement cap, while the
+            # header stays inside its own cap.
+            st["subject"] = ""
+            base = len(json.dumps(st, sort_keys=True, separators=(",", ":")).encode())
+            st["subject"] = "x" * (8200 - base)
+        rec = self.rebuild(self.b_result_copy(), statement=pad)
+        self.assertGreater(len(base64.b64decode(rec["peer"]["statement"])), 8192)
+        # Under the field-body cap, so only the statement cap can refuse it.
+        self.assertLessEqual(len(rec["peer"]["statement_header"]),
+                             __import__("router.hoplink").hoplink.STATEMENT_HEADER_MAX)
+        self.assertInvalidResult()
+
     def test_valid_non_matching_copies_are_still_a_clean_answer(self):
         """The positive control: with every copy valid, a selector nobody
         carries is a clean none, and the real one is found."""
